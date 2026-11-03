@@ -10909,6 +10909,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transaction_receipt_retains_system_metadata_after_body_pruning() {
+        let handler = setup();
+        let (block_hash, user_hash) = store_block_with_tx(&handler, 0, true);
+        let recipient = test_address(b"retained-system-receipt");
+        let rewards = vec![
+            SystemTransaction::block_gas_reward(
+                42,
+                0,
+                1,
+                recipient,
+                U256::from(10u64),
+                ShellHash::ZERO,
+            ),
+            SystemTransaction::stark_reward(shell_core::StarkRewardParams {
+                chain_id: 42,
+                block_number: 0,
+                tx_index: 2,
+                recipient,
+                value: U256::from(20u64),
+                source_hash: ShellHash::from([0x44; 32]),
+                layer: 1,
+                original_size: 100,
+                compressed_size: 40,
+                proof_payload: Bytes::from_static(b"retained-proof"),
+            }),
+        ];
+        handler
+            .chain_store
+            .put_system_transactions(&block_hash, 0, &rewards)
+            .unwrap();
+        let mut receipts = handler
+            .chain_store
+            .get_receipts(&block_hash)
+            .unwrap()
+            .unwrap();
+        for (index, reward) in rewards.iter().enumerate() {
+            receipts.push(TransactionReceipt {
+                tx_hash: reward.hash(),
+                block_number: 0,
+                tx_index: index as u32 + 1,
+                status: 1,
+                gas_used: 0,
+                cumulative_gas_used: 21_000,
+                contract_address: None,
+                logs_bloom: Bytes::default(),
+                logs: vec![],
+            });
+        }
+        handler
+            .chain_store
+            .put_receipts(&block_hash, &receipts)
+            .unwrap();
+        let mut before = Vec::new();
+        for reward in &rewards {
+            let receipt = EthApiServer::get_transaction_receipt(&handler, reward.hash())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.from, reward.from);
+            assert_eq!(receipt.to, Some(recipient));
+            assert_eq!(receipt.reward_kind.as_deref(), Some(reward.kind.as_str()));
+            before.push(serde_json::to_value(receipt).unwrap());
+        }
+        handler.chain_store.delete_body(&block_hash).unwrap();
+        for (reward, expected) in rewards.iter().zip(before) {
+            let receipt = EthApiServer::get_transaction_receipt(&handler, reward.hash())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(serde_json::to_value(receipt).unwrap(), expected);
+        }
+        // Retained receipts alone cannot recover ordinary transaction metadata.
+        assert!(EthApiServer::get_transaction_receipt(&handler, user_hash)
+            .await
+            .unwrap()
+            .is_none());
+        handler
+            .chain_store
+            .store()
+            .delete(&[b"h/".as_slice(), block_hash.as_bytes()].concat())
+            .unwrap();
+        for reward in rewards {
+            assert!(
+                EthApiServer::get_transaction_receipt(&handler, reward.hash())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn m5a6_eth_get_transaction_receipt_not_found() {
         let handler = setup();
         let fake_hash = ShellHash::from([0xCC; 32]);

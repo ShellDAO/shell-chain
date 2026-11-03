@@ -500,15 +500,20 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                 .chain_store
                 .get_receipts(&block_hash)
                 .map_err(internal_err)?;
-            if let (Some(block), Some(receipts)) = (block, receipts) {
+            if let Some(receipts) = receipts {
                 if let Some(receipt) = receipts.get(tx_index as usize).cloned() {
                     // F-067: populate from/to/effective_gas_price from the transaction.
                     let (from, to, eff_gas_price, tx_type_val, shell_type, reward_kind) =
-                        if let Some(tx) = block.transactions.get(tx_index as usize) {
+                        if let Some((tx, base_fee)) = block.as_ref().and_then(|block| {
+                            block
+                                .transactions
+                                .get(tx_index as usize)
+                                .map(|tx| (tx, block.header.base_fee_per_gas))
+                        }) {
                             let price = shell_core::effective_gas_price(
                                 tx.tx.max_fee_per_gas,
                                 tx.tx.max_priority_fee_per_gas,
-                                block.header.base_fee_per_gas,
+                                base_fee,
                             );
                             let shell_type = if tx.is_aa_bundle() {
                                 "aaBatch"
@@ -532,6 +537,18 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                             .get_system_transaction_by_hash(&hash)
                             .map_err(internal_err)?
                         {
+                            // System transactions and receipts outlive user
+                            // bodies. Require the retained header as well, but
+                            // do not hide a real receipt just because b/ expired.
+                            if block.is_none()
+                                && self
+                                    .chain_store
+                                    .get_header_by_hash(&block_hash)
+                                    .map_err(internal_err)?
+                                    .is_none()
+                            {
+                                return Ok(None);
+                            }
                             (
                                 system_tx.from,
                                 Some(system_tx.to),
@@ -540,6 +557,10 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
                                 Some(system_tx.kind.as_str().into()),
                                 Some(system_tx.kind.as_str().into()),
                             )
+                        } else if block.is_none() {
+                            // Ordinary transaction metadata is unavailable
+                            // without its body; do not synthesize it.
+                            return Ok(None);
                         } else {
                             (Address::ZERO, None, 0, 2u8, None, None)
                         };

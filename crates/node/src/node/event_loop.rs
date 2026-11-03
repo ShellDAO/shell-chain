@@ -2695,11 +2695,14 @@ impl<S: KvStore + 'static> Node<S> {
         // the canonical chain after a reorg.  We collect all settled sources from
         // canonical StarkReward system-txs first, then reconcile the durable
         // `ss/` index by removing stale entries and back-filling missing ones.
+        let Some(head_hash) = self.chain_store.get_head_hash()? else {
+            return Ok(0);
+        };
         let head = self
             .chain_store
-            .get_head_block()?
-            .map(|block| block.number())
-            .unwrap_or(0);
+            .get_header_by_hash(&head_hash)?
+            .ok_or_else(|| NodeError::Startup("STARK recovery: missing head header".into()))?
+            .number;
 
         // ── Step 1: build the canonical settled set from chain ────────────────
         let mut canonical: std::collections::HashSet<(u32, ShellHash)> =
@@ -2708,12 +2711,30 @@ impl<S: KvStore + 'static> Node<S> {
         let mut canonical_l1_finals: std::collections::HashSet<ShellHash> =
             std::collections::HashSet::new();
         for number in 0..=head {
-            let Some(block) = self.chain_store.get_block_by_number(number)? else {
-                continue;
-            };
-            let legacy = Self::decode_system_extra(&block.header.extra_data)?;
-            let tx_settlements = block
-                .system_transactions
+            let hash = self
+                .chain_store
+                .get_block_hash_by_number(number)?
+                .ok_or_else(|| {
+                    NodeError::Startup(format!("STARK recovery: missing canonical hash #{number}"))
+                })?;
+            let header = self.chain_store.get_header_by_hash(&hash)?.ok_or_else(|| {
+                NodeError::Startup(format!(
+                    "STARK recovery: missing canonical header #{number}"
+                ))
+            })?;
+            let legacy = Self::decode_system_extra(&header.extra_data)?;
+            // Body pruning retains canonical headers and the separate system-tx
+            // records. Requiring a user body here loses settled membership on
+            // restart and incorrectly makes already rewarded sources eligible.
+            let mut system_transactions = self.chain_store.get_system_transactions(&hash)?;
+            if system_transactions.is_empty() {
+                // Older stores may only retain the system transactions inside
+                // the body. Keep that recovery path when a body is available.
+                if let Some(block) = self.chain_store.get_block_by_hash(&hash)? {
+                    system_transactions = block.system_transactions;
+                }
+            }
+            let tx_settlements = system_transactions
                 .iter()
                 .filter(|tx| tx.kind == SystemTxKind::StarkReward)
                 .filter_map(|tx| {

@@ -5278,6 +5278,12 @@ mod tests {
             .expect("settlement tx")
             .hash();
 
+        // Legacy body-only storage still recovers when the separate system-tx
+        // record has not been populated.
+        node.store
+            .delete(&[b"sr/".as_slice(), settlement_block.hash().as_bytes()].concat())
+            .unwrap();
+
         for (key, _) in node.store.scan_prefix(b"pa/").unwrap() {
             node.store.delete(&key).unwrap();
         }
@@ -5323,6 +5329,81 @@ mod tests {
             }
             other => panic!("expected full proof, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rebuild_settled_recovers_pruned_bodies_with_populated_or_empty_index() {
+        for clear_index in [false, true] {
+            let (node, signer) = setup_node();
+            store_genesis(&node);
+            let genesis_hash = node
+                .chain_store
+                .get_block_hash_by_number(0)
+                .unwrap()
+                .unwrap();
+            let hashes = produce_witnessed_blocks(&node, &signer, 2);
+            let sources = vec![genesis_hash, hashes[0], hashes[1]];
+            let amendment = dummy_ordered_amendment(1, sources.clone(), 2);
+            node.pending_stark_settlements
+                .lock()
+                .push(amendment.clone());
+            let settlement = node.produce_block(&signer, 100).unwrap();
+            assert!(node
+                .chain_store
+                .get_system_transactions(&settlement.hash())
+                .unwrap()
+                .iter()
+                .any(|tx| tx.kind == SystemTxKind::StarkReward));
+
+            let mut bodies = sources.clone();
+            bodies.push(settlement.hash());
+            node.chain_store.delete_bodies(&bodies).unwrap();
+            assert!(node.chain_store.get_head_block().unwrap().is_none());
+            for (key, _) in node.store.scan_prefix(b"pa/").unwrap() {
+                node.store.delete(&key).unwrap();
+            }
+            if clear_index {
+                for (key, _) in node.store.scan_prefix(b"ss/").unwrap() {
+                    node.store.delete(&key).unwrap();
+                }
+            }
+            let stale = ShellHash::from([0xde; 32]);
+            node.settled_source_index.put(1, &stale).unwrap();
+            node.settled_stark_sources.lock().clear();
+
+            assert_eq!(node.rebuild_settled_stark_sources_from_chain().unwrap(), 3);
+            assert_eq!(node.store.scan_prefix(b"ss/").unwrap().len(), 3);
+            assert!(!node.settled_source_index.has(1, &stale).unwrap());
+            for hash in sources {
+                assert!(node.settled_source_index.has(1, &hash).unwrap());
+                assert!(node.amendment_store.has_amendment(&hash).unwrap());
+            }
+            let error = node
+                .validate_stark_amendment_ordering(&amendment)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("already compressed at layer 1"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rebuild_settled_missing_canonical_header_preserves_index() {
+        let (node, signer) = setup_node();
+        store_genesis(&node);
+        let hashes = produce_witnessed_blocks(&node, &signer, 2);
+        node.settled_source_index.put(1, &hashes[0]).unwrap();
+        node.store
+            .delete(&[b"h/".as_slice(), hashes[0].as_bytes()].concat())
+            .unwrap();
+        let before = node.store.scan_prefix(b"ss/").unwrap();
+        let error = node.rebuild_settled_stark_sources_from_chain().unwrap_err();
+        assert!(
+            error.to_string().contains("missing canonical header #1"),
+            "{error}"
+        );
+        assert_eq!(node.store.scan_prefix(b"ss/").unwrap(), before);
     }
 
     // ── stark-add-empty-range-tests ─────────────────────────────────────────

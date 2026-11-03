@@ -88,6 +88,24 @@ Broadcast to network (contains Dilithium3 sigs in WitnessBundle)
 
 ---
 
+## Recovery after block-body pruning
+
+Source builds containing the pruned-settlement recovery fix rebuild settled
+source membership from canonical headers and retained system-transaction
+records. Pruning an old user block body must not make its STARK sources eligible
+for another settlement after restart. Recovery also retains the older body-only
+format when that body is available, and removes entries from orphaned forks.
+Retained system-transaction receipts remain available through
+`eth_getTransactionReceipt` after their user block bodies are pruned, with the
+same reward metadata as before pruning.
+
+If an older build already cleared the settled-source index, restarting with the
+fix can reconstruct it while the canonical headers and settlement records are
+still retained. No proof resubmission or additional reward is required. Missing
+canonical headers stop recovery with an explicit error; restore trusted data
+rather than deleting chain state. This correction is unreleased and does not
+change proof eligibility, reward amounts, pruning windows or network activation.
+
 ## ProverRegistry
 
 The native ProverRegistry stores governance-approved proof signing identities in
