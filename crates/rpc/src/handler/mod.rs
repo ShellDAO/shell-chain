@@ -3755,8 +3755,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_get_block_witnesses_empty_bundle() {
-        // Block exists, witness store is wired, but no bundle stored → empty array.
+    async fn shell_get_block_witnesses_missing_bundle_is_null() {
+        // A known block without stored witnesses follows the published null contract.
         let handler = setup_with_witness();
         let block = make_genesis_block();
         let hash = block.hash();
@@ -3767,8 +3767,7 @@ mod tests {
         let result = ShellApiServer::get_block_witnesses(&handler, "latest".to_string())
             .await
             .unwrap();
-        assert_eq!(result["witnessCount"], 0);
-        assert!(result["witnesses"].as_array().unwrap().is_empty());
+        assert!(result.is_null());
     }
 
     #[tokio::test]
@@ -3795,6 +3794,15 @@ mod tests {
         handler.chain_store.set_head(&block1_hash).unwrap();
         *handler.finalized_number.write() = 0;
 
+        // A present, explicitly empty bundle remains distinguishable from a
+        // missing bundle while exercising each selector's block identity.
+        let store = handler.witness_store.as_ref().unwrap();
+        for hash in [genesis_hash, block1_hash] {
+            store
+                .put_bundle(&hash, &shell_core::WitnessBundle::new(vec![]))
+                .unwrap();
+        }
+
         let latest = ShellApiServer::get_block_witnesses(&handler, "latest".to_string())
             .await
             .unwrap();
@@ -3812,6 +3820,120 @@ mod tests {
                 serde_json::to_value(genesis_hash).unwrap()
             );
             assert_eq!(result["witnessCount"], 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn witness_queries_retain_number_and_finality_identity_after_body_pruning() {
+        use shell_core::{TxWitness, WitnessBundle};
+        let handler = setup_with_witness();
+        let genesis = make_genesis_block();
+        let signer = DilithiumSigner::generate();
+        let bundle = WitnessBundle::new(vec![TxWitness::new_embedded(
+            signer.sign(b"retained witness").unwrap(),
+            signer.public_key().to_vec(),
+        )]);
+        let committed = Block {
+            header: BlockHeader {
+                number: 1,
+                parent_hash: genesis.hash(),
+                witness_root: Some(bundle.compute_root()),
+                ..genesis.header.clone()
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let tip = Block {
+            header: BlockHeader {
+                number: 2,
+                parent_hash: committed.hash(),
+                ..genesis.header.clone()
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        for block in [&genesis, &committed, &tip] {
+            handler.chain_store.put_block(block).unwrap();
+            handler
+                .chain_store
+                .set_canonical(block.number(), &block.hash())
+                .unwrap();
+        }
+        handler.chain_store.set_head(&tip.hash()).unwrap();
+        *handler.finalized_number.write() = 1;
+        let hash = committed.hash();
+        let store = handler.witness_store.as_ref().unwrap();
+        store.put_bundle(&hash, &bundle).unwrap();
+        handler
+            .chain_store
+            .store()
+            .delete(&[b"b/".as_slice(), hash.as_bytes()].concat())
+            .unwrap();
+        assert!(handler
+            .chain_store
+            .get_block_by_number(1)
+            .unwrap()
+            .is_none());
+        assert!(handler
+            .chain_store
+            .get_header_by_hash(&hash)
+            .unwrap()
+            .is_some());
+        for selector in [
+            hash.to_string(),
+            "0x1".into(),
+            "safe".into(),
+            "finalized".into(),
+        ] {
+            let witnesses = ShellApiServer::get_block_witnesses(&handler, selector.clone())
+                .await
+                .unwrap();
+            assert_eq!(witnesses["blockHash"], serde_json::to_value(hash).unwrap());
+            assert_eq!(witnesses["witnessCount"], 1);
+            let verification = ShellApiServer::verify_witness_root(&handler, selector.clone())
+                .await
+                .unwrap();
+            assert_eq!(verification["verified"], true);
+            let sdk = ShellApiServer::get_witness(&handler, selector)
+                .await
+                .unwrap();
+            assert_eq!(sdk["block_number"], 1);
+            assert_eq!(sdk["witness_root_verified"], true);
+        }
+        assert_eq!(
+            handler.chain_store.get_head_hash().unwrap(),
+            Some(tip.hash())
+        );
+        assert_eq!(store.get_bundle(&hash).unwrap().unwrap(), bundle);
+        // Once witnesses are evicted, every selector reports unavailable;
+        // the retained header still distinguishes this from an unknown block.
+        handler.chain_store.delete_witness_bundle(&hash).unwrap();
+        for selector in [
+            hash.to_string(),
+            "0x1".into(),
+            "safe".into(),
+            "finalized".into(),
+        ] {
+            assert!(
+                ShellApiServer::get_block_witnesses(&handler, selector.clone())
+                    .await
+                    .unwrap()
+                    .is_null()
+            );
+            assert!(ShellApiServer::get_witness(&handler, selector.clone())
+                .await
+                .unwrap()
+                .is_null());
+            let verification = ShellApiServer::verify_witness_root(&handler, selector)
+                .await
+                .unwrap();
+            assert!(verification["verified"].is_null());
+            assert_eq!(
+                verification["reason"],
+                "witness bundle not stored (pruned or never written)"
+            );
         }
     }
 

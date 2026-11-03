@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Return the documented null when a block has no retained witness bundle.
+  Resolve witness queries from canonical headers so block numbers and finality
+  tags keep working after transaction bodies are pruned.
+
 ### Added
 
 - Opt in to witness commitments with `shell-node run --commit-witness-root`.

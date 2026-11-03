@@ -1527,12 +1527,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
 
         let bundle = ws.get_bundle(&block_hash).map_err(internal_err)?;
         let Some(bundle) = bundle else {
-            return Ok(serde_json::json!({
-                "blockHash": block_hash,
-                "witnessRoot": witness_root,
-                "witnessCount": 0,
-                "witnesses": [],
-            }));
+            return Ok(serde_json::Value::Null);
         };
 
         let witnesses: Vec<serde_json::Value> = bundle
@@ -2045,25 +2040,25 @@ fn resolve_witness_block<S: KvStore + 'static>(
         ShellHash::from(arr)
     } else {
         let tag = parse_block_tag(block)?;
-        let blk = match tag {
+        let hash = match tag {
             BlockTag::Latest | BlockTag::Pending => {
-                handler.chain_store.get_head_block().map_err(internal_err)?
+                handler.chain_store.get_head_hash().map_err(internal_err)?
             }
             BlockTag::Finalized => {
                 let finalized = *handler.finalized_number.read();
                 handler
                     .chain_store
-                    .get_block_by_number(finalized)
+                    .get_block_hash_by_number(finalized)
                     .map_err(internal_err)?
             }
             BlockTag::Number(n) => handler
                 .chain_store
-                .get_block_by_number(n)
+                .get_block_hash_by_number(n)
                 .map_err(internal_err)?,
         };
-        match blk {
+        match hash {
             None => return Ok(None),
-            Some(b) => b.hash(),
+            Some(hash) => hash,
         }
     };
 

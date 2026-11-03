@@ -39,3 +39,9 @@ The native witness acceptance checks genuine ML-DSA transactions and independent
 RLP/Keccak computation across producer, importing peer and process restarts. It
 does not establish light-client consensus verification, Byzantine fault tolerance
 or public release availability.
+
+Witness queries resolve numbers and finality tags through the canonical hash
+index and retained header. They do not require a transaction body to retrieve
+separately stored witnesses. A missing bundle returns null from the bundle APIs;
+root verification retains the known header identity and reports why witness data
+is unavailable. Queries do not recreate an empty bundle or restore pruned data.

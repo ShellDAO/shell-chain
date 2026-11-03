@@ -1704,6 +1704,13 @@ not imply that its header has a commitment.
 
 Returns `null` when no witness bundle is stored (pruned or not applicable).
 
+**Unreleased correction:** missing bundles return literal JSON `null` rather
+than a synthetic zero-count object. A present, explicitly empty bundle still
+returns an object. Witness selectors use retained canonical headers, so a
+pruned transaction body does not make a known block appear unknown. This also
+applies to `shell_getWitness` and `shell_verifyWitnessRoot`, including their
+`"safe"` and `"finalized"` selectors.
+
 ```bash
 curl -s http://localhost:8545 -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"shell_getBlockWitnesses","params":["latest"],"id":1}'
