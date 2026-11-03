@@ -3399,8 +3399,6 @@ dependencies = [
 [[package]]
 name = "jsonrpsee-server"
 version = "0.24.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c625c78b8d545478370b6e7a2a191b0d921f831a9eef38dc1e7efb57e7a5472f"
 dependencies = [
  "futures-util",
  "http",

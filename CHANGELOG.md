@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Execute JSON-RPC method notifications through the HTTP/WebSocket RPC middleware,
+  suppress their responses, and reject malformed identified envelopes without
+  executing them. Keep notification batches subject to normal limits and
+  subscription setup subject to its identified handshake.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

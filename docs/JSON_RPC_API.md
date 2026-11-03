@@ -6,6 +6,33 @@ Complete reference for the shell-chain JSON-RPC API. All methods follow the [JSO
 
 ---
 
+## Notifications (unreleased)
+
+The unreleased node dispatches JSON-RPC 2.0 requests without an `id` through
+ordinary method validation and execution, but emits no JSON-RPC Response.
+Notifications in a batch execute as well; only identified calls contribute
+Response objects. HTTP acknowledges a notification-only exchange with an empty
+body. WebSocket notifications produce no response frame. An explicit `"id":null`
+is still an identified call and receives a response.
+
+Authentication, enabled namespaces, request size, batch size and per-call rate
+limits apply before execution. Rejected notifications do not bypass transaction
+signature or permission checks. A notification supplies no result or error to
+its sender; query the resulting transaction receipt/state separately. HTTP
+transport rejection may still return an HTTP error status, such as 401 or 429.
+
+PubSub setup (`eth_subscribe`) requires an identified request so its acceptance
+can return a subscription ID. Id-less subscription setup is rejected without a
+response or subscription allocation. `eth_unsubscribe` can be a notification.
+Public v0.27.13 acknowledges method notifications without executing them; this
+fix requires a release containing the notification dispatcher patch.
+
+Build the node, then run `python3 tests/e2e/rpc-notifications.py` for a local
+signed-transaction, HTTP/WebSocket, authorization, rate-limit and restart check.
+The script creates its own accounts and data. Set `SHELL_NODE_BIN` to select a
+binary; `--expect-ignored` reproduces the old failure and validates the same
+signed transaction as an identified call instead of claiming notification support.
+
 ## Table of Contents
 
 - [Connection](#connection)
