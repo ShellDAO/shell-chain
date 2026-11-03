@@ -7395,6 +7395,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consensus_info_tracks_weighted_engine_and_current_view() {
+        use shell_consensus::{ViewChangeMessage, WPoaConfig, WPoaEngine};
+
+        let authorities = [
+            Address::from([1; 32]),
+            Address::from([2; 32]),
+            Address::from([3; 32]),
+        ];
+        let engine = Arc::new(parking_lot::RwLock::new(WPoaEngine::new(
+            WPoaConfig::with_weights(PoaConfig::new(authorities.to_vec(), 1), vec![3, 2, 1]),
+            Arc::new(shell_crypto::DilithiumVerifier),
+        )));
+        let handler = setup().with_consensus_engine(engine.clone());
+
+        // Weighted round-robin slots 0..3 belong to the first authority.
+        // A view change rotates that live assignment; it is not a new height.
+        let first = ShellApiServer::consensus_info(&handler).await.unwrap();
+        assert_eq!(first["current_proposer"], authorities[0].to_string());
+        assert!(!engine.write().handle_view_change_message(
+            ViewChangeMessage::new(0, 1, 0, ShellHash::ZERO, authorities[0], vec![1]),
+            6,
+        ));
+        assert_eq!(
+            ShellApiServer::consensus_info(&handler).await.unwrap(),
+            first
+        );
+        assert!(engine.write().handle_view_change_message(
+            ViewChangeMessage::new(0, 1, 0, ShellHash::ZERO, authorities[1], vec![2]),
+            6,
+        ));
+        let rotated = ShellApiServer::consensus_info(&handler).await.unwrap();
+        assert_eq!(rotated["current_proposer"], authorities[1].to_string());
+        assert_eq!(rotated["block_number"], first["block_number"]);
+        assert_eq!(rotated["validators"], first["validators"]);
+    }
+
+    #[tokio::test]
+    async fn consensus_info_preserves_defaults_and_poa_live_selection() {
+        let unknown = ShellApiServer::consensus_info(&setup()).await.unwrap();
+        assert_eq!(unknown["engine"], "unknown");
+        assert_eq!(unknown["validators"], serde_json::json!([]));
+        assert_eq!(unknown["current_proposer"], serde_json::Value::Null);
+
+        let first = Address::from([4; 32]);
+        let second = Address::from([5; 32]);
+        let mut config = PoaConfig::new(vec![first, second], 1).with_epoch_length(4);
+        config.slash_weight_bps = 10_000;
+        let engine = Arc::new(parking_lot::RwLock::new(PoaEngine::new(config)));
+        let handler = setup().with_consensus_engine(engine.clone());
+        let mut block = make_genesis_block();
+        block.header.number = 3;
+        let hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(3, &hash).unwrap();
+        handler.chain_store.set_head(&hash).unwrap();
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+
+        let original = ShellApiServer::consensus_info(&handler).await.unwrap();
+        assert_eq!(original["current_proposer"], first.to_string());
+        assert_eq!(original["epoch"], 1);
+        assert_eq!(original["epoch_progress"], 0);
+        engine.write().slash_authority(&first);
+        let slashed = ShellApiServer::consensus_info(&handler).await.unwrap();
+        assert_eq!(slashed["current_proposer"], second.to_string());
+        assert_eq!(slashed["block_number"], original["block_number"]);
+        engine.write().slash_authority(&second);
+        let empty = ShellApiServer::consensus_info(&handler).await.unwrap();
+        assert_eq!(empty["current_proposer"], Address::default().to_string());
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
     async fn consensus_info_omits_next_block_fields_at_terminal_head() {
         let handler = setup();
         let mut block = make_genesis_block();

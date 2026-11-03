@@ -625,7 +625,8 @@ pub trait ShellApi {
     /// Response fields:
     /// - `engine`          — `"poa"` or `"wpoa"`
     /// - `validators`      — array of `{ address, weight }` for active validators
-    /// - `current_proposer`— hex address of the validator expected to propose next
+    /// - `current_proposer`— hex address selected for the next block by the active
+    ///   engine, including its current view; null at the terminal block height
     /// - `block_number`    — head block number (proposer is for `block_number + 1`)
     /// - `epoch`           — current epoch index
     /// - `epoch_length`    — blocks per epoch

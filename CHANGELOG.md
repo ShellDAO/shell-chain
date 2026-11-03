@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Report the active consensus engine's next proposer in `shell_consensusInfo`,
+  including weighted scheduling and view changes at the same block height.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

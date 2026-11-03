@@ -1317,7 +1317,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             }));
         };
 
-        let (engine_name, weights, poa_cfg) = {
+        let (engine_name, weights, poa_cfg, next_proposer) = {
             let engine = engine_lock.read();
             let engine_name = match engine.engine_type() {
                 EngineType::PoA => "poa",
@@ -1328,6 +1328,9 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
                 engine_name,
                 engine.validator_weights(),
                 engine.poa_config().clone(),
+                head_number
+                    .checked_add(1)
+                    .map(|number| engine.proposer_for_block(number)),
             )
         };
 
@@ -1352,7 +1355,6 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         let epoch_length = poa_cfg.epoch_length;
         let (current_proposer, epoch, epoch_progress) = match head_number.checked_add(1) {
             Some(next_number) => {
-                let proposer = poa_cfg.proposer_for_block(next_number);
                 let epoch = poa_cfg.epoch_of(next_number);
                 let epoch_progress = if epoch_length == 0 {
                     serde_json::Value::Null
@@ -1360,7 +1362,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
                     serde_json::json!(next_number % epoch_length)
                 };
                 (
-                    serde_json::json!(format!("{proposer}")),
+                    serde_json::json!(next_proposer.map(|proposer| proposer.to_string())),
                     serde_json::json!(epoch),
                     epoch_progress,
                 )

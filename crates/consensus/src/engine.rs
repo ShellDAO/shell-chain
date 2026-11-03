@@ -64,6 +64,16 @@ pub trait ConsensusEngine: Send + Sync {
     /// Slot is typically `timestamp / block_interval`.
     fn is_proposer(&self, slot: u64, address: &Address) -> bool;
 
+    /// Return the proposer selected by the active engine, including its current view.
+    ///
+    /// The default supports engines that expose selection through `is_proposer`.
+    fn proposer_for_block(&self, block_number: u64) -> Address {
+        self.validator_weights()
+            .into_keys()
+            .find(|address| self.is_proposer(block_number, address))
+            .unwrap_or_default()
+    }
+
     /// Return the engine type identifier.
     fn engine_type(&self) -> EngineType;
 

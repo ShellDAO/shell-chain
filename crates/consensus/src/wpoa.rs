@@ -354,6 +354,10 @@ impl ConsensusEngine for WPoaEngine {
         self.proposer_for_block(block_number) == *address
     }
 
+    fn proposer_for_block(&self, block_number: u64) -> Address {
+        WPoaEngine::proposer_for_block(self, block_number)
+    }
+
     fn engine_type(&self) -> EngineType {
         EngineType::WPoA
     }

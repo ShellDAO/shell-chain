@@ -1949,20 +1949,42 @@ Returns whether a transaction would be sponsored by a paymaster.
 
 ### shell_consensusInfo
 
-Returns current consensus engine state.
+Returns the active consensus engine, validator weights and next-block proposer.
+`current_proposer` follows the engine's weighted schedule and current view; it
+can change at the same head height after a certified view change. This is a
+prediction, not a promise that a particular validator will produce the block.
+The engine-backed prediction requires a node containing this Unreleased fix.
 
 **Parameters:** None
+
+```bash
+curl -s http://localhost:8545 -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"shell_consensusInfo","params":[]}'
+```
 
 **Returns:**
 ```json
 {
   "engine": "wpoa",
-  "currentProposer": "0x...",
-  "epochNumber": 5,
-  "validatorCount": 3,
-  "finalizedHeight": "0x18"
+  "validators": [{"address": "0x...", "weight": 1, "stake": "0x0"}],
+  "stakeDerivedWeights": false,
+  "current_proposer": "0x...",
+  "block_number": 24,
+  "epoch": 0,
+  "epoch_length": 0,
+  "epoch_progress": null
 }
 ```
+
+The proposer is for `block_number + 1`. At the terminal `u64` head height,
+`current_proposer`, `epoch` and `epoch_progress` are null. If no engine is
+available, its name is `unknown`, validators are empty and proposer/epoch fields
+are null.
+
+To verify predictions against signed blocks, a real validator view change and
+RocksDB restart, build `shell-node` with `--features libp2p` and run
+`python3 tests/e2e/consensus-proposer.py`. The script uses fresh local test keys
+and retains its isolated databases and receipts for inspection.
 
 ---
 

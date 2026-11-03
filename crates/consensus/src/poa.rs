@@ -427,6 +427,10 @@ impl ConsensusEngine for PoaEngine {
         self.expected_proposer_for_block(slot) == *address
     }
 
+    fn proposer_for_block(&self, block_number: u64) -> Address {
+        self.expected_proposer_for_block(block_number)
+    }
+
     fn engine_type(&self) -> EngineType {
         EngineType::PoA
     }
