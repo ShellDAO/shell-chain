@@ -114,10 +114,23 @@ code assumes a block is complete:
 | `BodyOnly` | `b/<hash>` without `w/<hash>` | valid for empty blocks, STARK-replaced witnesses, or body-only back-fill |
 | `BodyWithWitness` | `b/<hash>` + `w/<hash>` | full local block data with PQ witness material |
 
-Historical body sync uses this classifier to request only missing stripped
-bodies. Import may execute body-only/reference transactions with empty signature
-stubs during historical catch-up; the canonical state-root check remains the
-security backstop.
+Historical body backfill uses this classifier to request missing execution data
+for headers already validated and made canonical locally. Restoring these bodies
+does not authorize a new block or waive its transaction authentication rules.
+
+Fresh synchronization through normal block import still needs the PQ witness
+material required for admission. Transactions requiring PQ signature admission are
+rejected if that signature is missing; a matching execution state root does not
+replace the applicable authentication policy. Custom-validation accounts remain
+governed by their configured validation code.
+If a full peer has pruned the requested witnesses, use a peer that still retains
+them, typically an archive peer. The full profile's historical body availability
+does not guarantee historical witness availability.
+
+Current STARK artifacts commit to the declared witness-entry list. They do not
+by themselves establish that every PQ signature is valid; see the whitepaper's
+proof-replacement model. This distinction also separates historical body backfill
+from a future header-only light client.
 
 ### L2 — Proof replaces witness (`ProofAmendment` handler)
 
