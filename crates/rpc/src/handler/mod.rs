@@ -3123,6 +3123,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_transactions_by_address_retains_system_rewards_after_body_pruning() {
+        let handler = setup();
+        let recipient = test_address(b"pruned-history-recipient");
+        let mut block = make_genesis_block();
+        let rewards = vec![
+            SystemTransaction::block_gas_reward(
+                42,
+                0,
+                0,
+                recipient,
+                U256::from(10u64),
+                ShellHash::ZERO,
+            ),
+            SystemTransaction::stark_reward(shell_core::StarkRewardParams {
+                chain_id: 42,
+                block_number: 0,
+                tx_index: 1,
+                recipient,
+                value: U256::from(20u64),
+                source_hash: ShellHash::from([0x44; 32]),
+                layer: 1,
+                original_size: 100,
+                compressed_size: 40,
+                proof_payload: Bytes::from_static(b"retained-history-proof"),
+            }),
+        ];
+        block.system_transactions = rewards.clone();
+        let hash = block.hash();
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(0, &hash).unwrap();
+        handler.chain_store.set_head(&hash).unwrap();
+        handler
+            .chain_store
+            .put_system_transactions(&hash, 0, &rewards)
+            .unwrap();
+        let before = ShellApiServer::get_transactions_by_address(
+            &handler,
+            recipient,
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(before["total"], 2);
+        assert_eq!(before["transactions"].as_array().unwrap().len(), 2);
+        for reward in &rewards {
+            assert!(before["transactions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tx| tx["hash"] == serde_json::json!(reward.hash())
+                    && tx["rewardKind"] == reward.kind.as_str()));
+        }
+        let mut before_v2 = Vec::new();
+        for detail in [
+            RpcV2TxDetail::Hashes,
+            RpcV2TxDetail::Summary,
+            RpcV2TxDetail::Full,
+        ] {
+            let page = ShellApiServer::get_transactions_by_address_v2(
+                &handler,
+                recipient,
+                Some(RpcAddressTransactionsV2Options {
+                    from_block: Some(0),
+                    to_block: Some(0),
+                    detail,
+                    include_total: Some(true),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            before_v2.push((detail, serde_json::to_value(page).unwrap()));
+        }
+        handler.chain_store.delete_body(&hash).unwrap();
+        let after = ShellApiServer::get_transactions_by_address(
+            &handler,
+            recipient,
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after, before);
+        for (detail, expected) in before_v2 {
+            let page = ShellApiServer::get_transactions_by_address_v2(
+                &handler,
+                recipient,
+                Some(RpcAddressTransactionsV2Options {
+                    from_block: Some(0),
+                    to_block: Some(0),
+                    detail,
+                    include_total: Some(true),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(serde_json::to_value(page).unwrap(), expected);
+        }
+        let page0 = ShellApiServer::get_transactions_by_address(
+            &handler,
+            recipient,
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(1),
+        )
+        .await
+        .unwrap();
+        let page1 = ShellApiServer::get_transactions_by_address(
+            &handler,
+            recipient,
+            Some(0),
+            Some(0),
+            Some(1),
+            Some(1),
+        )
+        .await
+        .unwrap();
+        let page2 = ShellApiServer::get_transactions_by_address(
+            &handler,
+            recipient,
+            Some(0),
+            Some(0),
+            Some(2),
+            Some(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page0["total"], 2);
+        assert_eq!(page0["transactions"].as_array().unwrap().len(), 1);
+        assert_ne!(
+            page0["transactions"][0]["hash"],
+            page1["transactions"][0]["hash"]
+        );
+        assert!(page2["transactions"].as_array().unwrap().is_empty());
+        handler
+            .chain_store
+            .store()
+            .delete(&[b"h/".as_slice(), hash.as_bytes()].concat())
+            .unwrap();
+        let missing = ShellApiServer::get_transactions_by_address(
+            &handler,
+            recipient,
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(20),
+        )
+        .await
+        .unwrap();
+        assert!(missing["transactions"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn get_block_after_store() {
         let handler = setup();
         let block = make_genesis_block();

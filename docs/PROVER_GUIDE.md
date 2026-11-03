@@ -98,6 +98,10 @@ format when that body is available, and removes entries from orphaned forks.
 Retained system-transaction receipts remain available through
 `eth_getTransactionReceipt` after their user block bodies are pruned, with the
 same reward metadata as before pruning.
+Recipient address history through `shell_getTransactionsByAddress` and the
+source cursor-based history API also retains these system rewards, including
+their original block timestamp. The retained header and system record are
+required; this does not reconstruct pruned ordinary transaction bodies.
 
 If an older build already cleared the settled-source index, restarting with the
 fix can reconstruct it while the canonical headers and settlement records are

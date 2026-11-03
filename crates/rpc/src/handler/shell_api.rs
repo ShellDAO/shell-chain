@@ -116,25 +116,18 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             else {
                 continue;
             };
-            let Some(block) = self
+            let block = self
                 .chain_store
                 .get_block_by_hash(&block_hash)
-                .map_err(internal_err)?
-            else {
-                continue;
-            };
+                .map_err(internal_err)?;
             if let Some(mut value) = self.tx_value_for_location(
                 &entry.tx_hash,
-                &block,
+                block.as_ref(),
                 block_hash,
                 tx_index,
                 options.detail,
             )? {
                 if let serde_json::Value::Object(ref mut object) = value {
-                    object.insert(
-                        "timestamp".into(),
-                        serde_json::json!(hex_u64(block.header.timestamp)),
-                    );
                     if let Some(receipt) = self
                         .chain_store
                         .get_receipt_by_tx_hash(&entry.tx_hash)
@@ -182,51 +175,72 @@ impl<S: KvStore + 'static> RpcHandler<S> {
     fn tx_value_for_location(
         &self,
         hash: &ShellHash,
-        block: &Block,
+        block: Option<&Block>,
         block_hash: ShellHash,
         tx_index: u32,
         detail: RpcV2TxDetail,
     ) -> Result<Option<serde_json::Value>, ErrorObjectOwned> {
-        if matches!(detail, RpcV2TxDetail::Hashes) {
+        let header = match block {
+            Some(block) => block.header.clone(),
+            None => match self
+                .chain_store
+                .get_header_by_hash(&block_hash)
+                .map_err(internal_err)?
+            {
+                Some(header) => header,
+                None => return Ok(None),
+            },
+        };
+        if block.is_some() && matches!(detail, RpcV2TxDetail::Hashes) {
             return Ok(Some(serde_json::json!(hash)));
         }
-        if let Some(tx) = block.transactions.get(tx_index as usize) {
-            let value = match detail {
-                RpcV2TxDetail::Full => serde_json::to_value(tx_to_rpc(
-                    tx,
-                    Some(block_hash),
-                    Some(block.number()),
-                    Some(tx_index),
-                    Some(block.header.base_fee_per_gas),
-                )),
-                RpcV2TxDetail::None | RpcV2TxDetail::Hashes | RpcV2TxDetail::Summary => {
-                    serde_json::to_value(tx_to_rpc_summary(
+        let mut value =
+            if let Some(tx) = block.and_then(|block| block.transactions.get(tx_index as usize)) {
+                match detail {
+                    RpcV2TxDetail::Full => serde_json::to_value(tx_to_rpc(
                         tx,
                         Some(block_hash),
-                        Some(block.number()),
+                        Some(header.number),
                         Some(tx_index),
-                    ))
+                        Some(header.base_fee_per_gas),
+                    )),
+                    RpcV2TxDetail::None | RpcV2TxDetail::Hashes | RpcV2TxDetail::Summary => {
+                        serde_json::to_value(tx_to_rpc_summary(
+                            tx,
+                            Some(block_hash),
+                            Some(header.number),
+                            Some(tx_index),
+                        ))
+                    }
                 }
-            }
-            .map_err(|e| internal_err(format!("serialize tx: {e}")))?;
-            return Ok(Some(value));
+                .map_err(|e| internal_err(format!("serialize tx: {e}")))?
+            } else {
+                let system_tx = self
+                    .chain_store
+                    .get_system_transaction_by_hash(hash)
+                    .map_err(internal_err)?;
+                let Some(system_tx) = system_tx else {
+                    return Ok(None);
+                };
+                if matches!(detail, RpcV2TxDetail::Hashes) {
+                    return Ok(Some(serde_json::json!(hash)));
+                }
+                match detail {
+                    RpcV2TxDetail::Full => {
+                        serde_json::to_value(system_tx_to_rpc(&system_tx, Some(block_hash)))
+                    }
+                    RpcV2TxDetail::None | RpcV2TxDetail::Hashes | RpcV2TxDetail::Summary => {
+                        serde_json::to_value(system_tx_to_rpc_summary(&system_tx, Some(block_hash)))
+                    }
+                }
+                .map_err(|e| internal_err(format!("serialize system tx: {e}")))?
+            };
+        if let serde_json::Value::Object(ref mut object) = value {
+            object.insert(
+                "timestamp".into(),
+                serde_json::json!(hex_u64(header.timestamp)),
+            );
         }
-        let system_tx = self
-            .chain_store
-            .get_system_transaction_by_hash(hash)
-            .map_err(internal_err)?;
-        let Some(system_tx) = system_tx else {
-            return Ok(None);
-        };
-        let value = match detail {
-            RpcV2TxDetail::Full => {
-                serde_json::to_value(system_tx_to_rpc(&system_tx, Some(block_hash)))
-            }
-            RpcV2TxDetail::None | RpcV2TxDetail::Hashes | RpcV2TxDetail::Summary => {
-                serde_json::to_value(system_tx_to_rpc_summary(&system_tx, Some(block_hash)))
-            }
-        }
-        .map_err(|e| internal_err(format!("serialize system tx: {e}")))?;
         Ok(Some(value))
     }
 
@@ -638,17 +652,13 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
                 timestamp: None,
             });
         };
-        let transaction = self
-            .tx_value_for_location(&hash, &block, block_hash, tx_index, RpcV2TxDetail::Summary)?
-            .map(|mut value| {
-                if let serde_json::Value::Object(ref mut object) = value {
-                    object.insert(
-                        "timestamp".into(),
-                        serde_json::json!(hex_u64(block.header.timestamp)),
-                    );
-                }
-                value
-            });
+        let transaction = self.tx_value_for_location(
+            &hash,
+            Some(&block),
+            block_hash,
+            tx_index,
+            RpcV2TxDetail::Summary,
+        )?;
         let receipt = self
             .receipt_for_location(&hash, &block, block_hash, tx_index)
             .map_err(internal_err)?;
@@ -1463,32 +1473,13 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
                     .chain_store
                     .get_block_by_hash(&block_hash)
                     .map_err(internal_err)?;
-                if let Some(block) = block {
-                    let mut value = if let Some(tx) = block.transactions.get(tx_index as usize) {
-                        serde_json::to_value(tx_to_rpc(
-                            tx,
-                            Some(block_hash),
-                            Some(block.number()),
-                            Some(tx_index),
-                            Some(block.header.base_fee_per_gas),
-                        ))
-                        .map_err(|e| internal_err(format!("serialize tx: {e}")))?
-                    } else if let Some(system_tx) = self
-                        .chain_store
-                        .get_system_transaction_by_hash(hash)
-                        .map_err(internal_err)?
-                    {
-                        serde_json::to_value(system_tx_to_rpc(&system_tx, Some(block_hash)))
-                            .map_err(|e| internal_err(format!("serialize system tx: {e}")))?
-                    } else {
-                        continue;
-                    };
-                    if let serde_json::Value::Object(ref mut object) = value {
-                        object.insert(
-                            "timestamp".into(),
-                            serde_json::json!(hex_u64(block.header.timestamp)),
-                        );
-                    }
+                if let Some(value) = self.tx_value_for_location(
+                    hash,
+                    block.as_ref(),
+                    block_hash,
+                    tx_index,
+                    RpcV2TxDetail::Full,
+                )? {
                     txs.push(value);
                 }
             }
