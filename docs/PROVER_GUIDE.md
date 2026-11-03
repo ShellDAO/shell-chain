@@ -102,6 +102,10 @@ Recipient address history through `shell_getTransactionsByAddress` and the
 source cursor-based history API also retains these system rewards, including
 their original block timestamp. The retained header and system record are
 required; this does not reconstruct pruned ordinary transaction bodies.
+The compact detail endpoint `shell_getTransactionSummary` retains the same
+system reward header and status after pruning. Set `includeReceipt: true` to
+include its persisted receipt; the default response omits that receipt and
+continues to omit proof calldata from the transaction summary.
 
 If an older build already cleared the settled-source index, restarting with the
 fix can reconstruct it while the canonical headers and settlement records are

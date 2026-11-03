@@ -9,7 +9,7 @@ All notable changes to this project will be documented in this file.
 - Rebuild settled STARK source membership from retained canonical headers and
   system transactions after block-body pruning, including indexes cleared by
   older builds. Preserve system-transaction receipt queries and recipient
-  address history after body pruning.
+  address history and compact transaction summaries after body pruning.
 
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 

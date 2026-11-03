@@ -11069,7 +11069,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transaction_receipt_retains_system_metadata_after_body_pruning() {
+    async fn transaction_summary_and_receipt_retain_system_metadata_after_body_pruning() {
         let handler = setup();
         let (block_hash, user_hash) = store_block_with_tx(&handler, 0, true);
         let recipient = test_address(b"retained-system-receipt");
@@ -11121,7 +11121,32 @@ mod tests {
             .chain_store
             .put_receipts(&block_hash, &receipts)
             .unwrap();
+        let user_summary = ShellApiServer::get_transaction_summary(
+            &handler,
+            user_hash,
+            Some(RpcTransactionSummaryOptions {
+                include_receipt: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            user_summary.transaction.as_ref().unwrap()["hash"],
+            serde_json::json!(user_hash)
+        );
+        assert_eq!(user_summary.status.as_deref(), Some("0x1"));
+        assert_eq!(user_summary.gas_used.as_deref(), Some("0x5208"));
+        assert_eq!(
+            serde_json::to_value(user_summary.receipt).unwrap(),
+            serde_json::to_value(
+                EthApiServer::get_transaction_receipt(&handler, user_hash)
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+        );
         let mut before = Vec::new();
+        let mut summaries = Vec::new();
         for reward in &rewards {
             let receipt = EthApiServer::get_transaction_receipt(&handler, reward.hash())
                 .await
@@ -11130,27 +11155,97 @@ mod tests {
             assert_eq!(receipt.from, reward.from);
             assert_eq!(receipt.to, Some(recipient));
             assert_eq!(receipt.reward_kind.as_deref(), Some(reward.kind.as_str()));
+            let mut modes = Vec::new();
+            for include in [false, true] {
+                let summary = ShellApiServer::get_transaction_summary(
+                    &handler,
+                    reward.hash(),
+                    Some(RpcTransactionSummaryOptions {
+                        include_receipt: Some(include),
+                    }),
+                )
+                .await
+                .unwrap();
+                let tx = summary.transaction.as_ref().unwrap();
+                assert_eq!(tx["hash"], serde_json::json!(reward.hash()));
+                assert_eq!(tx["to"], serde_json::json!(recipient));
+                assert_eq!(tx["rewardKind"], reward.kind.as_str());
+                assert!(tx.get("input").is_none());
+                assert_eq!(summary.status.as_deref(), Some("0x1"));
+                assert_eq!(summary.gas_used.as_deref(), Some("0x0"));
+                assert_eq!(summary.log_count, Some(0));
+                assert_eq!(summary.timestamp.as_deref(), Some("0x6553f100"));
+                assert_eq!(summary.receipt.is_some(), include);
+                if include {
+                    assert_eq!(
+                        serde_json::to_value(summary.receipt.as_ref().unwrap()).unwrap(),
+                        serde_json::to_value(&receipt).unwrap()
+                    );
+                }
+                modes.push(serde_json::to_value(summary).unwrap());
+            }
+            summaries.push(modes);
             before.push(serde_json::to_value(receipt).unwrap());
         }
         handler.chain_store.delete_body(&block_hash).unwrap();
-        for (reward, expected) in rewards.iter().zip(before) {
+        for (index, (reward, expected)) in rewards.iter().zip(before).enumerate() {
             let receipt = EthApiServer::get_transaction_receipt(&handler, reward.hash())
                 .await
                 .unwrap()
                 .unwrap();
             assert_eq!(serde_json::to_value(receipt).unwrap(), expected);
+            for include in [false, true] {
+                let summary = ShellApiServer::get_transaction_summary(
+                    &handler,
+                    reward.hash(),
+                    Some(RpcTransactionSummaryOptions {
+                        include_receipt: Some(include),
+                    }),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    serde_json::to_value(summary).unwrap(),
+                    summaries[index][include as usize]
+                );
+            }
         }
         // Retained receipts alone cannot recover ordinary transaction metadata.
         assert!(EthApiServer::get_transaction_receipt(&handler, user_hash)
             .await
             .unwrap()
             .is_none());
+        let unavailable_user = ShellApiServer::get_transaction_summary(
+            &handler,
+            user_hash,
+            Some(RpcTransactionSummaryOptions {
+                include_receipt: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(unavailable_user.transaction.is_none());
+        assert!(unavailable_user.receipt.is_none());
+        assert!(unavailable_user.timestamp.is_none());
         handler
             .chain_store
             .store()
             .delete(&[b"h/".as_slice(), block_hash.as_bytes()].concat())
             .unwrap();
         for reward in rewards {
+            let missing = ShellApiServer::get_transaction_summary(
+                &handler,
+                reward.hash(),
+                Some(RpcTransactionSummaryOptions {
+                    include_receipt: Some(true),
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(missing.transaction.is_none());
+            assert!(missing.receipt.is_none());
+            assert!(missing.status.is_none());
+            assert!(missing.timestamp.is_none());
             assert!(
                 EthApiServer::get_transaction_receipt(&handler, reward.hash())
                     .await

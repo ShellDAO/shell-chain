@@ -243,79 +243,6 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         }
         Ok(Some(value))
     }
-
-    fn receipt_for_location(
-        &self,
-        hash: &ShellHash,
-        block: &Block,
-        block_hash: ShellHash,
-        tx_index: u32,
-    ) -> Result<Option<RpcReceipt>, shell_storage::StorageError> {
-        let Some(receipt) = self.chain_store.get_receipt_by_tx_hash(hash)? else {
-            return Ok(None);
-        };
-        let (from, to, effective_gas_price, tx_type, shell_type, reward_kind) =
-            if let Some(tx) = block.transactions.get(tx_index as usize) {
-                let shell_type = if tx.is_aa_bundle() {
-                    "aaBatch"
-                } else if tx.tx.to.is_none() {
-                    "contractCreate"
-                } else if !tx.tx.data.is_empty() {
-                    "contractCall"
-                } else {
-                    "transfer"
-                };
-                (
-                    tx.sender(),
-                    tx.tx.to,
-                    shell_core::effective_gas_price(
-                        tx.tx.max_fee_per_gas,
-                        tx.tx.max_priority_fee_per_gas,
-                        block.header.base_fee_per_gas,
-                    ),
-                    tx.tx.tx_type,
-                    Some(shell_type.into()),
-                    None,
-                )
-            } else if let Some(system_tx) = self.chain_store.get_system_transaction_by_hash(hash)? {
-                (
-                    system_tx.from,
-                    Some(system_tx.to),
-                    0,
-                    0x80u8,
-                    Some(system_tx.kind.as_str().into()),
-                    Some(system_tx.kind.as_str().into()),
-                )
-            } else {
-                (Address::ZERO, None, 0, 2u8, None, None)
-            };
-        Ok(Some(RpcReceipt {
-            transaction_hash: receipt.tx_hash,
-            block_hash,
-            block_number: hex_u64(receipt.block_number),
-            transaction_index: hex_u64(tx_index as u64),
-            from,
-            to,
-            status: hex_u64(receipt.status as u64),
-            gas_used: hex_u64(receipt.gas_used),
-            cumulative_gas_used: hex_u64(receipt.cumulative_gas_used),
-            effective_gas_price: hex_u64(effective_gas_price),
-            contract_address: receipt.contract_address,
-            logs: receipt
-                .logs
-                .into_iter()
-                .map(|log| RpcLog {
-                    address: log.address,
-                    topics: log.topics,
-                    data: hex_bytes(log.data.as_ref()),
-                })
-                .collect(),
-            logs_bloom: hex_bytes(receipt.logs_bloom.as_ref()),
-            tx_type: format!("{:#x}", tx_type),
-            shell_type,
-            reward_kind,
-        }))
-    }
 }
 
 #[jsonrpsee::core::async_trait]
@@ -624,44 +551,45 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
         options: Option<RpcTransactionSummaryOptions>,
     ) -> Result<RpcTransactionSummaryResult, ErrorObjectOwned> {
         let include_receipt = options.unwrap_or_default().include_receipt.unwrap_or(false);
+        let empty = RpcTransactionSummaryResult {
+            transaction: None,
+            receipt: None,
+            status: None,
+            gas_used: None,
+            log_count: None,
+            timestamp: None,
+        };
         let Some((block_hash, tx_index)) = self
             .chain_store
             .get_tx_location(&hash)
             .map_err(internal_err)?
         else {
-            return Ok(RpcTransactionSummaryResult {
-                transaction: None,
-                receipt: None,
-                status: None,
-                gas_used: None,
-                log_count: None,
-                timestamp: None,
-            });
+            return Ok(empty);
+        };
+        let Some(header) = self
+            .chain_store
+            .get_header_by_hash(&block_hash)
+            .map_err(internal_err)?
+        else {
+            return Ok(empty);
         };
         let block = self
             .chain_store
             .get_block_by_hash(&block_hash)
             .map_err(internal_err)?;
-        let Some(block) = block else {
-            return Ok(RpcTransactionSummaryResult {
-                transaction: None,
-                receipt: None,
-                status: None,
-                gas_used: None,
-                log_count: None,
-                timestamp: None,
-            });
-        };
         let transaction = self.tx_value_for_location(
             &hash,
-            Some(&block),
+            block.as_ref(),
             block_hash,
             tx_index,
             RpcV2TxDetail::Summary,
         )?;
-        let receipt = self
-            .receipt_for_location(&hash, &block, block_hash, tx_index)
-            .map_err(internal_err)?;
+        if block.is_none() && transaction.is_none() {
+            // Ordinary transaction metadata cannot be reconstructed from a
+            // retained receipt alone. System records use the shared resolver.
+            return Ok(empty);
+        }
+        let receipt = EthApiServer::get_transaction_receipt(self, hash).await?;
         let status = receipt.as_ref().map(|r| r.status.clone());
         let gas_used = receipt.as_ref().map(|r| r.gas_used.clone());
         let log_count = receipt.as_ref().map(|r| r.logs.len() as u64);
@@ -671,7 +599,7 @@ impl<S: KvStore + 'static> ShellApiServer for RpcHandler<S> {
             status,
             gas_used,
             log_count,
-            timestamp: Some(hex_u64(block.header.timestamp)),
+            timestamp: Some(hex_u64(header.timestamp)),
         })
     }
 
