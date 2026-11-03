@@ -4,7 +4,7 @@
 //!
 //! - `admin_nodeInfo` — static metadata about this node instance.
 //! - `admin_peers`    — reserved for future per-peer snapshots; currently returns method-not-found.
-//! - `admin_addPeer`  — dynamically add a bootnode / dial-out peer.
+//! - `admin_addPeer`  — initiate a transient outbound peer connection.
 //!
 //! The `admin` namespace is **opt-in** via `--rpc-api admin` and should
 //! **never** be exposed on a public endpoint without API-key protection.
@@ -68,7 +68,11 @@ pub trait AdminApi {
 
     /// Dial a peer given its multiaddr.
     ///
-    /// Returns `true` if the dial was initiated (connection outcome is async).
+    /// Returns `true` only after the running transport accepts the dial;
+    /// the connection outcome is asynchronous. A known peer already connected
+    /// or being dialed returns `false`. This does not save a static bootnode.
+    /// Empty, malformed, oversized (over 4096 bytes), and local-identity
+    /// addresses are invalid params. A missing transport is feature-not-enabled.
     #[method(name = "addPeer")]
     async fn add_peer(&self, multiaddr: String)
         -> Result<bool, jsonrpsee::types::ErrorObjectOwned>;

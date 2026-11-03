@@ -88,6 +88,7 @@ pub struct RpcHandler<S: KvStore + 'static> {
     /// Local P2P identity, bound addresses and enabled transport protocols are live.
     admin_rpc_addr: String,
     local_node_info: Arc<std::sync::RwLock<shell_network::LocalNodeInfo>>,
+    peer_dialer: Option<Arc<dyn shell_network::PeerDialer>>,
     /// Optional witness store for Phase B witness bundle queries (B4).
     witness_store: Option<Arc<WitnessStore<S>>>,
     /// Optional active storage profile descriptor surfaced via
@@ -127,6 +128,7 @@ impl<S: KvStore + 'static> Clone for RpcHandler<S> {
             dev_control: self.dev_control.clone(),
             admin_rpc_addr: self.admin_rpc_addr.clone(),
             local_node_info: Arc::clone(&self.local_node_info),
+            peer_dialer: self.peer_dialer.clone(),
             witness_store: self.witness_store.clone(),
             storage_profile: self.storage_profile.clone(),
             consensus_engine: self.consensus_engine.clone(),
@@ -177,6 +179,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             local_node_info: Arc::new(std::sync::RwLock::new(
                 shell_network::LocalNodeInfo::default(),
             )),
+            peer_dialer: None,
             witness_store: None,
             storage_profile: None,
             consensus_engine: None,
@@ -331,6 +334,12 @@ impl<S: KvStore + 'static> RpcHandler<S> {
     }
 
     /// Share actual transport state with all cloned RPC handlers.
+    /// Attach the live transport control used by the opt-in admin namespace.
+    pub fn with_peer_dialer(mut self, dialer: Option<Arc<dyn shell_network::PeerDialer>>) -> Self {
+        self.peer_dialer = dialer;
+        self
+    }
+
     pub fn with_local_node_info(
         mut self,
         info: Arc<std::sync::RwLock<shell_network::LocalNodeInfo>>,
@@ -11944,5 +11953,15 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), crate::error::FEATURE_NOT_ENABLED);
         assert!(err.message().contains("storage profile"));
+    }
+    #[tokio::test]
+    async fn admin_peer_dial_requires_an_actual_network_control() {
+        let handler =
+            setup().with_admin_context("metadata-only".into(), "/ip4/127.0.0.1/tcp/12345".into());
+        let error =
+            crate::admin::AdminApiServer::add_peer(&handler, "/ip4/127.0.0.1/tcp/12346".into())
+                .await
+                .unwrap_err();
+        assert_eq!(error.code(), crate::error::FEATURE_NOT_ENABLED);
     }
 }

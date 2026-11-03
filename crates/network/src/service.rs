@@ -16,6 +16,15 @@ pub struct LocalNodeInfo {
     pub protocols: Vec<String>,
 }
 
+/// Cloneable control surface for a transport actor's real outbound dialing.
+#[allow(clippy::double_must_use)]
+#[async_trait]
+pub trait PeerDialer: Send + Sync {
+    /// True only when the transport accepts a dial; connection is asynchronous.
+    /// A known peer already connected or being dialed returns false.
+    async fn dial_peer(&self, multiaddr: String) -> Result<bool, NetworkError>;
+}
+
 /// Trait abstracting the P2P network layer.
 ///
 /// Implementations handle peer management, message serialization,
@@ -59,6 +68,11 @@ pub trait NetworkService: Send + Sync {
     /// Shared live local transport information; absent transports expose no listener.
     fn local_node_info_handle(&self) -> Arc<RwLock<LocalNodeInfo>> {
         Arc::new(RwLock::new(LocalNodeInfo::default()))
+    }
+
+    /// Optional control handle that does not borrow the event receiver.
+    fn peer_dialer_handle(&self) -> Option<Arc<dyn PeerDialer>> {
+        None
     }
 
     /// Shut down the network service gracefully.

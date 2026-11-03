@@ -27,7 +27,7 @@ pub mod types;
 pub use admin::{AdminApiServer, NodeInfo, PeerInfo};
 pub use dev_control::{DevRpcControl, DynDevRpcControl};
 pub use handler::RpcHandler;
-pub use server::{start_rpc_server, RpcConfig, RpcServerHandle};
+pub use server::{start_rpc_server, AdminP2pContext, RpcConfig, RpcServerHandle};
 pub use subscriptions::{BlockEvent, SubscriptionTracker, SyncStatus};
 pub use tls::TlsConfig;
 pub use tls_proxy::TlsProxyHandle;

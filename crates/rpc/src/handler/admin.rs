@@ -49,11 +49,19 @@ impl<S: KvStore + 'static> AdminApiServer for RpcHandler<S> {
         ))
     }
 
-    async fn add_peer(&self, _multiaddr: String) -> Result<bool, ErrorObjectOwned> {
-        // Dynamic peer dialling requires a command channel to the network layer.
-        // Stubbed for Batch 4; full implementation in Batch 5 (P2P observability).
-        Err(crate::error::method_not_found(
-            "admin_addPeer not yet implemented; use --bootnodes at startup",
-        ))
+    async fn add_peer(&self, multiaddr: String) -> Result<bool, ErrorObjectOwned> {
+        let dialer = self
+            .peer_dialer
+            .as_ref()
+            .ok_or_else(|| crate::error::feature_not_enabled("P2P peer dialing is unavailable"))?;
+        dialer
+            .dial_peer(multiaddr)
+            .await
+            .map_err(|error| match error {
+                shell_network::NetworkError::InvalidPeerAddress(message) => {
+                    crate::error::invalid_params(message)
+                }
+                error => crate::error::server_error(error.to_string()),
+            })
     }
 }

@@ -1249,6 +1249,52 @@ checks transient catch-up monitoring.
 
 ---
 
+### admin_addPeer
+
+Initiates a real outbound connection through the running libp2p transport.
+Enable P2P and opt into the `admin` namespace with `--p2p --rpc-api eth,shell,admin`.
+Non-loopback admin endpoints require `--rpc-api-key`; authenticate requests with
+`Authorization: Bearer <api-key>`. The same guard applies to HTTP and WebSocket.
+
+**Parameters:** One multiaddr string, for example the remote node's actual
+`admin_nodeInfo.listenAddr` followed by `/p2p/` and its `admin_nodeInfo.id` when
+the address does not already contain that peer ID. The address must be reachable
+from the dialing node; a loopback address only works on the same host.
+
+**Returns:** `true` after the live transport accepts the dial. Connection success
+is asynchronous: observe `admin_nodeInfo.peerCount` and actual chain sync before
+considering the peer usable. For an address with a peer ID, a peer already
+connected or being dialed returns `false` without initiating another connection.
+
+Empty, malformed, over-4096-byte and local-identity addresses return invalid
+params (`-32602`). An unavailable P2P transport returns feature-not-enabled
+(`-32003`); a stopped transport, full command queue or immediate transport
+failure returns server error (`-32000`). A later network connection failure can
+follow a `true` result. The method does not persist a static peer configuration;
+configure `--bootnodes` separately when startup reconnection is required.
+`admin_peers` remains reserved and returns method-not-found.
+
+**Version:** This implementation is in unreleased node source. Published
+v0.27.13 returns method-not-found for `admin_addPeer`; source acceptance does
+not establish availability in that binary.
+
+**Local acceptance:** Build and run the standalone Python 3 regression from the
+node repository:
+
+```bash
+cargo build -p shell-cli --bin shell-node --features libp2p
+python3 tests/e2e/admin-peer-dial.py
+```
+
+It creates separate temporary signing and P2P identities, starts two isolated
+nodes with no bootnodes, checks authentication and invalid inputs, connects over
+HTTP and WebSocket, and verifies genuinely signed transfers through matching
+receipts, canonical blocks, finality, balances and nonces on both nodes. Physical
+RocksDB reopen preserves that state; a fresh API dial reconnects the nodes.
+Private data and execution receipts are retained in the printed test directory.
+
+---
+
 ### shell_getChainStats
 
 Returns aggregate chain statistics. `totalTransactions` and `gasUsedTotal`

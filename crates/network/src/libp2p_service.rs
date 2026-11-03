@@ -40,6 +40,7 @@ const MAX_PENDING_DIRECT_BYTES: usize = 2 * crate::message::MAX_MESSAGE_SIZE;
 const MAX_INBOUND_DIRECT_BYTES_PER_CONNECTION: usize = 2 * crate::message::MAX_MESSAGE_SIZE;
 const MAX_PENDING_COMMAND_BYTES: usize = 2 * crate::message::MAX_MESSAGE_SIZE;
 const MAX_PENDING_EVENT_BYTES: usize = 2 * crate::message::MAX_MESSAGE_SIZE;
+const MAX_PEER_ADDRESS_BYTES: usize = 4096;
 const MAX_IDENTITY_KEY_SIZE: u64 = 64 * 1024;
 
 fn max_concurrent_direct_streams(max_message_size: usize) -> usize {
@@ -67,6 +68,11 @@ enum SwarmCommand {
         peer: Libp2pPeerId,
         topic: TopicKind,
         data: Vec<u8>,
+        byte_permit: OwnedSemaphorePermit,
+    },
+    DialPeer {
+        address: Multiaddr,
+        reply: oneshot::Sender<Result<bool, NetworkError>>,
         byte_permit: OwnedSemaphorePermit,
     },
     /// Request a snapshot of current peer scores.
@@ -312,6 +318,47 @@ pub struct Libp2pNetwork {
     peer_count: Arc<AtomicUsize>,
     bandwidth: Arc<BandwidthTracker>,
     max_msg_size: usize,
+}
+
+struct SwarmPeerDialer {
+    commands: mpsc::Sender<SwarmCommand>,
+    byte_budget: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl crate::PeerDialer for SwarmPeerDialer {
+    async fn dial_peer(&self, multiaddr: String) -> Result<bool, NetworkError> {
+        if multiaddr.is_empty() || multiaddr.len() > MAX_PEER_ADDRESS_BYTES {
+            return Err(NetworkError::InvalidPeerAddress(
+                "expected 1..=4096 bytes".into(),
+            ));
+        }
+        let address: Multiaddr = multiaddr.parse().map_err(|e: libp2p::multiaddr::Error| {
+            NetworkError::InvalidPeerAddress(e.to_string())
+        })?;
+        if address.is_empty() {
+            return Err(NetworkError::InvalidPeerAddress("empty multiaddr".into()));
+        }
+        let byte_permit = Arc::clone(&self.byte_budget)
+            .try_acquire_many_owned(multiaddr.len() as u32)
+            .map_err(|_| {
+                NetworkError::Transport("peer dial command byte budget exhausted".into())
+            })?;
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .try_send(SwarmCommand::DialPeer {
+                address,
+                reply,
+                byte_permit,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Closed(_) => NetworkError::Shutdown,
+                mpsc::error::TrySendError::Full(_) => {
+                    NetworkError::Transport("peer dial command queue full".into())
+                }
+            })?;
+        result.await.map_err(|_| NetworkError::Shutdown)?
+    }
 }
 
 impl Libp2pNetwork {
@@ -1057,6 +1104,36 @@ async fn swarm_loop(
                         }
                         drop(byte_permit);
                     }
+                    Some(SwarmCommand::DialPeer { address, reply, byte_permit }) => {
+                        use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+                        let peer = extract_peer_id(&address);
+                        if peer.as_ref() == Some(swarm.local_peer_id()) {
+                            let _ = reply.send(Err(NetworkError::InvalidPeerAddress(
+                                "cannot dial the local peer identity".into(),
+                            )));
+                            drop(byte_permit);
+                            continue;
+                        }
+                        let options = match peer {
+                            Some(peer) => DialOpts::peer_id(peer)
+                                .condition(PeerCondition::DisconnectedAndNotDialing)
+                                .addresses(vec![address.clone()]).build(),
+                            None => address.clone().into(),
+                        };
+                        let result = match swarm.dial(options) {
+                            Ok(()) => {
+                                if let (Some(peer), Some(kad)) = (peer, swarm.behaviour_mut().kademlia.as_mut()) {
+                                    kad.add_address(&peer, address.clone());
+                                }
+                                info!(%address, "admin peer dial initiated");
+                                Ok(true)
+                            }
+                            Err(libp2p::swarm::DialError::DialPeerConditionFalse(_)) => Ok(false),
+                            Err(error) => Err(NetworkError::Transport(error.to_string())),
+                        };
+                        let _ = reply.send(result);
+                        drop(byte_permit);
+                    }
                     Some(SwarmCommand::PeerScores { reply }) => {
                         let scores = collect_peer_scores(&swarm);
                         let _ = reply.send(scores);
@@ -1747,6 +1824,13 @@ fn message_matches_topic(
 
 #[async_trait]
 impl NetworkService for Libp2pNetwork {
+    fn peer_dialer_handle(&self) -> Option<Arc<dyn crate::PeerDialer>> {
+        Some(Arc::new(SwarmPeerDialer {
+            commands: self.cmd_tx.clone(),
+            byte_budget: Arc::clone(&self.command_byte_budget),
+        }))
+    }
+
     fn local_node_info_handle(&self) -> Arc<std::sync::RwLock<crate::LocalNodeInfo>> {
         Arc::clone(&self.local_node_info)
     }
@@ -3099,5 +3183,128 @@ mod tests {
             swarm.is_ok(),
             "build_swarm should succeed with connection limits and relay"
         );
+    }
+    #[tokio::test]
+    async fn admin_peer_dial_connects_real_transport_and_rejects_self_or_stopped_service() {
+        let config = NetworkConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            enable_mdns: false,
+            enable_kademlia: false,
+            enable_peer_scoring: false,
+            enable_relay: false,
+            enable_dcutr: false,
+            enable_autonat: false,
+            ..Default::default()
+        };
+        let first = Libp2pNetwork::new(&config).await.unwrap();
+        let second = Libp2pNetwork::new(&config).await.unwrap();
+        let first_info = first.local_node_info_handle();
+        let second_info = second.local_node_info_handle();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while first_info.read().unwrap().listen_addresses.is_empty()
+                || second_info.read().unwrap().listen_addresses.is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let target = {
+            let i = second_info.read().unwrap();
+            format!("{}/p2p/{}", i.listen_addresses[0], i.peer_id)
+        };
+        let own = {
+            let i = first_info.read().unwrap();
+            format!("{}/p2p/{}", i.listen_addresses[0], i.peer_id)
+        };
+        let control = first.peer_dialer_handle().unwrap();
+        assert!(
+            control.dial_peer(own).await.is_err(),
+            "self dialing cannot report initiation"
+        );
+        assert_eq!(first.peer_count().await, 0);
+        // A real TCP listener without a Noise handshake keeps this distinct
+        // peer in flight, so repeated API calls cannot start duplicate dials.
+        let stalled = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let pending = format!(
+            "/ip4/127.0.0.1/tcp/{}/p2p/{}",
+            stalled.local_addr().unwrap().port(),
+            Libp2pPeerId::random()
+        );
+        assert!(control.dial_peer(pending.clone()).await.unwrap());
+        assert!(!control.dial_peer(pending).await.unwrap());
+        assert_eq!(first.peer_count().await, 0);
+        assert!(control.dial_peer(target.clone()).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while first.peer_count().await != 1 || second.peer_count().await != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !control.dial_peer(target.clone()).await.unwrap(),
+            "connected peer is idempotent"
+        );
+        assert_eq!(first.peer_count().await, 1);
+        first.shutdown().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), control.dial_peer(target))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        second.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_peer_dial_bounds_queue_bytes_and_rejects_invalid_input_before_enqueue() {
+        let (tx, rx) = mpsc::channel(1);
+        let budget = Arc::new(Semaphore::new(MAX_PEER_ADDRESS_BYTES));
+        let control: Arc<dyn crate::PeerDialer> = Arc::new(SwarmPeerDialer {
+            commands: tx.clone(),
+            byte_budget: budget.clone(),
+        });
+        for value in [
+            String::new(),
+            "not-a-multiaddr".into(),
+            "x".repeat(MAX_PEER_ADDRESS_BYTES + 1),
+        ] {
+            assert!(matches!(
+                control.dial_peer(value).await,
+                Err(NetworkError::InvalidPeerAddress(_))
+            ));
+        }
+        assert_eq!(tx.capacity(), 1);
+        assert_eq!(budget.available_permits(), MAX_PEER_ADDRESS_BYTES);
+        let address = "/ip4/127.0.0.1/tcp/9".to_string();
+        let pending = tokio::spawn({
+            let control = control.clone();
+            let address = address.clone();
+            async move { control.dial_peer(address).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while tx.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let remaining = budget.available_permits();
+        assert!(matches!(
+            control.dial_peer(address).await,
+            Err(NetworkError::Transport(_))
+        ));
+        assert_eq!(
+            budget.available_permits(),
+            remaining,
+            "rejected request releases its byte reservation"
+        );
+        drop(rx);
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(NetworkError::Shutdown)
+        ));
+        assert_eq!(budget.available_permits(), MAX_PEER_ADDRESS_BYTES);
     }
 }

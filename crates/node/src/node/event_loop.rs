@@ -585,7 +585,10 @@ impl<S: KvStore + 'static> Node<S> {
                     } else {
                         None
                     },
-                    Some(network.local_node_info_handle()),
+                    Some(shell_rpc::AdminP2pContext {
+                        local_node_info: network.local_node_info_handle(),
+                        peer_dialer: network.peer_dialer_handle(),
+                    }),
                     Some(Arc::clone(&self.witness_store)), // B5: witness store wired
                     Some({
                         let p = &self.config.pruning;

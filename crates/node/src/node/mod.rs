@@ -841,6 +841,10 @@ impl<'a, N: NetworkService + ?Sized> NetworkInterface<'a, N> {
         self.inner.local_node_info_handle()
     }
 
+    fn peer_dialer_handle(&self) -> Option<Arc<dyn shell_network::PeerDialer>> {
+        self.inner.peer_dialer_handle()
+    }
+
     async fn shutdown(&self) -> Result<(), shell_network::NetworkError> {
         self.inner.shutdown().await
     }

@@ -33,3 +33,26 @@ updates across cloned handlers and absent transport behaviour. Run
 `shell-cli` with the `libp2p` feature for actual two-node RPC, backlog import,
 canonical hash agreement and enabled/disabled transport restarts. IPv6,
 multiple listeners and external-network reachability remain unverified.
+
+## Outbound admin control
+
+The same context now carries an optional typed `PeerDialer` handle. The event
+receiver remains owned by the node; RPC clones only the bounded swarm command
+sender and byte budget. A oneshot reply is completed after the actor calls
+`Swarm::dial`, so a queued request alone cannot report initiation. Address input
+is limited to 4096 bytes before parsing, queue admission is non-blocking, and
+command bytes use the existing shared semaphore. The transport's existing
+pending/established connection limits continue to apply. Known peer IDs use
+`DisconnectedAndNotDialing`; the actor rejects its own peer ID explicitly.
+
+The opt-in namespace and API-key middleware remain the authority boundary.
+Metadata-only or disabled network implementations expose no dial handle and
+return feature-not-enabled. Dynamic dialing does not write bootnode settings;
+operators retain the existing startup configuration for persistent peers.
+`admin_peers` still requires a separate real per-peer snapshot capability.
+
+`tests/e2e/admin-peer-dial.py` exercises authenticated HTTP/WebSocket control,
+actual connections, signed transaction import and physical state reopen.
+Network tests cover pending/connected duplicates, invalid input, bounded queue
+and bytes, and transport shutdown. IPv6, relay addresses and external-network
+reachability remain outside this local acceptance.

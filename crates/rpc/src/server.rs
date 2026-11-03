@@ -230,6 +230,21 @@ impl RpcServerHandle {
     }
 }
 
+/// Live P2P metadata and optional transport control for the admin namespace.
+pub struct AdminP2pContext {
+    pub local_node_info: Arc<std::sync::RwLock<shell_network::LocalNodeInfo>>,
+    pub peer_dialer: Option<Arc<dyn shell_network::PeerDialer>>,
+}
+
+impl From<Arc<std::sync::RwLock<shell_network::LocalNodeInfo>>> for AdminP2pContext {
+    fn from(local_node_info: Arc<std::sync::RwLock<shell_network::LocalNodeInfo>>) -> Self {
+        Self {
+            local_node_info,
+            peer_dialer: None,
+        }
+    }
+}
+
 /// Build and start the JSON-RPC server(s).
 ///
 /// When `config.ws_addr` is `Some`, two servers are started:
@@ -260,7 +275,7 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
     finality: Arc<parking_lot::RwLock<FinalityState>>,
     peer_count: Arc<std::sync::atomic::AtomicUsize>,
     dev_control: Option<DynDevRpcControl>,
-    admin_p2p_context: Option<Arc<std::sync::RwLock<shell_network::LocalNodeInfo>>>,
+    admin_p2p_context: Option<AdminP2pContext>,
     witness_store: Option<Arc<WitnessStore<S>>>,
     storage_profile_info: Option<crate::types::StorageProfileInfo>,
     consensus_engine: Option<Arc<parking_lot::RwLock<dyn ConsensusEngine>>>,
@@ -322,7 +337,9 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
         handler = handler.with_proposer(signer, addr);
     }
     if let Some(info) = admin_p2p_context {
-        handler = handler.with_local_node_info(info);
+        handler = handler
+            .with_local_node_info(info.local_node_info)
+            .with_peer_dialer(info.peer_dialer);
     }
     if let Some(ws) = witness_store {
         handler = handler.with_witness_store(ws);

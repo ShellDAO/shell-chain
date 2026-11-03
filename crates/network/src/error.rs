@@ -4,6 +4,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum NetworkError {
+    #[error("invalid peer address: {0}")]
+    InvalidPeerAddress(String),
+
     #[error("transport error: {0}")]
     Transport(String),
 
