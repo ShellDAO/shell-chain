@@ -2279,6 +2279,9 @@ impl<S: KvStore + 'static> Node<S> {
         import_cs.put_block_signers(&block.hash(), &[proposer_evidence])?;
         import_cs.commit_canonical_overlay(&block, Some(receipts.as_slice()))?;
 
+        self.metrics
+            .update_canonical_head(block.number(), self.finality.read().last_finalized_number());
+
         // Commit to storage.
         let committed_world_state = WorldState::at_root(self.store.clone(), &imported_state_root)?;
         let block_hash = block.hash();

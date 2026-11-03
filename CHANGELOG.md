@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Publish canonical head/finality metrics from direct production, import and dev
+  rewind commits so health and readiness probes observe the actual chain tip.
+
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

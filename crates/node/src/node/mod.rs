@@ -981,8 +981,7 @@ impl<S: KvStore + 'static> Node<S> {
             .flatten()
             .map(|b| b.number())
             .unwrap_or(0);
-        metrics.block_height.set(current_head as i64);
-        metrics.update_finality(current_head, finality_state.last_finalized_number());
+        metrics.update_canonical_head(current_head, finality_state.last_finalized_number());
         let fork_choice = restore_fork_choice(&chain_store, fin_number, fin_hash, current_head);
 
         // Startup rechecks errors before serving network traffic.
@@ -1659,6 +1658,9 @@ impl<S: KvStore + 'static> Node<S> {
         } else {
             shell_consensus::FinalityState::new()
         };
+
+        self.metrics
+            .update_canonical_head(snapshot.head_number, snapshot.finalized_number);
 
         self.tx_pool.clear();
         let mut world_state = self.world_state.write();
@@ -23166,5 +23168,58 @@ mod tests {
                 _ => panic!("expected WPoaViewChange after deserialization"),
             }
         }
+    }
+    #[test]
+    fn canonical_head_metrics_follow_direct_publication_and_failed_batches() {
+        let (producer, signer) = setup_node();
+        store_consistent_genesis(&producer);
+        let authority = producer.config.proposer_address.unwrap();
+        let follower = setup_node_with_authority(authority);
+        follower.register_authority_pubkey(authority, signer.public_key().to_vec());
+        store_consistent_genesis(&follower);
+        let block = producer.produce_block(&signer, 100).unwrap();
+        assert_eq!(block.number(), 1);
+        assert_eq!(producer.metrics.block_height.get(), 1);
+        assert_eq!(producer.metrics.last_finalized_number.get(), 0);
+        assert_eq!(producer.metrics.finality_lag_blocks.get(), 1);
+        follower
+            .import_block(block.clone(), &MultiVerifier)
+            .unwrap();
+        assert_eq!(follower.metrics.block_height.get(), 1);
+        assert_eq!(follower.metrics.finality_lag_blocks.get(), 1);
+
+        let (failed_producer, other_signer, db) = setup_failing_batch_node();
+        store_consistent_genesis(&failed_producer);
+        db.fail_head_batch();
+        assert!(failed_producer.produce_block(&other_signer, 100).is_err());
+        assert_eq!(
+            failed_producer
+                .chain_store
+                .get_head_block()
+                .unwrap()
+                .unwrap()
+                .number(),
+            0
+        );
+        assert_eq!(failed_producer.metrics.block_height.get(), 0);
+        assert_eq!(failed_producer.metrics.finality_lag_blocks.get(), 0);
+
+        let db = Arc::new(FailingBatchDb::new());
+        let failed_follower = setup_node_with_store(authority, Arc::clone(&db));
+        failed_follower.register_authority_pubkey(authority, signer.public_key().to_vec());
+        store_consistent_genesis(&failed_follower);
+        db.fail_head_batch();
+        assert!(failed_follower.import_block(block, &MultiVerifier).is_err());
+        assert_eq!(
+            failed_follower
+                .chain_store
+                .get_head_block()
+                .unwrap()
+                .unwrap()
+                .number(),
+            0
+        );
+        assert_eq!(failed_follower.metrics.block_height.get(), 0);
+        assert_eq!(failed_follower.metrics.finality_lag_blocks.get(), 0);
     }
 }

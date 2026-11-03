@@ -56,6 +56,25 @@ on a validator with connected peers.
 
 ---
 
+
+### Canonical head after dev operations (unreleased)
+
+The unreleased node updates `shell_block_height` and the finality gauges when a
+canonical production/import batch or a dev snapshot rewind commits. The
+`/health` and `/healthz` responses expose that committed tip. Readiness evaluates
+the tip together with synchronization and consensus production gates, so a closed
+gate can still produce HTTP 503 after blocks exist; its reason identifies that
+gate rather than claiming the chain is empty.
+
+Public v0.27.13 can retain an old height after direct dev mining, causing stale
+health data and an incorrect no-blocks readiness reason. This fix requires a
+release containing the canonical head metrics update. Build that node and run
+`python3 tests/e2e/canonical-head-metrics.py` to check real dev mining, rejected
+operations, snapshot rewind and physical RocksDB restart with fresh local keys.
+The WPoA check follows existing recovery of an uncertified dev suffix, then
+verifies that a real finalized transaction and its canonical state survive restart.
+
+
 ## 2. Prometheus metrics reference
 
 All metrics are prefixed `shell_`.

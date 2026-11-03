@@ -420,6 +420,12 @@ impl Metrics {
         String::from_utf8(buffer).unwrap_or_default()
     }
 
+    /// Publish gauges after a canonical head change has committed to storage.
+    pub(crate) fn update_canonical_head(&self, current_head: u64, finalized: u64) {
+        self.block_height.set(current_head as i64);
+        self.update_finality(current_head, finalized);
+    }
+
     /// Update finality gauges from the current canonical head/finality pair.
     pub fn update_finality(&self, current_head: u64, finalized: u64) {
         self.last_finalized_number.set(finalized as i64);

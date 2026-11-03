@@ -566,6 +566,9 @@ impl<S: KvStore + 'static> Node<S> {
             prover.restore_pending_stark_settlements(drained_stark_settlements);
             return Err(err.into());
         }
+        self.metrics
+            .update_canonical_head(block.number(), self.finality.read().last_finalized_number());
+
         algorithm_registry_rollback.commit();
         let committed_world_state =
             WorldState::at_root(self.store.clone(), &block.header.state_root)?;
