@@ -33,6 +33,12 @@ if [ "${GENESIS_CREATOR:-false}" = "true" ]; then
     # Wait for genesis.json and a non-loopback libp2p listen address to be
     # written by the node during startup.
     for i in $(seq 1 120); do
+        if ! kill -0 "$NODE_PID" 2>/dev/null; then
+            echo "ERROR: shell-node exited before publishing genesis and bootnode" >&2
+            wait "$NODE_PID" || exit "$?"
+            exit 1
+        fi
+
         if [ -f "$DATADIR/genesis.json" ] && [ ! -f "$SHARED/genesis.json" ]; then
             cp "$DATADIR/genesis.json" "$SHARED/genesis.json"
             echo "✓ Genesis shared to $SHARED/genesis.json"
