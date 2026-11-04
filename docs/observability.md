@@ -135,13 +135,21 @@ levelled diagnostics. Control verbosity via the `RUST_LOG` environment variable
 
 ```bash
 # Show info-level logs for all crates
-RUST_LOG=info shell-chain-node
+RUST_LOG=info shell-node run --config node.toml
 
 # Verbose RPC + consensus, info elsewhere
-RUST_LOG=info,shell_rpc=debug,shell_consensus=debug shell-chain-node
+RUST_LOG=info,shell_rpc=debug,shell_consensus=debug shell-node run --config node.toml
 
 # JSON output (for log aggregators)
-RUST_LOG=info SHELL_LOG_FORMAT=json shell-chain-node
+RUST_LOG=info shell-node run --config node.toml --log-format json
+```
+
+JSON tracing events go to stdout. The node writes its startup banner and other
+diagnostics to stderr. Keep stderr separate when collecting newline-delimited
+JSON. The event message and its structured values are inside `fields`.
+
+```json
+{"timestamp":"2026-11-04T22:10:47.886276Z","level":"INFO","target":"shell_node::node::p2p_handlers","fields":{"message":"FF: block finalized","block_number":1,"block_hash":"0x75cdfe121389bc13f6aa749abfaed194b39e282958dc10a392e92acbaf5dd2f6"}}
 ```
 
 Key spans and log fields:
