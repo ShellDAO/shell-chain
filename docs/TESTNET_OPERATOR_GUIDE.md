@@ -896,13 +896,18 @@ Monitor `shell_stark_frontier_lag` (the difference in blocks between the chain t
 
 - Verify your address is in the `authorities` list in genesis.json.
 - Check that `--keystore` is provided and the password is correct.
-- Confirm `shell_mining` returns `true` via `eth_mining` RPC call:
+- Check whether the node has loaded a proposer signer with `eth_mining`:
 
 ```bash
 curl -s http://localhost:8545 \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"eth_mining","params":[],"id":1}'
 ```
+
+A `true` response means the node has loaded a proposer signer. When transactions
+are pending, sample `eth_blockNumber` and `eth_getBlockByNumber` with the
+`finalized` tag over several expected block intervals to check production and
+finality. A node configured to wait for transactions may stay idle.
 
 ### Peers not connecting
 
