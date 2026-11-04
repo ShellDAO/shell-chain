@@ -255,7 +255,7 @@ enum Commands {
         #[arg(long)]
         consensus_engine: Option<String>,
 
-        /// Node role: "validator" (default), "validator-prover", or "prover".
+        /// Node role: "validator" (default), "validator-prover", "prover", or "rpc".
         ///
         ///   validator        — produces blocks only (no STARK proof work).
         ///   validator-prover — produces blocks AND runs the background ProverService.

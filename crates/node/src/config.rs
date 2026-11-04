@@ -31,17 +31,20 @@ pub enum NodeRole {
     ValidatorProver,
     /// Standalone prover node — no block production, full-time proving.
     Prover,
+    /// RPC observer that follows the chain without proposing or proving.
+    Rpc,
 }
 
 impl NodeRole {
-    /// Parse from a CLI string (`validator`, `validator-prover`, `prover`).
+    /// Parse from a CLI string (`validator`, `validator-prover`, `prover`, `rpc`).
     pub fn from_role_str(s: &str) -> Result<Self, String> {
         match s.to_lowercase().as_str() {
             "validator" => Ok(Self::Validator),
             "validator-prover" => Ok(Self::ValidatorProver),
             "prover" => Ok(Self::Prover),
+            "rpc" => Ok(Self::Rpc),
             other => Err(format!(
-                "unknown node role '{other}'; expected validator, validator-prover, or prover"
+                "unknown node role '{other}'; expected validator, validator-prover, prover, or rpc"
             )),
         }
     }
@@ -464,6 +467,7 @@ mod tests {
             NodeRole::ValidatorProver
         );
         assert_eq!("prover".parse::<NodeRole>().unwrap(), NodeRole::Prover);
+        assert_eq!("rpc".parse::<NodeRole>().unwrap(), NodeRole::Rpc);
     }
 
     #[test]
@@ -486,6 +490,7 @@ mod tests {
         assert!(NodeRole::Validator.is_validator());
         assert!(NodeRole::ValidatorProver.is_validator());
         assert!(!NodeRole::Prover.is_validator());
+        assert!(!NodeRole::Rpc.is_validator());
     }
 
     #[test]
@@ -493,6 +498,7 @@ mod tests {
         assert!(!NodeRole::Validator.runs_prover());
         assert!(NodeRole::ValidatorProver.runs_prover());
         assert!(NodeRole::Prover.runs_prover());
+        assert!(!NodeRole::Rpc.runs_prover());
     }
 
     #[test]

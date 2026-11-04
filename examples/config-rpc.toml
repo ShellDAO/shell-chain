@@ -1,7 +1,8 @@
 # Shell-chain read-only RPC node configuration.
-# No keystore — this node does not produce blocks.
+# Use the network’s trusted genesis.json in the data directory.
 
 [node]
+node_role = "rpc"
 datadir = "/data"
 chain_id = 31337
 db = "rocksdb"

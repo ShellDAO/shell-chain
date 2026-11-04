@@ -88,7 +88,7 @@ pub struct RunArgs {
     pub l2_stark_mode: String,
     /// Consensus engine: "poa" (default) or "wpoa".
     pub consensus_engine: Option<String>,
-    /// Node role: "validator", "validator-prover", or "prover".
+    /// Node role: "validator", "validator-prover", "prover", or "rpc".
     pub node_role: String,
     /// Password source for keystore decryption.
     pub password_args: PasswordArgs,
@@ -304,6 +304,20 @@ fn validate_transaction_protocol<S: KvStore + 'static>(
 /// Start the node: load genesis, initialize state, and run the event loop.
 pub async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     let _: NetworkType = args.network.parse()?;
+    let node_role = args
+        .node_role
+        .parse::<NodeRole>()
+        .map_err(|e| format!("invalid --node-role: {e}"))?;
+    if node_role == NodeRole::Rpc {
+        if args.keystore.is_some() {
+            return Err("--node-role rpc cannot use a validator keystore".into());
+        }
+        if !args.datadir.join("genesis.json").try_exists()? {
+            return Err(
+                "--node-role rpc requires a trusted genesis.json in the data directory".into(),
+            );
+        }
+    }
 
     // F-096: Canonicalize and validate data directory.
     let datadir = if args.datadir.exists() {
@@ -319,7 +333,7 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         "memory" => {
             info!("Using in-memory storage (non-persistent)");
             let store = Arc::new(MemoryDb::new());
-            run_with_store(store, args).await
+            run_with_store(store, args, node_role).await
         }
         "rocksdb" => {
             #[cfg(feature = "rocksdb")]
@@ -332,7 +346,7 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
                 // Use the `state` column family as a unified KvStore.
                 // ChainStore and WorldState coexist via byte-prefix namespacing.
                 let store = Arc::new(stores.state);
-                run_with_store(store, args).await
+                run_with_store(store, args, node_role).await
             }
             #[cfg(not(feature = "rocksdb"))]
             {
@@ -584,10 +598,13 @@ async fn initialize_chain<S: KvStore + 'static>(
 async fn run_with_store<S: KvStore + 'static>(
     store: Arc<S>,
     args: RunArgs,
+    node_role: NodeRole,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Load or generate the signer.
-    let signer: Arc<dyn Signer> = match args.keystore {
-        Some(path) => {
+    let signer: Arc<dyn Signer> = match (node_role, args.keystore) {
+        // The node loop expects a signer even for observers. Never use a stored
+        // authority identity for an RPC observer.
+        (NodeRole::Rpc, _) => Arc::new(DilithiumSigner::generate()),
+        (_, Some(path)) => {
             // F-096: Validate keystore path.
             if !path.exists() {
                 return Err(format!("keystore file not found: {}", path.display()).into());
@@ -625,7 +642,7 @@ async fn run_with_store<S: KvStore + 'static>(
             info!("Keystore unlocked: {unlocked_address}");
             Arc::from(signer)
         }
-        None => {
+        (_, None) => {
             let path = args.datadir.join(DEV_AUTHORITY_KEY_FILE);
             info!(
                 "No keystore provided, loading or creating persisted dev key at {}",
@@ -763,6 +780,8 @@ async fn run_with_store<S: KvStore + 'static>(
         }
         info!("Loading genesis from {}", genesis_file.display());
         GenesisConfig::from_file(&genesis_file)?
+    } else if node_role == NodeRole::Rpc {
+        return Err("--node-role rpc requires a trusted genesis.json in the data directory".into());
     } else {
         info!("No genesis.json found, using dev genesis");
         use shell_primitives::U256;
@@ -856,10 +875,6 @@ async fn run_with_store<S: KvStore + 'static>(
     let authority_pubkeys = genesis_config.consensus.authority_pubkeys().to_vec();
     let max_future_secs = genesis_config.consensus.max_future_secs();
     let epoch_length = genesis_config.consensus.epoch_length();
-    let node_role = args
-        .node_role
-        .parse::<NodeRole>()
-        .map_err(|e| format!("invalid --node-role: {e}"))?;
     validate_role_authority(node_role, authority, &authorities)?;
 
     // F4: validate network_type vs block_time_secs consistency, log at info on mismatch.

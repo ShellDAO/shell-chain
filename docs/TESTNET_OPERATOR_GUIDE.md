@@ -648,13 +648,16 @@ You will be prompted for the keystore password on startup.
 
 ### RPC-only node
 
-An RPC node syncs the chain but does not produce blocks. Omit `--keystore`
-and set `BOOTNODE` to the validator's complete multiaddr, including its peer ID:
+Use the `rpc` role to follow the chain without proposing blocks or producing
+proofs. Place the network’s trusted `genesis.json` in the data directory and
+set `BOOTNODE` to the validator’s complete multiaddr, including its peer ID.
+The RPC role runs without a validator keystore:
 
 ```bash
 : "${BOOTNODE:?Set BOOTNODE to a full multiaddr ending in /p2p/PEER_ID}"
 shell-node --datadir shell-data run \
   --config examples/config-rpc.toml \
+  --node-role rpc \
   --db rocksdb \
   --p2p \
   --p2p-addr 0.0.0.0:30303 \

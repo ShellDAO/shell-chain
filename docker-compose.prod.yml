@@ -152,9 +152,9 @@ services:
     environment:
       - DATADIR=/data
       - SHARED=/shared
-      - SHELL_NODE_ROLE=rpc
     command: >
       --datadir /data
+      --node-role rpc
       --rpc-addr 0.0.0.0:8545
       --ws --ws-port 8546
       --p2p --p2p-addr 0.0.0.0:30303

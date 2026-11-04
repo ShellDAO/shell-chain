@@ -499,7 +499,9 @@ impl<S: KvStore + 'static> Node<S> {
             ))
         })?;
         *AlgorithmRegistry::global_mut() = registry;
-        *self.runtime_signer.write() = Some(Arc::clone(&signer));
+        if self.config.node_role != crate::config::NodeRole::Rpc {
+            *self.runtime_signer.write() = Some(Arc::clone(&signer));
+        }
         let mut network = NetworkInterface::new(network);
         let local_signer_address =
             Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
@@ -580,7 +582,9 @@ impl<S: KvStore + 'static> Node<S> {
                     finalized_number.clone(),
                     self.finality.clone(),
                     peer_count_handle,
-                    if self.config.rpc.has_api_namespace("evm") {
+                    if self.config.node_role != crate::config::NodeRole::Rpc
+                        && self.config.rpc.has_api_namespace("evm")
+                    {
                         Some(self.clone() as Arc<dyn DevRpcControl>)
                     } else {
                         None
