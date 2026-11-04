@@ -1936,14 +1936,41 @@ Returns the paymaster policy for a given paymaster address.
 
 ### shell_isSponsored
 
-Returns whether a transaction would be sponsored by a paymaster.
+Looks up sponsorship metadata for a transaction hash, first in the mempool and
+then in stored blocks. This is a lookup of an existing transaction, not a
+preflight validation of a proposed transaction or paymaster signature.
 
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
-| 1 | `Object` | Yes | Transaction object |
+| 1 | `String` | Yes | Transaction hash (`0x` + 64 hex characters) |
 
-**Returns:** `Boolean` — `true` if the transaction would be sponsored.
+**Returns:** an object with the following fields (wire names use snake_case):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `found` | boolean | Whether the transaction was located |
+| `location` | string \| null | `"mempool"`, `"chain"`, or `null` when not found |
+| `is_aa_bundle` | boolean | Whether the transaction is a Native-AA bundle |
+| `sponsored` | boolean | Whether it is an AA bundle with a paymaster distinct from its sender |
+| `paymaster` | string \| null | Full 32-byte paymaster address, or `null` |
+| `sender` | string \| null | Full 32-byte sender address, or `null` when not found |
+| `inner_call_count` | number \| null | Number of inner calls, or `null` for a non-AA or missing transaction |
+
+For an unknown hash, `found`, `is_aa_bundle`, and `sponsored` are `false`, and the
+other fields are `null`. A found ordinary transaction has `found: true` and
+`sponsored: false`; inspect `found` separately from `sponsored`.
+
+This read-only public-testnet example queries the zero hash:
+
+```bash
+curl -sS https://testnet-rpc.shell.org \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"shell_isSponsored","params":["0x0000000000000000000000000000000000000000000000000000000000000000"],"id":1}'
+```
+
+Use the submitted transaction hash to inspect a real bundle. Passing a transaction
+object instead of a hash returns invalid parameters (`-32602`).
 
 ---
 
