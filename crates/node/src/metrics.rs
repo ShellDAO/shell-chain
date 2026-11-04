@@ -76,6 +76,8 @@ pub struct Metrics {
     pub epoch_number: IntGauge,
     /// Number of currently active validators.
     pub validator_active_count: IntGauge,
+    /// Successful, newly persisted WPoA finality advances observed in this process.
+    consensus_rounds: prometheus::IntCounterVec,
     /// Per-validator weight gauge: `shell_validator_weight{validator="0x..."}`.
     pub validator_weight: GaugeVec,
     /// Per-validator missed-slot counter: `shell_consensus_slot_miss_total{validator="0x..."}`.
@@ -202,6 +204,14 @@ impl Metrics {
             Opts::new("shell_validator_weight", "Per-validator proposer weight"),
             &["validator"],
         )?;
+        let consensus_rounds = prometheus::IntCounterVec::new(
+            Opts::new(
+                "shell_consensus_rounds_total",
+                "Observed WPoA round outcomes",
+            ),
+            &["outcome"],
+        )?;
+        consensus_rounds.with_label_values(&["committed"]);
         let validator_slot_miss = CounterVec::new(
             Opts::new(
                 "shell_consensus_slot_miss_total",
@@ -317,6 +327,7 @@ impl Metrics {
         registry.register(Box::new(txs_received.clone()))?;
         registry.register(Box::new(epoch_number.clone()))?;
         registry.register(Box::new(validator_active_count.clone()))?;
+        registry.register(Box::new(consensus_rounds.clone()))?;
         registry.register(Box::new(validator_weight.clone()))?;
         registry.register(Box::new(validator_slot_miss.clone()))?;
         registry.register(Box::new(stark_proofs_generated.clone()))?;
@@ -352,6 +363,7 @@ impl Metrics {
             txs_received,
             epoch_number,
             validator_active_count,
+            consensus_rounds,
             validator_weight,
             validator_slot_miss,
             stark_proofs_generated,
@@ -425,6 +437,15 @@ impl Metrics {
         self.last_finalized_number.set(finalized as i64);
         self.finality_lag_blocks
             .set(current_head.saturating_sub(finalized) as i64);
+    }
+
+    /// Count a commit only after finality backed by verified quorum evidence
+    /// was persisted and volatile finality advanced. Restore, duplicate evidence and failed writes
+    /// must not call this method.
+    pub(crate) fn record_committed_round(&self) {
+        self.consensus_rounds
+            .with_label_values(&["committed"])
+            .inc();
     }
 
     /// Update validator weight metric for a single validator.

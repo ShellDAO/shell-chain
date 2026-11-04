@@ -165,6 +165,9 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         if finalized {
+            if self.consensus.read().engine_type() == EngineType::WPoA {
+                self.metrics.record_committed_round();
+            }
             tracing::info!(
                 block = block_number,
                 hash = %block_hash,
@@ -513,6 +516,7 @@ impl<S: KvStore + 'static> Node<S> {
                                 }
                             };
                             if advanced {
+                                self.metrics.record_committed_round();
                                 self.advance_fork_choice_finality(block_number, block_hash);
                                 let current_head = self
                                     .chain_store
@@ -843,6 +847,7 @@ impl<S: KvStore + 'static> Node<S> {
             }
         };
         if advanced {
+            self.metrics.record_committed_round();
             self.advance_fork_choice_finality(block_number, block_hash);
             let current_head = self
                 .chain_store

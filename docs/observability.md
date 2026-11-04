@@ -89,6 +89,30 @@ All metrics are prefixed `shell_`.
 | `shell_last_finalized_number` | Gauge | — | Latest finalized block number |
 | `shell_finality_lag_blocks` | Gauge | — | Difference between canonical head and latest finalized block |
 
+Unreleased node source also exposes
+`shell_consensus_rounds_total{outcome="committed"}`. This process-local counter
+increments after successfully persisting a local finality advance backed by
+verified WPoA quorum evidence, through local votes, a received certificate,
+canonical attestations or adoption of a quorum-attested fork. It counts
+finality-advance events, including an advance to a later
+certified height, rather than reconstructing rounds skipped during catch-up.
+Producing an uncertified block, rejected or duplicate evidence, failed storage
+writes, startup restoration and metrics scrapes do not increment it. A process
+restart resets the counter while retaining finalized chain state.
+
+The following native regression checks genuine signed transactions, independent
+producer/follower finality, duplicate handling and RocksDB reopen. Build the node
+with libp2p and set `SHELL_SDK_ENTRY` to a compatible built `shell-sdk`
+`dist/index.js` (the published `0.14.0-rc.3` package is compatible):
+
+```bash
+NODE_BIN="$PWD/target/debug/shell-node" \
+  node tests/e2e/native-aa-registry.mjs --committed-round-metrics
+```
+
+This command covers the `committed` outcome only. The advertised `timeout` and
+`skip` outcomes still require runtime instrumentation and separate acceptance.
+
 ### STARK prover (K4)
 
 | Metric | Type | Description |

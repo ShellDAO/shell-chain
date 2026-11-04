@@ -42,6 +42,7 @@ const sphincsSignersScenario = process.argv.includes("--block-signers-sphincs");
 const blockSignersScenario =
   process.argv.includes("--block-signers") || sphincsSignersScenario;
 const syncStatusScenario = process.argv.includes("--sync-status");
+const committedRoundsScenario = process.argv.includes("--committed-round-metrics");
 const out = await mkdtemp(join(tmpdir(), "shell-native-aa-registry-"));
 const keyPath = join(out, "validator.json"),
   passwordPath = join(out, "password.txt");
@@ -80,7 +81,7 @@ async function unusedPort() {
 }
 const ports = [await unusedPort(), await unusedPort()];
 assert.notEqual(ports[0], ports[1]);
-const metricsPorts = syncStatusScenario ? [await unusedPort(), await unusedPort()] : [];
+const metricsPorts = syncStatusScenario || committedRoundsScenario ? [await unusedPort(), await unusedPort()] : [];
 const outsider = new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
 const signers = [miner, outsider];
 const prunedEpochScenario = process.argv.includes("--epoch-pruned-restart");
@@ -105,6 +106,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
+  nodeRuns: [],
   scenario: sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
@@ -150,6 +152,8 @@ async function stop(i) {
     await new Promise((done) => child.once("exit", done));
   }
   assert.ok(!running());
+  const record = result.nodeRuns.findLast((run) => run.pid === child.pid);
+  if (record) Object.assign(record, { exitCode: child.exitCode, signal: child.signalCode, endedAt: new Date().toISOString() });
   nodes[i] = undefined;
 }
 for (const signal of ["SIGINT", "SIGTERM"])
@@ -170,7 +174,7 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
     "--rpc-addr",
     `127.0.0.1:${ports[i]}`,
     "--metrics-addr",
-    syncStatusScenario ? `127.0.0.1:${metricsPorts[i]}` : "127.0.0.1:0",
+    syncStatusScenario || committedRoundsScenario ? `127.0.0.1:${metricsPorts[i]}` : "127.0.0.1:0",
     "--block-time",
     "2000",
     "--max-idle-interval",
@@ -198,6 +202,7 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
   if (bootnode) args.push("--bootnode", bootnode);
   const fd = openSync(join(out, label + "-node.log"), "w");
   const child = spawn(binary, args, { stdio: ["ignore", fd, fd] });
+  result.nodeRuns.push({ index: i, pid: child.pid, args, label, startedAt: new Date().toISOString() });
   closeSync(fd);
   nodes[i] = child;
   nodeLogLabels[i] = label;
@@ -500,6 +505,42 @@ async function runScenario() {
     await pause(250);
   }
   assert.ok(bootnode, "leader complete multiaddr");
+  if (committedRoundsScenario) {
+    result.scenario = "committed-round-metrics";
+    const exposition = async (i) => {
+      const response = await fetch(`http://127.0.0.1:${metricsPorts[i]}/metrics`);
+      assert.equal(response.status, 200);
+      return response.text();
+    };
+    const check = async (i, expected, label) => {
+      const text = await exposition(i);
+      result.roundMetrics ??= [];
+      result.roundMetrics.push({ node: i, label, expected, exposition: text });
+      await save();
+      assert.equal(text.match(/^shell_consensus_rounds_total\{outcome="committed"\} (\d+)$/m)?.[1], String(expected), label);
+      assert.equal((await exposition(i)).match(/^shell_consensus_rounds_total\{outcome="committed"\} (\d+)$/m)?.[1], String(expected), "scraping does not count a commit");
+    };
+    await start(1, dirs[1], followerKey, "round-follower", bootnode);
+    await peerReady();
+    const before = BigInt(await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"]));
+    const first = await confirmed("first genuine commit", miner, [buildInnerCall(outsider.getAddress(), "0x", 100000, 7n)]);
+    assert.equal(BigInt(await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"])), before + 7n);
+    for (const i of [0, 1]) await check(i, 1, "actual finalized commit counted once");
+    await stop(1);
+    await start(1, dirs[1], followerKey, "round-reopened-follower", bootnode);
+    await peerReady();
+    await compare(first.hash);
+    await check(1, 0, "restored finality is not a new commit");
+    await check(0, 1, "peer reconnect and certificate replay do not count twice");
+    const second = await confirmed("next genuine commit after reopen", miner, [buildInnerCall(outsider.getAddress(), "0x", 100000, 11n)]);
+    assert.equal(BigInt(await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"])), before + 18n);
+    await check(0, 2, "producer has two new commits");
+    await check(1, 1, "reopened follower has one new commit");
+    result.finalHeight = height;
+    result.finalState = await compare(second.hash);
+    result.passed = true;
+    return;
+  }
   if (syncStatusScenario) {
     // Create the backlog through the existing real signed transaction path.
     for (let block = 1; block <= 21; block++)
@@ -1443,4 +1484,6 @@ try {
   await save();
   for (const signer of signers) signer.dispose();
   console.log(`Acceptance report: ${join(out, "runtime.json")}`);
+  if (committedRoundsScenario && result.passed)
+    assert.ok(result.nodeRuns.every((run) => run.exitCode === 0 && run.signal === null), "native nodes exit cleanly");
 }

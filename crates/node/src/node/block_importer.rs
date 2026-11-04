@@ -1605,6 +1605,9 @@ impl<S: KvStore + 'static> Node<S> {
             );
             debug_assert!(finalized, "prechecked preferred-fork finality must apply");
             drop(finality);
+            if self.consensus.read().engine_type() == EngineType::WPoA {
+                self.metrics.record_committed_round();
+            }
             tracing::info!(
                 block = plan.preferred_number,
                 hash = %plan.preferred_hash,

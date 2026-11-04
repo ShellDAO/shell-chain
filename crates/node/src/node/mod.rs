@@ -19963,40 +19963,59 @@ mod tests {
 
     #[test]
     fn handle_attestation_persists_before_advancing_finality_and_retries_duplicate() {
-        let (node, signer, db) = setup_failing_batch_node();
-        store_genesis(&node);
-        let authority = node.config.proposer_address.unwrap();
-        node.register_authority_pubkey(authority, signer.public_key().to_vec());
+        for wpoa in [false, true] {
+            let (mut node, signer, db) = setup_failing_batch_node();
+            if wpoa {
+                let authority = node.config.proposer_address.unwrap();
+                node.consensus = Arc::new(RwLock::new(WPoaEngine::new(
+                    WPoaConfig::from_poa(PoaConfig::new(vec![authority], 1)),
+                    Arc::new(MultiVerifier),
+                )));
+            }
+            store_genesis(&node);
+            let authority = node.config.proposer_address.unwrap();
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
 
-        let block = node.produce_block(&signer, 100).unwrap();
-        let block_hash = block.hash();
-        let block_number = block.header.number;
-        let attestation = node
-            .create_attestation(block_hash, block_number, &signer)
-            .unwrap();
+            let block = node.produce_block(&signer, 100).unwrap();
+            let block_hash = block.hash();
+            let block_number = block.header.number;
+            let attestation = node
+                .create_attestation(block_hash, block_number, &signer)
+                .unwrap();
 
-        db.fail_next_put();
-        let error = node
-            .handle_attestation(attestation.clone(), &MultiVerifier)
-            .unwrap_err();
-        assert!(error.to_string().contains("injected put failure"));
-        assert_eq!(node.finality.read().last_finalized_number(), 0);
-        assert_eq!(node.finality.read().last_finalized_hash(), &ShellHash::ZERO);
-        assert_eq!(
-            node.finality.read().attestation_count(&block_hash),
-            1,
-            "the pending attestation must remain available for retry"
-        );
-        assert_eq!(node.chain_store.get_finalized_number().unwrap(), None);
+            db.fail_next_put();
+            let error = node
+                .handle_attestation(attestation.clone(), &MultiVerifier)
+                .unwrap_err();
+            assert!(error.to_string().contains("injected put failure"));
+            assert_eq!(node.finality.read().last_finalized_number(), 0);
+            assert_eq!(node.finality.read().last_finalized_hash(), &ShellHash::ZERO);
+            assert_eq!(
+                node.finality.read().attestation_count(&block_hash),
+                1,
+                "the pending attestation must remain available for retry"
+            );
+            assert_eq!(node.chain_store.get_finalized_number().unwrap(), None);
+            assert!(node
+                .metrics
+                .gather()
+                .contains("shell_consensus_rounds_total{outcome=\"committed\"} 0\n"));
 
-        node.handle_attestation(attestation, &MultiVerifier)
-            .unwrap();
-        assert_eq!(node.finality.read().last_finalized_number(), block_number);
-        assert_eq!(node.finality.read().last_finalized_hash(), &block_hash);
-        assert_eq!(
-            node.chain_store.get_finalized_number().unwrap(),
-            Some(block_number)
-        );
+            node.handle_attestation(attestation.clone(), &MultiVerifier)
+                .unwrap();
+            assert_eq!(node.finality.read().last_finalized_number(), block_number);
+            assert_eq!(node.finality.read().last_finalized_hash(), &block_hash);
+            assert_eq!(
+                node.chain_store.get_finalized_number().unwrap(),
+                Some(block_number)
+            );
+            node.handle_attestation(attestation, &MultiVerifier)
+                .unwrap();
+            let expected = if wpoa { 1 } else { 0 };
+            assert!(node.metrics.gather().contains(&format!(
+                "shell_consensus_rounds_total{{outcome=\"committed\"}} {expected}\n"
+            )));
+        }
     }
 
     #[test]
@@ -22173,6 +22192,10 @@ mod tests {
             assert_eq!(node.chain_store.get_finalized_number().unwrap(), None);
             assert!(failed_certificate.is_none());
             assert!(node
+                .metrics
+                .gather()
+                .contains("shell_consensus_rounds_total{outcome=\"committed\"} 0\n"));
+            assert!(node
                 .chain_store
                 .get_commit_certificate(&block_hash)
                 .unwrap()
@@ -22190,6 +22213,10 @@ mod tests {
                 Some("Committed")
             );
             assert_eq!(node.finality.read().last_finalized_number(), 1);
+            assert!(node
+                .metrics
+                .gather()
+                .contains("shell_consensus_rounds_total{outcome=\"committed\"} 1\n"));
             assert_eq!(node.chain_store.get_finalized_number().unwrap(), Some(1));
             assert!(node
                 .chain_store
@@ -22955,6 +22982,10 @@ mod tests {
 
             assert!(!node.fast_finalize_with_certificate(1, side_hash, &cert));
             assert_eq!(node.finality.read().last_finalized_number(), 0);
+            assert!(node
+                .metrics
+                .gather()
+                .contains("shell_consensus_rounds_total{outcome=\"committed\"} 0\n"));
             assert_eq!(node.chain_store.get_finalized_number().unwrap(), None);
             assert!(node
                 .chain_store
@@ -22981,6 +23012,10 @@ mod tests {
 
             db.fail_next_batch();
             assert!(!node.fast_finalize_with_certificate(1, block_hash, &cert));
+            assert!(node
+                .metrics
+                .gather()
+                .contains("shell_consensus_rounds_total{outcome=\"committed\"} 0\n"));
             assert_eq!(node.finality.read().last_finalized_number(), 0);
             assert_eq!(node.chain_store.get_finalized_number().unwrap(), None);
             assert!(node
@@ -22990,6 +23025,15 @@ mod tests {
                 .is_none());
 
             assert!(node.fast_finalize_with_certificate(1, block_hash, &cert));
+            assert!(node
+                .metrics
+                .gather()
+                .contains("shell_consensus_rounds_total{outcome=\"committed\"} 1\n"));
+            assert!(node.fast_finalize_with_certificate(1, block_hash, &cert));
+            assert!(node
+                .metrics
+                .gather()
+                .contains("shell_consensus_rounds_total{outcome=\"committed\"} 1\n"));
             assert_eq!(node.finality.read().last_finalized_number(), 1);
             assert_eq!(node.chain_store.get_finalized_number().unwrap(), Some(1));
             assert!(node

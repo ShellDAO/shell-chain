@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Emit the advertised `shell_consensus_rounds_total{outcome="committed"}`
+  counter after newly persisted WPoA finality advances. Failed writes, duplicate
+  certificates and startup restoration do not count; the counter resets on
+  process restart. Other consensus outcome labels remain separate work.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed
