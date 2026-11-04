@@ -9,13 +9,15 @@ to consume it.
 ## 1. Metrics HTTP server
 
 The node starts a lightweight HTTP server for observability endpoints. Configure
-it in `node.toml`:
+it in `node.toml` and pass it to `shell-node run --config node.toml`:
 
 ```toml
 [metrics]
 enabled  = true
-listen_addr = "0.0.0.0:9000"   # default
+listen_addr = "127.0.0.1:9090"   # default
 ```
+
+Add `--metrics-addr` to the `run` command to override the configured address.
 
 ### Endpoints
 
@@ -23,7 +25,7 @@ listen_addr = "0.0.0.0:9000"   # default
 |------|--------|-------------|
 | `/metrics` | GET | Prometheus text exposition (v0.0.4) |
 | `/health` / `/healthz` | GET | Liveness probe — always 200 when process is up |
-| `/ready` / `/readyz` | GET | Readiness probe — 503 while syncing or while the production gate is closed |
+| `/ready` / `/readyz` | GET | Readiness probe — 503 at genesis, while syncing, or while the production gate is closed |
 
 #### `/healthz` response
 
