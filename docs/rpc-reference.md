@@ -834,15 +834,18 @@ In v0.18.0 Phase 1, paymasters are plain EOAs; the "policy" is
 "sponsor any bundle that carries a valid paymaster signature over the
 bundle's signing hash, as long as balance covers `gas_used × max_fee`".
 
+Any valid address returns this metadata object, including an address
+without a registered PQ key. This lookup does not authorize sponsorship.
+
 Response:
 - `address` — queried address
-- `hasPqPubkey` — whether a PQ public key is registered (prerequisite
+- `has_pq_pubkey` — whether a PQ public key is registered (prerequisite
   to act as a paymaster on Native AA)
 - `balance` — hex wei balance (available to sponsor gas)
 - `policy` — constant string `"eoa-open"` (Phase 1)
-- `maxGasSponsorship` — `null` (no per-tx cap in Phase 1; bounded only
+- `max_gas_sponsorship` — `null` (no per-tx cap in Phase 1; bounded only
   by balance)
-- `pubkeyBytes` — hex length of the registered pubkey (sanity only),
+- `pubkey_bytes` — byte length of the registered pubkey as a JSON number,
   or `null`
 
 ### shell_isSponsored

@@ -1923,14 +1923,38 @@ Estimates gas for an AA batch transaction.
 
 ### shell_getPaymasterPolicy
 
-Returns the paymaster policy for a given paymaster address.
+Returns EOA paymaster metadata for any valid native address, including an address
+without a registered PQ public key. The response is an object, not `null` for an
+unregistered address.
 
 **Parameters:**
 | # | Type | Required | Description |
 |---|------|----------|-------------|
 | 1 | `String` | Yes | Paymaster address (`0x...`, 32 bytes) |
 
-**Returns:** `Object|null` — Policy object or `null` if no policy registered.
+**Returns:** an object with snake_case wire fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `address` | string | Queried full 32-byte native address |
+| `has_pq_pubkey` | boolean | Whether a PQ public key is registered |
+| `pubkey_bytes` | number \| null | Registered public-key length in bytes, or `null` |
+| `balance` | string | Balance in wei as a hex quantity |
+| `policy` | string | `"eoa-open"` for this EOA policy lookup |
+| `max_gas_sponsorship` | null | No separate per-transaction policy cap; funding and transaction validation still apply |
+
+An unregistered address has `has_pq_pubkey: false` and `pubkey_bytes: null`.
+This metadata is not sponsorship authorization or contract-paymaster simulation:
+EOA sponsorship still requires a registered PQ key, a valid signature and enough
+funds. Use `shell_estimatePaymasterGas` for the separate versioned contract check.
+
+This read-only example queries the zero address on the public testnet:
+
+```bash
+curl -sS https://testnet-rpc.shell.org \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"shell_getPaymasterPolicy","params":["0x0000000000000000000000000000000000000000000000000000000000000000"],"id":1}'
+```
 
 ---
 
