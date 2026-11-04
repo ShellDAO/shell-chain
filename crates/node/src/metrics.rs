@@ -76,8 +76,10 @@ pub struct Metrics {
     pub epoch_number: IntGauge,
     /// Number of currently active validators.
     pub validator_active_count: IntGauge,
-    /// Successful, newly persisted WPoA finality advances observed in this process.
+    /// Local WPoA consensus outcome events observed in this process.
     consensus_rounds: prometheus::IntCounterVec,
+    /// Consecutive retries of the same local candidate are one skipped round.
+    last_skipped_round: parking_lot::Mutex<Option<(shell_primitives::ShellHash, u64, u64)>>,
     /// Per-validator weight gauge: `shell_validator_weight{validator="0x..."}`.
     pub validator_weight: GaugeVec,
     /// Per-validator missed-slot counter: `shell_consensus_slot_miss_total{validator="0x..."}`.
@@ -211,7 +213,9 @@ impl Metrics {
             ),
             &["outcome"],
         )?;
-        consensus_rounds.with_label_values(&["committed"]);
+        for outcome in ["committed", "timeout", "skip"] {
+            consensus_rounds.with_label_values(&[outcome]);
+        }
         let validator_slot_miss = CounterVec::new(
             Opts::new(
                 "shell_consensus_slot_miss_total",
@@ -364,6 +368,7 @@ impl Metrics {
             epoch_number,
             validator_active_count,
             consensus_rounds,
+            last_skipped_round: parking_lot::Mutex::new(None),
             validator_weight,
             validator_slot_miss,
             stark_proofs_generated,
@@ -446,6 +451,27 @@ impl Metrics {
         self.consensus_rounds
             .with_label_values(&["committed"])
             .inc();
+    }
+
+    /// The consensus engine has accepted quorum and advanced to a new view.
+    pub(crate) fn record_timeout_round(&self) {
+        self.consensus_rounds.with_label_values(&["timeout"]).inc();
+    }
+
+    /// Observe an active local authority's rejected proposal attempt. Keep only
+    /// the latest identity so idle retries cannot grow memory or metric counts.
+    pub(crate) fn record_skipped_round(
+        &self,
+        parent: shell_primitives::ShellHash,
+        number: u64,
+        view: u64,
+    ) {
+        let identity = (parent, number, view);
+        let mut previous = self.last_skipped_round.lock();
+        if previous.as_ref() != Some(&identity) {
+            self.consensus_rounds.with_label_values(&["skip"]).inc();
+            *previous = Some(identity);
+        }
     }
 
     /// Update validator weight metric for a single validator.

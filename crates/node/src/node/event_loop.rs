@@ -1230,9 +1230,8 @@ impl<S: KvStore + 'static> Node<S> {
                                         .copied()
                                         .sum();
                                     let quorum = self
-                                        .consensus
-                                        .write()
-                                        .handle_view_change_message(msg.clone(), total_weight);
+                                        .consensus_manager()
+                                        .apply_view_change(msg.clone(), total_weight);
                                     warn!(
                                         view,
                                         block_number,

@@ -89,29 +89,40 @@ All metrics are prefixed `shell_`.
 | `shell_last_finalized_number` | Gauge | — | Latest finalized block number |
 | `shell_finality_lag_blocks` | Gauge | — | Difference between canonical head and latest finalized block |
 
-Unreleased node source also exposes
-`shell_consensus_rounds_total{outcome="committed"}`. This process-local counter
-increments after successfully persisting a local finality advance backed by
-verified WPoA quorum evidence, through local votes, a received certificate,
-canonical attestations or adoption of a quorum-attested fork. It counts
-finality-advance events, including an advance to a later
-certified height, rather than reconstructing rounds skipped during catch-up.
-Producing an uncertified block, rejected or duplicate evidence, failed storage
-writes, startup restoration and metrics scrapes do not increment it. A process
-restart resets the counter while retaining finalized chain state.
+### Consensus outcomes (Unreleased)
 
-The following native regression checks genuine signed transactions, independent
-producer/follower finality, duplicate handling and RocksDB reopen. Build the node
-with libp2p and set `SHELL_SDK_ENTRY` to a compatible built `shell-sdk`
-`dist/index.js` (the published `0.14.0-rc.3` package is compatible):
+Unreleased node source emits `shell_consensus_rounds_total{outcome="..."}`
+with three fixed outcomes:
+
+| Outcome | Event |
+|---------|-------|
+| `committed` | A new local WPoA finality advance is successfully persisted after verified quorum evidence, through votes, certificates, canonical attestations or attested-fork adoption. |
+| `timeout` | Valid weighted view-change quorum actually advances the local consensus view. Expired local timers and sub-quorum or duplicate votes alone do not count. |
+| `skip` | An active local WPoA authority attempts a proposal when another authority is scheduled. Consecutive attempts at the same parent, height and view count once; idle/readiness checks and inactive or PoA identities do not count. |
+
+These are local observed events: one height can have a skip and a timeout before
+its later committed view. Commits count observed finality-advance events rather
+than reconstructing every skipped height during catch-up. Failed finality
+writes, duplicate evidence and metrics scrapes do not add events. Restarting a
+process resets all counters and local skip identity while preserving finalized
+chain state.
+
+From a node source checkout, build with libp2p and set `SHELL_SDK_ENTRY` to a
+compatible built `shell-sdk` `dist/index.js` (published `0.14.0-rc.3` is compatible).
+Run the existing native acceptance entry:
 
 ```bash
 NODE_BIN="$PWD/target/debug/shell-node" \
-  node tests/e2e/native-aa-registry.mjs --committed-round-metrics
+  node tests/e2e/native-aa-registry.mjs --consensus-round-metrics
 ```
 
-This command covers the `committed` outcome only. The advertised `timeout` and
-`skip` outcomes still require runtime instrumentation and separate acceptance.
+This uses fresh ML-DSA-65 test accounts and two isolated full RocksDB nodes with
+weights 3 and 1. It stops the scheduled weight-1 proposer, observes the unchanged
+protocol timeout and a genuine weight-3 quorum/rotated commit, then restores
+both nodes' state and checks process-local counter resets after physical reopen.
+It covers this private weighted profile; production quorum/scale requires its
+own validation. The narrower `--committed-round-metrics` mode checks only the
+single-authority commit/import/restart path.
 
 ### STARK prover (K4)
 

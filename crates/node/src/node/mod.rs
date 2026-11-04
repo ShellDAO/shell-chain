@@ -503,15 +503,43 @@ struct ConsensusManagerBoundary<'a, S: KvStore + 'static> {
     finality: &'a Arc<RwLock<FinalityState>>,
     fork_choice: &'a Arc<RwLock<ForkChoice>>,
     world_state: &'a Arc<RwLock<WorldState<S>>>,
+    metrics: &'a Metrics,
 }
 
 impl<'a, S: KvStore + 'static> ConsensusManagerBoundary<'a, S> {
-    fn ensure_local_proposer(&self, block_number: u64, proposer: Address) -> Result<(), NodeError> {
-        if self.consensus.read().is_proposer(block_number, &proposer) {
+    fn ensure_local_proposer(
+        &self,
+        parent: ShellHash,
+        block_number: u64,
+        proposer: Address,
+    ) -> Result<(), NodeError> {
+        let consensus = self.consensus.read();
+        if consensus.is_proposer(block_number, &proposer) {
             Ok(())
         } else {
+            if consensus.engine_type() == EngineType::WPoA
+                && consensus
+                    .validator_weights()
+                    .get(&proposer)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+            {
+                self.metrics
+                    .record_skipped_round(parent, block_number, consensus.current_view());
+            }
             Err(NodeError::NotProposer)
         }
+    }
+
+    fn apply_view_change(&self, msg: ViewChangeMessage, total_weight: u64) -> bool {
+        let mut consensus = self.consensus.write();
+        let previous = consensus.current_view();
+        let quorum = consensus.handle_view_change_message(msg, total_weight);
+        if consensus.engine_type() == EngineType::WPoA && consensus.current_view() > previous {
+            self.metrics.record_timeout_round();
+        }
+        quorum
     }
 
     fn finalized_cursor(&self) -> (u64, ShellHash) {
@@ -1083,6 +1111,7 @@ impl<S: KvStore + 'static> Node<S> {
             finality: &self.finality,
             fork_choice: &self.fork_choice,
             world_state: &self.world_state,
+            metrics: &self.metrics,
         }
     }
 
@@ -21713,6 +21742,166 @@ mod tests {
 
         fn dummy_sig() -> PQSignature {
             PQSignature::new(SignatureType::Dilithium3, vec![0u8; 32])
+        }
+
+        fn signed_round_view(signer: &dyn Signer, view: u64) -> ViewChangeMessage {
+            let validator =
+                Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+            let payload = ViewChangeMessage::signing_message(1337, 1, view, &ShellHash::ZERO);
+            ViewChangeMessage::new(
+                1337,
+                1,
+                view,
+                ShellHash::ZERO,
+                validator,
+                signer.sign(&payload).unwrap().data,
+            )
+        }
+
+        #[test]
+        fn round_metrics_timeout_counts_only_actual_verified_view_advances() {
+            for local in [false, true] {
+                let (mut node, signer) = setup_wpoa_node();
+                let authority = node.config.proposer_address.unwrap();
+                let other = DilithiumSigner::generate();
+                let other_address =
+                    Address::from_public_key(other.public_key(), other.sig_type().as_u8());
+                node.consensus = Arc::new(RwLock::new(WPoaEngine::new(
+                    WPoaConfig::with_weights(
+                        PoaConfig::new(vec![authority, other_address], 1),
+                        vec![3, 1],
+                    ),
+                    Arc::new(MultiVerifier),
+                )));
+                node.register_authority_pubkey(authority, signer.public_key().to_vec());
+                node.register_authority_pubkey(other_address, other.public_key().to_vec());
+                let head = store_genesis_wpoa(&node);
+                let weak = signed_round_view(&other, 0);
+                assert!(!node
+                    .handle_wpoa_view_change(weak.clone(), &MultiVerifier)
+                    .unwrap());
+                assert!(!node.handle_wpoa_view_change(weak, &MultiVerifier).unwrap());
+                let strong = signed_round_view(&signer, 0);
+                let mut tampered = strong.clone();
+                tampered.signature[0] ^= 1;
+                assert!(node
+                    .handle_wpoa_view_change(tampered, &MultiVerifier)
+                    .is_err());
+                let mut impersonated = strong.clone();
+                impersonated.validator = other_address;
+                assert!(node
+                    .handle_wpoa_view_change(impersonated, &MultiVerifier)
+                    .is_err());
+                let mut foreign = strong.clone();
+                foreign.chain_id += 1;
+                foreign.signature = signer.sign(&foreign.own_signing_message()).unwrap().data;
+                assert!(node
+                    .handle_wpoa_view_change(foreign, &MultiVerifier)
+                    .is_err());
+                assert_eq!(node.consensus.read().current_view(), 0);
+                assert!(node
+                    .metrics
+                    .gather()
+                    .contains("shell_consensus_rounds_total{outcome=\"timeout\"} 0\n"));
+                if local {
+                    assert!(node
+                        .consensus_manager()
+                        .apply_view_change(strong.clone(), 4));
+                } else {
+                    assert!(node
+                        .handle_wpoa_view_change(strong.clone(), &MultiVerifier)
+                        .unwrap());
+                }
+                assert_eq!(node.consensus.read().current_view(), 1);
+                assert!(!node
+                    .handle_wpoa_view_change(strong, &MultiVerifier)
+                    .unwrap());
+                assert!(node
+                    .metrics
+                    .gather()
+                    .contains("shell_consensus_rounds_total{outcome=\"timeout\"} 1\n"));
+                assert!(node
+                    .metrics
+                    .gather()
+                    .contains("shell_consensus_rounds_total{outcome=\"committed\"} 0\n"));
+                assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(head));
+                assert_eq!(node.chain_store.get_finalized_number().unwrap(), None);
+            }
+        }
+
+        #[test]
+        fn round_metrics_skip_deduplicates_candidate_and_excludes_inactive_and_poa() {
+            let (mut node, signer) = setup_wpoa_node();
+            let authority = node.config.proposer_address.unwrap();
+            let other = DilithiumSigner::generate();
+            let other_address =
+                Address::from_public_key(other.public_key(), other.sig_type().as_u8());
+            let config = PoaConfig::new(vec![authority, other_address], 1);
+            node.consensus = Arc::new(RwLock::new(WPoaEngine::new(
+                WPoaConfig::from_poa(config.clone()),
+                Arc::new(MultiVerifier),
+            )));
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
+            node.register_authority_pubkey(other_address, other.public_key().to_vec());
+            let head = store_genesis_wpoa(&node);
+            for _ in 0..3 {
+                assert!(matches!(
+                    node.produce_block(&signer, 1),
+                    Err(NodeError::NotProposer)
+                ));
+            }
+            assert!(node
+                .metrics
+                .gather()
+                .contains("shell_consensus_rounds_total{outcome=\"skip\"} 1\n"));
+            for view in 0..2 {
+                assert!(!node
+                    .handle_wpoa_view_change(signed_round_view(&signer, view), &MultiVerifier)
+                    .unwrap());
+                assert!(node
+                    .handle_wpoa_view_change(signed_round_view(&other, view), &MultiVerifier)
+                    .unwrap());
+                if view == 0 {
+                    node.consensus_manager()
+                        .ensure_local_proposer(head, 1, authority)
+                        .unwrap();
+                    assert!(node
+                        .metrics
+                        .gather()
+                        .contains("shell_consensus_rounds_total{outcome=\"skip\"} 1\n"));
+                }
+            }
+            assert!(matches!(
+                node.produce_block(&signer, 1),
+                Err(NodeError::NotProposer)
+            ));
+            assert!(node
+                .metrics
+                .gather()
+                .contains("shell_consensus_rounds_total{outcome=\"skip\"} 2\n"));
+            node.consensus.write().set_authorities(vec![other_address]);
+            assert!(matches!(
+                node.produce_block(&signer, 1),
+                Err(NodeError::NotProposer)
+            ));
+            assert!(node
+                .metrics
+                .gather()
+                .contains("shell_consensus_rounds_total{outcome=\"skip\"} 2\n"));
+            node.consensus = Arc::new(RwLock::new(shell_consensus::PoaEngine::new(config)));
+            let use_other = node.consensus.read().is_proposer(1, &authority);
+            node.config.proposer_address = Some(if use_other { other_address } else { authority });
+            let actor: &dyn Signer = if use_other { &other } else { &signer };
+            assert!(matches!(
+                node.produce_block(actor, 1),
+                Err(NodeError::NotProposer)
+            ));
+            assert!(node
+                .metrics
+                .gather()
+                .contains("shell_consensus_rounds_total{outcome=\"skip\"} 2\n"));
+            assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(head));
+            assert_eq!(node.chain_store.get_finalized_number().unwrap(), None);
         }
 
         /// Build a Node backed by a WPoA engine.

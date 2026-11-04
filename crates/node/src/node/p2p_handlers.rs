@@ -964,8 +964,7 @@ impl<S: KvStore + 'static> Node<S> {
             .copied()
             .sum();
         Ok(self
-            .consensus
-            .write()
-            .handle_view_change_message(msg, total_weight))
+            .consensus_manager()
+            .apply_view_change(msg, total_weight))
     }
 }

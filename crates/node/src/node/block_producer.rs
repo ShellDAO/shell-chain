@@ -34,7 +34,7 @@ impl<S: KvStore + 'static> Node<S> {
         let next_number = ChainStateMachine::next_block_number(head.number())?;
 
         let proposer_addr = self.config.proposer_address.ok_or(NodeError::NotProposer)?;
-        consensus.ensure_local_proposer(next_number, proposer_addr)?;
+        consensus.ensure_local_proposer(head_hash, next_number, proposer_addr)?;
 
         let (finalized_number, finalized_hash) = consensus.finalized_cursor();
         ChainStateMachine::ensure_production_parent(

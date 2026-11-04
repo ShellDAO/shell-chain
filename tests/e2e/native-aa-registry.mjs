@@ -37,7 +37,8 @@ const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
 const sameHeightForkScenario = process.argv.includes("--fork-sync-same-height");
 const weightedForkScenario = process.argv.includes("--fork-sync-weighted") || sameHeightForkScenario;
 const forkSyncScenario = process.argv.includes("--fork-sync") || weightedForkScenario;
-const twoAuthorities = quorumRecoveryScenario || forkSyncScenario;
+const roundOutcomesScenario = process.argv.includes("--consensus-round-metrics");
+const twoAuthorities = quorumRecoveryScenario || forkSyncScenario || roundOutcomesScenario;
 const sphincsSignersScenario = process.argv.includes("--block-signers-sphincs");
 const blockSignersScenario =
   process.argv.includes("--block-signers") || sphincsSignersScenario;
@@ -56,7 +57,7 @@ const generated = spawnSync(
     "key",
     "generate",
     "--algorithm",
-    sphincsSignersScenario || (twoAuthorities && !sameHeightForkScenario) ? "slhdsa" : "mldsa65",
+    sphincsSignersScenario || (twoAuthorities && !sameHeightForkScenario && !roundOutcomesScenario) ? "slhdsa" : "mldsa65",
     "--output",
     keyPath,
   ],
@@ -81,7 +82,7 @@ async function unusedPort() {
 }
 const ports = [await unusedPort(), await unusedPort()];
 assert.notEqual(ports[0], ports[1]);
-const metricsPorts = syncStatusScenario || committedRoundsScenario ? [await unusedPort(), await unusedPort()] : [];
+const metricsPorts = syncStatusScenario || committedRoundsScenario || roundOutcomesScenario ? [await unusedPort(), await unusedPort()] : [];
 const outsider = new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
 const signers = [miner, outsider];
 const prunedEpochScenario = process.argv.includes("--epoch-pruned-restart");
@@ -174,7 +175,7 @@ async function start(i, data, key, label, bootnode, waitForRpc = true) {
     "--rpc-addr",
     `127.0.0.1:${ports[i]}`,
     "--metrics-addr",
-    syncStatusScenario || committedRoundsScenario ? `127.0.0.1:${metricsPorts[i]}` : "127.0.0.1:0",
+    syncStatusScenario || committedRoundsScenario || roundOutcomesScenario ? `127.0.0.1:${metricsPorts[i]}` : "127.0.0.1:0",
     "--block-time",
     "2000",
     "--max-idle-interval",
@@ -401,6 +402,11 @@ async function confirmed(
     ...(batch ? { aaBundle: batch.aa_bundle } : {}),
     includePublicKey: true,
   });
+  if (roundOutcomesScenario) {
+    result.inputs ??= [];
+    result.inputs.push({ label, method: "shell_sendTransaction", params: [signed] });
+    await save();
+  }
   const hash = await paced(() => providers[0].sendTransaction(signed));
   let receipt;
   for (let k = 0; k < 120; k++) {
@@ -476,7 +482,7 @@ async function runScenario() {
       authorities: authorities.map((signer) => signer.getAddress()),
       authority_pubkeys: authorities.map((signer) =>
         "0x" + Buffer.from(signer.getPublicKey()).toString("hex")),
-      weights: authorities.map((_, index) => weightedForkScenario && index === 1 ? 3 : 1),
+      weights: authorities.map((_, index) => (weightedForkScenario && index === 1) || (roundOutcomesScenario && index === 0) ? 3 : 1),
       stakes: [],
       block_time_secs: 2,
       max_future_secs: 300,
@@ -505,6 +511,81 @@ async function runScenario() {
     await pause(250);
   }
   assert.ok(bootnode, "leader complete multiaddr");
+  if (roundOutcomesScenario) {
+    result.scenario = "consensus-round-metrics";
+    result.adaptations = ["Fresh MLDSA65 authorities weighted3/1 on private Dev1337/full RocksDB. One online signing identity has strict3/4 quorum; no production quorum or scale claim.", "Use actual weighted block proposers/certificates as oracle, not the separately known RPC prediction bug. Protocol timeout unchanged."];
+    expectedMembers = authorities.map((signer) => signer.getAddress());
+    const metric = async (i, outcome, expected, label) => {
+      for (let repeat = 0; repeat < 2; repeat++) {
+        const response = await fetch(`http://127.0.0.1:${metricsPorts[i]}/metrics`);
+        assert.equal(response.status, 200);
+        const text = await response.text();
+        result.roundMetrics ??= [];
+        result.roundMetrics.push({ node: i, outcome, expected, label, exposition: text });
+        await save();
+        assert.equal(text.match(new RegExp(`^shell_consensus_rounds_total\\{outcome="${outcome}"\\} (\\d+)$`, "m"))?.[1], String(expected), label);
+      }
+    };
+    const transfer = (label, value, sync = true) => confirmed(label, miner, [buildInnerCall(outsider.getAddress(), "0x", 100000, value)], "0x1", sync);
+    await start(1, dirs[1], followerKey, "outcome-follower", bootnode);
+    await peerReady();
+    const initialBalance = BigInt(await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"]));
+    await transfer("weighted base slot1", 7n);
+    await transfer("weighted base slot2", 11n);
+    const block2 = await rpc(0, "eth_getBlockByNumber", ["0x2", false]);
+    assert.equal(block2.miner.toLowerCase(), miner.getAddress().toLowerCase());
+    await stop(1);
+    const third = await transfer("offline scheduled proposer requires view change", 13n, false);
+    for (let attempt = 0; attempt < 80; attempt++) {
+      if (BigInt((await rpc(0, "shell_getFinalityInfo")).lastFinalizedBlock) >= 3n) break;
+      await pause(250);
+    }
+    assert.equal((await rpc(0, "eth_getBlockByNumber", ["finalized", false])).number, "0x3");
+    const block3 = await rpc(0, "eth_getBlockByNumber", ["0x3", false]);
+    const proof = await rpc(0, "shell_finalityProof", [block3.hash]);
+    assert.equal(block3.miner.toLowerCase(), miner.getAddress().toLowerCase(), "base slot3 belongs to absent weight1 authority; actual proposer rotated");
+    assert.ok(BigInt(block3.timestamp) - BigInt(block2.timestamp) >= 10n, "protocol timeout is not shortened");
+    assert.ok(proof?.certificate, "actual quorum certificate exists");
+    assert.deepEqual(Object.keys(proof.certificate).map((address) => address.toLowerCase()), [miner.getAddress().toLowerCase()], "one genuine weight3 signer reaches strict quorum");
+    assert.equal(BigInt(await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"])), initialBalance + 31n);
+    result.rotation = { block2, block3, proof, weights: [3, 1], totalWeight: 4, signedWeight: 3 };
+    await save();
+    await metric(0, "timeout", 1, "one accepted view advance despite repeated polling");
+    await metric(0, "skip", 1, "one unchanged local round skipped before timeout");
+    await metric(0, "committed", 3, "three actual finalized commits");
+    await start(1, dirs[1], followerKey, "outcome-reopened-follower", bootnode);
+    await peerReady();
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const imported = await rpc(1, "eth_getBlockByNumber", ["0x3", false]);
+      const finality = await rpc(1, "shell_getFinalityInfo");
+      if (imported?.hash === block3.hash && BigInt(finality.lastFinalizedBlock) >= 3n) break;
+      await pause(250);
+    }
+    assert.equal((await rpc(1, "eth_getBlockByNumber", ["finalized", false])).hash, block3.hash, "catch-up requires matching certified state, not height alone");
+    const state3 = await compare(third.hash);
+    await metric(1, "timeout", 0, "catch-up does not reconstruct historical timeout");
+    await metric(1, "committed", 1, "catch-up observes one new finalized commit");
+    await stop(0);
+    const followerLog = join(out, "outcome-reopened-follower-node.log");
+    const followerBoot = (await readFile(followerLog, "utf8")).match(/Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/)?.[1];
+    assert.ok(followerBoot);
+    await start(0, dirs[0], keyPath, "outcome-reopened-leader", followerBoot);
+    await peerReady();
+    assert.deepEqual(await compare(third.hash), state3, "physical reopen preserves canonical business state");
+    await metric(0, "timeout", 0, "reopened process counter resets");
+    await metric(0, "skip", 0, "reopened local round cache resets");
+    await metric(0, "committed", 0, "restored finalized state is not new work");
+    const fourth = await transfer("ordinary commit after reopen", 17n);
+    assert.equal(BigInt(await rpc(0, "eth_getBalance", [outsider.getAddress(), "latest"])), initialBalance + 48n);
+    await metric(0, "timeout", 0, "ordinary next commit is not a timeout");
+    await metric(0, "skip", 0, "eligible next proposer is not skipped");
+    await metric(0, "committed", 1, "post-reopen finalized commit");
+    await metric(1, "committed", 2, "independent follower sees both new commits");
+    result.finalState = await compare(fourth.hash);
+    result.finalHeight = height;
+    result.passed = true;
+    return;
+  }
   if (committedRoundsScenario) {
     result.scenario = "committed-round-metrics";
     const exposition = async (i) => {
@@ -1484,6 +1565,6 @@ try {
   await save();
   for (const signer of signers) signer.dispose();
   console.log(`Acceptance report: ${join(out, "runtime.json")}`);
-  if (committedRoundsScenario && result.passed)
+  if ((committedRoundsScenario || roundOutcomesScenario) && result.passed)
     assert.ok(result.nodeRuns.every((run) => run.exitCode === 0 && run.signal === null), "native nodes exit cleanly");
 }
