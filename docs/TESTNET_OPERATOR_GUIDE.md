@@ -377,7 +377,7 @@ Shell-Chain supports structured JSON logging for integration with log aggregatio
 ### Enable JSON logging
 
 ```bash
-shell-node run --log-format json --log-level info ...
+shell-node run --config config.toml --log-format json --log-level info
 ```
 
 Or in TOML config:
@@ -390,10 +390,11 @@ level = "info"
 
 ### JSON log format
 
-Each log line is a JSON object:
+Tracing events on stdout are JSON objects. Event values and the message are
+inside `fields`. The startup banner and other diagnostics go to stderr.
 
 ```json
-{"timestamp":"2025-01-15T10:30:00Z","level":"INFO","target":"shell_node::consensus","message":"Block produced","block_number":1234,"block_hash":"0xabc...","tx_count":5}
+{"timestamp":"2026-11-04T22:10:47.886276Z","level":"INFO","target":"shell_node::node::p2p_handlers","fields":{"message":"FF: block finalized","block_number":1,"block_hash":"0x75cdfe121389bc13f6aa749abfaed194b39e282958dc10a392e92acbaf5dd2f6"}}
 ```
 
 ### Log rotation
@@ -401,8 +402,7 @@ Each log line is a JSON object:
 When writing logs to a file, use `logrotate` or a similar tool:
 
 ```bash
-shell-node run --config config.toml --log-format json 2>&1 | \
-  tee -a /var/log/shell-chain/node.log
+shell-node run --config config.toml --log-format json >>node.jsonl 2>>node.stderr.log
 ```
 
 ---
@@ -856,8 +856,7 @@ shell-node --datadir shell-data removedb --force
 When using `--log-format json`, pipe logs to a file and use `logrotate` or similar:
 
 ```bash
-shell-node run --config config.toml --log-format json 2>&1 | \
-  tee -a /var/log/shell-chain/node.log
+shell-node run --config config.toml --log-format json >>node.jsonl 2>>node.stderr.log
 ```
 
 ---
