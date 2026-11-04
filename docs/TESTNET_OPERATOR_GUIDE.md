@@ -788,7 +788,12 @@ acceptance does not establish public-network health or production capacity.
 
 ### Key metrics to alert on
 
-- `shell_block_height` not increasing → block production stalled
+- `shell_block_height` staying flat warrants investigation when valid transactions
+  have been waiting for several expected block intervals, or when the configured
+  idle-block interval has passed without a new block. A healthy chain can stay at
+  the same height with an empty transaction pool before that interval elapses.
+  Check the pool and finalized height, and compare with an independent synced
+  node when available.
 - `shell_peer_count == 0` → network isolation
 - `shell_tx_pool_size` growing unboundedly → mempool congestion
 - `shell_block_production_duration_seconds` p95 > block_time → node falling behind
