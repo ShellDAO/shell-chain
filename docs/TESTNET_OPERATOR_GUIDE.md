@@ -48,7 +48,8 @@ This guide covers everything you need to run a shell-chain testnet node — from
 
 ### Software Prerequisites
 
-- **Rust** 1.75+ (with `cargo`)
+- **Rust stable** with Cargo. Use the installation steps below to update the
+  toolchain before building.
 - **Git**
 - **Docker** & **Docker Compose** (for containerized deployment)
 - **C/C++ build tools**, `pkg-config`, `clang`, `cmake`, and `protobuf-compiler` for native dependencies

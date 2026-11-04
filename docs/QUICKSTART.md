@@ -8,7 +8,8 @@ Get a local Shell Chain node running from source and verify it with JSON-RPC.
 
 ## Prerequisites
 
-- **Rust** 1.75+ from the official installer: <https://www.rust-lang.org/tools/install>
+- **Rust stable** with Cargo from the [official installer](https://www.rust-lang.org/tools/install).
+  If you already use rustup, run `rustup update stable` before building.
 - **Git**
 - **curl** and **python3** for the verification commands
 
