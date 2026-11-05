@@ -343,11 +343,18 @@ curl https://testnet-rpc.shell.org \
 
 ### Manual nginx setup
 
-If running nginx outside Docker, point it at the RPC endpoint:
+With the node started using `--ws --ws-port 8546`, HTTP JSON-RPC listens on
+port 8545 and WebSocket listens on port 8546. On the same host, put this example
+in nginx's `http` context. It routes HTTP requests at `/` to the HTTP listener
+and WebSocket connections at `/ws` to the dedicated listener.
 
 ```nginx
 upstream shell_rpc {
     server 127.0.0.1:8545;
+}
+
+upstream shell_ws {
+    server 127.0.0.1:8546;
 }
 
 server {
@@ -359,11 +366,16 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
 
-        # WebSocket support
+    location = /ws {
+        proxy_pass http://shell_ws;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 }
 ```
