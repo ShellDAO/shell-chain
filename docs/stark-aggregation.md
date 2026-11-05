@@ -6,14 +6,39 @@
 
 ## Overview
 
-Shell Chain uses post-quantum (PQ) signatures — either Dilithium3 or ML-DSA-65 — for every
-transaction. These are large (2–4 KB each) compared to ECDSA. The **STARK aggregate proof**
-compresses all per-transaction PQ signatures in a block into a single STARK proof, allowing
-light clients to verify block integrity without downloading every individual signature.
+The target is to compress the evidence for PQ-signed transactions into STARK
+proofs. The current implementation is a **batch-commitment STARK**: native
+validation checks the PQ signatures, and the prover builds a dual accumulator
+from message/public-key hash entries. Its four-column AIR checks accumulator
+transitions and boundary values. It does **not** implement Dilithium3 or
+ML-DSA signature verification inside the AIR. Full in-AIR PQ verification
+remains an unimplemented target; a commitment proof must not be described as
+that capability or used to bypass applicable native/canonical-source checks.
 
-The proof is generated **asynchronously** (after block sealing) to keep block latency low.
-A prover node generates the proof, attaches it as a `ProofAmendment`, and propagates it via
-P2P gossip. Peers store the amendment so future block importers can skip per-signature checks.
+Proof generation runs asynchronously after block sealing. A prover wraps the
+artifact in an authenticated `ProofAmendment` and propagates it via P2P. Peers
+apply the relevant authentication, source, registration and proof checks before
+using an artifact for settlement or witness replacement.
+
+### Run the current proof statement
+
+In the `0.27.14` development source checkout, run:
+
+```bash
+cargo run --locked -p shell-stark-prover --example batch-commitment
+```
+
+The [example](../crates/stark-prover/examples/batch-commitment.rs) generates a
+temporary ML-DSA key in memory, verifies two genuine signatures natively,
+generates actual Winterfell proof bytes, verifies them and checks a JSON
+roundtrip. It rejects changed native signatures/messages, a mismatched expected
+source root, a changed proof root/count, a truncated proof, and a commitment-only
+payload. No private key is printed or saved. An assertion failure exits nonzero.
+
+The example also shows why native verification is separate: changing a signature
+does not change the message/key hash entries supplied to this AIR. It is a
+primitive proof-statement demonstration, not block admission, registration,
+settlement, pruning, full PQ verification in AIR, or a released binary acceptance.
 
 ---
 
@@ -40,17 +65,17 @@ registry state on producers, importers and historical replay.
   ─────────────────────────────────────────
   3. Receive sealed block from internal channel
   4. Extract PQ signatures from witness bundle
-  5. Run STARK batch proof over all signatures
-  6. Wrap in ProofAmendment { block_hash, block_number, proof, prover, prover_signature }
+  5. Prove the batch commitment of native-verified message/key entries
+  6. Wrap in the versioned ProofAmendment envelope and authenticate its metadata
   7. Store in ProofAmendmentStore (key: "pa/<block_hash>")
   8. Broadcast amendment via P2P gossip
 
   Peers
   ─────
   9.  Receive amendment gossip
-  10. Verify prover_signature, check prover is registered
+  10. Check envelope authentication and applicable source/registration/proof rules
   11. Store in local ProofAmendmentStore
-  12. Optionally prune raw witness bundle (proof_replacement_grace window)
+  12. Prune only after canonical settlement and profile/grace eligibility
 ```
 
 ---
@@ -130,8 +155,12 @@ node.
 }
 ```
 
-These fields are `null` when no proof has been generated yet. The RPC handler automatically
-falls back to the `ProofAmendmentStore` if the block header's inline proof field is `None`.
+These optional fields are omitted when the block has no aggregate proof;
+consumers should also tolerate `null` from other versions. Presence or a nonzero
+summary size alone does not establish a full Winterfell payload or PQ signature
+validity. The handler can consult the `ProofAmendmentStore` when no inline proof
+is present. Inspect the amendment response and apply the appropriate verifier
+rather than treating a block summary as a verified proof.
 
 ### Fetch a proof amendment directly
 
@@ -141,22 +170,42 @@ curl -X POST http://localhost:8545 \
   -d '{"jsonrpc":"2.0","method":"shell_getProofAmendment","params":["0x<block_hash>"],"id":1}'
 ```
 
-**Response (proof present):**
+**Response (amendment summary, illustrative values):**
 ```json
 {
   "jsonrpc": "2.0",
   "id": 1,
   "result": {
-    "block_hash": "0x...",
+    "block_hash": "0x<64 hex digits>",
     "block_number": 12345,
+    "start_block": 12345,
+    "end_block": 12345,
+    "source_count": 1,
+    "layer": 1,
+    "proof_entries": 1,
+    "original_size": null,
+    "compressed_size": null,
     "proof_version": 1,
-    "prover": "0x<PROVER_ADDRESS_64_HEX>",
-    "proof": "0x...(hex STARK bytes)..."
+    "prover": "0x<64 hex digits>",
+    "settlement_tx_hash": null,
+    "proof": "0x<Winterfell proof bytes>"
   }
 }
 ```
 
-**Response (no proof):** `"result": null`
+`proof_version` here is the **outer amendment** version (`1`), not the inner
+`SigBatchProof.version` (`2`). This RPC returns an inspection summary, not the
+serialized, signed `ProofAmendment` JSON described above. It does not expose the
+complete authentication envelope or batch root. Do not feed this summary to
+`ProofAmendment::from_json` or treat the prover address alone as authentication.
+
+For an amendment, `proof` is the hex-encoded `proof.proof_bytes`. A
+commitment-only payload returns `"proof": "0x"`, which is not a full STARK proof.
+A range's non-terminal source may instead return a **pointer** object with
+`source_hash`, `source_block`, `target_hash`, `target_block`, `start_block`,
+`end_block`, `source_count`, `layer`, `settlement_tx_hash` and `"proof": null`.
+Query `target_hash` for the target amendment; a pointer is not itself proof bytes.
+When no artifact is available, the entire result is JSON `null`.
 
 ---
 
@@ -172,9 +221,10 @@ The `ProofAmendmentStore` provides:
 | `has_amendment(block_hash)` | Check existence without deserializing. |
 | `delete_amendment(block_hash)` | Prune (e.g. after archival compression). |
 
-When a proof amendment arrives for a block, the node can optionally delete the raw
-witness bundle if the storage profile is not `"archive"` and the
-`proof_replacement_grace` window has elapsed. Challenges for a proof stay `Open` for at most `T_c = 7200` blocks; a valid response marks them `Resolved`, while a timeout marks them `Slashed` and triggers prover slashing.
+Receiving an amendment alone does not authorize witness deletion. Replacement
+must satisfy the canonical settled frontier and the storage profile's retention
+and `proof_replacement_grace` rules; archive nodes retain witnesses. See the
+[pruning rules](BLOCK_PRUNING_AND_COMPRESSION.md) for the exact cutoff. Challenges for a proof stay `Open` for at most `T_c = 7200` blocks; a valid response marks them `Resolved`, while a timeout marks them `Slashed` and triggers prover slashing.
 
 ---
 
@@ -233,12 +283,20 @@ cargo test -p shell-node --features rocksdb challenge -- --nocapture
 
 ## Security Model
 
-1. **Prover registration** — Only nodes registered in the `ProverRegistry` system contract
-   can submit valid amendments. The `prover` field must match a registered address.
-2. **Prover signature** — The amendment carries a PQ signature from the prover's key.
-   Verifiers check `sig over (block_hash ‖ block_number ‖ proof.batch_root_bytes)`.
-3. **STARK soundness** — The STARK proof itself proves that all transaction signatures in
-   the block are valid PQ signatures without revealing the raw signatures.
+1. **Prover registration** — Registered-only admission applies when the
+   `prover_registry_height` activation rule is enabled. The authenticated
+   prover address must match its public key and the applicable registry policy.
+2. **Prover authentication** — Verify the versioned public-key/signature
+   envelope over `ProofAmendment::signing_message()`. It binds the full source
+   range, proof metadata and proof-bytes digest described in
+   [the format section](#proofamendment-format). The old short concatenation
+   `(block_hash || block_number || batch_root_bytes)` is not this message.
+3. **Proof statement** — The current AIR proves accumulator consistency over
+   hash-derived entries. Native PQ signature validation and canonical-source
+   binding remain separate requirements. Full cryptographic PQ verification
+   inside the AIR is still unimplemented. A commitment-only payload has no
+   Winterfell proof bytes; neither envelope authentication nor an RPC summary
+   alone establishes full proof verification or settlement.
 4. **Amendment ordering** — Only one amendment per `(layer, source_hash)` pair is stored (tracked by `SettledSourceIndex`, `ss/` key prefix). A settlement from a lower-priority prover cannot overwrite one from a higher-priority prover. The index is rebuilt from genesis on first v0.22.x boot.
 
 ---

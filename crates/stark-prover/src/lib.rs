@@ -1,41 +1,34 @@
-//! STARK-based aggregate proof for PQ (Dilithium3) signature batches.
+//! STARK batch-commitment proofs for PQ signature metadata.
 //!
-//! # Design (Phase C)
+//! # Current proof statement
 //!
-//! Full Dilithium3 verification in a STARK AIR requires encoding NTT over
-//! the Dilithium ring `Zq[x]/(x^256+1)` as arithmetic constraints — roughly
-//! 50K–100K trace rows per single verify.  That's 20–120 s of proof time,
-//! which is not viable for inline block production.
+//! The caller must verify PQ signatures natively before constructing
+//! [`SigBatchEntry`] values. [`prove_sig_batch`] receives message/public-key
+//! hashes, not raw signatures. Its AIR verifies dual hash-chain accumulator
+//! constraints; it does not implement Dilithium3 or ML-DSA verification.
+//! Full PQ signature verification inside the AIR remains a target, not a
+//! capability supplied by this circuit.
 //!
-//! Instead, **C2 implements a batch-commitment STARK**:
+//! The caller derives each leaf as `BLAKE3(msg_hash || pk_hash)`. Its two
+//! little-endian 128-bit halves feed independent f128 accumulators. Canonical
+//! source binding requires checking the expected entries/root outside the AIR.
 //!
-//! 1. The prover verifies all Dilithium3 signatures **natively** (fast, ~5 ms
-//!    per signature using the existing `shell-crypto` library).
-//! 2. From each verified (msg_hash, pk_hash) pair the prover derives a
-//!    **field element entry** and builds a **hash-chain accumulator** trace.
-//! 3. A STARK proof attests that the accumulator was computed correctly over
-//!    the `n_sigs` entries, producing a `batch_root`.
-//! 4. The `batch_root` + proof are stored in the block header's
-//!    `sig_aggregate_proof` field.  Validators re-verify the short STARK proof
-//!    (~50 µs) instead of re-running all Dilithium3 verifications.
+//! # Circuit
 //!
-//! ## AIR description
-//!
-//! Trace width: 2 columns
-//! - `col0`: running accumulator `acc`
-//! - `col1`: entry value for this step
-//!
-//! Transition constraint (degree 3, evaluated at each step except the last):
+//! Four trace columns: `acc_lo`, `acc_hi`, `leaf_lo`, `leaf_hi`.
+//! Two degree-three transitions:
 //! ```text
-//! acc[t+1] = acc[t]^3 + entry[t]
+//! acc_lo[t+1] = acc_lo[t]^3 + leaf_lo[t]
+//! acc_hi[t+1] = acc_hi[t]^3 + leaf_hi[t]
 //! ```
+//! Both accumulators start at zero and end at the claimed root halves.
+//! The root is the concatenation of those two little-endian halves (32 bytes).
+//! Padding rows preserve both accumulators. Proof options use 28 queries,
+//! blowup 8, grinding 16, and no field extension.
 //!
-//! Boundary assertions:
-//! - `acc[0] = 0` (accumulator starts at zero)
-//! - `acc[trace_len - 1] = batch_root` (final value matches claimed root)
-//!
-//! Proof options are tuned for fast verification: 28 queries, blowup 8,
-//! grinding 16, no field extension.
+//! Run `cargo run --locked -p shell-stark-prover --example batch-commitment`
+//! for native signature checks, actual Winterfell proof generation, verification,
+//! JSON roundtrip, and negative controls demonstrating the separate statements.
 
 pub mod air;
 pub mod amendment;

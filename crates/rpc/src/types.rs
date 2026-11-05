@@ -40,11 +40,11 @@ pub struct RpcBlock {
     pub parent_beacon_block_root: String,
     pub blob_gas_used: String,
     pub excess_blob_gas: String,
-    /// STARK aggregate proof over the block's PoA signatures (hex-encoded).
-    /// `null` when the block has no aggregate proof (genesis or pre-proof blocks).
+    /// Optional hex-encoded aggregate-proof summary; presence is not verification.
+    /// Omitted when the block has no aggregate proof (genesis or pre-proof blocks).
     #[serde(rename = "sigAggregateProof", skip_serializing_if = "Option::is_none")]
     pub sig_aggregate_proof: Option<String>,
-    /// Byte length of the STARK aggregate proof. `null` when no proof exists.
+    /// Byte length of the aggregate proof summary. Omitted when no proof exists.
     #[serde(
         rename = "sigAggregateProofSize",
         skip_serializing_if = "Option::is_none"

@@ -1,9 +1,16 @@
 # Prover Guide
 
 Shell-Chain supports asynchronous STARK proof generation. Blocks are produced
-and broadcast immediately (native Dilithium3 signature verification), and a
+and broadcast immediately (native PQ signature verification), and a
 `ProofAmendment` is attached later by a prover node. This lets validators stay
 responsive without waiting for expensive proof generation.
+
+The current prover generates a batch-commitment STARK over message/public-key
+hash entries after native PQ signature validation. Its AIR checks accumulator
+consistency, not the full Dilithium3 or ML-DSA verification algorithm. Full PQ
+signature verification inside the AIR remains an unimplemented target. Native
+validation, canonical-source binding and the applicable admission checks remain
+necessary; an authenticated or commitment-only artifact does not replace them.
 
 ---
 

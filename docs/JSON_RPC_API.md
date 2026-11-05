@@ -1904,7 +1904,12 @@ Returns the STARK proof amendment for a block if one has been generated asynchro
 |---|------|----------|-------------|
 | 1 | `String` | Yes | Block hash (`0x...`) |
 
-**Returns:** `Object|null` — Proof amendment object or `null` if not yet generated.
+**Returns:** `Object|null` — An amendment inspection summary, a range pointer, or
+`null` when no artifact is available. For an amendment, `proof` contains only
+its proof bytes (`"0x"` for a commitment-only payload); a pointer has `proof: null`
+and a `target_hash` to query. `proof_version` is the outer amendment version,
+not the inner batch-proof version. This response is not the complete signed
+envelope and cannot itself be passed to `ProofAmendment::from_json`.
 
 ---
 
