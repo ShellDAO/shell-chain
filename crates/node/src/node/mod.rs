@@ -1708,7 +1708,6 @@ impl<S: KvStore + 'static> Node<S> {
     fn record_canonical_state_root(&self, block_number: u64, state_root: ShellHash) {
         let profile = StorageProfile::from_pruning_config(&self.config.pruning);
         let keep_recent = self.config.pruning.keep_recent;
-        let mut prune_keep_below = None;
         let finalized_number = match self.chain_store.get_finalized_number() {
             Ok(stored) => stored.unwrap_or(0),
             Err(e) => {
@@ -1747,16 +1746,20 @@ impl<S: KvStore + 'static> Node<S> {
                     root = %evicted.state_root,
                     "state root eligible for pruning"
                 );
-                if matches!(profile, StorageProfile::Light) && keep_recent > 0 {
-                    prune_keep_below = state_trie_prune_boundary(
-                        finalized_number,
-                        keep_recent,
-                        self.consensus.read().poa_config().epoch_length,
-                    );
-                }
             }
         }
 
+        // The process-local tracker is cold after restart or a profile switch.
+        // Persisted finality, rather than refilling that tracker, drives catch-up.
+        let prune_keep_below = if matches!(profile, StorageProfile::Light) && keep_recent > 0 {
+            state_trie_prune_boundary(
+                finalized_number,
+                keep_recent,
+                self.consensus.read().poa_config().epoch_length,
+            )
+        } else {
+            None
+        };
         if let Some(keep_below_block) = prune_keep_below {
             match prune_state_trie(Arc::clone(&self.store), keep_below_block, profile) {
                 Ok(result) => {
@@ -18770,6 +18773,89 @@ mod tests {
             state_trie_prune_boundary(finalized, 4, 0),
             Some(retention_cutoff(unfinalized_head, 4))
         );
+    }
+
+    #[test]
+    fn cold_tracker_prunes_existing_finalized_history_without_refilling_window() {
+        for profile in [
+            StorageProfile::Light,
+            StorageProfile::Full,
+            StorageProfile::Archive,
+        ] {
+            let (mut node, _) = setup_node_with_pruning(4);
+            node.config.pruning = profile.to_pruning_config(
+                None,
+                None,
+                Some(if profile == StorageProfile::Archive {
+                    0
+                } else {
+                    4
+                }),
+            );
+            *node.state_root_tracker.write() = StateRootTracker::new(node.config.pruning.clone());
+            node.consensus.write().poa_config_mut().epoch_length = 0;
+            let authority = node.config.proposer_address.unwrap();
+            let mut roots = Vec::new();
+            let mut parent = ShellHash::ZERO;
+            for number in 0..=10 {
+                let root = {
+                    let mut state = node.world_state.write();
+                    state.set_validators(&[authority]).unwrap();
+                    state.set_validator_weight(&authority, number + 1).unwrap();
+                    state.state_root().unwrap()
+                };
+                let block = Block {
+                    header: BlockHeader {
+                        number,
+                        parent_hash: parent,
+                        state_root: root,
+                        ..BlockHeader::default()
+                    },
+                    transactions: Vec::new(),
+                    system_transactions: Vec::new(),
+                    proposer_seal: None,
+                };
+                parent = block.hash();
+                node.chain_store.put_block(&block).unwrap();
+                node.chain_store.set_canonical(number, &parent).unwrap();
+                node.chain_store.set_head(&parent).unwrap();
+                roots.push(root);
+            }
+            node.chain_store.set_finalized_number(8).unwrap();
+            // The database has history, but the process-local tracker is cold on reopen.
+            assert!(node.state_root_tracker.read().is_empty());
+            node.record_canonical_state_root(10, roots[10]);
+            let rolling = profile == StorageProfile::Light;
+            assert_eq!(
+                state_trie_pruned_below(node.store.as_ref()).unwrap(),
+                if rolling { 5 } else { 0 }
+            );
+            assert_eq!(
+                node.store.get(roots[1].as_bytes()).unwrap().is_none(),
+                rolling
+            );
+            assert!(node.store.get(roots[5].as_bytes()).unwrap().is_some());
+            assert!(node.store.get(roots[10].as_bytes()).unwrap().is_some());
+
+            // A second restart must not reset progress; pruning still follows finality.
+            *node.state_root_tracker.write() = StateRootTracker::new(node.config.pruning.clone());
+            node.chain_store.set_finalized_number(10).unwrap();
+            node.record_canonical_state_root(10, roots[10]);
+            assert_eq!(
+                state_trie_pruned_below(node.store.as_ref()).unwrap(),
+                if rolling { 7 } else { 0 }
+            );
+            assert_eq!(
+                node.store.get(roots[5].as_bytes()).unwrap().is_none(),
+                rolling
+            );
+            assert!(node.store.get(roots[7].as_bytes()).unwrap().is_some());
+            assert!(node.store.get(roots[10].as_bytes()).unwrap().is_some());
+            assert_eq!(
+                node.chain_store.get_head_block().unwrap().unwrap().number(),
+                10
+            );
+        }
     }
 
     #[test]

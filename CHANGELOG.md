@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Resume rolling state-trie pruning from persisted finality after a restart or
+  profile switch, without waiting for a new retention window of blocks.
+  Full/archive retention, finalized epoch recovery, and bounded cleanup passes
+  remain unchanged.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

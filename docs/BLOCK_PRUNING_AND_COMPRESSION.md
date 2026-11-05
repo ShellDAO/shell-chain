@@ -194,6 +194,12 @@ Rolling/light profiles prune state snapshots automatically when `keep_recent`
 is nonzero. `state_pruning_experimental` is a legacy compatibility field and
 does not gate this pruning.
 
+After restart or a profile switch, canonical state-root recording resumes cleanup
+from persisted finality and the durable pruning cursor. It does not wait for the
+process-local root tracker to refill its retention window. Each pass is bounded;
+later canonical commits continue any remaining catch-up work. Full and archive
+profiles retain their historical state even when the root tracker evicts entries.
+
 During a pruning pass, `prune_state_trie()` walks canonical state roots below the light-profile retention floor, computes the set of protected nodes reachable from retained roots, and deletes unreachable snapshot nodes from older roots. The return value reports `pruned_roots`, `deleted_nodes`, and `skipped_roots` so operators can measure how much historical trie data was reclaimed.
 
 For a nonzero consensus epoch length, pruning also retains the last finalized
