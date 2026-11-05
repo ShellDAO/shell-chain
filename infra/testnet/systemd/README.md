@@ -57,6 +57,8 @@ Operational defaults:
 - `SHELL_MAX_IDLE_INTERVAL_SECS=600`
 - optional `SHELL_EXPECTED_AUTHORITY=0x...` fail-fast check against the
   configured keystore
+- The launcher enables libp2p. Use a node binary built with the `libp2p` feature.
+  `SHELL_P2P_ADDR` sets the local P2P listener (default `0.0.0.0:30303`).
 - `SHELL_BOOTNODES` accepts a comma-separated list. Use at least two reachable
   validators or sentry peers for multi-validator networks, and configure each
   validator with the other validators' public P2P addresses so recovery does not

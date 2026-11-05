@@ -19,6 +19,7 @@ set -euo pipefail
 : "${SHELL_NODE_ROLE:=validator}"
 : "${SHELL_CONSENSUS_ENGINE:=wpoa}"
 : "${SHELL_ENABLE_STARK_AGGREGATION:=false}"
+: "${SHELL_P2P_ADDR:=0.0.0.0:30303}"
 : "${SHELL_BOOTNODES:=}"
 : "${SHELL_EXPECTED_AUTHORITY:=}"
 
@@ -78,6 +79,8 @@ args=(
   --rpc-cors "$SHELL_RPC_CORS"
   --metrics-addr "$SHELL_METRICS_ADDR"
   --network "$SHELL_NETWORK"
+  --p2p
+  --p2p-addr "$SHELL_P2P_ADDR"
   --chain-id "$SHELL_CHAIN_ID"
   --block-time "$SHELL_BLOCK_TIME_MS"
   --max-idle-interval "$SHELL_MAX_IDLE_INTERVAL_SECS"
