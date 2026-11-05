@@ -6,6 +6,41 @@ use super::*;
 
 #[jsonrpsee::core::async_trait]
 impl<S: KvStore + 'static> AdminApiServer for RpcHandler<S> {
+    async fn create_snapshot(&self) -> Result<CheckpointInfo, ErrorObjectOwned> {
+        let directory = self
+            .backup_directory
+            .clone()
+            .ok_or_else(|| server_error("physical checkpoint directory is not configured"))?;
+        let permit = Arc::clone(&self.checkpoint_limit)
+            .try_acquire_owned()
+            .map_err(|_| server_error("a physical checkpoint is already in progress"))?;
+        let store = Arc::clone(self.chain_store.store());
+        tokio::task::spawn_blocking(move || {
+            // Retain the permit even if the HTTP caller disconnects: blocking
+            // checkpoint work must still count against the one-operation bound.
+            let _permit = permit;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(internal_err)?;
+            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+            let destination = directory.join(format!(
+                "checkpoint-{}-{}",
+                now.as_nanos(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            store
+                .create_checkpoint(&destination)
+                .map_err(internal_err)?;
+            let path = destination.canonicalize().map_err(internal_err)?;
+            Ok(CheckpointInfo {
+                backup_path: path.to_string_lossy().into_owned(),
+                timestamp: now.as_secs(),
+            })
+        })
+        .await
+        .map_err(internal_err)?
+    }
+
     async fn node_info(&self) -> Result<NodeInfo, ErrorObjectOwned> {
         let block_height = self
             .chain_store

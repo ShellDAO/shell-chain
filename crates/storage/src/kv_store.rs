@@ -91,6 +91,15 @@ pub trait KvStore: Send + Sync {
     fn flush(&self) -> Result<(), StorageError>;
     fn write_batch(&self, batch: WriteBatch) -> Result<(), StorageError>;
 
+    /// Capture a consistent physical checkpoint of the entire backing database,
+    /// including all column families, without reopening the live database.
+    /// Logical/in-memory stores do not provide a physical backup format.
+    fn create_checkpoint(&self, _destination: &std::path::Path) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "physical checkpoints are unsupported by this storage backend".into(),
+        ))
+    }
+
     /// Copy selected prefixes from one consistent read view, bounded by estimated
     /// entry storage. Implementations must not combine independently timed reads.
     #[allow(clippy::type_complexity)]

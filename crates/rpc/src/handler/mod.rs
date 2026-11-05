@@ -18,7 +18,7 @@ pub(crate) use shell_pqvm::{ShellPqvm, ShellStateDb};
 pub(crate) use shell_primitives::{Address, Bytes, ShellHash, U256};
 pub(crate) use shell_storage::{ChainStore, KvStore, WitnessStore, WorldState};
 
-pub(crate) use crate::admin::{AdminApiServer, NodeInfo, PeerInfo};
+pub(crate) use crate::admin::{AdminApiServer, CheckpointInfo, NodeInfo, PeerInfo};
 pub(crate) use crate::api::{
     DebugApiServer, EthApiServer, LegacyEvmApiServer, NetApiServer, ShellApiServer, TraceApiServer,
     Web3ApiServer,
@@ -42,9 +42,9 @@ mod shell_api;
 
 /// JSON-RPC handler wired to storage and mempool backends.
 ///
-/// All methods are read-only against storage (no state mutation).
-/// `send_raw_transaction` is a stub that returns an error until
-/// full tx deserialization from raw bytes is implemented.
+/// Queries, signed transaction admission and explicitly enabled operator controls.
+/// Physical checkpoints write separate backup artifacts without rewriting the
+/// canonical chain or account state.
 pub struct RpcHandler<S: KvStore + 'static> {
     chain_store: Arc<ChainStore<S>>,
     world_state: Arc<parking_lot::RwLock<WorldState<S>>>,
@@ -87,6 +87,8 @@ pub struct RpcHandler<S: KvStore + 'static> {
     /// `admin_rpc_addr`   — HTTP/RPC listen address (e.g. "127.0.0.1:8545").
     /// Local P2P identity, bound addresses and enabled transport protocols are live.
     admin_rpc_addr: String,
+    backup_directory: Option<std::path::PathBuf>,
+    checkpoint_limit: Arc<tokio::sync::Semaphore>,
     local_node_info: Arc<std::sync::RwLock<shell_network::LocalNodeInfo>>,
     /// Optional witness store for Phase B witness bundle queries (B4).
     witness_store: Option<Arc<WitnessStore<S>>>,
@@ -126,6 +128,8 @@ impl<S: KvStore + 'static> Clone for RpcHandler<S> {
             peer_count: Arc::clone(&self.peer_count),
             dev_control: self.dev_control.clone(),
             admin_rpc_addr: self.admin_rpc_addr.clone(),
+            backup_directory: self.backup_directory.clone(),
+            checkpoint_limit: Arc::clone(&self.checkpoint_limit),
             local_node_info: Arc::clone(&self.local_node_info),
             witness_store: self.witness_store.clone(),
             storage_profile: self.storage_profile.clone(),
@@ -174,6 +178,8 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             peer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dev_control: None,
             admin_rpc_addr: String::new(),
+            backup_directory: None,
+            checkpoint_limit: Arc::new(tokio::sync::Semaphore::new(1)),
             local_node_info: Arc::new(std::sync::RwLock::new(
                 shell_network::LocalNodeInfo::default(),
             )),
@@ -341,6 +347,11 @@ impl<S: KvStore + 'static> RpcHandler<S> {
 
     /// Set the RPC listen address used in `admin_nodeInfo` responses.
     /// Called internally by `start_rpc_server` after the address is bound.
+    pub fn with_backup_directory(mut self, directory: std::path::PathBuf) -> Self {
+        self.backup_directory = Some(directory);
+        self
+    }
+
     pub fn with_admin_rpc_addr(mut self, rpc_addr: String) -> Self {
         self.admin_rpc_addr = rpc_addr;
         self
@@ -11944,5 +11955,48 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), crate::error::FEATURE_NOT_ENABLED);
         assert!(err.message().contains("storage profile"));
+    }
+    #[tokio::test]
+    async fn admin_checkpoint_missing_backend_and_busy_preserve_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("backups");
+        let handler = setup().with_backup_directory(destination.clone());
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let error = AdminApiServer::create_snapshot(&handler).await.unwrap_err();
+        assert_eq!(error.code(), crate::error::INTERNAL_ERROR);
+        assert!(!destination.exists());
+        let permit = Arc::clone(&handler.checkpoint_limit)
+            .try_acquire_owned()
+            .unwrap();
+        let clone = handler.clone();
+        let error = AdminApiServer::create_snapshot(&clone).await.unwrap_err();
+        assert!(error.message().contains("already in progress"));
+        assert!(!destination.exists());
+        drop(permit);
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+        assert!(AdminApiServer::create_snapshot(&setup())
+            .await
+            .unwrap_err()
+            .message()
+            .contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn admin_checkpoint_rejects_caller_selected_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("backups");
+        let handler = setup().with_backup_directory(root.clone());
+        let mut module = AdminApiServer::into_rpc(handler);
+        crate::server::register_checkpoint_rpc(&mut module).unwrap();
+        let (response, _) = module.raw_json_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"admin_createSnapshot","params":["caller-path"]}"#,
+            1,
+        ).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(!root.exists());
     }
 }

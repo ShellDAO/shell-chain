@@ -335,6 +335,58 @@ impl RocksDbStore {
 }
 
 impl KvStore for RocksDbStore {
+    fn create_checkpoint(&self, destination: &Path) -> Result<(), StorageError> {
+        let parent = destination.parent().ok_or_else(|| {
+            StorageError::InvalidInput("checkpoint needs a parent directory".into())
+        })?;
+        let database = self
+            .db
+            .path()
+            .canonicalize()
+            .map_err(|error| StorageError::Database(error.to_string()))?;
+        match std::fs::symlink_metadata(parent) {
+            Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
+                return Err(StorageError::InvalidInput(
+                    "checkpoint parent must be a real directory".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let ancestor = parent.parent().ok_or_else(|| {
+                    StorageError::InvalidInput("checkpoint needs an existing ancestor".into())
+                })?;
+                if ancestor
+                    .canonicalize()
+                    .map_err(|error| StorageError::Database(error.to_string()))?
+                    .starts_with(&database)
+                {
+                    return Err(StorageError::InvalidInput(
+                        "checkpoint must be outside the live database".into(),
+                    ));
+                }
+                std::fs::create_dir(parent)
+                    .map_err(|error| StorageError::Database(error.to_string()))?;
+            }
+            Err(error) => return Err(StorageError::Database(error.to_string())),
+        }
+        let parent = parent
+            .canonicalize()
+            .map_err(|error| StorageError::Database(error.to_string()))?;
+
+        if parent.starts_with(&database) {
+            return Err(StorageError::InvalidInput(
+                "checkpoint must be outside the live database".into(),
+            ));
+        }
+        // Checkpoint refuses an existing destination. No existing backup or
+        // live files are removed, including after a failed creation attempt.
+        let checkpoint = rocksdb::checkpoint::Checkpoint::new(&self.db)
+            .map_err(|error| StorageError::Database(format!("checkpoint init: {error}")))?;
+        checkpoint
+            .create_checkpoint(destination)
+            .map_err(|error| StorageError::Database(format!("checkpoint create: {error}")))
+    }
+
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         self.db
             .get_cf(&self.cf(), key)
@@ -932,5 +984,117 @@ mod tests {
     fn verify_integrity_on_empty_db() {
         let (_dir, stores) = open_temp();
         assert!(stores.verify_integrity().is_ok());
+    }
+    #[test]
+    fn live_checkpoint_keeps_every_column_family_and_refuses_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = RocksDbStore::open_all(temp.path().join("source"), None).unwrap();
+        for store in [
+            &source.state,
+            &source.chain,
+            &source.receipts,
+            &source.index,
+            &source.witness,
+        ] {
+            store.put(b"live-checkpoint", b"before").unwrap();
+        }
+        let checkpoint = temp.path().join("backups").join("cut");
+        source.state.create_checkpoint(&checkpoint).unwrap();
+        for store in [
+            &source.state,
+            &source.chain,
+            &source.receipts,
+            &source.index,
+            &source.witness,
+        ] {
+            store.put(b"live-checkpoint", b"after").unwrap();
+        }
+        assert!(source.state.create_checkpoint(&checkpoint).is_err());
+        let restored = RocksDbStore::open_all(&checkpoint, None).unwrap();
+        for store in [
+            &restored.state,
+            &restored.chain,
+            &restored.receipts,
+            &restored.index,
+            &restored.witness,
+        ] {
+            assert_eq!(
+                store.get(b"live-checkpoint").unwrap(),
+                Some(b"before".to_vec())
+            );
+        }
+        assert_eq!(
+            source.state.get(b"live-checkpoint").unwrap(),
+            Some(b"after".to_vec())
+        );
+    }
+
+    #[test]
+    fn live_checkpoint_is_an_atomic_cut_under_a_continuing_writer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let temp = tempfile::tempdir().unwrap();
+        let source = RocksDbStore::open_all(temp.path().join("source"), None).unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_store = source.state.clone();
+        let worker_flag = Arc::clone(&running);
+        let (ready, started) = std::sync::mpsc::sync_channel(0);
+        let worker = std::thread::spawn(move || {
+            let mut value = 0u64;
+            while worker_flag.load(Ordering::Acquire) {
+                let mut batch = WriteBatch::new();
+                batch.put(b"head".to_vec(), value.to_be_bytes().to_vec());
+                batch.put(b"root".to_vec(), value.to_be_bytes().to_vec());
+                worker_store.write_batch(batch).unwrap();
+                if value == 0 {
+                    ready.send(()).unwrap();
+                }
+                value += 1;
+            }
+            value
+        });
+        started.recv().unwrap();
+        let checkpoint = temp.path().join("backups").join("cut");
+        source.state.create_checkpoint(&checkpoint).unwrap();
+        running.store(false, Ordering::Release);
+        assert!(worker.join().unwrap() > 0);
+        let restored = RocksDbStore::open_all(&checkpoint, None).unwrap();
+        assert!(restored.state.get(b"head").unwrap().is_some());
+        assert_eq!(
+            restored.state.get(b"head").unwrap(),
+            restored.state.get(b"root").unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_checkpoint_rejects_symlink_and_live_database_destinations() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source");
+        let source = RocksDbStore::open_all(&source_path, None).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("sentinel"), b"unchanged").unwrap();
+        let link = temp.path().join("backups");
+        symlink(outside.path(), &link).unwrap();
+        assert!(source.state.create_checkpoint(&link.join("cut")).is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+        assert!(source
+            .state
+            .create_checkpoint(&source_path.join("cut"))
+            .is_err());
+        let forbidden = source_path.join("backups");
+        assert!(source
+            .state
+            .create_checkpoint(&forbidden.join("cut"))
+            .is_err());
+        assert!(!forbidden.exists());
+        let file = temp.path().join("not-a-directory");
+        std::fs::write(&file, b"keep").unwrap();
+        assert!(source.state.create_checkpoint(&file.join("cut")).is_err());
+        assert_eq!(std::fs::read(file).unwrap(), b"keep");
+        assert_eq!(
+            std::fs::read(outside.path().join("sentinel")).unwrap(),
+            b"unchanged"
+        );
     }
 }

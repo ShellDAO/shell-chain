@@ -926,6 +926,7 @@ async fn run_with_store<S: KvStore + 'static>(
             allow_unsafe_dev_exposed: args.unsafe_dev_exposed,
             max_request_body_size: 5 * 1024 * 1024,
             api_key: args.rpc_api_key.clone(),
+            backup_directory: Some(args.datadir.join("backups")),
             tls_cert_path: args.rpc_tls_cert.clone(),
             tls_key_path: args.rpc_tls_key.clone(),
             ..RpcConfig::default()

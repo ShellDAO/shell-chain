@@ -305,6 +305,47 @@ shell-node backup restore <BACKUP_DIR>
 Stop the node before creating or restoring a backup. On Unix, restore refuses
 to replace a database that another process still has locked.
 
+For a live RocksDB node built from a checkout containing this capability, enable
+`admin` in `--rpc-api` and use
+[`admin_createSnapshot`](JSON_RPC_API.md#admin_createsnapshot). It creates a
+physical checkpoint through the running database handle while the node continues
+serving transactions. The server chooses a new directory under `<datadir>/backups`;
+the request accepts no output path. The admin namespace is disabled by default.
+Configure `--rpc-api-key` to authenticate requests; non-loopback admin listeners
+require it.
+
+The returned `backupPath` is a local filesystem path on the node, not a download
+URL. Copy the completed checkpoint to independent storage for disaster recovery.
+It contains database column families, not the genesis configuration, keystore,
+passwords or pending mempool transactions. Retain those inputs separately.
+Restore using the ordinary command with the node stopped:
+
+```bash
+shell-node --datadir restored-data backup restore "$BACKUP_PATH"
+```
+
+Provision the network's trusted genesis and the operator's own keys separately
+before starting the restored node. Startup applies normal finality recovery:
+any unfinalized suffix may be rolled back. Check network identity, finalized
+hash, account balances, nonces and receipts before continuing operations. Stop
+the original validator before starting a restored copy with the same identity.
+
+From a matching node source checkout, run the isolated native regression with
+Node.js 24 or later and a compatible built Shell SDK:
+
+```bash
+cargo build --locked -p shell-cli
+NODE_BIN=target/debug/shell-node SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-backup.mjs
+```
+
+The regression generates temporary encrypted validator keys and test funds. It
+checks default-disabled and authenticated HTTP access, signed transfers, live
+checkpoint creation, ordinary restore, independent continued spending and a
+physical reopen. It retains its temporary data and logs at the printed path and
+exits nonzero on failure. This is source acceptance; verify that a published
+binary contains the method before relying on it.
+
 ---
 
 ### 2.9 `export-state` / `import-state`

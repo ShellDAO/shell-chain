@@ -24,7 +24,7 @@ pub mod tls;
 pub mod tls_proxy;
 pub mod types;
 
-pub use admin::{AdminApiServer, NodeInfo, PeerInfo};
+pub use admin::{AdminApiServer, CheckpointInfo, NodeInfo, PeerInfo};
 pub use dev_control::{DevRpcControl, DynDevRpcControl};
 pub use handler::RpcHandler;
 pub use server::{start_rpc_server, RpcConfig, RpcServerHandle};

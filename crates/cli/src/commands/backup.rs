@@ -1,4 +1,4 @@
-//! `shell-node backup` — hot backup and restore for the RocksDB data directory.
+//! `shell-node backup` — offline backup and restore for the RocksDB data directory.
 //!
 //! # Subcommands
 //!
@@ -8,7 +8,7 @@
 //!   because `RocksDbStore::open_all` opens the database with an exclusive
 //!   lock; attempting to open an already-open database will fail.
 //!   For live (in-process) backups without stopping the node, use the
-//!   `admin_createSnapshot` RPC method (planned) which calls `Checkpoint`
+//!   opt-in `admin_createSnapshot` RPC method which calls `Checkpoint`
 //!   on the live DB handle.
 //!
 //! - `backup restore <backup-dir>`     — restore the data directory from a checkpoint.

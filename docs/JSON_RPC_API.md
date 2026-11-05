@@ -19,6 +19,7 @@ Complete reference for the shell-chain JSON-RPC API. All methods follow the [JSO
 - [shell\_ Namespace](#shell_-namespace)
 - [debug\_ Namespace](#debug_-namespace)
 - [trace\_ Namespace](#trace_-namespace)
+- [admin\_ Namespace](#admin_-namespace)
 
 ---
 
@@ -1965,6 +1966,43 @@ Returns current consensus engine state.
 ```
 
 ---
+
+## admin_ Namespace
+
+Administrative methods require `admin` in `--rpc-api`. It is disabled by
+default; non-loopback admin listeners require `--rpc-api-key` authentication.
+
+### admin_createSnapshot
+
+Creates a consistent, local physical RocksDB checkpoint while the node stays
+online. Available in source checkouts containing live checkpoints. It accepts no
+parameters and never accepts a caller-selected filesystem path.
+
+```bash
+curl http://127.0.0.1:8545 \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $RPC_API_KEY" \
+  --data '{"jsonrpc":"2.0","id":1,"method":"admin_createSnapshot","params":[]}'
+```
+
+**Returns:** an object with `backupPath` (absolute server-local directory under
+`<datadir>/backups`) and `timestamp` (Unix seconds when the operation began).
+Success is returned only after the checkpoint is complete. It covers every
+physical database column family; it does not include keys, genesis configuration
+or uncommitted mempool transactions. Writes and signed transaction processing
+continue during creation. A checkpoint is a database sequence cut, not a promise
+that the latest observed RPC head was finalized. Restoring applies normal startup
+recovery of an unfinalized suffix.
+
+Nonempty parameters return `-32602`. The method returns an error when another
+checkpoint is in progress, the backend is in memory, the output root is a symlink
+or non-directory, or storage creation fails. Existing backups are never
+overwritten. One checkpoint may run per server, including work whose HTTP caller
+has disconnected. Authentication failures are rejected by HTTP middleware before
+filesystem work; the disabled namespace returns method-not-found.
+
+See [backup and restore](node-cli.md#28-backup-subcommands) for the stopped-node
+restore procedure, required recovery inputs and the native acceptance command.
 
 ## Method Summary
 

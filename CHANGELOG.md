@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Add opt-in `admin_createSnapshot` for live RocksDB physical checkpoints, with
+  server-selected destinations and one concurrent operation. Preserve all column
+  families while transactions continue, and restore through the existing offline
+  command with ordinary finality recovery. Add native signed-transfer, restore
+  and reopen coverage; in-memory backends and caller-selected paths are rejected.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

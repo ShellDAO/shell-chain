@@ -359,7 +359,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum BackupCommands {
-    /// Create a RocksDB checkpoint (hot backup).
+    /// Create a RocksDB checkpoint (offline backup).
     Create {
         /// Output directory for the backup (default: <datadir>/backups/<timestamp>/).
         #[arg(long)]

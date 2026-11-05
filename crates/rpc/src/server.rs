@@ -87,6 +87,31 @@ fn register_block_signers_rpc<S: KvStore + 'static>(
     Ok(())
 }
 
+// Generated zero-argument methods ignore extra parameters. Reject caller paths
+// before spawning filesystem work, using the same wire guard as read-only APIs.
+pub(crate) fn register_checkpoint_rpc<S: KvStore + 'static>(
+    module: &mut jsonrpsee::RpcModule<RpcHandler<S>>,
+) -> Result<(), jsonrpsee::core::RegisterMethodError> {
+    module.remove_method("admin_createSnapshot");
+    module.register_async_method("admin_createSnapshot", |params, handler, _| async move {
+        if let Some(raw) = params.as_str() {
+            let empty = match serde_json::from_str::<serde_json::Value>(raw) {
+                Ok(serde_json::Value::Null) => true,
+                Ok(serde_json::Value::Array(values)) => values.is_empty(),
+                Ok(serde_json::Value::Object(values)) => values.is_empty(),
+                _ => false,
+            };
+            if !empty {
+                return Err(crate::handler::invalid_params_err(
+                    "admin_createSnapshot takes no parameters",
+                ));
+            }
+        }
+        AdminApiServer::create_snapshot(handler.as_ref()).await
+    })?;
+    Ok(())
+}
+
 /// Configuration for the JSON-RPC server.
 #[derive(Debug, Clone)]
 pub struct RpcConfig {
@@ -122,6 +147,9 @@ pub struct RpcConfig {
     /// When set, every HTTP request must include `Authorization: Bearer <key>`.
     /// `None` disables authentication (open access).
     pub api_key: Option<String>,
+    /// Server-selected directory for live physical checkpoints. No caller path
+    /// is accepted; None leaves this administrative operation unconfigured.
+    pub backup_directory: Option<std::path::PathBuf>,
 }
 
 impl Default for RpcConfig {
@@ -139,6 +167,7 @@ impl Default for RpcConfig {
             max_request_body_size: 5 * 1024 * 1024,
             max_response_body_size: DEFAULT_MAX_RESPONSE_BODY_SIZE,
             api_key: None,
+            backup_directory: None,
         }
     }
 }
@@ -343,6 +372,9 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
     // (The actual bound port may differ when using ephemeral port 0, but for
     // admin_nodeInfo the configured address is what operators care about.)
     handler = handler.with_admin_rpc_addr(config.listen_addr.to_string());
+    if let Some(directory) = &config.backup_directory {
+        handler = handler.with_backup_directory(directory.clone());
+    }
 
     // Build CORS middleware layer.
     let cors = if let Some(ref origins) = config.cors_allowed_origins {
@@ -464,7 +496,9 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
                     .into(),
             );
         }
-        module.merge(AdminApiServer::into_rpc(handler))?;
+        let mut admin_module = AdminApiServer::into_rpc(handler);
+        register_checkpoint_rpc(&mut admin_module)?;
+        module.merge(admin_module)?;
     }
 
     if let Some(ws_listen) = internal_ws {

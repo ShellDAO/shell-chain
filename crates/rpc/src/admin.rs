@@ -4,6 +4,7 @@
 //!
 //! - `admin_nodeInfo` — static metadata about this node instance.
 //! - `admin_peers`    — reserved for future per-peer snapshots; currently returns method-not-found.
+//! - `admin_createSnapshot` — create a live physical database checkpoint.
 //! - `admin_addPeer`  — dynamically add a bootnode / dial-out peer.
 //!
 //! The `admin` namespace is **opt-in** via `--rpc-api admin` and should
@@ -52,9 +53,23 @@ pub struct PeerInfo {
     pub connected_seconds: u64,
 }
 
+/// A completed physical database checkpoint. Keys and genesis configuration
+/// are intentionally outside this artifact and must be retained separately.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointInfo {
+    pub backup_path: String,
+    pub timestamp: u64,
+}
+
 /// Admin namespace RPC API trait.
 #[rpc(server, namespace = "admin")]
 pub trait AdminApi {
+    /// Create a live native database checkpoint in the operator-configured
+    /// backup directory. The caller cannot select a filesystem path.
+    #[method(name = "createSnapshot")]
+    async fn create_snapshot(&self) -> Result<CheckpointInfo, jsonrpsee::types::ErrorObjectOwned>;
+
     /// Returns static metadata about this node.
     #[method(name = "nodeInfo")]
     async fn node_info(&self) -> Result<NodeInfo, jsonrpsee::types::ErrorObjectOwned>;
