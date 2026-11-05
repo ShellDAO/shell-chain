@@ -34,7 +34,15 @@ http://127.0.0.1:8545
 ws://127.0.0.1:8546
 ```
 
-All requests use POST with `Content-Type: application/json`.
+HTTP requests use POST with `Content-Type: application/json`.
+
+With both `--rpc-tls-cert` and `--rpc-tls-key`, the native TLS listener serves
+HTTPS and WSS on the same `--rpc-addr`, such as `https://127.0.0.1:8545` and
+`wss://127.0.0.1:8545`. The separate `--ws-port` is ignored in TLS mode.
+`--rpc-api-key` requires `Authorization: Bearer <token>` on HTTPS requests and
+the WSS upgrade. Clients must trust the certificate chain and validate the
+hostname. See [native HTTPS and WSS](node-cli.md#native-https-and-wss) for setup
+and the signed-transfer/reopen regression.
 
 **Address note:** RPC input and output addresses use canonical 32-byte `0x` + 64 lowercase hex throughout the current codebase.
 

@@ -21,7 +21,7 @@ Shell-Chain follows [Vitalik Buterin's vision](https://ethresear.ch/t/how-to-har
 - 🗄️ **Storage Profiles** — `--storage-profile archive|full|light` controls data retention; nodes auto-backfill missing history from richer peers via P2P
 - 🛠️ **Developer Ecosystem** — TypeScript SDK (`shell-sdk`) with viem-based PQ signers and AA transaction builders
 - 🌐 **P2P Networking** — libp2p with GossipSub, Kademlia DHT, peer scoring, and message signature verification
-- 📡 **Full JSON-RPC** — Ethereum-shaped read namespaces (`eth_*`, `web3_*`, `net_*`, `debug_*`) plus Shell-specific APIs such as `shell_getFinalityInfo` and `shell_getAlgorithmRegistry`, secured by TLS, rate limiting, and API keys
+- 📡 **Full JSON-RPC** — Ethereum-shaped read namespaces (`eth_*`, `web3_*`, `net_*`, `debug_*`) plus Shell-specific APIs such as `shell_getFinalityInfo` and `shell_getAlgorithmRegistry`, secured by [TLS](docs/node-cli.md#native-https-and-wss), rate limiting, and API keys
 - 🐳 **Production Ready** — Docker Compose orchestration, Prometheus/Grafana monitoring, hot backups, and TOML configuration
 - 🛡️ **Security Hardened** — 50+ audit findings addressed, Criterion benchmarks, and continuous fuzzing
 

@@ -61,7 +61,7 @@ shell-node [GLOBAL FLAGS] run [OPTIONS]
 | `--chain-id <ID>` | `1337` | Chain ID |
 | `--db <BACKEND>` | profile default | Storage backend: `memory` or `rocksdb` (`dev` defaults to `memory`; `testnet`/`mainnet` default to `rocksdb`) |
 | `--ws` | `false` | Enable WebSocket RPC server |
-| `--ws-port <PORT>` | `8546` | WebSocket RPC port (used with `--ws`) |
+| `--ws-port <PORT>` | `8546` | Dedicated plaintext WebSocket port (used with `--ws`; ignored when TLS is enabled) |
 | `--p2p` | `false` | Enable libp2p P2P networking |
 | `--p2p-addr <ADDR>` | `0.0.0.0:30303` | P2P TCP listen address |
 | `--bootnode <MULTIADDR>` | — | Bootstrap peer multiaddr (repeatable) |
@@ -88,6 +88,67 @@ shell-node [GLOBAL FLAGS] run [OPTIONS]
 | `--body-retention <N>` | profile default | Override TX body retention (0 = keep forever) |
 | `--enable-stark-aggregation` | `false` | Enable local STARK aggregate proof generation. Expensive; use only on prover or validator-prover nodes. |
 | `--consensus-engine <ENGINE>` | `poa` | Consensus engine: `poa` or `wpoa` |
+
+
+#### Native HTTPS and WSS
+
+Supply both `--rpc-tls-cert` and `--rpc-tls-key` to enable native TLS. HTTPS and
+WSS share the address selected by `--rpc-addr`, for example
+`https://127.0.0.1:8545` and `wss://127.0.0.1:8545`. With TLS enabled,
+`--ws-port` is ignored; no separate plaintext WS listener is opened. A TLS
+certificate and matching unencrypted PEM private key are required. Use a
+certificate chain trusted by your clients and a hostname present in its SANs.
+
+For isolated local development, generate a short-lived self-signed certificate:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -subj '/CN=localhost' \
+  -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+  -out cert.pem -keyout tls-key.pem
+```
+
+Set `RPC_API_KEY` to the same chosen nonempty token in both terminal sessions.
+Start the normally configured node, adding TLS and authentication:
+
+```bash
+shell-node --datadir chain-data run \
+  --rpc-addr 127.0.0.1:8545 --ws \
+  --rpc-tls-cert cert.pem --rpc-tls-key tls-key.pem \
+  --rpc-api-key "$RPC_API_KEY"
+```
+
+In a second terminal, query the HTTPS endpoint:
+
+```bash
+curl --cacert cert.pem https://127.0.0.1:8545 \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $RPC_API_KEY" \
+  --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
+```
+
+The Bearer header is required for both HTTPS requests and the WSS HTTP upgrade. Configure
+the WebSocket client's trusted CA and Authorization header; the SDK's
+`rpcApiKey` option applies to its HTTP clients. Do not disable certificate
+verification to connect to the self-signed development endpoint.
+
+Run the native transport regression from a node source checkout with Node.js 24
+or later, OpenSSL 3, and a compatible built Shell SDK whose installation provides
+`ws` (verified with 8.21.0):
+
+```bash
+NODE_BIN=target/release/shell-node SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-tls.mjs
+```
+
+The runner generates its own certificate, encrypted validator key and isolated
+test funds. It verifies certificate and API-key rejection, an actual signed
+transfer's WSS `newHeads` event against HTTPS canonical state and finality,
+unsubscribe behavior after another transfer, and physical database reopen.
+It retains temporary data at the printed path and exits nonzero on failure.
+The native flow was verified on published v0.27.13; reverse proxies, browser
+clients, public CA deployments and other platform/profile combinations require
+separate acceptance.
 
 In unreleased source builds, `[storage].profile` in a TOML file selects the
 same policy as `run --storage-profile`. For example:

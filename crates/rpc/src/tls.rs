@@ -5,17 +5,13 @@
 //! [`super::RpcConfig`], [`load_tls_config`] parses the PEM files and builds a
 //! [`rustls::ServerConfig`] that can be used with a TLS acceptor.
 //!
-//! # Current status
+//! The RPC server uses the native `tokio-rustls` proxy in `tls_proxy` to
+//! terminate TLS before forwarding to a loopback jsonrpsee listener. HTTPS
+//! requests and WSS upgrades share the configured RPC address. A separate
+//! plaintext WebSocket listener is not started when TLS is enabled.
 //!
-//! jsonrpsee's `ServerBuilder` does not natively accept a `rustls::ServerConfig`,
-//! so full WSS transport requires either:
-//!
-//! 1. A TLS-terminating reverse proxy in front of the RPC server, **or**
-//! 2. A custom `tokio-rustls` + `hyper` service that terminates TLS before
-//!    handing the stream to jsonrpsee (planned for a future release).
-//!
-//! This module validates the TLS material at startup so misconfigured
-//! certificates are caught early, even before the transport layer is wired.
+//! This module validates the certificate chain and private key at startup;
+//! both paths must be supplied together.
 
 use std::fs;
 use std::path::Path;
