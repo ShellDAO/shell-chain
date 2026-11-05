@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Standard `eth_getTransactionByBlockNumberAndIndex` and
+  `eth_getTransactionByBlockHashAndIndex` reads for retained and pending blocks,
+  with absolute system/user ordering, strict quantity parameters and explicit
+  unavailable-body errors. Includes a native signed producer/follower regression
+  through import, finality and physical reopen.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

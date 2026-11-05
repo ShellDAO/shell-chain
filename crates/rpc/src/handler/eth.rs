@@ -178,6 +178,65 @@ fn append_filter_logs<S: KvStore + 'static>(
     Ok(())
 }
 
+impl<S: KvStore + 'static> RpcHandler<S> {
+    fn stored_transaction_at(
+        &self,
+        hash: Option<ShellHash>,
+        index: u64,
+    ) -> Result<Option<RpcTransaction>, ErrorObjectOwned> {
+        let Some(hash) = hash else { return Ok(None) };
+        let Some(block) = self
+            .chain_store
+            .get_block_by_hash(&hash)
+            .map_err(internal_err)?
+        else {
+            return if self
+                .chain_store
+                .get_header_by_hash(&hash)
+                .map_err(internal_err)?
+                .is_some()
+            {
+                Err(not_found_err("block body is unavailable"))
+            } else {
+                Ok(None)
+            };
+        };
+        // Side-fork bodies need no canonical transaction indexes. Older bodies
+        // can instead retain their rewards in separate system records.
+        let system = if block.system_transactions.is_empty() {
+            self.chain_store
+                .get_system_transactions(&hash)
+                .map_err(internal_err)?
+        } else {
+            block.system_transactions.clone()
+        };
+        let system = ordered_system_txs(&system);
+        let Ok(position) = usize::try_from(index) else {
+            return Ok(None);
+        };
+        let mut tx = if let Some(tx) = system.get(position) {
+            system_tx_to_rpc(tx, Some(hash))
+        } else if let Some(tx) = position
+            .checked_sub(system.len())
+            .and_then(|i| block.transactions.get(i))
+        {
+            tx_to_rpc(
+                tx,
+                Some(hash),
+                Some(block.number()),
+                None,
+                Some(block.header.base_fee_per_gas),
+            )
+        } else {
+            return Ok(None);
+        };
+        // The database's user transaction index excludes preceding rewards.
+        // This endpoint exposes the absolute position in the displayed block.
+        tx.transaction_index = Some(hex_u64(index));
+        Ok(Some(tx))
+    }
+}
+
 #[jsonrpsee::core::async_trait]
 impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
     async fn block_number(&self) -> Result<String, ErrorObjectOwned> {
@@ -480,6 +539,46 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
         }
 
         Ok(None)
+    }
+
+    async fn get_transaction_by_block_hash_and_index(
+        &self,
+        hash: ShellHash,
+        index: String,
+    ) -> Result<Option<RpcTransaction>, ErrorObjectOwned> {
+        self.stored_transaction_at(Some(hash), parse_hex_u64(&index)?)
+    }
+
+    async fn get_transaction_by_block_number_and_index(
+        &self,
+        number: String,
+        index: String,
+    ) -> Result<Option<RpcTransaction>, ErrorObjectOwned> {
+        let index = parse_hex_u64(&index)?;
+        if matches!(parse_block_tag(&number)?, BlockTag::Pending) {
+            // Reuse the exact fee/nonce/gas-limited pending block candidate set.
+            let Some(block) = EthApiServer::get_block_by_number(self, number, true).await? else {
+                return Ok(None);
+            };
+            let Some(value) = usize::try_from(index)
+                .ok()
+                .and_then(|i| block.transactions.as_array()?.get(i))
+            else {
+                return Ok(None);
+            };
+            let mut tx: RpcTransaction =
+                serde_json::from_value(value.clone()).map_err(internal_err)?;
+            tx.block_hash = None;
+            tx.block_number = None;
+            tx.transaction_index = None;
+            return Ok(Some(tx));
+        }
+        let hash = match self.parse_block_number(&number)? {
+            Some(number) => self.chain_store.get_block_hash_by_number(number),
+            None => self.chain_store.get_head_hash(),
+        }
+        .map_err(internal_err)?;
+        self.stored_transaction_at(hash, index)
     }
 
     async fn get_transaction_receipt(

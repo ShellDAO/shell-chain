@@ -107,6 +107,22 @@ pub trait EthApi {
         hash: ShellHash,
     ) -> Result<Option<RpcTransaction>, jsonrpsee::types::ErrorObjectOwned>;
 
+    /// Returns a transaction at its absolute position in a retained block.
+    #[method(name = "getTransactionByBlockHashAndIndex")]
+    async fn get_transaction_by_block_hash_and_index(
+        &self,
+        hash: ShellHash,
+        index: String,
+    ) -> Result<Option<RpcTransaction>, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Returns a retained or pending block's transaction at the given position.
+    #[method(name = "getTransactionByBlockNumberAndIndex")]
+    async fn get_transaction_by_block_number_and_index(
+        &self,
+        number: String,
+        index: String,
+    ) -> Result<Option<RpcTransaction>, jsonrpsee::types::ErrorObjectOwned>;
+
     /// Returns the receipt of a transaction by hash.
     #[method(name = "getTransactionReceipt")]
     async fn get_transaction_receipt(

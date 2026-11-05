@@ -587,6 +587,53 @@ Returns a block by hash.
 
 ---
 
+### eth_getTransactionByBlockNumberAndIndex / eth_getTransactionByBlockHashAndIndex
+
+Returns the transaction at a zero-based position in a block. These methods are
+available in unreleased node source; published v0.27.13 does not expose them.
+
+**Parameters:**
+
+| Method | First parameter | Second parameter |
+|---|---|---|
+| `eth_getTransactionByBlockNumberAndIndex` | Minimal hex block number, `earliest`, `latest`, `safe`, `finalized` or `pending` | Minimal hex transaction index, e.g. `"0x0"` |
+| `eth_getTransactionByBlockHashAndIndex` | 32-byte block hash | Minimal hex transaction index |
+
+**Returns:** A transaction object, or `null` for an unknown block or an index
+outside the block. Indices must fit an unsigned 64-bit quantity; empty, decimal,
+negative, padded or overflowing quantities are rejected with `-32602`.
+
+Stored positions follow block presentation: gas rewards, STARK rewards, then
+user transactions. The returned `transactionIndex` is the absolute position,
+including preceding rewards. Hash lookups also support retained side-fork
+bodies. Older bodies can use the existing separate system records. Witness
+pruning preserves transaction payload reads; a known header with an unavailable
+body returns `-32001`, without reporting an invented transaction or unknown block.
+
+`pending` selects from the same fee, nonce and gas limited candidates as
+`eth_getBlockByNumber("pending", false)`. Its transactions have `null` for
+`blockHash`, `blockNumber` and `transactionIndex`, and exclude future system
+rewards. Queries leave canonical state, transaction indexes and the pool unchanged.
+
+With Node.js 24 or later and Shell SDK 0.14.0-rc.3 or a compatible built SDK, run the native test
+from a matching source checkout:
+
+```bash
+cargo build --locked -p shell-cli --features libp2p
+NODE_BIN=target/debug/shell-node SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-block-index.mjs
+```
+
+The script creates encrypted test accounts and an isolated funded genesis, checks
+the SDK's `getTransaction({ blockNumber, index })` and `{ blockHash, index }`
+variants, queues a real signed transfer and verifies independent producer/follower
+import, finality, historical reads and physical reopen. Its isolated nodes use
+`--rpc-rate-limit 1000` for assertion bursts and distinct P2P identities. Artifacts
+are retained in the printed directory; failures exit nonzero. Native fork/body
+pruning and other algorithms or storage profiles require separate qualification.
+
+---
+
 ### eth_getTransactionByHash
 
 Returns a transaction by hash. Checks the mempool first, then on-chain storage.
@@ -1968,7 +2015,7 @@ Returns current consensus engine state.
 
 ## Method Summary
 
-For the canonical method list (currently 79 methods across `web3_`, `net_`, `eth_`, `debug_`, `trace_`, `evm_`, `shell_` namespaces), see `docs/rpc-reference.md`, which is auto-generated from `crates/rpc/src/api.rs`.
+For the canonical method list (currently 99 methods across `web3_`, `net_`, `eth_`, `debug_`, `trace_`, `evm_`, `shell_` namespaces), see `docs/rpc-reference.md`, which is auto-generated from `crates/rpc/src/api.rs`.
 
 ---
 

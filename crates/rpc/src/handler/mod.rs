@@ -1578,6 +1578,46 @@ mod tests {
         setup_with_store(Arc::new(MemoryDb::new()))
     }
 
+    async fn assert_pending_transaction_lookup(handler: &RpcHandler<MemoryDb>) {
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let pool_before = handler.tx_pool.len();
+        let block = EthApiServer::get_block_by_number(handler, "pending".into(), false)
+            .await
+            .unwrap();
+        let hashes = block
+            .as_ref()
+            .map(|b| b.transactions.as_array().unwrap().clone())
+            .unwrap_or_default();
+        for (i, hash) in hashes.iter().enumerate() {
+            let tx = EthApiServer::get_transaction_by_block_number_and_index(
+                handler,
+                "pending".into(),
+                hex_u64(i as u64),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(serde_json::to_value(tx.hash).unwrap(), *hash);
+            assert_eq!(
+                (tx.block_hash, tx.block_number, tx.transaction_index),
+                (None, None, None)
+            );
+        }
+        assert!(EthApiServer::get_transaction_by_block_number_and_index(
+            handler,
+            "pending".into(),
+            hex_u64(hashes.len() as u64)
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+        assert_eq!(handler.tx_pool.len(), pool_before);
+    }
+
     fn test_address(seed: &[u8]) -> Address {
         Address::from_public_key(seed, 0)
     }
@@ -8158,6 +8198,7 @@ mod tests {
         // Still has standard Ethereum fields.
         assert_eq!(rpc.total_difficulty, "0x1");
         assert_eq!(rpc.nonce, "0x0000000000000000");
+        assert_pending_transaction_lookup(&handler).await;
     }
 
     #[tokio::test]
@@ -8220,6 +8261,7 @@ mod tests {
         assert_eq!(rpc.base_fee_per_gas, "0x70");
         assert_eq!(rpc.transactions, serde_json::json!([]));
         assert_eq!(rpc.gas_used, "0x0");
+        assert_pending_transaction_lookup(&handler).await;
     }
 
     #[tokio::test]
@@ -8363,6 +8405,7 @@ mod tests {
             serde_json::json!([oversized_hash, fit_hash])
         );
         assert_eq!(rpc.gas_used, "0xf618");
+        assert_pending_transaction_lookup(&handler).await;
     }
 
     #[tokio::test]
@@ -8479,6 +8522,7 @@ mod tests {
             serde_json::json!([other_hash, sender_tx0_hash, sender_tx1_hash])
         );
         assert_eq!(rpc.gas_used, "0xf618");
+        assert_pending_transaction_lookup(&handler).await;
     }
 
     #[tokio::test]
@@ -8496,6 +8540,7 @@ mod tests {
             .unwrap();
 
         assert!(rpc.is_none());
+        assert_pending_transaction_lookup(&handler).await;
     }
 
     #[tokio::test]
@@ -8505,6 +8550,7 @@ mod tests {
             .await
             .unwrap();
         assert!(rpc.is_none());
+        assert_pending_transaction_lookup(&handler).await;
     }
 
     // ── Finality RPC tests ─────────────────────────────────────
@@ -11944,5 +11990,297 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), crate::error::FEATURE_NOT_ENABLED);
         assert!(err.message().contains("storage profile"));
+    }
+
+    #[tokio::test]
+    async fn transaction_by_block_index_preserves_order_history_and_pruning_boundaries() {
+        let handler = setup();
+        assert!(EthApiServer::get_transaction_by_block_number_and_index(
+            &handler,
+            "latest".into(),
+            "0x0".into()
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let genesis = make_genesis_block();
+        handler.chain_store.put_block(&genesis).unwrap();
+        handler
+            .chain_store
+            .set_canonical(0, &genesis.hash())
+            .unwrap();
+        handler.chain_store.set_head(&genesis.hash()).unwrap();
+        assert!(EthApiServer::get_transaction_by_block_number_and_index(
+            &handler,
+            "earliest".into(),
+            "0x0".into()
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let mut block = genesis.clone();
+        block.header.number = 1;
+        block.header.parent_hash = genesis.hash();
+        block.header.timestamp += 1;
+        block.header.base_fee_per_gas = 10;
+        let signer = DilithiumSigner::generate();
+        for nonce in 0..2 {
+            let tx = Transaction {
+                chain_id: 42,
+                nonce,
+                max_priority_fee_per_gas: 2,
+                max_fee_per_gas: 100,
+                gas_limit: 21_000,
+                to: Some(test_address(b"block-index-to")),
+                value: U256::from(17u64 + nonce),
+                data: Bytes::from(vec![nonce as u8]),
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            let sig = signer.sign(tx.hash().as_bytes()).unwrap();
+            block
+                .transactions
+                .push(SignedTransaction::new(signer_address(&signer), tx, sig));
+        }
+        let gas = SystemTransaction::block_gas_reward(
+            42,
+            1,
+            7,
+            block.header.proposer,
+            U256::from(5u64),
+            genesis.hash(),
+        );
+        let mut stark = gas.clone();
+        stark.kind = shell_core::SystemTxKind::StarkReward;
+        stark.tx_index = 9;
+        // Embedded order and metadata indices deliberately differ from displayed order.
+        block.system_transactions = vec![stark.clone(), gas.clone()];
+        handler.chain_store.put_block(&block).unwrap();
+        handler.chain_store.set_canonical(1, &block.hash()).unwrap();
+        handler.chain_store.set_head(&block.hash()).unwrap();
+        *handler.finalized_number.write() = 1;
+        let hashes = [
+            gas.hash(),
+            stark.hash(),
+            block.transactions[0].hash(),
+            block.transactions[1].hash(),
+        ];
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let mut expected = Vec::new();
+        for (i, hash) in hashes.iter().enumerate() {
+            let tx = EthApiServer::get_transaction_by_block_hash_and_index(
+                &handler,
+                block.hash(),
+                hex_u64(i as u64),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(tx.hash, *hash);
+            assert_eq!(tx.block_hash, Some(block.hash()));
+            assert_eq!(tx.block_number.as_deref(), Some("0x1"));
+            assert_eq!(tx.transaction_index, Some(hex_u64(i as u64)));
+            if i >= 2 {
+                assert_eq!(tx.gas_price, "0xc");
+                assert_eq!(tx.from, signer_address(&signer));
+            }
+            let value = serde_json::to_value(&tx).unwrap();
+            for tag in ["0x1", "latest", "safe", "finalized"] {
+                let by_number = EthApiServer::get_transaction_by_block_number_and_index(
+                    &handler,
+                    tag.into(),
+                    hex_u64(i as u64),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(serde_json::to_value(by_number).unwrap(), value);
+            }
+            expected.push(value);
+        }
+        for index in ["0x4", "0xffffffffffffffff"] {
+            assert!(EthApiServer::get_transaction_by_block_hash_and_index(
+                &handler,
+                block.hash(),
+                index.into()
+            )
+            .await
+            .unwrap()
+            .is_none());
+        }
+        for index in [
+            "0x",
+            "0x00",
+            "0x01",
+            "1",
+            "-1",
+            "0xg",
+            "latest",
+            "0x10000000000000000",
+        ] {
+            assert_eq!(
+                EthApiServer::get_transaction_by_block_hash_and_index(
+                    &handler,
+                    block.hash(),
+                    index.into()
+                )
+                .await
+                .unwrap_err()
+                .code(),
+                -32602
+            );
+            assert_eq!(
+                EthApiServer::get_transaction_by_block_number_and_index(
+                    &handler,
+                    "latest".into(),
+                    index.into()
+                )
+                .await
+                .unwrap_err()
+                .code(),
+                -32602
+            );
+        }
+        for tag in ["bad-tag", "0x01", "0x10000000000000000"] {
+            assert_eq!(
+                EthApiServer::get_transaction_by_block_number_and_index(
+                    &handler,
+                    tag.into(),
+                    "0x0".into()
+                )
+                .await
+                .unwrap_err()
+                .code(),
+                -32602
+            );
+        }
+        assert!(EthApiServer::get_transaction_by_block_hash_and_index(
+            &handler,
+            ShellHash::from([0xff; 32]),
+            "0x0".into()
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert!(EthApiServer::get_transaction_by_block_number_and_index(
+            &handler,
+            "0xffff".into(),
+            "0x0".into()
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+        let mut newer = genesis.clone();
+        newer.header.number = 2;
+        newer.header.timestamp += 2;
+        newer.header.parent_hash = block.hash();
+        handler.chain_store.put_block(&newer).unwrap();
+        handler.chain_store.set_canonical(2, &newer.hash()).unwrap();
+        handler.chain_store.set_head(&newer.hash()).unwrap();
+        handler
+            .world_state
+            .write()
+            .add_balance(&signer_address(&signer), U256::from(123u64))
+            .unwrap();
+        handler
+            .chain_store
+            .delete_witness_bundle(&block.hash())
+            .unwrap();
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        for (i, value) in expected.iter().enumerate() {
+            let tx = EthApiServer::get_transaction_by_block_number_and_index(
+                &handler,
+                "0x1".into(),
+                hex_u64(i as u64),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(serde_json::to_value(tx).unwrap(), *value);
+        }
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+        // A retained side fork has an embedded body but no canonical tx indexes.
+        let mut side = block.clone();
+        side.header.timestamp += 3;
+        handler.chain_store.put_side_fork_block(&side).unwrap();
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        for (i, hash) in hashes.iter().enumerate() {
+            let tx = EthApiServer::get_transaction_by_block_hash_and_index(
+                &handler,
+                side.hash(),
+                hex_u64(i as u64),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(tx.hash, *hash);
+            assert_eq!(tx.block_hash, Some(side.hash()));
+            assert_eq!(tx.transaction_index, Some(hex_u64(i as u64)));
+        }
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+        // Legacy bodies may retain rewards only in separate system records.
+        let mut legacy = block.clone();
+        legacy.system_transactions.clear();
+        handler.chain_store.put_block(&legacy).unwrap();
+        handler
+            .chain_store
+            .put_system_transactions(&legacy.hash(), 1, &[stark, gas])
+            .unwrap();
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        for (i, hash) in hashes.iter().enumerate() {
+            let tx = EthApiServer::get_transaction_by_block_hash_and_index(
+                &handler,
+                legacy.hash(),
+                hex_u64(i as u64),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(tx.hash, *hash);
+        }
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+        handler.chain_store.delete_body(&block.hash()).unwrap();
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        assert_eq!(
+            EthApiServer::get_transaction_by_block_hash_and_index(
+                &handler,
+                block.hash(),
+                "0x0".into()
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            -32001
+        );
+        assert_eq!(
+            EthApiServer::get_transaction_by_block_number_and_index(
+                &handler,
+                "0x1".into(),
+                "0x0".into()
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            -32001
+        );
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
     }
 }
