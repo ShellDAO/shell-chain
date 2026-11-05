@@ -345,13 +345,14 @@ impl<S: KvStore + 'static> RpcHandler<S> {
         self
     }
 
-    /// Set the RPC listen address used in `admin_nodeInfo` responses.
-    /// Called internally by `start_rpc_server` after the address is bound.
+    /// Select the server-managed output root for live physical checkpoints.
     pub fn with_backup_directory(mut self, directory: std::path::PathBuf) -> Self {
         self.backup_directory = Some(directory);
         self
     }
 
+    /// Set the RPC listen address used in `admin_nodeInfo` responses.
+    /// Called internally by `start_rpc_server` after the address is bound.
     pub fn with_admin_rpc_addr(mut self, rpc_addr: String) -> Self {
         self.admin_rpc_addr = rpc_addr;
         self
