@@ -624,6 +624,10 @@ This creates the data directory structure and writes the genesis block.
 
 ## Starting a Node
 
+Initialize each node with the same trusted genesis. The commands below use
+chain ID 10 and WPoA to match the genesis above. When joining another network,
+use the chain ID and consensus engine from its trusted genesis.
+
 ### Validator node
 
 A validator requires a keystore and produces blocks:
@@ -632,6 +636,9 @@ A validator requires a keystore and produces blocks:
 shell-node --datadir shell-data run \
   --config examples/config-validator.toml \
   --keystore my-validator-key.json \
+  --network testnet \
+  --chain-id 10 \
+  --consensus-engine wpoa \
   --db rocksdb \
   --p2p \
   --p2p-addr 0.0.0.0:30303 \
@@ -655,6 +662,9 @@ and set `BOOTNODE` to the validator's complete multiaddr, including its peer ID:
 : "${BOOTNODE:?Set BOOTNODE to a full multiaddr ending in /p2p/PEER_ID}"
 shell-node --datadir shell-data run \
   --config examples/config-rpc.toml \
+  --network testnet \
+  --chain-id 10 \
+  --consensus-engine wpoa \
   --db rocksdb \
   --p2p \
   --p2p-addr 0.0.0.0:30303 \
