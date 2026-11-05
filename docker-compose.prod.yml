@@ -1,5 +1,6 @@
 # Production shell-chain deployment: 3 validators + RPC node + nginx + monitoring.
 # Usage: docker compose -f docker-compose.prod.yml up -d
+# Container port 8545 serves HTTP and WebSocket. Keep both published host ports.
 
 services:
   node1:
@@ -15,7 +16,6 @@ services:
     command: >
       --datadir /data
       --rpc-addr 0.0.0.0:8545
-      --ws --ws-port 8546
       --p2p --p2p-addr 0.0.0.0:30303
       --enable-mdns
       --rpc-cors "http://localhost:3000"
@@ -27,7 +27,7 @@ services:
       --log-format json
     ports:
       - "8545:8545"
-      - "8546:8546"
+      - "8546:8545"
       - "30303:30303"
     volumes:
       - genesis:/shared
@@ -62,7 +62,6 @@ services:
     command: >
       --datadir /data
       --rpc-addr 0.0.0.0:8545
-      --ws --ws-port 8546
       --p2p --p2p-addr 0.0.0.0:30303
       --enable-mdns
       --rpc-cors "http://localhost:3000"
@@ -74,7 +73,7 @@ services:
       --log-format json
     ports:
       - "8555:8545"
-      - "8556:8546"
+      - "8556:8545"
       - "30304:30303"
     volumes:
       - genesis:/shared
@@ -109,7 +108,6 @@ services:
     command: >
       --datadir /data
       --rpc-addr 0.0.0.0:8545
-      --ws --ws-port 8546
       --p2p --p2p-addr 0.0.0.0:30303
       --enable-mdns
       --rpc-cors "http://localhost:3000"
@@ -121,7 +119,7 @@ services:
       --log-format json
     ports:
       - "8565:8545"
-      - "8566:8546"
+      - "8566:8545"
       - "30305:30303"
     volumes:
       - genesis:/shared
@@ -156,7 +154,6 @@ services:
     command: >
       --datadir /data
       --rpc-addr 0.0.0.0:8545
-      --ws --ws-port 8546
       --p2p --p2p-addr 0.0.0.0:30303
       --enable-mdns
       --rpc-cors "http://localhost:3000"
@@ -166,7 +163,7 @@ services:
       --log-format json
     ports:
       - "8548:8545"
-      - "8549:8546"
+      - "8549:8545"
       - "30306:30303"
     volumes:
       - genesis:/shared
