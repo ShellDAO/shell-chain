@@ -86,6 +86,74 @@ impl ViewChangeMessage {
     }
 }
 
+/// Signed timeout votes retained for independent verification and transport.
+/// This V1 observation binds the highest QC, not a particular unfinalized parent;
+/// it must not by itself drive offline penalties or canonical state transitions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeoutCertificate {
+    pub votes: Vec<ViewChangeMessage>,
+}
+
+impl TimeoutCertificate {
+    /// Verify against an independently selected active roster and expected context.
+    /// Stored or remote votes never supply their own trusted weights or keys.
+    #[allow(clippy::too_many_arguments)] // Explicit trusted round context and roster are independent of the proof.
+    pub fn verify(
+        &self,
+        chain_id: u64,
+        block_number: u64,
+        view: u64,
+        highest_qc_hash: ShellHash,
+        weights: &HashMap<Address, u64>,
+        public_keys: &HashMap<Address, Vec<u8>>,
+        verifier: &dyn shell_crypto::Verifier,
+    ) -> bool {
+        let total: u128 = weights.values().map(|weight| u128::from(*weight)).sum();
+        if total == 0 || self.votes.is_empty() || self.votes.len() > weights.len() {
+            return false;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut signed = 0u128;
+        for vote in &self.votes {
+            if vote.chain_id != chain_id
+                || vote.block_number != block_number
+                || vote.view != view
+                || vote.highest_qc_hash != highest_qc_hash
+                || !seen.insert(vote.validator)
+            {
+                return false;
+            }
+            let Some(weight) = weights
+                .get(&vote.validator)
+                .copied()
+                .filter(|weight| *weight > 0)
+            else {
+                return false;
+            };
+            let Some(key) = public_keys.get(&vote.validator) else {
+                return false;
+            };
+            let Some(algorithm) =
+                shell_crypto::infer_signature_type_from_address(key, &vote.validator)
+            else {
+                return false;
+            };
+            if !shell_crypto::is_algorithm_allowed(algorithm) {
+                return false;
+            }
+            let signature = shell_crypto::PQSignature::new(algorithm, vote.signature.clone());
+            if !verifier
+                .verify(key, &vote.own_signing_message(), &signature)
+                .unwrap_or(false)
+            {
+                return false;
+            }
+            signed += u128::from(weight);
+        }
+        signed > total * 2 / 3
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ViewChangeState {
     pub current_view: u64,
@@ -166,6 +234,10 @@ impl ViewChangeState {
         self.current_view
     }
 
+    pub(crate) fn restart_timeout_clock(&mut self) {
+        self.last_block_time_ms = wall_clock_millis();
+    }
+
     pub fn select_proposer(view: u64, authorities: &[Address]) -> Address {
         assert!(!authorities.is_empty(), "authority set must not be empty");
         authorities[round_robin_index(view, authorities.len()).unwrap_or(0)]
@@ -176,6 +248,11 @@ impl ViewChangeState {
         self.last_block_time_ms = now_ms;
         self.pending_view_changes.clear();
         self.pending_view_change_weights.clear();
+    }
+
+    pub(crate) fn configure_strict_quorum(&mut self, weights: HashMap<Address, u64>, total: u64) {
+        self.configure_quorum(weights, total);
+        self.quorum_weight = crate::FinalityState::strict_quorum_weight(total);
     }
 
     pub(crate) fn configure_quorum(

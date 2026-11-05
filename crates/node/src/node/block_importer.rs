@@ -182,6 +182,9 @@ impl<S: KvStore + 'static> Node<S> {
         parent: &Block,
         finalized_import: bool,
     ) -> Result<shell_core::BlockSignerEvidence, NodeError> {
+        let active = self.offline_accounting_active(block.number())?;
+        let load_context = || self.branch_state_store(parent);
+        let mut timeout_context = None;
         let max_transactions = self.config.network_type.default_params().max_tx_per_block;
         if block.transactions.len() > max_transactions {
             return Err(NodeError::Startup(format!(
@@ -198,10 +201,12 @@ impl<S: KvStore + 'static> Node<S> {
 
         {
             let consensus = self.consensus.read();
-            if finalized_import {
-                consensus.verify_header_for_finalized_import(&block.header, &parent.header)?;
-            } else {
-                consensus.verify_header(&block.header)?;
+            if !active {
+                if finalized_import {
+                    consensus.verify_header_for_finalized_import(&block.header, &parent.header)?;
+                } else {
+                    consensus.verify_header(&block.header)?;
+                }
             }
             let cfg = consensus.poa_config();
             let max_allowed =
@@ -239,7 +244,17 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         let proposer = &block.header.proposer;
-        let pubkey = self.authority_pubkey(proposer)?.ok_or_else(|| {
+        let pubkey = match self.authority_pubkey(proposer)? {
+            Some(key) => Some(key),
+            None if active => {
+                let store = load_context()?;
+                let key = ChainStore::new(store.clone()).get_pubkey(proposer)?;
+                timeout_context = Some(store);
+                key
+            }
+            None => None,
+        }
+        .ok_or_else(|| {
             NodeError::Startup(format!(
                 "block {} seal verification failed: proposer {} pubkey unknown",
                 block.number(),
@@ -251,6 +266,13 @@ impl<S: KvStore + 'static> Node<S> {
         self.consensus
             .read()
             .verify_seal(&block.header, seal, &pubkey, &verifier)?;
+        if active {
+            let store = match timeout_context {
+                Some(store) => store,
+                None => load_context()?,
+            };
+            self.verify_canonical_timeouts(store, &block.header)?;
+        }
         self.known_authorities
             .write()
             .entry(*proposer)
@@ -383,6 +405,17 @@ impl<S: KvStore + 'static> Node<S> {
 
     /// Reconstruct only the retained, unfinalized branch prefix in a disposable overlay.
     /// Provisional validation must not publish branch state or governance policy.
+    pub(super) fn branch_state_store(
+        &self,
+        block: &Block,
+    ) -> Result<Arc<OverlayStore<S>>, NodeError> {
+        if self.chain_store.get_block_hash_by_number(block.number())? == Some(block.hash()) {
+            Ok(Arc::new(OverlayStore::new(self.store.clone())))
+        } else {
+            self.side_fork_parent_store(block)
+        }
+    }
+
     fn side_fork_parent_store(
         &self,
         parent: &Block,
@@ -1226,6 +1259,7 @@ impl<S: KvStore + 'static> Node<S> {
                     "preferred-fork replay",
                 )
             })?;
+            self.apply_canonical_timeouts(evm.state_db_mut().world_state_mut(), &block.header)?;
             evm.state_db_mut().world_state_mut().state_root()?
         } else {
             if block.header.gas_used != 0 || !block.system_transactions.is_empty() {
@@ -1246,6 +1280,7 @@ impl<S: KvStore + 'static> Node<S> {
                     "preferred-fork empty-block replay",
                 )
             })?;
+            self.apply_canonical_timeouts(&mut world_state, &block.header)?;
             world_state.state_root()?
         };
 
@@ -1385,6 +1420,11 @@ impl<S: KvStore + 'static> Node<S> {
                 "failed to restore algorithm registry at finalized block #{finalized_number}: {error}"
             ))
         })?;
+        let restored_authorities = if self.offline_accounting_active(head.number())? {
+            Some(self.canonical_epoch_authorities(finalized_number)?)
+        } else {
+            None
+        };
         let reverted_settlements = old_chain
             .iter()
             .map(Self::reverted_stark_settlements)
@@ -1405,6 +1445,11 @@ impl<S: KvStore + 'static> Node<S> {
         )?;
 
         *self.world_state.write() = restored_state;
+        if let Some((validators, weights)) = restored_authorities {
+            self.consensus
+                .write()
+                .set_authorities_with_weights(validators, weights);
+        }
         *AlgorithmRegistry::global_mut() = restored_registry;
         *self.fork_choice.write() = restore_fork_choice(
             self.chain_store.as_ref(),
@@ -1563,6 +1608,18 @@ impl<S: KvStore + 'static> Node<S> {
                 reason: "preferred-fork plan does not terminate at the selected head".into(),
             });
         }
+        let restored_authorities = if self.offline_accounting_active(current_head.number())?
+            || self.offline_accounting_active(parent.number())?
+        {
+            let epoch_length = self.consensus.read().poa_config().epoch_length;
+            Some(self.epoch_authorities_for_parent(
+                overlay.clone(),
+                &parent.header,
+                epoch_length,
+            )?)
+        } else {
+            None
+        };
         let reverted_settlements = plan
             .old_chain
             .iter()
@@ -1575,9 +1632,8 @@ impl<S: KvStore + 'static> Node<S> {
             Vec::new()
         };
         let total_weight = self
-            .consensus
-            .read()
-            .validator_weights()
+            .authority_context_for_block(&parent)?
+            .weights
             .values()
             .copied()
             .fold(0u64, u64::saturating_add);
@@ -1625,6 +1681,11 @@ impl<S: KvStore + 'static> Node<S> {
         state = WorldState::at_root(self.store.clone(), &parent_state_root)?;
         let block_store = self.block_store();
         block_store.replace_world_state(state);
+        if let Some((validators, weights)) = restored_authorities {
+            self.consensus
+                .write()
+                .set_authorities_with_weights(validators, weights);
+        }
         for block_settlements in &reverted_settlements {
             block_store.cancel_settled_witness_deletes(block_settlements);
         }
@@ -2215,6 +2276,7 @@ impl<S: KvStore + 'static> Node<S> {
                     "import",
                 )?;
             }
+            self.apply_canonical_timeouts(evm.state_db_mut().world_state_mut(), &block.header)?;
             evm.state_db_mut().world_state_mut().state_root()?
         } else {
             if block.header.gas_used != 0 {
@@ -2243,6 +2305,7 @@ impl<S: KvStore + 'static> Node<S> {
                     "empty-block import",
                 )?;
             }
+            self.apply_canonical_timeouts(&mut ws, &block.header)?;
             ws.state_root()
                 .map_err(|e| NodeError::Startup(format!("state_root for empty block: {e}")))?
         };

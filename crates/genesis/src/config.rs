@@ -219,6 +219,9 @@ pub struct GenesisConfig {
     /// First block enabling independent prover governance registration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prover_registry_height: Option<u64>,
+    /// First block committing certified assigned-opportunity accounting; absent preserves legacy behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_accounting_height: Option<u64>,
     /// First block whose new algorithm proposals preserve live policy until quorum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_proposal_staging_height: Option<u64>,

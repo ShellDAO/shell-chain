@@ -33,6 +33,12 @@ const binary = resolve(
   process.env.NODE_BIN ??
     fileURLToPath(new URL("../../target/debug/shell-node", import.meta.url)),
 );
+const pendingRejoinScenario = process.argv.includes("--pending-rejoin");
+const slhOfflineParticipationScenario = process.argv.includes("--offline-participation-slh");
+assert.ok(!slhOfflineParticipationScenario || !pendingRejoinScenario,
+  "The SLH recovery profile requires the full offline participation scenario");
+const offlineParticipationScenario =
+  process.argv.includes("--offline-participation") || slhOfflineParticipationScenario || pendingRejoinScenario;
 const quorumRecoveryScenario = process.argv.includes("--quorum-recovery");
 const sameHeightForkScenario = process.argv.includes("--fork-sync-same-height");
 const weightedForkScenario = process.argv.includes("--fork-sync-weighted") || sameHeightForkScenario;
@@ -55,7 +61,8 @@ const generated = spawnSync(
     "key",
     "generate",
     "--algorithm",
-    sphincsSignersScenario || (twoAuthorities && !sameHeightForkScenario) ? "slhdsa" : "mldsa65",
+    sphincsSignersScenario || slhOfflineParticipationScenario || (twoAuthorities && !sameHeightForkScenario)
+      ? "slhdsa" : "mldsa65",
     "--output",
     keyPath,
   ],
@@ -79,6 +86,7 @@ async function unusedPort() {
   return port;
 }
 const ports = [await unusedPort(), await unusedPort()];
+if (offlineParticipationScenario) ports.push(await unusedPort());
 assert.notEqual(ports[0], ports[1]);
 const metricsPorts = syncStatusScenario ? [await unusedPort(), await unusedPort()] : [];
 const outsider = new ShellSigner("MlDsa65", MlDsa65Adapter.generate());
@@ -105,7 +113,7 @@ const nodeLogLabels = [];
 let height = 0;
 const result = {
   startedAt: new Date().toISOString(),
-  scenario: sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
+  scenario: pendingRejoinScenario ? "pending-rejoin" : slhOfflineParticipationScenario ? "offline-participation-slh" : offlineParticipationScenario ? "offline-participation" : sameHeightForkScenario ? "fork-sync-same-height" : weightedForkScenario ? "fork-sync-weighted" : forkSyncScenario ? "fork-sync" : quorumRecoveryScenario ? "quorum-recovery" : blockSignersScenario ? "block-signers" : syncStatusScenario ? "live-sync-status" : prunedEpochScenario ? "epoch-pruned-restart" : epochScenario ? "epoch-restart" : "native-aa-events",
   transactions: [],
   versions: {
     node: process.version,
@@ -427,7 +435,275 @@ async function confirmed(
   await save();
   return entry;
 }
+async function runOfflineParticipation() {
+  const requireSdk = createRequire(pathToFileURL(resolve(process.env.SHELL_SDK_ENTRY)));
+  const { keccak256, toBytes } = requireSdk("viem");
+  const selector = (signature) => keccak256(toBytes(signature)).slice(0, 10);
+  const absentKey = join(out, "absent-validator.json");
+  const followerKey = join(out, "observer.json");
+  for (const key of [absentKey, followerKey]) {
+    const generatedKey = spawnSync(binary, ["--password-file", passwordPath,
+      "key", "generate", "--algorithm", "mldsa65", "--output", key], { encoding: "utf8" });
+    assert.equal(generatedKey.status, 0, generatedKey.stderr);
+  }
+  const absent = await decryptKeystore(JSON.parse(await readFile(absentKey, "utf8")), password);
+  signers.push(absent);
+  assert.equal(miner.signatureType, slhOfflineParticipationScenario ? "SphincsSha2256f" : "ML-DSA-65");
+  if (slhOfflineParticipationScenario) assert.equal(miner.getPublicKey().length, 64);
+  assert.equal(absent.signatureType, "ML-DSA-65");
+  const dirs = ["producer", "observer", "returned-validator"].map((name) => join(out, name));
+  const initialBalance = "0x3635c9adc5dea00000";
+  const genesis = {
+    chain_id: 1337, chain_name: "certified-offline-acceptance", network_type: "Dev",
+    timestamp: Math.floor(Date.now() / 1000) - 120, gas_limit: 30000000,
+    extra_data: "certified-offline-acceptance", boot_nodes: [],
+    registered_key_algorithm_height: 0, aa_account_manager_height: 0,
+    aa_validator_registry_height: 0, offline_accounting_height: 0,
+    bloom_activation_height: 0, fee_accounting_activation_height: 0,
+    alloc: Object.fromEntries(signers.map((signer) => [signer.getAddress(),
+      { balance: initialBalance, nonce: 0, code: null, storage: null }])),
+    consensus: { engine: "wpoa", authorities: [miner.getAddress(), absent.getAddress()],
+      authority_pubkeys: [miner, absent].map((signer) => "0x" + Buffer.from(signer.getPublicKey()).toString("hex")),
+      weights: [3, 1], stakes: [], block_time_secs: 2, max_future_secs: 300, epoch_length: 5 },
+  };
+  result.adaptations = [
+    `Unreleased source node and compatible source SDK; fresh Dev1337 ${slhOfflineParticipationScenario ? "SLH-DSA producer and ML-DSA returning validator" : "ML-DSA validators"} weighted3:1, epoch5,2s block interval. No production activation or public-binary availability claim.`,
+    "One producer, independent nonauthority observer and initially absent validator. No process uses the absent signing identity until governance recovery.",
+    "Actual wall-clock view timeouts and pending signed transfers. Full-block gas limits keep demand across assigned rounds; this is a consensus experiment, not a throughput benchmark.",
+    "No staking economics enabled; check unchanged registered stake, weight and absent balance. Staking-enabled economics remain a separate profile.",
+  ];
+  result.offlineParticipation = { observations: [], addresses: {
+    producer: miner.getAddress(), absent: absent.getAddress(), demandSender: outsider.getAddress() } };
+  const report = result.offlineParticipation;
+  if (pendingRejoinScenario) {
+    result.adaptations[1] = "Pending-pool catch-up diagnostic: B is initially absent and joins after twelve genuine source blocks. This short profile does not test100-miss suspension or governance recovery.";
+  }
+  for (const dir of dirs) {
+    await mkdir(dir);
+    await writeFile(join(dir, "genesis.json"), JSON.stringify(genesis, null, 2));
+  }
+  await save();
+  console.log(`Acceptance artifacts: ${out}`);
+  await start(0, dirs[0], keyPath, "offline-producer");
+  let bootnode;
+  for (let attempt = 0; attempt < 80; attempt++) {
+    bootnode = (await readFile(join(out, "offline-producer-node.log"), "utf8"))
+      .match(/Listening on (\/ip4\/127\.0\.0\.1\/tcp\/\d+\/p2p\/[a-zA-Z0-9]+)/)?.[1];
+    if (bootnode) break;
+    await pause(250);
+  }
+  assert.ok(bootnode, "producer complete multiaddr");
+  await start(1, dirs[1], followerKey, "offline-observer", bootnode);
+  await peerReady();
+  const call = selector("getValidatorOfflineState(address)") + absent.getAddress().slice(2);
+  const offline = async (i, tag = "latest") => {
+    const data = await rpc(i, "eth_call", [{ to: validatorRegistryAddress, data: call }, tag]);
+    assert.match(data, /^0x[0-9a-fA-F]{192}$/, "actual activated Registry getter returns three words");
+    return [0, 1, 2].map((index) => Number(BigInt("0x" + data.slice(2 + index * 64, 66 + index * 64))));
+  };
+  const head = (i) => rpc(i, "eth_getBlockByNumber", ["latest", false]);
+  const members = async (i) => (await rpc(i, "shell_consensusInfo")).validators
+    .map((validator) => ({ address: validator.address.toLowerCase(), weight: validator.weight }))
+    .sort((a, b) => a.address.localeCompare(b.address));
+  const allMembers = [{ address: miner.getAddress().toLowerCase(), weight: 3 },
+    { address: absent.getAddress().toLowerCase(), weight: 1 }].sort((a, b) => a.address.localeCompare(b.address));
+  assert.deepEqual(await members(0), allMembers);
+  assert.deepEqual(await offline(0), [0, 0, 0]);
+  const registered = await rpc(0, "shell_getValidatorStatus", [absent.getAddress()]);
+  assert.equal(registered.isValidator, true);
+  assert.equal(registered.weight, 1);
+  report.initialRegistered = registered;
+  let nextNonce = await nonce(outsider);
+  const demand = [];
+  const submit = async (signer, currentNonce, to, data, gasLimit = 30000000) => {
+    const tx = buildTransaction({ chainId: 1337, nonce: currentNonce, to, value: 0n, data, gasLimit });
+    const signed = await signer.buildSignedTransaction({ tx, includePublicKey: true });
+    return paced(() => providers[0].sendTransaction(signed));
+  };
+  const fill = async () => {
+    const committed = await nonce(outsider);
+    while (nextNonce < committed + 8) {
+      demand.push(await submit(outsider, nextNonce, outsider.getAddress(), "0x"));
+      nextNonce++;
+    }
+  };
+  const drain = async () => {
+    const deadline = Date.now() + 180000;
+    while ((await nonce(outsider)) < nextNonce) {
+      assert.ok(Date.now() < deadline, "pending demand drains");
+      await pause(500);
+    }
+    for (const hash of demand) {
+      const receipt = await rpc(0, "eth_getTransactionReceipt", [hash]);
+      assert.equal(receipt?.status, "0x1", "genuine demand transaction executes");
+    }
+  };
+  const agree = async (tag, budget = 120000) => {
+    const source = await rpc(0, "eth_getBlockByNumber", [tag, false]);
+    const deadline = Date.now() + budget;
+    for (const i of nodes.map((node, index) => node ? index : null).filter((index) => index !== null)) {
+      let imported, finalized;
+      do {
+        imported = await rpc(i, "eth_getBlockByNumber", [tag, false]);
+        finalized = await rpc(i, "eth_getBlockByNumber", ["finalized", false]);
+        if (imported?.hash === source.hash && BigInt(finalized.number) >= BigInt(source.number)) break;
+        assert.ok(Date.now() < deadline, `node${i} imports and finalizes target block`);
+        await pause(300);
+      } while (true);
+      assert.equal(imported.stateRoot, source.stateRoot, "independent imported root");
+      const finalizedAt = await rpc(i, "eth_getBlockByNumber", [source.number, false]);
+      assert.equal(finalizedAt.hash, source.hash, "same finalized block hash");
+    }
+    return source;
+  };
+  let suspendedTag;
+  if (pendingRejoinScenario) {
+    const prefixDeadline = Date.now() + 120000;
+    while (Number(BigInt((await head(0)).number)) < 12) {
+      assert.ok(Date.now() < prefixDeadline, "pending rejoin prefix completes");
+      await fill();
+      await pause(500);
+    }
+    assert.deepEqual(await members(0), allMembers);
+    report.pendingBeforeReturn = await rpc(0, "shell_getNodeInfo");
+    await save();
+  } else {
+  // The observed debug SLH cadence needs a larger test window.
+  const observationMinutes = slhOfflineParticipationScenario ? 55 : 45;
+  const deadline = Date.now() + observationMinutes * 60000;
+  let lastCount = -1, suspended;
+  while (true) {
+    assert.ok(Date.now() < deadline, "100 actual assigned timeouts complete within acceptance window");
+    await fill();
+    const block = await head(0), counters = await offline(0, block.number);
+    assert.ok(counters[0] >= lastCount, "absent validator consecutive misses do not reset");
+    if (counters[0] < 100) assert.equal(counters[2], 0, "no premature suspension");
+    if (counters[0] !== lastCount) {
+      report.observations.push({ at: new Date().toISOString(), height: block.number, counters });
+      lastCount = counters[0];
+      await save();
+    }
+    if (counters[2] === 2) {
+      assert.equal(counters[0], 100);
+      assert.equal(counters[1], 1);
+      suspended = block;
+      break;
+    }
+    await pause(500);
+  }
+  await drain();
+  suspendedTag = suspended.number;
+  await agree(suspendedTag);
+  assert.deepEqual(await members(0), [{ address: miner.getAddress().toLowerCase(), weight: 3 }]);
+  assert.deepEqual(await offline(1, suspendedTag), [100, 1, 2]);
+  assert.equal(await rpc(0, "eth_getBalance", [absent.getAddress(), "latest"]), initialBalance);
+  assert.deepEqual(await rpc(0, "shell_getValidatorStatus", [absent.getAddress()]), registered,
+    "suspension preserves registered membership, stored weight and stake");
+  report.suspended = { block: suspended, registered, counters: await offline(0, suspendedTag) };
+  const staleHash = await submit(miner, await nonce(miner), validatorRegistryAddress,
+    selector("recoverOfflineValidator(address,uint64)") + absent.getAddress().slice(2) + word(0));
+  let staleReceipt;
+  const staleDeadline = Date.now() + 60000;
+  while (!(staleReceipt = await rpc(0, "eth_getTransactionReceipt", [staleHash]))) {
+    assert.ok(Date.now() < staleDeadline, "stale generation rejection is included");
+    await pause(300);
+  }
+  assert.equal(staleReceipt.status, "0x0", "stale generation cannot authorize recovery");
+  assert.deepEqual(await offline(0), [100, 1, 2], "failed recovery preserves availability state");
+  result.transactions.push({ label: "stale generation rejection", hash: staleHash, receipt: staleReceipt });
+  const recoveryNonce = await nonce(miner);
+  const recoveryData = selector("recoverOfflineValidator(address,uint64)") + absent.getAddress().slice(2) + word(1);
+  const recoveryHash = await submit(miner, recoveryNonce, validatorRegistryAddress, recoveryData);
+  let recoveryReceipt;
+  const recoveryDeadline = Date.now() + 120000;
+  while (!(recoveryReceipt = await rpc(0, "eth_getTransactionReceipt", [recoveryHash]))) {
+    assert.ok(Date.now() < recoveryDeadline, "actual root recovery transaction included");
+    await pause(300);
+  }
+  assert.equal(recoveryReceipt.status, "0x1");
+  result.transactions.push({ label: "root generation recovery", hash: recoveryHash, receipt: recoveryReceipt });
+  const recoveryHeight = Number(BigInt(recoveryReceipt.blockNumber));
+  const effectiveHeight = Math.ceil(recoveryHeight / 5) * 5;
+  report.recovery = {
+    hash: recoveryHash, receipt: recoveryReceipt, effectiveHeight, rootAlgorithm: miner.signatureType,
+  };
+  while (Number(BigInt((await head(0)).number)) < effectiveHeight) {
+    assert.ok(Date.now() < recoveryDeadline, "recovery common boundary reached");
+    await fill();
+    await pause(500);
+  }
+  await drain();
+  assert.deepEqual(await members(0), allMembers);
+  await agree("0x" + effectiveHeight.toString(16));
+  assert.deepEqual(await members(1), allMembers);
+  const afterRecovery = await offline(0);
+  assert.equal(afterRecovery[1], 1);
+  assert.equal(afterRecovery[2], 0);
+  }
+  // Start the initially absent signing identity once after the selected setup.
+  await start(2, dirs[2], absentKey, "offline-returned-validator", bootnode);
+  if (slhOfflineParticipationScenario) {
+    // Cold SLH history has larger signatures. Verify a fixed finalized prefix
+    // before adding demand and measuring the first proposal after recovery.
+    const catchupTarget = await rpc(0, "eth_getBlockByNumber", ["finalized", false]);
+    report.returnCatchupTarget = await agree(catchupTarget.number, 10 * 60000);
+    await save();
+  }
+  let returnedBlock;
+  const returnDeadline = Date.now() + (pendingRejoinScenario ? 60000 : 180000);
+  let lastRejoinObservation = 0;
+  let scanHeight = Number(BigInt((await head(0)).number));
+  while (!returnedBlock) {
+    assert.ok(Date.now() < returnDeadline, "returning validator syncs and proposes");
+    await fill();
+    const tip = Number(BigInt((await head(0)).number));
+    if (pendingRejoinScenario && Date.now() - lastRejoinObservation >= 5000) {
+      report.rejoinProgress ??= [];
+      report.rejoinProgress.push({ at: new Date().toISOString(),
+        producer: await rpc(0, "shell_getNodeInfo"), returned: await rpc(2, "shell_getNodeInfo"),
+        syncing: await rpc(2, "eth_syncing"), consensus: await rpc(2, "shell_consensusInfo") });
+      lastRejoinObservation = Date.now();
+      await save();
+    }
+    for (; scanHeight <= tip; scanHeight++) {
+      const block = await rpc(0, "eth_getBlockByNumber", ["0x" + scanHeight.toString(16), false]);
+      if (block.miner.toLowerCase() === absent.getAddress().toLowerCase()) {
+        returnedBlock = block;
+        break;
+      }
+    }
+    if (!returnedBlock) await pause(500);
+  }
+  await agree(returnedBlock.number);
+  assert.deepEqual(await offline(0, returnedBlock.number), [0, pendingRejoinScenario ? 0 : 1, 0]);
+  if (!pendingRejoinScenario) {
+    assert.deepEqual(await offline(1, suspendedTag), [100, 1, 2], "old suspension survives recovery");
+    assert.deepEqual(await offline(2, suspendedTag), [100, 1, 2], "rejoined node replays historical state");
+  }
+  await drain();
+  const stable = await head(0);
+  await agree(stable.number);
+  for (const i of [0, 1, 2]) {
+    const before = await head(i);
+    if (!pendingRejoinScenario) {
+      assert.deepEqual(await offline(i, suspendedTag), [100, 1, 2]);
+      const importedReceipt = await rpc(i, "eth_getTransactionReceipt", [report.recovery.hash]);
+      for (const field of ["transactionHash", "blockHash", "blockNumber", "status", "gasUsed"]) {
+        assert.equal(importedReceipt?.[field], report.recovery.receipt[field],
+          `node${i} agrees on recovery receipt ${field}`);
+      }
+    }
+    assert.equal((await head(i)).hash, before.hash, "historical query does not mutate canonical head");
+  }
+  report.returnedBlock = returnedBlock;
+  report.final = stable;
+  report.demandTransactions = demand.length;
+  result.finalHeight = Number(BigInt(stable.number));
+  result.passed = true;
+}
+
 async function runScenario() {
+  if (offlineParticipationScenario) return runOfflineParticipation();
   const dirs = [join(out, "leader"), join(out, "follower")];
   for (const dir of dirs) await mkdir(dir);
   const followerKey = join(out, "follower-key.json");

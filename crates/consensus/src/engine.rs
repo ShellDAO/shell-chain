@@ -112,6 +112,26 @@ pub trait ConsensusEngine: Send + Sync {
         false
     }
 
+    /// Explicitly activated strict timeout quorum; default engines keep legacy behavior.
+    fn set_strict_timeout_quorum(&mut self, _strict: bool) {}
+
+    /// Commit required timeout evidence before an activated view advances.
+    /// Unsupported engines fail closed; legacy transitions use the original hook.
+    fn handle_view_change_with_commit(
+        &mut self,
+        _msg: ViewChangeMessage,
+        _total_weight: u64,
+        _commit: &mut dyn FnMut(&[ViewChangeMessage]) -> bool,
+    ) -> bool {
+        false
+    }
+
+    /// Votes from the most recent view advance, before timeout state was cleared.
+    /// These are unverified observations until checked against a trusted roster.
+    fn last_view_change_votes(&self) -> Vec<ViewChangeMessage> {
+        Vec::new()
+    }
+
     /// Return the active view for the next in-flight block.
     fn current_view(&self) -> u64 {
         0
@@ -121,6 +141,9 @@ pub trait ConsensusEngine: Send + Sync {
     fn check_view_change_timeout(&self, _now_ms: u64, _block_time_ms: u64) -> bool {
         false
     }
+
+    /// Refresh a demand-driven idle window without changing the current view.
+    fn note_proposal_idle(&mut self, _now_ms: u64) {}
 
     /// Reset the view-change timeout window after a block is produced or imported.
     fn note_block_progress(&mut self, _now_ms: u64) {}

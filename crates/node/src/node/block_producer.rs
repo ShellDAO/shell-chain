@@ -449,7 +449,7 @@ impl<S: KvStore + 'static> Node<S> {
             settled_stark_artifacts.push((amendment, reward_hash));
             // settled_stark_proofs already holds the amendment (optimistic push above).
         }
-        header.extra_data = Bytes::default();
+        header.extra_data = self.timeout_extra_for_production(next_number)?;
 
         // Compute block-level logs bloom by OR-ing all receipt blooms.
         {
@@ -476,6 +476,7 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         // Compute state root from the updated world state (includes any activations above).
+        self.apply_canonical_timeouts(evm.state_db_mut().world_state_mut(), &header)?;
         header.state_root = evm.state_db_mut().world_state_mut().state_root()?;
 
         let mut block = Block {

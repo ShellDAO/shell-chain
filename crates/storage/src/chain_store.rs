@@ -120,6 +120,9 @@ pub struct ChainConfig {
     /// First block enabling independent prover governance registration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prover_registry_height: Option<u64>,
+    /// First block committing certified assigned-opportunity accounting; absent preserves legacy behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_accounting_height: Option<u64>,
     /// First block whose new algorithm proposals preserve live policy until quorum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithm_proposal_staging_height: Option<u64>,
@@ -2227,6 +2230,11 @@ impl<S: KvStore> ChainStore<S> {
                 desired.prover_registry_height,
             ),
             (
+                "offline accounting",
+                stored.offline_accounting_height,
+                desired.offline_accounting_height,
+            ),
+            (
                 "algorithm proposal staging",
                 stored.algorithm_proposal_staging_height,
                 desired.algorithm_proposal_staging_height,
@@ -2605,6 +2613,9 @@ impl<S: KvStore> ChainStore<S> {
             prover_registry_height: self
                 .get_chain_config()?
                 .and_then(|config| config.prover_registry_height),
+            offline_accounting_height: self
+                .get_chain_config()?
+                .and_then(|config| config.offline_accounting_height),
             algorithm_proposal_staging_height: self
                 .get_chain_config()?
                 .and_then(|config| config.algorithm_proposal_staging_height),
@@ -2673,6 +2684,7 @@ impl<S: KvStore> ChainStore<S> {
         let trusted_native_address_context = trusted.native_address_context_height;
         let trusted_native_validator_events = trusted.native_validator_events_height;
         let trusted_prover_registry = trusted.prover_registry_height;
+        let trusted_offline_accounting = trusted.offline_accounting_height;
         let trusted_algorithm_proposal_staging = trusted.algorithm_proposal_staging_height;
         let trusted_algorithm_quorum_activation = trusted.algorithm_quorum_activation_height;
         let trusted_algorithm_timelock_activation = trusted.algorithm_timelock_activation_height;
@@ -2843,6 +2855,7 @@ impl<S: KvStore> ChainStore<S> {
                     || config.native_address_context_height != trusted_native_address_context
                     || config.native_validator_events_height != trusted_native_validator_events
                     || config.prover_registry_height != trusted_prover_registry
+                    || config.offline_accounting_height != trusted_offline_accounting
                     || config.algorithm_proposal_staging_height
                         != trusted_algorithm_proposal_staging
                     || config.algorithm_quorum_activation_height
@@ -3133,6 +3146,15 @@ impl<S: KvStore> ChainStore<S> {
                 "snapshot is missing the trusted prover registry activation".into(),
             ));
         }
+        if snapshot_chain_config
+            .as_ref()
+            .and_then(|config| config.offline_accounting_height)
+            != trusted_offline_accounting
+        {
+            return Err(StorageError::State(
+                "snapshot is missing the trusted offline accounting activation".into(),
+            ));
+        }
 
         if snapshot_chain_config
             .as_ref()
@@ -3357,6 +3379,7 @@ impl<S: KvStore> ChainStore<S> {
             native_address_context_height: trusted_native_address_context,
             native_validator_events_height: trusted_native_validator_events,
             prover_registry_height: trusted_prover_registry,
+            offline_accounting_height: trusted_offline_accounting,
             algorithm_proposal_staging_height: trusted_algorithm_proposal_staging,
             algorithm_quorum_activation_height: trusted_algorithm_quorum_activation,
             algorithm_timelock_activation_height: trusted_algorithm_timelock_activation,
@@ -5292,6 +5315,7 @@ mod tests {
             native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
+            offline_accounting_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -5345,6 +5369,7 @@ mod tests {
             native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
+            offline_accounting_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -5384,6 +5409,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -5413,6 +5439,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -5474,6 +5501,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -5503,6 +5531,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -5564,6 +5593,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -5593,6 +5623,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -5653,6 +5684,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: trusted_height,
@@ -5682,6 +5714,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: Some(6),
@@ -5787,6 +5820,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
             };
@@ -5821,6 +5855,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
                 ..trusted
@@ -5887,6 +5922,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: trusted_height,
                 algorithm_timelock_activation_height: None,
             };
@@ -5916,6 +5952,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: Some(6),
                 algorithm_timelock_activation_height: None,
                 ..trusted
@@ -5985,6 +6022,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
             };
@@ -6017,6 +6055,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
                 ..trusted
@@ -6085,6 +6124,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
@@ -6117,6 +6157,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_timelock_activation_height: None,
@@ -6185,6 +6226,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -6217,6 +6259,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -6331,6 +6374,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -6363,6 +6407,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -6432,6 +6477,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -6464,6 +6510,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -6533,6 +6580,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -6565,6 +6613,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_deprecation_height: None,
                 algorithm_proposal_identity_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -6629,6 +6678,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 algorithm_activation_admission_height: None,
@@ -6661,6 +6711,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
                 algorithm_activation_admission_height: None,
@@ -6729,6 +6780,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 session_registered_root_height: trusted_height,
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
@@ -6761,6 +6813,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 session_registered_root_height: Some(6),
                 algorithm_session_deprecation_height: None,
                 algorithm_paymaster_deprecation_height: None,
@@ -7118,6 +7171,51 @@ mod tests {
     }
 
     #[test]
+    fn offline_accounting_snapshot_mismatch_is_rejected_before_writes() {
+        for (trusted_height, include_config) in [(None, true), (Some(5), true), (Some(5), false)] {
+            let store = Arc::new(MemoryDb::new());
+            let cs = ChainStore::new(Arc::clone(&store));
+            let trusted: ChainConfig = serde_json::from_value(serde_json::json!({
+                "chain_id": 1337, "genesis_hash": ShellHash::ZERO,
+                "offline_accounting_height": trusted_height
+            }))
+            .unwrap();
+            cs.put_chain_config(&trusted).unwrap();
+            let before = store.scan_prefix(b"").unwrap();
+            let mut untrusted = trusted;
+            untrusted.offline_accounting_height = Some(6);
+            let metadata = crate::SnapshotMetadata::new(
+                1337,
+                0,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+            );
+            let mut bytes = Vec::new();
+            let mut writer = crate::SnapshotWriter::new(&mut bytes, metadata).unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            if include_config {
+                writer
+                    .write_entry(
+                        prefix::CHAIN_CONFIG,
+                        &serde_json::to_vec(&untrusted).unwrap(),
+                    )
+                    .unwrap();
+            }
+            writer.finalize().unwrap();
+            let error = cs
+                .import_snapshot(std::io::Cursor::new(bytes), 1337, &ShellHash::ZERO)
+                .unwrap_err();
+            assert!(error.to_string().contains(if include_config {
+                "does not match the trusted chain"
+            } else {
+                "missing the trusted offline accounting activation"
+            }));
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[test]
     fn registered_key_algorithm_snapshot_mismatch_is_rejected_before_writes() {
         for (trusted_height, include_config) in [(None, true), (Some(5), true), (Some(5), false)] {
             let store = Arc::new(MemoryDb::new());
@@ -7142,6 +7240,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 paymaster_registered_root_height: None,
                 session_registered_root_height: None,
                 algorithm_session_deprecation_height: None,
@@ -7174,6 +7273,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 paymaster_registered_root_height: None,
                 session_registered_root_height: None,
                 algorithm_session_deprecation_height: None,
@@ -7248,6 +7348,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: trusted_height,
                 algorithm_timelock_activation_height: None,
@@ -7277,6 +7378,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: Some(6),
                 algorithm_timelock_activation_height: None,
@@ -7615,6 +7717,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -7644,6 +7747,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -7715,6 +7819,7 @@ mod tests {
             native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
+            offline_accounting_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -7851,6 +7956,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -8790,6 +8896,7 @@ mod tests {
             native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
+            offline_accounting_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -9415,6 +9522,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: quorum_activation,
                 algorithm_quorum_activation_height: quorum_activation,
                 algorithm_timelock_activation_height: timelock_activation,
@@ -9681,6 +9789,7 @@ mod tests {
             native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
+            offline_accounting_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -9755,6 +9864,7 @@ mod tests {
             native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
+            offline_accounting_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -11101,6 +11211,7 @@ mod tests {
             native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
+            offline_accounting_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -11147,6 +11258,7 @@ mod tests {
             native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
+            offline_accounting_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,

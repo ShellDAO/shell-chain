@@ -2,6 +2,7 @@
 
 mod block_importer;
 mod block_producer;
+mod canonical_timeouts;
 mod chain_state_machine;
 mod challenge_lifecycle;
 mod dev_rpc;
@@ -11,6 +12,7 @@ mod p2p_handlers;
 mod readiness;
 pub(crate) mod stark_sources;
 mod system_rewards;
+mod timeout_evidence;
 
 pub(crate) use std::collections::{BTreeMap, HashMap, HashSet};
 pub(crate) use std::sync::Arc;
@@ -197,6 +199,12 @@ fn state_trie_prune_boundary(
     let boundary = retention_cutoff(finalized_number, keep_recent)
         .min(authority_reload_height(finalized_number, epoch_length));
     (boundary > 0).then_some(boundary)
+}
+
+/// Validator identity and voting weight for one authenticated branch block.
+pub(crate) struct BlockAuthorityContext {
+    weights: HashMap<Address, u64>,
+    public_keys: HashMap<Address, Vec<u8>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -569,7 +577,15 @@ impl<'a, S: KvStore + 'static> ConsensusManagerBoundary<'a, S> {
 
         let (validators, weights) = {
             let ws = self.world_state.read();
-            let validators = ws.get_validators()?;
+            let offline_active = ChainStore::new(ws.store().clone())
+                .get_chain_config()?
+                .and_then(|config| config.offline_accounting_height)
+                .is_some_and(|activation| block_number >= activation);
+            let validators = if offline_active {
+                ws.get_participating_validators()?
+            } else {
+                ws.get_validators()?
+            };
             let weights: Result<Vec<u64>, _> = validators
                 .iter()
                 .map(|validator| ws.get_validator_weight(validator))
@@ -1227,6 +1243,33 @@ impl<S: KvStore + 'static> Node<S> {
             .reload_authorities_if_boundary(block_number)
     }
 
+    /// Read the effective epoch roster without applying pending head changes.
+    /// Call before a canonical rollback commits, so missing history fails atomically.
+    pub(crate) fn canonical_epoch_authorities(
+        &self,
+        height: u64,
+    ) -> Result<(Vec<Address>, Vec<u64>), NodeError> {
+        let epoch_length = self.consensus.read().poa_config().epoch_length;
+        let boundary = authority_reload_height(height, epoch_length);
+        let hash = self
+            .chain_store
+            .get_block_hash_by_number(boundary)?
+            .ok_or_else(|| {
+                NodeError::Startup(format!(
+                    "authority recovery: canonical epoch boundary #{boundary} is unavailable"
+                ))
+            })?;
+        let header = self.chain_store.get_header_by_hash(&hash)?.ok_or_else(|| {
+            NodeError::Startup(format!(
+                "authority recovery: epoch boundary #{boundary} header is unavailable"
+            ))
+        })?;
+        if header.number != boundary || header.hash() != hash {
+            return Err(NodeError::Startup(format!("authority recovery: epoch boundary #{boundary} header does not match canonical history")));
+        }
+        self.epoch_authorities_for_parent(self.store.clone(), &header, epoch_length)
+    }
+
     /// Register an authority's public key for seal verification.
     pub fn register_authority_pubkey(&self, address: Address, pubkey: Vec<u8>) {
         self.consensus_manager()
@@ -1314,7 +1357,15 @@ impl<S: KvStore + 'static> Node<S> {
             .values()
             .copied()
             .fold(0u64, u64::saturating_add);
-        let (preferred_hash, preferred_number, ancestor_hash, old_hashes, new_hashes) = {
+        let (
+            preferred_hash,
+            preferred_number,
+            preferred_weight,
+            active,
+            ancestor_hash,
+            old_hashes,
+            new_hashes,
+        ) = {
             let fork_choice = self.fork_choice.read();
             let preferred_hash = *fork_choice.head();
             let score = fork_choice.score(&preferred_hash).ok_or_else(|| {
@@ -1325,7 +1376,8 @@ impl<S: KvStore + 'static> Node<S> {
             if preferred_hash == canonical_hash || score.block_number < canonical_number {
                 return Ok(None);
             }
-            if !FinalityState::has_weighted_quorum(score.attested_weight, total_weight) {
+            let active = self.offline_accounting_active(score.block_number)?;
+            if !active && !FinalityState::has_weighted_quorum(score.attested_weight, total_weight) {
                 return Ok(None);
             }
             let ancestor_hash = fork_choice
@@ -1338,11 +1390,28 @@ impl<S: KvStore + 'static> Node<S> {
             (
                 preferred_hash,
                 score.block_number,
+                score.attested_weight,
+                active,
                 ancestor_hash,
                 fork_choice.chain_between(&canonical_hash, &ancestor_hash),
                 fork_choice.chain_between(&preferred_hash, &ancestor_hash),
             )
         };
+        if active {
+            let candidate = self
+                .chain_store
+                .get_block_by_hash(&preferred_hash)?
+                .ok_or_else(|| NodeError::Startup("preferred branch block unavailable".into()))?;
+            let context = self.authority_context_for_block(&candidate)?;
+            let total = context
+                .weights
+                .values()
+                .copied()
+                .fold(0u64, u64::saturating_add);
+            if !FinalityState::has_weighted_quorum(preferred_weight, total) {
+                return Ok(None);
+            }
+        }
         if new_hashes.is_empty() {
             return Err(NodeError::Startup(format!(
                 "fork-choice path from ancestor {ancestor_hash} to preferred block {preferred_hash} is empty"
@@ -2424,7 +2493,7 @@ mod tests {
         init
     }
 
-    fn submit_signed_tx<S: KvStore + 'static>(
+    pub(super) fn submit_signed_tx<S: KvStore + 'static>(
         node: &Node<S>,
         tx_signer: &impl Signer,
         sender: Address,
@@ -3779,6 +3848,7 @@ mod tests {
                         native_address_context_height: None,
                         native_validator_events_height: None,
                         prover_registry_height: None,
+                        offline_accounting_height: None,
                         algorithm_proposal_staging_height: None,
                         algorithm_quorum_activation_height: None,
                         algorithm_timelock_activation_height: None,
@@ -5654,6 +5724,7 @@ mod tests {
                             native_address_context_height: None,
                             native_validator_events_height: None,
                             prover_registry_height: None,
+                            offline_accounting_height: None,
                             algorithm_proposal_staging_height: None,
                             algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
@@ -5819,6 +5890,7 @@ mod tests {
                             native_address_context_height: None,
                             native_validator_events_height: None,
                             prover_registry_height: None,
+                            offline_accounting_height: None,
                             algorithm_proposal_staging_height: None,
                             algorithm_quorum_activation_height: None,
                             algorithm_timelock_activation_height: None,
@@ -5933,6 +6005,7 @@ mod tests {
                         native_address_context_height: None,
                         native_validator_events_height: None,
                         prover_registry_height: None,
+                        offline_accounting_height: None,
                         algorithm_proposal_staging_height: None,
                         algorithm_quorum_activation_height: None,
                         algorithm_timelock_activation_height: None,
@@ -22478,7 +22551,110 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn event_loop_finalizes_certificate_received_before_block() {
+        async fn caught_up_peer_recovers_pending_nonce_prefix_without_new_submission() {
+            use shell_network::{NetworkBus, NetworkConfig};
+            use std::time::Duration;
+
+            let (mut producer, signer) = setup_wpoa_node();
+            let authority = producer.config.proposer_address.unwrap();
+            let mut follower = setup_node_with_authority(authority);
+            follower.consensus = Arc::new(RwLock::new(WPoaEngine::new(
+                WPoaConfig::from_poa(PoaConfig::new(vec![authority], 1)),
+                Arc::new(MultiVerifier),
+            )));
+            for node in [&producer, &follower] {
+                node.register_authority_pubkey(authority, signer.public_key().to_vec());
+                fund_account(node, &authority, U256::from(10u128.pow(24)));
+                store_consistent_genesis(node);
+            }
+            let transaction = |nonce| Transaction {
+                chain_id: 1337,
+                nonce,
+                to: Some(Address::from([0x55; 32])),
+                value: U256::ZERO,
+                data: Bytes::new(),
+                gas_limit: 21_000,
+                max_fee_per_gas: shell_core::INITIAL_BASE_FEE * 2,
+                max_priority_fee_per_gas: 1,
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            for nonce in 0..3 {
+                submit_signed_tx(&producer, &signer, authority, transaction(nonce));
+                let block = producer.produce_block(&signer, 1).unwrap();
+                let hash = block.hash();
+                let certificate = Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(
+                    authority,
+                    signer.sign(hash.as_bytes()).unwrap(),
+                )]))
+                .unwrap();
+                assert!(producer.fast_finalize_with_certificate(
+                    block.number(),
+                    hash,
+                    &certificate
+                ));
+            }
+            let expected: Vec<_> = (3..11)
+                .map(|nonce| submit_signed_tx(&producer, &signer, authority, transaction(nonce)))
+                .collect();
+            for node in [&mut producer, &mut follower] {
+                node.config.proposer_address = None;
+                node.config.rpc_enabled = false;
+                node.config.metrics.enabled = false;
+            }
+            let producer = Arc::new(producer);
+            let follower = Arc::new(follower);
+            let bus = NetworkBus::new(128);
+            let mut producer_network = bus.join(&NetworkConfig::default());
+            let mut follower_network = bus.join(&NetworkConfig::default());
+            let signer = Arc::new(signer);
+            let producer_run = tokio::spawn({
+                let producer = Arc::clone(&producer);
+                let signer = Arc::clone(&signer);
+                async move { producer.run(signer, &mut producer_network).await }
+            });
+            let follower_run = tokio::spawn({
+                let follower = Arc::clone(&follower);
+                async move { follower.run(signer, &mut follower_network).await }
+            });
+            let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+                while follower.head_number() != 3 || follower.tx_pool.len() != expected.len() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            producer.shutdown();
+            follower.shutdown();
+            producer_run.await.unwrap().unwrap();
+            follower_run.await.unwrap().unwrap();
+            assert_eq!(
+                follower.head_number(),
+                3,
+                "genuine block synchronization succeeds"
+            );
+            assert_eq!(
+                follower
+                    .world_state
+                    .read()
+                    .get_account(&authority)
+                    .unwrap()
+                    .unwrap()
+                    .nonce,
+                3
+            );
+            recovered.expect("a caught-up peer must receive the pending contiguous nonce prefix");
+            let actual: Vec<_> = follower
+                .tx_pool
+                .pending_for_block_shared(8)
+                .iter()
+                .map(|tx| tx.hash())
+                .collect();
+            assert_eq!(actual, expected);
+        }
+
+        async fn check_certificate_received_before_block(activation: Option<u64>) {
             use shell_network::{NetworkBus, NetworkConfig, NetworkMessage, NetworkService};
             use std::time::Duration;
 
@@ -22491,7 +22667,18 @@ mod tests {
             )));
             for node in [&producer, &follower] {
                 node.register_authority_pubkey(authority, signer.public_key().to_vec());
+                if activation.is_some() {
+                    let mut state = node.world_state.write();
+                    state.set_validators(&[authority]).unwrap();
+                    state.set_validator_weight(&authority, 1).unwrap();
+                }
                 store_consistent_genesis(node);
+                if let Some(height) = activation {
+                    let genesis = node.chain_store.get_head_block().unwrap().unwrap();
+                    node.chain_store.put_chain_config(&serde_json::from_value(serde_json::json!({
+                        "chain_id":1337,"genesis_hash":genesis.hash(),"offline_accounting_height":height
+                    })).unwrap()).unwrap();
+                }
             }
             let block = producer.produce_block(&signer, 10).unwrap();
             let block_hash = block.hash();
@@ -22500,6 +22687,22 @@ mod tests {
                 signer.sign(block_hash.as_bytes()).unwrap(),
             )]))
             .unwrap();
+            let mut tampered_signature = signer.sign(block_hash.as_bytes()).unwrap();
+            tampered_signature.data[0] ^= 1;
+            let tampered_certificate = Node::<MemoryDb>::encode_commit_certificate(&HashMap::from(
+                [(authority, tampered_signature)],
+            ))
+            .unwrap();
+            let inactive = DilithiumSigner::generate();
+            let inactive_address =
+                Address::from_public_key(inactive.public_key(), inactive.sig_type().as_u8());
+            follower.register_authority_pubkey(inactive_address, inactive.public_key().to_vec());
+            let inactive_certificate =
+                Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(
+                    inactive_address,
+                    inactive.sign(block_hash.as_bytes()).unwrap(),
+                )]))
+                .unwrap();
             follower.config.proposer_address = None;
             follower.config.rpc_enabled = false;
             follower.config.metrics.enabled = false;
@@ -22507,9 +22710,11 @@ mod tests {
             let bus = NetworkBus::new(64);
             let mut network = bus.join(&NetworkConfig::default());
             let sender = bus.join(&NetworkConfig::default());
+            let signer = Arc::new(signer);
             let handle = tokio::spawn({
                 let follower = Arc::clone(&follower);
-                async move { follower.run(Arc::new(signer), &mut network).await }
+                let signer = Arc::clone(&signer);
+                async move { follower.run(signer, &mut network).await }
             });
             sender
                 .broadcast(NetworkMessage::CommitCertificate {
@@ -22525,6 +22730,23 @@ mod tests {
                     block_hash,
                     block_number: block.number(),
                     certificate: vec![0],
+                })
+                .await
+                .unwrap();
+            sender
+                .broadcast(NetworkMessage::CommitCertificate {
+                    block_hash,
+                    block_number: block.number(),
+                    certificate: tampered_certificate,
+                })
+                .await
+                .unwrap();
+            // Even a genuine known key without voting weight cannot evict quorum evidence.
+            sender
+                .broadcast(NetworkMessage::CommitCertificate {
+                    block_hash,
+                    block_number: block.number(),
+                    certificate: inactive_certificate,
                 })
                 .await
                 .unwrap();
@@ -22553,10 +22775,53 @@ mod tests {
                 }
             })
             .await;
+            let mut replay_check = None;
+            if finalized.is_ok() {
+                assert!(producer.fast_finalize_with_certificate(1, block_hash, &certificate));
+                let second = producer.produce_block(signer.as_ref(), 11).unwrap();
+                let second_hash = second.hash();
+                let second_certificate = Node::<MemoryDb>::encode_commit_certificate(
+                    &HashMap::from([(authority, signer.sign(second_hash.as_bytes()).unwrap())]),
+                )
+                .unwrap();
+                sender
+                    .broadcast(NetworkMessage::CommitCertificate {
+                        block_hash: second_hash,
+                        block_number: 2,
+                        certificate: second_certificate,
+                    })
+                    .await
+                    .unwrap();
+                // A reader can replay a published quorum certificate with a forged height.
+                // It must not evict the genuine next-block evidence.
+                sender
+                    .broadcast(NetworkMessage::CommitCertificate {
+                        block_hash,
+                        block_number: 2,
+                        certificate: certificate.clone(),
+                    })
+                    .await
+                    .unwrap();
+                sender
+                    .broadcast(NetworkMessage::NewBlock(Box::new(second)))
+                    .await
+                    .unwrap();
+                replay_check = Some(
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while follower.finality.read().last_finalized_number() != 2 {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await,
+                );
+            }
             follower.shutdown();
             handle.await.unwrap().unwrap();
-            assert_eq!(follower.head_number(), 1, "the block itself must import");
+            assert_eq!(follower.head_number(), 2, "both genuine blocks must import");
             finalized.expect("early quorum certificate must finalize after canonical import");
+            replay_check
+                .unwrap()
+                .expect("an old certificate with a forged height cannot evict genuine evidence");
             assert_eq!(
                 follower
                     .chain_store
@@ -22566,8 +22831,19 @@ mod tests {
             );
             assert_eq!(
                 follower.chain_store.get_finalized_number().unwrap(),
-                Some(1)
+                Some(2)
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn event_loop_finalizes_certificate_received_before_block() {
+            check_certificate_received_before_block(None).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn event_loop_finalizes_certificate_received_before_block_after_accounting_activation(
+        ) {
+            check_certificate_received_before_block(Some(0)).await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -22676,8 +22952,7 @@ mod tests {
             );
         }
 
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn suffix_probe_recovers_certificate_for_existing_canonical_tip() {
+        async fn check_block_response_certificate(activation: Option<u64>, existing: bool) {
             use shell_network::{
                 NetworkBus, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
             };
@@ -22692,14 +22967,27 @@ mod tests {
             )));
             for node in [&producer, &follower] {
                 node.register_authority_pubkey(authority, signer.public_key().to_vec());
+                if activation.is_some() {
+                    let mut state = node.world_state.write();
+                    state.set_validators(&[authority]).unwrap();
+                    state.set_validator_weight(&authority, 1).unwrap();
+                }
                 store_consistent_genesis(node);
+                if let Some(height) = activation {
+                    let genesis = node.chain_store.get_head_block().unwrap().unwrap();
+                    node.chain_store.put_chain_config(&serde_json::from_value(serde_json::json!({
+                        "chain_id":1337,"genesis_hash":genesis.hash(),"offline_accounting_height":height
+                    })).unwrap()).unwrap();
+                }
             }
             let block = producer.produce_block(&signer, 10).unwrap();
             let block_hash = block.hash();
-            follower
-                .import_block(block.clone(), &MultiVerifier)
-                .unwrap();
-            assert_eq!(follower.head_number(), 1);
+            if existing {
+                follower
+                    .import_block(block.clone(), &MultiVerifier)
+                    .unwrap();
+            }
+            assert_eq!(follower.head_number(), u64::from(existing));
             assert_eq!(follower.finality.read().last_finalized_number(), 0);
             let certificate = Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(
                 authority,
@@ -22733,8 +23021,11 @@ mod tests {
                     {
                         let (blocks, commit_certificates) = if start_number == 1 {
                             probes += 1;
+                            if !existing && probes > 1 {
+                                continue; // The first response must apply its own certificate.
+                            }
                             // Untrusted evidence must not finalize even an existing block.
-                            let cert = if probes == 1 {
+                            let cert = if existing && probes == 1 {
                                 vec![0]
                             } else {
                                 certificate.clone()
@@ -22758,10 +23049,12 @@ mod tests {
             follower.shutdown();
             handle.await.unwrap().unwrap();
             recovered.expect("a suffix probe must recover missing finality without a new block");
-            assert!(
-                probes >= 2,
-                "invalid certificate must be rejected before valid evidence arrives"
-            );
+            if existing {
+                assert!(
+                    probes >= 2,
+                    "invalid certificate must be rejected before valid evidence arrives"
+                );
+            }
             assert_eq!(follower.head_number(), 1);
             assert_eq!(
                 follower.chain_store.get_head_hash().unwrap(),
@@ -22778,6 +23071,16 @@ mod tests {
                     .unwrap(),
                 Some(certificate)
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn suffix_probe_recovers_certificate_for_existing_canonical_tip() {
+            check_block_response_certificate(None, true).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn block_response_finalizes_first_import_after_accounting_activation() {
+            check_block_response_certificate(Some(0), false).await;
         }
 
         #[test]

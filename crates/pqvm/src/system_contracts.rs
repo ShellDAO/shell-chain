@@ -99,6 +99,12 @@ pub const PROPOSE_ALGORITHM_ACTIVATION_SELECTOR: [u8; 4] =
 /// keccak256("deprecateAlgorithm(uint8)")[..4]
 pub const DEPRECATE_ALGORITHM_SELECTOR: [u8; 4] = compute_selector(b"deprecateAlgorithm(uint8)");
 /// keccak256("getValidators()")[..4]
+/// Generation-bound, ordinary weighted-governance availability recovery.
+pub const RECOVER_OFFLINE_VALIDATOR_SELECTOR: [u8; 4] =
+    compute_selector(b"recoverOfflineValidator(address,uint64)");
+/// Return consecutive misses, suspension generation and availability flags.
+pub const GET_VALIDATOR_OFFLINE_STATE_SELECTOR: [u8; 4] =
+    compute_selector(b"getValidatorOfflineState(address)");
 pub const GET_VALIDATORS_SELECTOR: [u8; 4] = compute_selector(b"getValidators()");
 /// keccak256("isValidator(address)")[..4]
 pub const IS_VALIDATOR_SELECTOR: [u8; 4] = compute_selector(b"isValidator(address)");
@@ -339,6 +345,59 @@ pub(crate) fn execute_signed_system_contract_call<S: KvStore + 'static>(
     chain_store: &ChainStore<S>,
     block_number: u64,
 ) -> Result<SystemContractOutcome, SystemContractError> {
+    if *target == registry_address()
+        && decode_selector(input)? == RECOVER_OFFLINE_VALIDATOR_SELECTOR
+        && offline_recovery_active(Some(chain_store), Some(block_number))?
+    {
+        use shell_crypto::Verifier;
+        let algorithm = signed_tx.signature.sig_type;
+        if chain_store
+            .emergency_governance_active(block_number)
+            .map_err(|error| SystemContractError::Storage(error.to_string()))?
+            && algorithm != SignatureType::MlDsa65
+        {
+            return Err(SystemContractError::Unauthorized);
+        }
+        let key = chain_store
+            .get_pubkey(&signed_tx.from)
+            .map_err(|error| SystemContractError::Storage(error.to_string()))?
+            .ok_or(SystemContractError::Unauthorized)?;
+        let account = world_state
+            .get_account(&signed_tx.from)
+            .map_err(|error| SystemContractError::Storage(error.to_string()))?;
+        let bound = if account.is_some_and(|account| account.pq_pubkey_hash != ShellHash::ZERO) {
+            crate::key_binding::key_matches(
+                world_state,
+                chain_store,
+                &signed_tx.from,
+                &key,
+                block_number,
+            )
+            .map_err(|error| SystemContractError::Storage(error.to_string()))?
+        } else {
+            true
+        }; // Registered genesis authority keys may precede a nonzero account key hash.
+        if !bound
+            || !shell_crypto::is_algorithm_allowed(algorithm)
+            || !shell_crypto::MultiVerifier
+                .verify(
+                    &key,
+                    signed_tx.sender_signing_hash().as_bytes(),
+                    &signed_tx.signature,
+                )
+                .map_err(|_| SystemContractError::Unauthorized)?
+        {
+            return Err(SystemContractError::Unauthorized);
+        }
+        return execute_system_contract_call_at_block(
+            target,
+            &signed_tx.from,
+            input,
+            world_state,
+            chain_store,
+            block_number,
+        );
+    }
     if *target == registry_address()
         && chain_store
             .emergency_governance_active(block_number)
@@ -591,6 +650,11 @@ fn execute_validator_registry_with_registry<S: KvStore + 'static>(
         s if s == ADD_VALIDATOR_SELECTOR => {
             let addr = decode_address(params)?;
             let applied = add_validator(caller, &addr, world_state, chain_store)?;
+            if applied && offline_recovery_active(chain_store, block_number)? {
+                world_state
+                    .reset_validator_offline_membership(&addr)
+                    .map_err(|error| SystemContractError::Storage(error.to_string()))?;
+            }
             let gas = SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS);
             Ok((encode_bool(applied), gas))
         }
@@ -656,6 +720,45 @@ fn execute_validator_registry_with_registry<S: KvStore + 'static>(
             let applied = deprecate_algorithm_op(caller, algo, world_state, registry)?;
             let gas = SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS);
             Ok((encode_bool(applied), gas))
+        }
+        s if s == RECOVER_OFFLINE_VALIDATOR_SELECTOR => {
+            if !offline_recovery_active(chain_store, block_number)? {
+                return Err(SystemContractError::UnknownSelector(selector));
+            }
+            let (addr, generation) = decode_address_u64(params)?;
+            let applied = recover_offline_validator(caller, &addr, generation, world_state)?;
+            Ok((
+                encode_bool(applied),
+                SYSTEM_CALL_BASE_GAS.saturating_add(SYSTEM_CALL_OP_GAS),
+            ))
+        }
+        s if s == GET_VALIDATOR_OFFLINE_STATE_SELECTOR => {
+            if !offline_recovery_active(chain_store, block_number)? {
+                return Err(SystemContractError::UnknownSelector(selector));
+            }
+            let addr = decode_address(params)?;
+            if !world_state
+                .get_validators()
+                .map_err(|error| SystemContractError::Storage(error.to_string()))?
+                .contains(&addr)
+            {
+                return Err(SystemContractError::NotFound(addr));
+            }
+            let values = [
+                world_state.get_validator_assigned_misses(&addr),
+                world_state.get_validator_suspension_generation(&addr),
+                world_state.get_validator_offline_flags(&addr),
+            ];
+            let mut output = Vec::with_capacity(96);
+            for value in values {
+                output.extend_from_slice(
+                    &U256::from(
+                        value.map_err(|error| SystemContractError::Storage(error.to_string()))?,
+                    )
+                    .to_be_bytes::<32>(),
+                );
+            }
+            Ok((output, SYSTEM_CALL_BASE_GAS))
         }
         s if s == GET_VALIDATORS_SELECTOR => {
             let validators = world_state
@@ -875,6 +978,72 @@ fn remove_validator<S: KvStore + 'static>(
         .set_validators(&validators)
         .map_err(|e| SystemContractError::Storage(e.to_string()))?;
 
+    Ok(true)
+}
+
+fn offline_recovery_active<S: KvStore>(
+    chain: Option<&ChainStore<S>>,
+    height: Option<u64>,
+) -> Result<bool, SystemContractError> {
+    let (Some(chain), Some(height)) = (chain, height) else {
+        return Ok(false);
+    };
+    Ok(chain
+        .get_chain_config()
+        .map_err(|error| SystemContractError::Storage(error.to_string()))?
+        .and_then(|config| config.offline_accounting_height)
+        .is_some_and(|activation| height >= activation))
+}
+
+fn recover_offline_validator<S: KvStore + 'static>(
+    caller: &Address,
+    target: &Address,
+    generation: u64,
+    world: &mut WorldState<S>,
+) -> Result<bool, SystemContractError> {
+    let validators = world
+        .get_validators()
+        .map_err(|error| SystemContractError::Storage(error.to_string()))?;
+    if !validators.contains(caller) {
+        return Err(SystemContractError::Unauthorized);
+    }
+    if !validators.contains(target) {
+        return Err(SystemContractError::NotFound(*target));
+    }
+    let flags = world
+        .get_validator_offline_flags(target)
+        .map_err(|error| SystemContractError::Storage(error.to_string()))?;
+    if world
+        .get_validator_suspension_generation(target)
+        .map_err(|error| SystemContractError::Storage(error.to_string()))?
+        != generation
+        || flags
+            & (WorldState::<S>::OFFLINE_PENDING_SUSPENSION | WorldState::<S>::OFFLINE_SUSPENDED)
+            == 0
+    {
+        return Err(SystemContractError::AbiDecode(
+            "offline recovery has no matching suspension generation".into(),
+        ));
+    }
+    if flags & WorldState::<S>::OFFLINE_RECOVERY_PENDING != 0 {
+        return Ok(false);
+    }
+    let op = ValidatorRegistryOp::RecoverOffline(generation);
+    if !record_validator_vote(world, op, target, caller, &validators)? {
+        return Ok(false);
+    }
+    world
+        .request_validator_offline_recovery(target, generation)
+        .map_err(|error| SystemContractError::Storage(error.to_string()))?;
+    for voter in &validators {
+        world
+            .set_storage(
+                &registry_address(),
+                &validator_vote_key(op, target, voter, &validators),
+                &ShellHash::ZERO,
+            )
+            .map_err(|error| SystemContractError::Storage(error.to_string()))?;
+    }
     Ok(true)
 }
 
@@ -1535,6 +1704,7 @@ enum ValidatorRegistryOp {
     Remove,
     SetWeight(u64),
     SetStake(U256),
+    RecoverOffline(u64),
 }
 
 impl ValidatorRegistryOp {
@@ -1545,12 +1715,14 @@ impl ValidatorRegistryOp {
             Self::Remove => b"remove",
             Self::SetWeight(_) => b"set_weight",
             Self::SetStake(_) => b"set_stake",
+            Self::RecoverOffline(_) => b"recover_offline_v1",
         }
     }
 
     fn write_context(self, bytes: &mut Vec<u8>) {
         match self {
             Self::SetWeight(weight) => bytes.extend_from_slice(&weight.to_be_bytes()),
+            Self::RecoverOffline(generation) => bytes.extend_from_slice(&generation.to_be_bytes()),
             Self::SetStake(stake) => bytes.extend_from_slice(&stake.to_be_bytes::<32>()),
             Self::Add | Self::Remove | Self::RegisterProver => {}
         }
@@ -1707,9 +1879,9 @@ fn record_validator_vote<S: KvStore + 'static>(
         ValidatorRegistryOp::Add
         | ValidatorRegistryOp::Remove
         | ValidatorRegistryOp::RegisterProver => voted_weight * 2 > total_weight,
-        ValidatorRegistryOp::SetWeight(_) | ValidatorRegistryOp::SetStake(_) => {
-            voted_weight * 3 > total_weight * 2
-        }
+        ValidatorRegistryOp::SetWeight(_)
+        | ValidatorRegistryOp::SetStake(_)
+        | ValidatorRegistryOp::RecoverOffline(_) => voted_weight * 3 > total_weight * 2,
     })
 }
 
@@ -2629,6 +2801,18 @@ pub fn encode_remove_validator_calldata(address: &Address) -> Vec<u8> {
     data
 }
 
+pub fn encode_recover_offline_validator_calldata(address: &Address, generation: u64) -> Vec<u8> {
+    let mut data = encode_set_validator_weight_calldata(address, generation);
+    data[..4].copy_from_slice(&RECOVER_OFFLINE_VALIDATOR_SELECTOR);
+    data
+}
+
+pub fn encode_get_validator_offline_state_calldata(address: &Address) -> Vec<u8> {
+    let mut data = encode_add_validator_calldata(address);
+    data[..4].copy_from_slice(&GET_VALIDATOR_OFFLINE_STATE_SELECTOR);
+    data
+}
+
 /// Encode calldata for `setValidatorWeight(address,uint64)`.
 ///
 /// ABI layout: selector (4) + address (32) + uint64 (32, big-endian right-aligned).
@@ -3066,6 +3250,162 @@ mod tests {
 
         fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
             self.inner.scan_prefix(prefix)
+        }
+    }
+
+    #[test]
+    fn offline_recovery_requires_real_root_generation_and_existing_governance_quorum() {
+        use shell_core::{Account, SignedTransaction, Transaction};
+        use shell_crypto::{DilithiumSigner, Signer};
+        let keys = [
+            DilithiumSigner::generate(),
+            DilithiumSigner::generate(),
+            DilithiumSigner::generate(),
+        ];
+        let addresses: Vec<_> = keys
+            .iter()
+            .map(|key| Address::from_public_key(key.public_key(), key.sig_type().as_u8()))
+            .collect();
+        for activation in [None, Some(9), Some(0)] {
+            let mut world = setup_with_validators(&addresses[..2]);
+            let chain = ChainStore::new(world.store().clone());
+            chain.put_chain_config(&serde_json::from_value(serde_json::json!({
+                "chain_id":1337,"genesis_hash":ShellHash::ZERO,"offline_accounting_height":activation
+            })).unwrap()).unwrap();
+            world
+                .set_validator_weights(&addresses[..2], &[2, 1])
+                .unwrap();
+            for (address, key) in addresses.iter().zip(&keys) {
+                chain.put_pubkey(address, key.public_key()).unwrap();
+                let mut account = Account::new_user_account(
+                    shell_primitives::blake3_hash(key.public_key()),
+                    U256::from(1000),
+                );
+                // Even if a custom policy permits other keys, recovery must use the real root.
+                account.validation_code_hash = Some(ShellHash::from([9; 32]));
+                world.set_account(address, &account).unwrap();
+            }
+            for _ in 0..100 {
+                world.record_validator_assigned_miss(&addresses[1]).unwrap();
+            }
+            world.apply_validator_offline_epoch().unwrap();
+            let signed = |identity: usize, signer: usize, generation| {
+                let tx = Transaction {
+                    chain_id: 1337,
+                    nonce: 0,
+                    to: Some(registry_address()),
+                    value: U256::ZERO,
+                    data: shell_primitives::Bytes::from(encode_recover_offline_validator_calldata(
+                        &addresses[1],
+                        generation,
+                    )),
+                    gas_limit: 100_000,
+                    max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+                    max_priority_fee_per_gas: 0,
+                    access_list: None,
+                    tx_type: 2,
+                    max_fee_per_blob_gas: None,
+                    blob_versioned_hashes: None,
+                };
+                let sig = keys[signer]
+                    .sign(tx.signing_hash(keys[signer].sig_type().as_u8()).as_bytes())
+                    .unwrap();
+                SignedTransaction::with_pubkey(
+                    addresses[identity],
+                    tx,
+                    sig,
+                    keys[signer].public_key().to_vec(),
+                )
+            };
+            let call = |tx: &SignedTransaction, state: &mut WorldState<MemoryDb>| {
+                execute_signed_system_contract_call(
+                    &registry_address(),
+                    tx,
+                    tx.tx.data.as_ref(),
+                    state,
+                    &chain,
+                    1,
+                )
+            };
+            let original = world.state_root().unwrap();
+            if activation != Some(0) {
+                assert!(matches!(
+                    call(&signed(0, 0, 1), &mut world),
+                    Err(SystemContractError::UnknownSelector(_))
+                ));
+                assert_eq!(world.state_root().unwrap(), original);
+                continue;
+            }
+            for tx in [
+                signed(0, 1, 1),
+                signed(2, 2, 1),
+                signed(0, 0, 0),
+                signed(0, 0, 2),
+            ] {
+                assert!(call(&tx, &mut world).is_err());
+                assert_eq!(world.state_root().unwrap(), original);
+            }
+            let mut tampered = signed(0, 0, 1);
+            tampered.signature.data[0] ^= 1;
+            assert!(matches!(
+                call(&tampered, &mut world),
+                Err(SystemContractError::Unauthorized)
+            ));
+            assert_eq!(world.state_root().unwrap(), original);
+            // Exactly2/3 does not approve recovery; duplicate votes cannot accumulate weight.
+            let first = signed(0, 0, 1);
+            call(&first, &mut world).unwrap();
+            call(&first, &mut world).unwrap();
+            assert_eq!(world.get_validator_offline_flags(&addresses[1]).unwrap(), 2);
+            call(&signed(1, 1, 1), &mut world).unwrap();
+            assert_eq!(world.get_validator_offline_flags(&addresses[1]).unwrap(), 6);
+            assert!(!world
+                .get_participating_validators()
+                .unwrap()
+                .contains(&addresses[1]));
+            let root = world.state_root().unwrap();
+            let outcome = execute_system_contract_call_at_block(
+                &registry_address(),
+                &addresses[2],
+                &encode_get_validator_offline_state_calldata(&addresses[1]),
+                &mut world,
+                &chain,
+                1,
+            )
+            .unwrap();
+            let expected: Vec<_> = [100u64, 1, 6]
+                .into_iter()
+                .flat_map(|v| U256::from(v).to_be_bytes::<32>())
+                .collect();
+            assert_eq!(outcome.output, expected);
+            assert_eq!(world.state_root().unwrap(), root);
+            world.apply_validator_offline_epoch().unwrap();
+            assert_eq!(
+                world.get_validator_assigned_misses(&addresses[1]).unwrap(),
+                0
+            );
+            for _ in 0..100 {
+                world.record_validator_assigned_miss(&addresses[1]).unwrap();
+            }
+            world.apply_validator_offline_epoch().unwrap();
+            assert_eq!(
+                world
+                    .get_validator_suspension_generation(&addresses[1])
+                    .unwrap(),
+                2
+            );
+            let original = world.state_root().unwrap();
+            assert!(call(&first, &mut world).is_err());
+            assert_eq!(
+                world.state_root().unwrap(),
+                original,
+                "old signed generation must not recover a later suspension"
+            );
+            // Recovery vote approvals from generation1 were cleared and cannot count for2.
+            call(&signed(1, 1, 2), &mut world).unwrap();
+            assert_eq!(world.get_validator_offline_flags(&addresses[1]).unwrap(), 2);
+            call(&signed(0, 0, 2), &mut world).unwrap();
+            assert_eq!(world.get_validator_offline_flags(&addresses[1]).unwrap(), 6);
         }
     }
 
@@ -3680,6 +4020,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: activation,
@@ -3770,6 +4111,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: Some(0),
                 algorithm_voting_window: activation.map(|activation_height| {
                     shell_storage::AlgorithmVotingWindow {
@@ -3879,6 +4221,7 @@ mod tests {
             native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
+            offline_accounting_height: None,
             algorithm_proposal_staging_height: Some(0),
             algorithm_voting_window: Some(shell_storage::AlgorithmVotingWindow {
                 activation_height: 0,
@@ -3953,6 +4296,7 @@ mod tests {
                     native_address_context_height: None,
                     native_validator_events_height: None,
                     prover_registry_height: None,
+                    offline_accounting_height: None,
                     algorithm_proposal_staging_height: activation,
                 })
                 .unwrap();
@@ -4108,6 +4452,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_timelock_activation_height: None,
                 algorithm_quorum_activation_height: activation,

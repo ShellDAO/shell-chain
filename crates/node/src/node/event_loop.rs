@@ -40,9 +40,25 @@ impl EarlyCommitCertificate {
         hash: ShellHash,
         certificate: Vec<u8>,
     ) {
-        if node.head_number().checked_add(1) == Some(number)
-            && node.verify_commit_certificate(number, hash, &certificate)
+        if node.head_number().checked_add(1) != Some(number) {
+            return;
+        }
+        // A published old certificate must not occupy the next-height slot.
+        if !node
+            .chain_store
+            .get_header_by_hash(&hash)
+            .is_ok_and(|header| header.is_none_or(|header| header.number == number))
         {
+            return;
+        }
+        let authenticated = if node.offline_accounting_active(number).unwrap_or(false) {
+            // A current-roster quorum is only a bounded retention hint. The unseen
+            // target may change weights; actual finality is rechecked after import.
+            node.authenticate_early_commit_certificate(hash, &certificate)
+        } else {
+            node.verify_commit_certificate(number, hash, &certificate)
+        };
+        if authenticated {
             self.pending = Some((number, hash, certificate));
         }
     }
@@ -500,6 +516,11 @@ impl<S: KvStore + 'static> Node<S> {
         })?;
         *AlgorithmRegistry::global_mut() = registry;
         *self.runtime_signer.write() = Some(Arc::clone(&signer));
+        // Recover verified timeout views before exposing services or starting tasks.
+        if let Some(addr) = self.config.proposer_address {
+            self.register_authority_pubkey(addr, signer.public_key().to_vec());
+        }
+        self.restore_pending_timeouts()?;
         let mut network = NetworkInterface::new(network);
         let local_signer_address =
             Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
@@ -613,11 +634,6 @@ impl<S: KvStore + 'static> Node<S> {
             None
         };
 
-        // Register own authority pubkey for seal verification.
-        if let Some(addr) = self.config.proposer_address {
-            self.register_authority_pubkey(addr, signer.public_key().to_vec());
-        }
-
         // ops-banner: print storage policy at startup.
         self.log_pruning_banner();
 
@@ -647,6 +663,7 @@ impl<S: KvStore + 'static> Node<S> {
         let mut sync_requested = false;
         let mut sync_request: Option<BlockRequestState> = None;
         let mut early_commit_certificate = EarlyCommitCertificate::default();
+        let mut caught_up_tx_sync = HashMap::<PeerId, std::time::Instant>::new();
         let mut body_request: Option<BodyRequestState> = None;
         let mut deferred_body_gap: Option<u64> = None;
         let startup_peers = network.peer_count().await;
@@ -1068,6 +1085,9 @@ impl<S: KvStore + 'static> Node<S> {
                             && !has_pending_stark_settlement
                             && !Self::block_time_elapsed(head.header.timestamp, now_secs, max_idle_ms)
                         {
+                            if let Err(error) = self.note_idle_proposal_window(head.number(), Self::wall_clock_millis()) {
+                                debug!(%error, "cannot refresh idle proposal window");
+                            }
                             continue;
                         }
                         // Heartbeat: produce an empty block to keep chain alive.
@@ -1203,7 +1223,10 @@ impl<S: KvStore + 'static> Node<S> {
                                     }
                                 };
                             let chain_id = self.config.chain_id;
-                            let highest_qc_hash = *self.finality.read().last_finalized_hash();
+                            let highest_qc_hash = match self.timeout_vote_qc(block_number) {
+                                Ok(hash) => hash,
+                                Err(error) => { debug!(%error, "W.5: timeout parent not ready"); continue; }
+                            };
                             let signing_message = ViewChangeMessage::signing_message(
                                 chain_id,
                                 block_number,
@@ -1222,17 +1245,7 @@ impl<S: KvStore + 'static> Node<S> {
                                         validator,
                                         signature.data,
                                     );
-                                    let total_weight: u64 = self
-                                        .consensus
-                                        .read()
-                                        .validator_weights()
-                                        .values()
-                                        .copied()
-                                        .sum();
-                                    let quorum = self
-                                        .consensus
-                                        .write()
-                                        .handle_view_change_message(msg.clone(), total_weight);
+                                    let quorum = self.apply_observed_view_change(msg.clone());
                                     warn!(
                                         view,
                                         block_number,
@@ -1526,12 +1539,29 @@ impl<S: KvStore + 'static> Node<S> {
                                             }
                                         })
                                         .collect();
+                                    let caught_up_probe = blocks.is_empty()
+                                        && self.head_number().checked_add(1) == Some(start_number);
                                     let resp = NetworkMessage::BlockResponse {
                                         blocks,
                                         commit_certificates,
                                         nonce,
                                     };
-                                    let _ = network.send_to_peer(&peer, resp).await;
+                                    let sent = network.send_to_peer(&peer, resp).await.is_ok();
+                                    if sent && caught_up_probe && !self.tx_pool.is_empty() {
+                                        let now = std::time::Instant::now();
+                                        let cooldown = Duration::from_secs(TX_REBROADCAST_INTERVAL_SECS);
+                                        caught_up_tx_sync.retain(|_, sent_at| now.saturating_duration_since(*sent_at) < cooldown);
+                                        if let std::collections::hash_map::Entry::Vacant(entry) = caught_up_tx_sync.entry(peer.clone()) {
+                                            entry.insert(now);
+                                            // Pending gossip may have arrived before this peer's
+                                            // sender state. Direct replay bypasses gossip dedup;
+                                            // normal signature/nonce admission remains mandatory.
+                                            self.rebroadcast_pending_transactions(
+                                                &network, Some(&peer), MAX_TX_REBROADCAST_PER_TICK,
+                                                "peer-caught-up",
+                                            ).await;
+                                        }
+                                    }
                                 }
                                 NetworkMessage::BlockResponse { blocks, commit_certificates, nonce } => {
                                     let first_block_number =
@@ -1596,6 +1626,13 @@ impl<S: KvStore + 'static> Node<S> {
                                         });
                                         match import_result {
                                             Ok(()) => {
+                                                // Activated quorum needs the imported target's epoch
+                                                // state, which may not exist during the precheck.
+                                                let verified_certificate = verified_certificate.or_else(|| {
+                                                    self.offline_accounting_active(num).ok().filter(|active| *active)
+                                                        .and_then(|_| certs.get(&bhash))
+                                                        .filter(|cert| self.verify_commit_certificate(num, bhash, cert))
+                                                });
                                                 let adoption = if let Some(cert) = verified_certificate {
                                                     match tokio::task::block_in_place(|| self.adopt_certified_fork(num, bhash, cert)) {
                                                         Ok(plan) => plan,
@@ -2433,6 +2470,7 @@ impl<S: KvStore + 'static> Node<S> {
                         Some(NetworkEvent::PeerDisconnected(peer)) => {
                             info!(%peer, "peer disconnected");
                             self.peer_caps.remove(&peer);
+                            caught_up_tx_sync.remove(&peer);
                             let peers = network.peer_count().await;
                             if let Some((start_number, previous_nonce)) =
                                 release_body_request_for_disconnected_peer(
@@ -3415,7 +3453,10 @@ mod challenge_tests {
                 .env(PHASE, phase)
                 .status()
                 .unwrap();
-            assert!(status.success(), "challenge recovery phase failed: {phase}");
+            assert!(
+                status.success(),
+                "challenge recovery phase failed: {phase}: {status}"
+            );
         }
         std::fs::remove_dir_all(directory).unwrap();
     }

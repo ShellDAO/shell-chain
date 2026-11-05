@@ -78,6 +78,8 @@ crates/node/src/
 | `node/event_loop.rs` | orchestrator | Main runtime loop |
 | `node/p2p_handlers.rs` | orchestrator | Network msg dispatch |
 | `node/readiness.rs` | orchestrator | Startup readiness |
+| `node/timeout_evidence.rs` | orchestrator | Verify and retain the latest signed timeout observation |
+| `node/canonical_timeouts.rs` | consensus_apply | Verify parent-bound timeout sequences, persist assigned misses and apply epoch participation changes |
 | `node/block_producer.rs` | consensus_apply | Block production + AA path |
 | `node/block_importer.rs` | consensus_apply | Block import + AA path + STARK reject |
 | `node/chain_state_machine.rs` | consensus_apply | State transitions |

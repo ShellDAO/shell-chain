@@ -467,6 +467,182 @@ impl<S: KvStore + 'static> WorldState<S> {
         Ok(())
     }
 
+    /// Availability suspension threshold, independent of economic weight/stake.
+    pub const OFFLINE_MISS_THRESHOLD: u64 = 100;
+    pub const OFFLINE_PENDING_SUSPENSION: u64 = 1;
+    pub const OFFLINE_SUSPENDED: u64 = 2;
+    pub const OFFLINE_RECOVERY_PENDING: u64 = 4;
+
+    fn validator_offline_key(domain: &[u8], validator: &Address) -> ShellHash {
+        let mut bytes = domain.to_vec();
+        bytes.extend_from_slice(validator.as_bytes());
+        keccak256(&bytes)
+    }
+
+    pub fn get_validator_offline_flags(&self, validator: &Address) -> Result<u64, StorageError> {
+        let flags = Self::hash_to_u64(self.get_storage(
+            &validator_registry_addr(),
+            &Self::validator_offline_key(b"shell:offline-status:v1:", validator),
+        )?)?;
+        if flags
+            & !(Self::OFFLINE_PENDING_SUSPENSION
+                | Self::OFFLINE_SUSPENDED
+                | Self::OFFLINE_RECOVERY_PENDING)
+            != 0
+        {
+            return Err(StorageError::Codec(
+                "invalid validator offline flags".into(),
+            ));
+        }
+        Ok(flags)
+    }
+
+    fn set_validator_offline_flags(
+        &mut self,
+        validator: &Address,
+        flags: u64,
+    ) -> Result<(), StorageError> {
+        self.set_storage(
+            &validator_registry_addr(),
+            &Self::validator_offline_key(b"shell:offline-status:v1:", validator),
+            &Self::u64_to_hash(flags),
+        )
+    }
+
+    pub fn get_validator_suspension_generation(
+        &self,
+        validator: &Address,
+    ) -> Result<u64, StorageError> {
+        Self::hash_to_u64(self.get_storage(
+            &validator_registry_addr(),
+            &Self::validator_offline_key(b"shell:offline-generation:v1:", validator),
+        )?)
+    }
+
+    /// Keep registered membership and stored economic weight intact; only the
+    /// epoch's effective production/finality roster excludes suspended members.
+    pub fn get_participating_validators(&self) -> Result<Vec<Address>, StorageError> {
+        self.get_validators()?
+            .into_iter()
+            .filter_map(|address| match self.get_validator_offline_flags(&address) {
+                Ok(flags) if flags & Self::OFFLINE_SUSPENDED != 0 => None,
+                Ok(_) => Some(Ok(address)),
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
+
+    pub fn record_validator_assigned_miss(
+        &mut self,
+        validator: &Address,
+    ) -> Result<(), StorageError> {
+        let count = self
+            .get_validator_assigned_misses(validator)?
+            .saturating_add(1);
+        let flags = self.get_validator_offline_flags(validator)?;
+        if count >= Self::OFFLINE_MISS_THRESHOLD && flags == 0 {
+            let generation = self
+                .get_validator_suspension_generation(validator)?
+                .checked_add(1)
+                .ok_or_else(|| {
+                    StorageError::State("offline suspension generation exhausted".into())
+                })?;
+            self.set_storage(
+                &validator_registry_addr(),
+                &Self::validator_offline_key(b"shell:offline-generation:v1:", validator),
+                &Self::u64_to_hash(generation),
+            )?;
+            self.set_validator_offline_flags(validator, Self::OFFLINE_PENDING_SUSPENSION)?;
+        }
+        self.set_validator_assigned_misses(validator, count)
+    }
+
+    pub fn request_validator_offline_recovery(
+        &mut self,
+        validator: &Address,
+        generation: u64,
+    ) -> Result<(), StorageError> {
+        let flags = self.get_validator_offline_flags(validator)?;
+        if self.get_validator_suspension_generation(validator)? != generation
+            || flags & (Self::OFFLINE_PENDING_SUSPENSION | Self::OFFLINE_SUSPENDED) == 0
+        {
+            return Err(StorageError::State(
+                "offline recovery has no matching suspension".into(),
+            ));
+        }
+        self.set_validator_offline_flags(validator, flags | Self::OFFLINE_RECOVERY_PENDING)
+    }
+
+    /// Joining starts a new availability counter, but never reuses a previous
+    /// suspension generation (old signed recovery requests remain stale).
+    pub fn reset_validator_offline_membership(
+        &mut self,
+        validator: &Address,
+    ) -> Result<(), StorageError> {
+        self.set_validator_assigned_misses(validator, 0)?;
+        self.set_validator_offline_flags(validator, 0)
+    }
+
+    /// Apply only at the common canonical epoch boundary. A previously triggered
+    /// suspension is not canceled merely by a later proposal resetting its count.
+    pub fn apply_validator_offline_epoch(&mut self) -> Result<(), StorageError> {
+        let mut changes = Vec::new();
+        let mut participating = 0;
+        for address in self.get_validators()? {
+            let flags = self.get_validator_offline_flags(&address)?;
+            let next = if flags & Self::OFFLINE_RECOVERY_PENDING != 0 {
+                0
+            } else if flags & Self::OFFLINE_PENDING_SUSPENSION != 0 {
+                Self::OFFLINE_SUSPENDED
+            } else {
+                flags
+            };
+            if next & Self::OFFLINE_SUSPENDED == 0 {
+                participating += 1;
+            }
+            changes.push((address, flags, next));
+        }
+        if participating == 0 {
+            return Err(StorageError::State("offline epoch cannot remove the last participating validator; authenticated recovery is required".into()));
+        }
+        for (address, flags, next) in changes {
+            if flags & Self::OFFLINE_RECOVERY_PENDING != 0 {
+                self.set_validator_assigned_misses(&address, 0)?;
+            }
+            if flags != next {
+                self.set_validator_offline_flags(&address, next)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Consecutive certified assigned proposal misses committed in canonical state.
+    pub fn get_validator_assigned_misses(&self, validator: &Address) -> Result<u64, StorageError> {
+        Self::hash_to_u64(self.get_storage(
+            &validator_registry_addr(),
+            &Self::validator_assigned_misses_key(validator),
+        )?)
+    }
+
+    pub fn set_validator_assigned_misses(
+        &mut self,
+        validator: &Address,
+        misses: u64,
+    ) -> Result<(), StorageError> {
+        self.set_storage(
+            &validator_registry_addr(),
+            &Self::validator_assigned_misses_key(validator),
+            &Self::u64_to_hash(misses),
+        )
+    }
+
+    /// Domain-separated Registry storage key, also usable for historical RPC reads.
+    pub fn validator_assigned_misses_key(validator: &Address) -> ShellHash {
+        let mut bytes = b"shell:offline-assigned-misses:v1:".to_vec();
+        bytes.extend_from_slice(validator.as_bytes());
+        keccak256(&bytes)
+    }
+
     /// Return the validator's canonical voting/proposer weight.
     ///
     /// Missing or zero weights normalize to 1 so legacy genesis files remain

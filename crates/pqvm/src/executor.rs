@@ -3141,6 +3141,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -3368,6 +3369,7 @@ mod tests {
                 native_address_context_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
+                offline_accounting_height: None,
                 algorithm_proposal_staging_height: None,
                 algorithm_quorum_activation_height: None,
                 algorithm_timelock_activation_height: None,
@@ -3453,6 +3455,7 @@ mod tests {
                                 native_address_context_height: native_activation,
                                 native_validator_events_height: None,
                                 prover_registry_height: None,
+                                offline_accounting_height: None,
                                 algorithm_proposal_staging_height: None,
                                 algorithm_quorum_activation_height: None,
                                 algorithm_timelock_activation_height: None,
@@ -4031,6 +4034,7 @@ mod tests {
                     native_address_context_height: None,
                     native_validator_events_height: None,
                     prover_registry_height: None,
+                    offline_accounting_height: None,
                     algorithm_proposal_staging_height: None,
                     algorithm_quorum_activation_height: None,
                     algorithm_timelock_activation_height: None,
@@ -6853,6 +6857,542 @@ mod tests {
                     success
                 );
                 assert_eq!(get_nonce(&mut evm, &sender), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn direct_offline_recovery_slh_root_respects_emergency_activation() {
+        use crate::tx_validation::{validate_tx_for_import_at_block, TxValidationError};
+        use shell_crypto::{
+            with_algorithm_registry_override, AlgorithmRegistry, MlDsaSigner, MultiVerifier,
+            Signer, SphincsSigner,
+        };
+
+        with_algorithm_registry_override(&AlgorithmRegistry::default(), || {
+            let root = SphincsSigner::generate();
+            let primary = MlDsaSigner::generate();
+            let fallback = SphincsSigner::generate();
+            let voter = ShellAddress::from_public_key(root.public_key(), root.sig_type().as_u8());
+            let target =
+                ShellAddress::from_public_key(primary.public_key(), primary.sig_type().as_u8());
+            assert_ne!(root.public_key(), fallback.public_key());
+            let balance = U256::from(10_000_000);
+            let stake = U256::from(123);
+            let target_account = Account::new_user_account(
+                shell_primitives::blake3_hash(primary.public_key()),
+                balance,
+            );
+
+            let signed_recovery = |sender, signer: &dyn Signer, embed_key| {
+                let mut signed = make_system_tx(
+                    sender,
+                    system_contracts::encode_recover_offline_validator_calldata(&target, 1),
+                );
+                signed.tx.max_fee_per_gas = 7;
+                signed.signature = PQSignature::new(signer.sig_type(), Vec::new());
+                if embed_key {
+                    signed.pubkey_mode =
+                        shell_core::PubkeyMode::Embedded(signer.public_key().to_vec());
+                }
+                signed.signature = signer
+                    .sign(signed.sender_signing_hash().as_bytes())
+                    .unwrap();
+                signed
+            };
+            let recovery = signed_recovery(voter, &root, false);
+            let fallback_attempt = signed_recovery(target, &fallback, true);
+            assert_eq!(root.public_key().len(), 64);
+            assert_eq!(recovery.signature.data.len(), 49_856);
+
+            for (height, expected_status) in [(4, 1), (5, 0), (6, 0)] {
+                let mut evm = setup_native_aa_evm();
+                let (world, chain) = evm.state_db_mut().world_state_and_chain_store();
+                chain
+                    .put_chain_config(
+                        &serde_json::from_value(serde_json::json!({
+                            "chain_id": 1337,
+                            "genesis_hash": ShellHash::ZERO,
+                            "offline_accounting_height": 0,
+                            "emergency_governance_height": 5,
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                // The ML authority is bound at genesis; the SLH voter is a distinct
+                // registered root in the later roster.
+                chain
+                    .initialize_genesis_authority_keys(
+                        &[(target, primary.public_key().to_vec())],
+                        &[(target, fallback.public_key().to_vec())],
+                    )
+                    .unwrap();
+                chain.put_pubkey(&voter, root.public_key()).unwrap();
+                world
+                    .set_account(
+                        &voter,
+                        &Account::new_user_account(
+                            shell_primitives::blake3_hash(root.public_key()),
+                            balance,
+                        ),
+                    )
+                    .unwrap();
+                world.set_account(&target, &target_account).unwrap();
+                world.set_validators(&[voter, target]).unwrap();
+                world
+                    .set_validator_weights(&[voter, target], &[3, 1])
+                    .unwrap();
+                world.set_validator_stake(&target, stake).unwrap();
+                for _ in 0..100 {
+                    world.record_validator_assigned_miss(&target).unwrap();
+                }
+                world.apply_validator_offline_epoch().unwrap();
+                let suspended = world.state_root().unwrap();
+                let registry_before = world
+                    .get_account(&system_contracts::registry_address())
+                    .unwrap();
+                let store = Arc::clone(world.store());
+                let header = BlockHeader {
+                    number: height,
+                    base_fee_per_gas: 7,
+                    ..sample_header()
+                };
+                assert_eq!(
+                    chain.emergency_governance_active(height).unwrap(),
+                    expected_status == 0
+                );
+                assert!(validate_tx_for_import_at_block(
+                    &fallback_attempt,
+                    world,
+                    chain,
+                    &MultiVerifier,
+                    1337,
+                    None,
+                    &header,
+                )
+                .is_err());
+                validate_tx_for_import_at_block(
+                    &recovery,
+                    world,
+                    chain,
+                    &MultiVerifier,
+                    1337,
+                    None,
+                    &header,
+                )
+                .expect("the registered SLH key can authorize the transaction envelope");
+                assert_eq!(world.state_root().unwrap(), suspended);
+
+                let outcome = evm.execute_tx(&recovery, &header, 0, 0).unwrap();
+                assert_eq!(outcome.receipt.status, expected_status);
+                assert!(outcome.gas_used > 0);
+                if expected_status == 0 {
+                    assert!(outcome.output.starts_with(b"unauthorized:"));
+                }
+                commit_pqvm_state(&outcome, evm.state_db_mut()).unwrap();
+                let persisted = evm.state_db_mut().world_state_mut().state_root().unwrap();
+                let block_hash = header.hash();
+                evm.state_db()
+                    .chain_store()
+                    .put_receipts(&block_hash, std::slice::from_ref(&outcome.receipt))
+                    .unwrap();
+                drop(evm);
+
+                let mut world = WorldState::at_root(store.clone(), &persisted).unwrap();
+                let chain = ChainStore::new(store.clone());
+                assert_eq!(
+                    chain.get_receipts(&block_hash).unwrap().unwrap(),
+                    vec![outcome.receipt]
+                );
+                assert_eq!(world.get_nonce(&voter).unwrap(), 1);
+                assert_eq!(
+                    world.get_balance(&voter).unwrap(),
+                    balance - U256::from(outcome.gas_used * 7)
+                );
+                assert_eq!(
+                    world.get_validator_offline_flags(&target).unwrap(),
+                    if expected_status == 1 { 6 } else { 2 }
+                );
+                if expected_status == 0 {
+                    assert_eq!(
+                        world
+                            .get_account(&system_contracts::registry_address())
+                            .unwrap(),
+                        registry_before
+                    );
+                }
+                assert!(!world
+                    .get_participating_validators()
+                    .unwrap()
+                    .contains(&target));
+                assert!(matches!(
+                    validate_tx_for_import_at_block(
+                        &recovery,
+                        &mut world,
+                        &chain,
+                        &MultiVerifier,
+                        1337,
+                        None,
+                        &header,
+                    ),
+                    Err(TxValidationError::NonceMismatch {
+                        expected: 1,
+                        got: 0
+                    })
+                ));
+                world.apply_validator_offline_epoch().unwrap();
+                assert_eq!(
+                    world
+                        .get_participating_validators()
+                        .unwrap()
+                        .contains(&target),
+                    expected_status == 1
+                );
+                assert_eq!(
+                    world.get_validator_suspension_generation(&target).unwrap(),
+                    1
+                );
+                assert_eq!(
+                    world.get_validator_assigned_misses(&target).unwrap(),
+                    if expected_status == 1 { 0 } else { 100 }
+                );
+                assert_eq!(world.get_validator_stake(&target).unwrap(), stake);
+                assert_eq!(world.get_validator_weight(&target).unwrap(), 1);
+                assert_eq!(
+                    world.get_account(&target).unwrap(),
+                    Some(target_account.clone())
+                );
+                let history = WorldState::at_root(store, &suspended).unwrap();
+                assert_eq!(history.get_validator_offline_flags(&target).unwrap(), 2);
+                assert_eq!(history.get_nonce(&voter).unwrap(), 0);
+                println!(
+                    "direct recovery at height {height}: status={expected_status}, gas={}",
+                    outcome.gas_used
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn aa_offline_recovery_root_emergency_and_failed_batch_rollback() {
+        use shell_crypto::{
+            with_algorithm_registry_override, AlgorithmRegistry, DilithiumSigner, MlDsaSigner,
+            Signer,
+        };
+        for algorithm in [
+            SignatureType::Dilithium3,
+            SignatureType::MlDsa65,
+            SignatureType::SphincsSha2256f,
+        ] {
+            let primary = algorithm == SignatureType::MlDsa65;
+            for emergency in [None, Some(0)] {
+                with_algorithm_registry_override(&AlgorithmRegistry::default(), || {
+                    let root: Box<dyn Signer> = if primary {
+                        Box::new(MlDsaSigner::generate())
+                    } else if algorithm == SignatureType::Dilithium3 {
+                        Box::new(DilithiumSigner::generate())
+                    } else {
+                        Box::new(shell_crypto::SphincsSigner::generate())
+                    };
+                    assert_eq!(root.sig_type(), algorithm);
+                    let other = MlDsaSigner::generate();
+                    let fallback = shell_crypto::SphincsSigner::generate();
+                    let owner =
+                        ShellAddress::from_public_key(root.public_key(), root.sig_type().as_u8());
+                    let target =
+                        ShellAddress::from_public_key(other.public_key(), other.sig_type().as_u8());
+                    let mut evm = setup_native_aa_evm();
+                    let balance = U256::from(10_000_000);
+                    let target_balance = U256::from(123_456);
+                    evm.state_db()
+                        .chain_store()
+                        .put_pubkey(&owner, root.public_key())
+                        .unwrap();
+                    evm.state_db()
+                        .chain_store()
+                        .put_pubkey(&target, other.public_key())
+                        .unwrap();
+                    evm.state_db()
+                        .chain_store()
+                        .put_chain_config(
+                            &serde_json::from_value(serde_json::json!({
+                                "chain_id":1337,"genesis_hash":ShellHash::ZERO,
+                                "aa_validator_registry_height":0,"offline_accounting_height":0,
+                                "emergency_governance_height":emergency
+                            }))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    {
+                        let world = evm.state_db_mut().world_state_mut();
+                        world
+                            .set_account(
+                                &owner,
+                                &Account::new_user_account(
+                                    shell_primitives::blake3_hash(root.public_key()),
+                                    balance,
+                                ),
+                            )
+                            .unwrap();
+                        world
+                            .set_account(
+                                &target,
+                                &Account::new_user_account(
+                                    shell_primitives::blake3_hash(other.public_key()),
+                                    target_balance,
+                                ),
+                            )
+                            .unwrap();
+                        world.set_validators(&[owner, target]).unwrap();
+                        world
+                            .set_validator_weights(&[owner, target], &[3, 1])
+                            .unwrap();
+                        world.set_validator_stake(&target, U256::from(123)).unwrap();
+                        // Suspended fixture isolates AA atomicity; genuine timeout
+                        // accounting and network epoch timing have separate regressions.
+                        for _ in 0..100 {
+                            world.record_validator_assigned_miss(&target).unwrap();
+                        }
+                        world.apply_validator_offline_epoch().unwrap();
+                        assert_eq!(world.get_validator_offline_flags(&target).unwrap(), 2);
+                    }
+                    evm.state_db()
+                        .chain_store()
+                        .initialize_genesis_authority_keys(
+                            &[(target, other.public_key().to_vec())],
+                            &[(target, fallback.public_key().to_vec())],
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        evm.state_db()
+                            .chain_store()
+                            .emergency_governance_active(sample_header().number,)
+                            .unwrap(),
+                        emergency.is_some(),
+                        "actual opt-in bindings activate the configured rule"
+                    );
+                    let recovery =
+                        system_contracts::encode_recover_offline_validator_calldata(&target, 1);
+                    if primary && emergency.is_none() {
+                        // Independent component copy keeps this delegated attempt
+                        // separate from the root rollback/retry nonce sequence below.
+                        let initial_root =
+                            evm.state_db_mut().world_state_mut().state_root().unwrap();
+                        let store = Arc::new(MemoryDb::new());
+                        for (key, value) in evm
+                            .state_db()
+                            .world_state()
+                            .store()
+                            .scan_prefix(b"")
+                            .unwrap()
+                        {
+                            store.put(&key, &value).unwrap();
+                        }
+                        let world = WorldState::at_root(store.clone(), &initial_root).unwrap();
+                        let mut delegated_evm =
+                            ShellPqvm::new(ShellStateDb::new(world, ChainStore::new(store)), 1337);
+                        let session = MlDsaSigner::generate();
+                        let mut auth = shell_core::SessionAuth {
+                            session_pubkey: shell_primitives::Bytes::from(
+                                session.public_key().to_vec(),
+                            ),
+                            session_algo: session.sig_type().as_u8(),
+                            target: Some(system_contracts::registry_address()),
+                            value_cap: U256::ZERO,
+                            expiry_block: 10,
+                            root_signature: shell_primitives::Bytes::new(),
+                            session_signature: shell_primitives::Bytes::from(vec![1]),
+                        };
+                        auth.root_signature = shell_primitives::Bytes::from(
+                            root.sign(auth.auth_hash(1337).as_bytes()).unwrap().data,
+                        );
+                        let mut delegated = make_aa_signed(
+                            owner,
+                            0,
+                            500_000,
+                            10,
+                            vec![registry_inner(recovery.clone())],
+                            None,
+                        );
+                        delegated.signature = PQSignature::new(session.sig_type(), vec![1]);
+                        delegated.aa_bundle.as_mut().unwrap().session_auth = Some(auth);
+                        delegated.signature = session
+                            .sign(delegated.sender_signing_hash().as_bytes())
+                            .unwrap();
+                        delegated
+                            .aa_bundle
+                            .as_mut()
+                            .unwrap()
+                            .session_auth
+                            .as_mut()
+                            .unwrap()
+                            .session_signature =
+                            shell_primitives::Bytes::from(delegated.signature.data.clone());
+                        crate::aa_validation::validate_aa_tx(
+                            &delegated,
+                            delegated_evm.state_db().world_state(),
+                            delegated_evm.state_db().chain_store(),
+                            &shell_crypto::MultiVerifier,
+                        )
+                        .unwrap();
+                        let rejected = delegated_evm
+                            .execute_aa_bundle(&delegated, &sample_header(), 0, 0)
+                            .unwrap();
+                        assert_eq!(rejected.receipt.status, 0,
+                            "a genuine permitted session cannot replace the recovery root signature");
+                        assert_eq!(get_nonce(&mut delegated_evm, &owner), 1);
+                        assert_eq!(
+                            delegated_evm
+                                .state_db()
+                                .world_state()
+                                .get_validator_offline_flags(&target)
+                                .unwrap(),
+                            2
+                        );
+                        let mut root_retry = make_aa_signed(
+                            owner,
+                            1,
+                            500_000,
+                            10,
+                            vec![registry_inner(recovery.clone())],
+                            None,
+                        );
+                        root_retry.signature = root.sign(&[0]).unwrap();
+                        root_retry.signature = root
+                            .sign(root_retry.sender_signing_hash().as_bytes())
+                            .unwrap();
+                        crate::aa_validation::validate_aa_tx(
+                            &root_retry,
+                            delegated_evm.state_db().world_state(),
+                            delegated_evm.state_db().chain_store(),
+                            &shell_crypto::MultiVerifier,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            delegated_evm
+                                .execute_aa_bundle(&root_retry, &sample_header(), 0, 0)
+                                .unwrap()
+                                .receipt
+                                .status,
+                            1
+                        );
+                        assert_eq!(
+                            delegated_evm
+                                .state_db()
+                                .world_state()
+                                .get_validator_offline_flags(&target)
+                                .unwrap(),
+                            6
+                        );
+                    }
+                    let mut failed = make_aa_signed(
+                        owner,
+                        0,
+                        500_000,
+                        10,
+                        vec![
+                            registry_inner(recovery.clone()),
+                            registry_inner(vec![0xff; 4]),
+                        ],
+                        None,
+                    );
+                    failed.signature = root.sign(&[0]).unwrap();
+                    failed.signature = root.sign(failed.sender_signing_hash().as_bytes()).unwrap();
+                    if algorithm == SignatureType::SphincsSha2256f {
+                        assert_eq!(root.public_key().len(), 64, "FIPS205 public key width");
+                        assert_eq!(
+                            failed.signature.data.len(),
+                            49_856,
+                            "FIPS205 SHA2-256f signature width"
+                        );
+                        let before = evm.state_db_mut().world_state_mut().state_root().unwrap();
+                        let mut tampered = failed.clone();
+                        tampered.signature.data[0] ^= 1;
+                        let mut wrong_identity = failed.clone();
+                        wrong_identity.from = target;
+                        for invalid in [&tampered, &wrong_identity] {
+                            assert!(crate::aa_validation::validate_aa_tx(
+                                invalid, evm.state_db().world_state(),
+                                evm.state_db().chain_store(), &shell_crypto::MultiVerifier,
+                            ).is_err(), "invalid fallback signature or account identity must reject before execution");
+                        }
+                        assert_eq!(
+                            evm.state_db_mut().world_state_mut().state_root().unwrap(),
+                            before
+                        );
+                        assert_eq!(get_nonce(&mut evm, &owner), 0);
+                        assert_eq!(get_balance(&mut evm, &owner), balance);
+                        assert_eq!(get_nonce(&mut evm, &target), 0);
+                        assert_eq!(get_balance(&mut evm, &target), target_balance);
+                    }
+                    crate::aa_validation::validate_aa_tx(
+                        &failed,
+                        evm.state_db().world_state(),
+                        evm.state_db().chain_store(),
+                        &shell_crypto::MultiVerifier,
+                    )
+                    .unwrap();
+                    let result = evm
+                        .execute_aa_bundle(&failed, &sample_header(), 0, 0)
+                        .unwrap();
+                    assert_eq!(result.receipt.status, 0);
+                    assert!(!result.system_contract_effects.validator_set_changed);
+                    assert!(result.system_contract_effects.updated_accounts.is_empty());
+                    assert_eq!(get_nonce(&mut evm, &owner), 1);
+                    assert_eq!(
+                        get_balance(&mut evm, &owner),
+                        balance - U256::from(result.receipt.gas_used) * U256::from(10)
+                    );
+                    {
+                        let world = evm.state_db().world_state();
+                        assert_eq!(world.get_validator_assigned_misses(&target).unwrap(), 100);
+                        assert_eq!(
+                            world.get_validator_suspension_generation(&target).unwrap(),
+                            1
+                        );
+                        assert_eq!(world.get_validator_offline_flags(&target).unwrap(), 2);
+                        assert_eq!(world.get_validator_stake(&target).unwrap(), U256::from(123));
+                        assert_eq!(world.get_balance(&target).unwrap(), target_balance);
+                    }
+                    let mut retry =
+                        make_aa_signed(owner, 1, 500_000, 10, vec![registry_inner(recovery)], None);
+                    retry.signature = root.sign(&[0]).unwrap();
+                    retry.signature = root.sign(retry.sender_signing_hash().as_bytes()).unwrap();
+                    crate::aa_validation::validate_aa_tx(
+                        &retry,
+                        evm.state_db().world_state(),
+                        evm.state_db().chain_store(),
+                        &shell_crypto::MultiVerifier,
+                    )
+                    .unwrap();
+                    let result = evm
+                        .execute_aa_bundle(&retry, &sample_header(), 0, 0)
+                        .unwrap();
+                    let allowed = primary || emergency.is_none();
+                    assert_eq!(result.receipt.status, u8::from(allowed));
+                    assert_eq!(get_nonce(&mut evm, &owner), 2);
+                    let world = evm.state_db_mut().world_state_mut();
+                    assert_eq!(
+                        world.get_validator_offline_flags(&target).unwrap(),
+                        if allowed { 6 } else { 2 }
+                    );
+                    assert_eq!(world.get_validator_assigned_misses(&target).unwrap(), 100);
+                    world.apply_validator_offline_epoch().unwrap();
+                    assert_eq!(
+                        world.get_validator_assigned_misses(&target).unwrap(),
+                        if allowed { 0 } else { 100 }
+                    );
+                    assert_eq!(
+                        world.get_validator_suspension_generation(&target).unwrap(),
+                        1
+                    );
+                    assert_eq!(
+                        world.get_validator_offline_flags(&target).unwrap(),
+                        if allowed { 0 } else { 2 }
+                    );
+                    assert_eq!(world.get_validator_weight(&target).unwrap(), 1);
+                    assert_eq!(world.get_validator_stake(&target).unwrap(), U256::from(123));
+                });
             }
         }
     }

@@ -80,6 +80,8 @@ pub struct WPoaEngine {
     slash_weights: HashMap<Address, u64>,
     view_change_state: Mutex<ViewChangeState>,
     signer: Option<Arc<dyn Signer>>,
+    last_view_change_votes: Vec<ViewChangeMessage>,
+    strict_timeout_quorum: bool,
 }
 
 impl WPoaEngine {
@@ -124,6 +126,8 @@ impl WPoaEngine {
             slash_weights: HashMap::new(),
             view_change_state: Mutex::new(view_change_state),
             signer: None,
+            last_view_change_votes: Vec::new(),
+            strict_timeout_quorum: false,
         }
     }
 
@@ -155,7 +159,7 @@ impl WPoaEngine {
             .unwrap_or_else(|| self.inner.config().proposer_for_block(block_number))
     }
 
-    fn proposer_for_block_in_view(&self, block_number: u64, view: u64) -> Address {
+    pub fn proposer_for_block_in_view(&self, block_number: u64, view: u64) -> Address {
         if view == 0 {
             return self.base_proposer_for_block(block_number);
         }
@@ -199,18 +203,44 @@ impl WPoaEngine {
         msg: ViewChangeMessage,
         total_weight: u64,
     ) -> bool {
-        let validator_weights = self.validator_weights();
-        let mut state = self.view_change_state();
+        self.handle_view_change_with_commit(msg, total_weight, &mut |_| true)
+    }
 
-        if msg.view != state.current_view {
+    fn handle_view_change_with_commit(
+        &mut self,
+        msg: ViewChangeMessage,
+        total_weight: u64,
+        commit: &mut dyn FnMut(&[ViewChangeMessage]) -> bool,
+    ) -> bool {
+        let validator_weights = self.validator_weights();
+        let strict = self.strict_timeout_quorum;
+        let mut candidate = self.view_change_state().clone();
+        if msg.view != candidate.current_view {
             return false;
         }
-
-        state.configure_quorum(validator_weights, total_weight);
-        if state.record_view_change(msg) {
-            state.advance_view();
+        if strict {
+            candidate.configure_strict_quorum(validator_weights, total_weight);
+        } else {
+            candidate.configure_quorum(validator_weights, total_weight);
+        }
+        if candidate.record_view_change(msg) {
+            let votes = candidate
+                .pending_view_changes
+                .get(&candidate.current_view)
+                .cloned()
+                .unwrap_or_default();
+            if strict && !commit(&votes) {
+                return false;
+            }
+            candidate.advance_view();
+            if strict {
+                candidate.restart_timeout_clock();
+            }
+            *self.view_change_state() = candidate;
+            self.last_view_change_votes = votes;
             true
         } else {
+            *self.view_change_state() = candidate;
             false
         }
     }
@@ -469,6 +499,23 @@ impl ConsensusEngine for WPoaEngine {
         WPoaEngine::handle_view_change_message(self, msg, total_weight)
     }
 
+    fn set_strict_timeout_quorum(&mut self, strict: bool) {
+        self.strict_timeout_quorum = strict;
+    }
+
+    fn handle_view_change_with_commit(
+        &mut self,
+        msg: ViewChangeMessage,
+        total_weight: u64,
+        commit: &mut dyn FnMut(&[ViewChangeMessage]) -> bool,
+    ) -> bool {
+        WPoaEngine::handle_view_change_with_commit(self, msg, total_weight, commit)
+    }
+
+    fn last_view_change_votes(&self) -> Vec<ViewChangeMessage> {
+        self.last_view_change_votes.clone()
+    }
+
     fn current_view(&self) -> u64 {
         WPoaEngine::current_view(self)
     }
@@ -476,6 +523,10 @@ impl ConsensusEngine for WPoaEngine {
     fn check_view_change_timeout(&self, now_ms: u64, block_time_ms: u64) -> bool {
         self.view_change_state()
             .check_timeout(now_ms, block_time_ms)
+    }
+
+    fn note_proposal_idle(&mut self, now_ms: u64) {
+        self.view_change_state().last_block_time_ms = now_ms;
     }
 
     fn note_block_progress(&mut self, now_ms: u64) {

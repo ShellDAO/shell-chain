@@ -120,6 +120,14 @@ impl request_response::Codec for DirectMessageCodec {
                 "direct message exceeds configured size limit",
             ));
         }
+        // A stream cancelled before its body arrives is a transport failure,
+        // not a malformed application message attributable to the peer.
+        if data.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "direct message stream closed before receiving a body",
+            ));
+        }
         Ok(data.into())
     }
 
@@ -1945,6 +1953,36 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
+    #[tokio::test]
+    async fn cancelled_empty_direct_stream_does_not_penalize_the_peer() {
+        let mut codec = DirectMessageCodec {
+            max_message_size: crate::message::MAX_MESSAGE_SIZE,
+        };
+        let error = request_response::Codec::read_request(
+            &mut codec,
+            &DIRECT_MESSAGE_PROTOCOL,
+            &mut Cursor::new(Vec::<u8>::new()),
+        )
+        .await
+        .expect_err("a cancelled stream must not become an empty application message");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(!inbound_direct_message_is_peer_violation(
+            &request_response::InboundFailure::Io(error)
+        ));
+
+        // A nonempty malformed body still reaches the normal decoder and ban path.
+        let body = request_response::Codec::read_request(
+            &mut codec,
+            &DIRECT_MESSAGE_PROTOCOL,
+            &mut Cursor::new(b"invalid message".to_vec()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            crate::message::deserialize_checked(&body, crate::message::MAX_MESSAGE_SIZE).is_err()
+        );
+    }
+
     #[test]
     fn direct_message_streams_respect_the_per_connection_byte_budget() {
         assert_eq!(
@@ -2372,6 +2410,143 @@ mod tests {
         assert!(!inbound_direct_message_is_peer_violation(
             &request_response::InboundFailure::Timeout
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn valid_direct_bursts_do_not_ban_connected_peers() {
+        let config = NetworkConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            enable_mdns: false,
+            enable_kademlia: false,
+            enable_peer_scoring: false,
+            enable_relay: false,
+            enable_relay_server: false,
+            enable_dcutr: false,
+            enable_autonat: false,
+            ..Default::default()
+        };
+        let first = Libp2pNetwork::new(&config).await.unwrap();
+        let first_info = first.local_node_info_handle();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while first_info.read().unwrap().listen_addresses.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let info = first_info.read().unwrap().clone();
+        let second = Libp2pNetwork::new(&NetworkConfig {
+            boot_nodes: vec![format!("{}/p2p/{}", info.listen_addresses[0], info.peer_id)],
+            ..config
+        })
+        .await
+        .unwrap();
+        let counts = [first.peer_count_handle(), second.peer_count_handle()];
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while counts
+                .iter()
+                .any(|count| count.load(Ordering::Relaxed) == 0)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let peers = [
+            PeerId(
+                second
+                    .local_node_info_handle()
+                    .read()
+                    .unwrap()
+                    .peer_id
+                    .clone(),
+            ),
+            PeerId(info.peer_id),
+        ];
+        let mut senders = Vec::new();
+        let mut workers = Vec::new();
+        let mut controls = Vec::new();
+        for (mut network, peer) in [first, second].into_iter().zip(peers) {
+            let control = Arc::new(AtomicUsize::new(0));
+            controls.push(Arc::clone(&control));
+            let (sender, mut commands) = mpsc::channel(32);
+            senders.push(sender);
+            workers.push(tokio::spawn(async move {
+                let mut received = 0;
+                loop {
+                    tokio::select! {
+                        event = network.next_event() => {
+                            if let Some(NetworkEvent::MessageReceived { message, .. }) = event {
+                                received += 1;
+                                if matches!(message, NetworkMessage::BlockRequest { nonce, .. }
+                                    if nonce >= u64::MAX - 1) {
+                                    control.store(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        command = commands.recv() => {
+                            let Some(message) = command else { break };
+                            network.send_to_peer(&peer, message).await.unwrap();
+                        }
+                    }
+                }
+                network.shutdown().await.unwrap();
+                received
+            }));
+        }
+        // More than the byte-bounded two-stream capacity, in both directions.
+        // Cancellation may drop a request, but must not turn it into a ban.
+        for batch in 0..32 {
+            for index in 0..8 {
+                for sender in &senders {
+                    sender
+                        .send(NetworkMessage::BlockRequest {
+                            start_number: 1,
+                            count: 1,
+                            nonce: batch * 8 + index,
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Delivery of the overloaded burst is not guaranteed. Require a new,
+        // independently identified control request after pressure subsides.
+        let control_result = tokio::time::timeout(Duration::from_secs(15), async {
+            for (index, sender) in senders.iter().enumerate() {
+                while controls[1 - index].load(Ordering::Relaxed) == 0 {
+                    sender
+                        .send(NetworkMessage::BlockRequest {
+                            start_number: 1,
+                            count: 1,
+                            nonce: u64::MAX - index as u64,
+                        })
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        })
+        .await;
+        let connected = counts.map(|count| count.load(Ordering::Relaxed));
+        drop(senders);
+        for worker in workers {
+            assert!(
+                worker.await.unwrap() > 0,
+                "actual direct messages were received"
+            );
+        }
+        assert!(
+            control_result.is_ok(),
+            "both post-burst control requests arrive"
+        );
+        assert_eq!(
+            connected,
+            [1, 1],
+            "valid burst traffic must not ban either peer"
+        );
     }
 
     #[tokio::test]

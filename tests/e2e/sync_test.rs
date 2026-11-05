@@ -187,6 +187,7 @@ async fn snapshot_export_import_roundtrip() {
     env.chain_store
         .put_chain_config(&ChainConfig {
             emergency_governance_height: None,
+            offline_accounting_height: None,
             log_address_activation_height: None,
             algorithm_voting_window: None,
             algorithm_proposal_identity_height: None,

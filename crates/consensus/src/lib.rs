@@ -36,7 +36,9 @@ fn round_robin_index(block_number: u64, count: usize) -> Option<usize> {
     let count = u64::try_from(count).expect("validator count fits in u64");
     Some(usize::try_from(block_number % count).expect("proposer index fits in usize"))
 }
-pub use view_change::{ViewChangeMessage, ViewChangeState, VIEW_CHANGE_TIMEOUT_MS};
+pub use view_change::{
+    TimeoutCertificate, ViewChangeMessage, ViewChangeState, VIEW_CHANGE_TIMEOUT_MS,
+};
 pub use window::{ProofWindowManager, WindowConfig, WindowError, WindowState};
 pub use wpoa::{WPoaConfig, WPoaEngine};
 pub use wpoa_state::{WPoaEvent, WPoaRound};

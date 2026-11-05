@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Retain independently verified PQ-signed timeout certificates and add explicit,
+  default-off canonical assigned-opportunity accounting. Signed parent-bound
+  header evidence is verified against epoch state in production/import/replay;
+  assigned misses and valid-proposal resets persist in the state trie. Immutable
+  future scheduling and trusted-snapshot checks preserve legacy behavior.
+  At 100 certified consecutive misses, suspend participation at the common epoch
+  boundary while retaining balance, stake, registered membership and stored weight.
+  Root-signed, generation-bound governance recovery applies at a common boundary.
+  Fresh CLI/P2P acceptance covers ML-DSA and SLH-DSA producer/recovery roots
+  with an ML-DSA returning validator, weights 3:1, actual timeouts, suspension,
+  root recovery and renewed proposal participation. Other configurations,
+  public delivery and activation remain pending.
+
+### Fixed
+
+- Treat an empty cancelled direct-message stream as a transport EOF rather than
+  malformed application data. Concurrent valid requests no longer accumulate
+  false peer-ban violations; message limits and malformed-payload bans remain.
+- Keep an unchanged retained canonical finality certificate verifiable after
+  later off-chain penalties. Recheck durable checkpoint identity and retained
+  address-bound signatures; newly insufficient quorum cannot finalize a new block.
+- Preserve authenticated early commit certificates until their activated target
+  state is available, then verify its actual epoch quorum before finalizing.
+  Recheck synchronization sidecars after importing a previously unseen block.
+  Reject published old certificates relabeled with a future height before they
+  can replace genuine next-block evidence.
+- Replay the bounded pending transaction prefix directly after a peer reaches
+  the current tip. A joining validator can recover transactions rejected during
+  block catch-up without depending on duplicate gossip or relaxing nonce checks.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed
@@ -24,6 +56,7 @@ All notable changes to this project will be documented in this file.
   unchanged.
 
 ### Added
+
 
 - Restore a mnemonic-backed wallet with `shell-node pq-hd restore`, including
   secure recovery-phrase/passphrase file inputs for noninteractive use. Save only

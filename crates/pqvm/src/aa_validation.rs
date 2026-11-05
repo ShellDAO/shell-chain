@@ -2671,6 +2671,7 @@ mod tests {
             native_address_context_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
+            offline_accounting_height: None,
             algorithm_proposal_staging_height: None,
             algorithm_quorum_activation_height: None,
             algorithm_timelock_activation_height: None,
@@ -3865,39 +3866,54 @@ mod tests {
         assert!(outcome.protocol_checks_nonce);
     }
 
-    #[test]
-    fn custom_signature_policy_respects_deprecation_activation() {
-        use shell_crypto::{with_algorithm_registry_override, AlgorithmRegistry, SphincsSigner};
+    // Test policy for the v2 ABI. Verify the supplied signing hash and
+    // signature against keys pinned in the policy bytecode.
+    fn custom_signature_policy(signers: &[&dyn Signer]) -> Vec<u8> {
         fn push(code: &mut Vec<u8>, value: usize) {
             code.push(0x61);
             code.extend_from_slice(&u16::try_from(value).unwrap().to_be_bytes());
         }
+
+        let mut code = vec![0x36, 0x5f, 0x5f, 0x37]; // CALLDATACOPY(0, 0, size)
+        let mut key_offsets = Vec::new();
+        for (index, signer) in signers.iter().enumerate() {
+            push(&mut code, signer.public_key().len());
+            key_offsets.push(code.len() + 1);
+            push(&mut code, 0);
+            push(&mut code, 60_000);
+            code.push(0x39); // CODECOPY: load the pinned key.
+            push(&mut code, signer.sig_type().as_u8().into());
+            push(&mut code, 32);
+            push(&mut code, 4); // Signing hash, after the ABI selector.
+            push(&mut code, signer.public_key().len());
+            push(&mut code, 60_000);
+            push(&mut code, 388);
+            code.push(0x51); // MLOAD: signature length.
+            push(&mut code, 420); // Signature bytes.
+            code.push(crate::pqvm_opcodes::OPCODE_PQVERIFY);
+            if index != 0 {
+                code.push(0x17); // OR: any pinned signer may authorize.
+            }
+        }
+        code.extend_from_slice(&[0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3]); // Return the verification result.
+        for (offset, signer) in key_offsets.into_iter().zip(signers) {
+            let key_start = u16::try_from(code.len()).unwrap().to_be_bytes();
+            code[offset..offset + 2].copy_from_slice(&key_start);
+            code.extend_from_slice(signer.public_key());
+        }
+        code
+    }
+
+    #[test]
+    fn custom_signature_policy_respects_deprecation_activation() {
+        use shell_crypto::{with_algorithm_registry_override, AlgorithmRegistry, SphincsSigner};
         for activation in [None, Some(10)] {
             for signer in [
                 Box::new(DilithiumSigner::generate()) as Box<dyn Signer>,
                 Box::new(MlDsaSigner::generate()),
                 Box::new(SphincsSigner::generate()),
             ] {
-                // The embedded key is the account policy; calldata supplies the current
-                // transaction signing hash and signature, not an arbitrary challenge.
-                let mut code = vec![0x36, 0x5f, 0x5f, 0x37];
-                push(&mut code, signer.public_key().len());
-                let offset_patch = code.len() + 1;
-                push(&mut code, 0);
-                push(&mut code, 60_000);
-                code.push(0x39);
-                push(&mut code, signer.sig_type().as_u8().into());
-                push(&mut code, 32);
-                push(&mut code, 4);
-                push(&mut code, signer.public_key().len());
-                push(&mut code, 60_000);
-                push(&mut code, 388);
-                code.push(0x51);
-                push(&mut code, 420);
-                code.extend_from_slice(&[0xb0, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3]);
-                let offset = u16::try_from(code.len()).unwrap().to_be_bytes();
-                code[offset_patch..offset_patch + 2].copy_from_slice(&offset);
-                code.extend_from_slice(signer.public_key());
+                let code = custom_signature_policy(&[signer.as_ref()]);
                 let from = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
                 let (mut ws, cs) = setup_stores();
                 install_paymaster(&mut ws, &cs, from, code);
@@ -4006,6 +4022,180 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn custom_policy_signer_cannot_replace_offline_recovery_root() {
+        use crate::executor::ShellPqvm;
+        use crate::state_db::ShellStateDb;
+        use crate::system_contracts::{
+            encode_recover_offline_validator_calldata, registry_address,
+        };
+        use crate::tx_validation::{validate_tx_for_import_at_block, TxValidationError};
+        use shell_core::AaBundle;
+        use shell_crypto::{with_algorithm_registry_override, AlgorithmRegistry};
+
+        with_algorithm_registry_override(&AlgorithmRegistry::default(), || {
+            let root = MlDsaSigner::generate();
+            let alternate = MlDsaSigner::generate();
+            let owner = Address::from_public_key(root.public_key(), root.sig_type().as_u8());
+            let target =
+                Address::from_public_key(alternate.public_key(), alternate.sig_type().as_u8());
+            assert_ne!(owner, target);
+            let registry = registry_address();
+            let store = Arc::new(MemoryDb::new());
+            let mut ws = WorldState::new(store.clone());
+            let cs = ChainStore::new(store);
+            let code = custom_signature_policy(&[&root, &alternate]);
+            let policy_hash = keccak256(&code);
+            cs.put_code(&policy_hash, &code).unwrap();
+            cs.put_pubkey(&owner, root.public_key()).unwrap();
+            cs.put_pubkey(&target, alternate.public_key()).unwrap();
+            cs.put_chain_config(
+                &serde_json::from_value(serde_json::json!({
+                    "chain_id": 1337,
+                    "genesis_hash": ShellHash::ZERO,
+                    "validation_pqvm_height": 0,
+                    "aa_validator_registry_height": 0,
+                    "offline_accounting_height": 0
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let balance = U256::from(10_000_000);
+            let mut owner_account =
+                Account::new_user_account(blake3_hash(root.public_key()), balance);
+            owner_account.validation_code_hash = Some(policy_hash);
+            ws.set_account(&owner, &owner_account).unwrap();
+            let target_account =
+                Account::new_user_account(blake3_hash(alternate.public_key()), U256::from(123_456));
+            ws.set_account(&target, &target_account).unwrap();
+            ws.set_validators(&[owner, target]).unwrap();
+            ws.set_validator_weights(&[owner, target], &[3, 1]).unwrap();
+            ws.set_validator_stake(&target, U256::from(123)).unwrap();
+            for _ in 0..100 {
+                ws.record_validator_assigned_miss(&target).unwrap();
+            }
+            ws.apply_validator_offline_epoch().unwrap();
+            let registry_before = ws.get_account(&registry).unwrap();
+
+            let header = BlockHeader {
+                number: 1,
+                gas_limit: 50_000_000,
+                base_fee_per_gas: 7,
+                ..BlockHeader::default()
+            };
+            let signed_recovery = |nonce, signer: &MlDsaSigner| {
+                let mut tx = base_tx(1337, nonce);
+                tx.tx_type = AA_BUNDLE_TX_TYPE;
+                tx.to = None;
+                tx.gas_limit = 500_000;
+                let mut signed = SignedTransaction::with_aa_bundle(
+                    owner,
+                    tx,
+                    PQSignature::new(signer.sig_type(), vec![1]),
+                    PubkeyMode::Reference,
+                    AaBundle {
+                        inner_calls: vec![InnerCall {
+                            to: Some(registry),
+                            value: U256::ZERO,
+                            data: Bytes::from(encode_recover_offline_validator_calldata(
+                                &target, 1,
+                            )),
+                            gas_limit: 100_000,
+                        }],
+                        ..AaBundle::default()
+                    },
+                )
+                .unwrap();
+                signed.signature = signer
+                    .sign(signed.sender_signing_hash().as_bytes())
+                    .unwrap();
+                signed
+            };
+            let delegated = signed_recovery(0, &alternate);
+            let mut tampered = delegated.clone();
+            tampered.signature.data[0] ^= 1;
+            let before_admission = ws.state_root().unwrap();
+            assert!(validate_tx_for_import_at_block(
+                &tampered,
+                &mut ws,
+                &cs,
+                &MultiVerifier,
+                1337,
+                None,
+                &header,
+            )
+            .is_err());
+            validate_tx_for_import_at_block(
+                &delegated,
+                &mut ws,
+                &cs,
+                &MultiVerifier,
+                1337,
+                None,
+                &header,
+            )
+            .expect("the custom policy permits the alternate signing key");
+            assert_eq!(ws.state_root().unwrap(), before_admission);
+
+            let mut evm = ShellPqvm::new(ShellStateDb::new(ws, cs), 1337);
+            let rejected = evm.execute_aa_bundle(&delegated, &header, 0, 0).unwrap();
+            assert_eq!(rejected.receipt.status, 0);
+            assert!(rejected.receipt.logs.is_empty());
+            assert!(rejected.output.starts_with(b"unauthorized:"));
+            let (ws, cs) = evm.state_db_mut().world_state_and_chain_store();
+            let owner_after = ws.get_account(&owner).unwrap().unwrap();
+            assert_eq!(owner_after.nonce, 1);
+            assert!(rejected.gas_used > 0);
+            // Fee reconciliation is inactive, so settlement uses the 10-unit fee cap.
+            assert_eq!(
+                owner_after.balance,
+                balance - U256::from(rejected.gas_used) * U256::from(10)
+            );
+            assert_eq!(owner_after.validation_code_hash, Some(policy_hash));
+            assert_eq!(cs.get_pubkey(&owner).unwrap().unwrap(), root.public_key());
+            assert_eq!(ws.get_account(&registry).unwrap(), registry_before);
+            assert_eq!(
+                ws.get_account(&target).unwrap(),
+                Some(target_account.clone())
+            );
+            assert_eq!(ws.get_validator_offline_flags(&target).unwrap(), 2);
+            assert_eq!(ws.get_validator_assigned_misses(&target).unwrap(), 100);
+            assert_eq!(ws.get_validator_suspension_generation(&target).unwrap(), 1);
+            assert!(matches!(
+                validate_tx_for_import_at_block(
+                    &delegated,
+                    ws,
+                    cs,
+                    &MultiVerifier,
+                    1337,
+                    None,
+                    &header,
+                ),
+                Err(TxValidationError::NonceMismatch {
+                    expected: 1,
+                    got: 0
+                })
+            ));
+
+            let retry = signed_recovery(1, &root);
+            validate_tx_for_import_at_block(&retry, ws, cs, &MultiVerifier, 1337, None, &header)
+                .expect("the same policy permits the registered root");
+            let recovered = evm
+                .execute_aa_bundle(&retry, &header, 1, rejected.gas_used)
+                .unwrap();
+            assert_eq!(recovered.receipt.status, 1);
+            let ws = evm.state_db_mut().world_state_mut();
+            assert_eq!(ws.get_validator_offline_flags(&target).unwrap(), 6);
+            ws.apply_validator_offline_epoch().unwrap();
+            assert_eq!(ws.get_validator_offline_flags(&target).unwrap(), 0);
+            assert_eq!(ws.get_validator_assigned_misses(&target).unwrap(), 0);
+            assert_eq!(ws.get_validator_suspension_generation(&target).unwrap(), 1);
+            assert_eq!(ws.get_validator_stake(&target).unwrap(), U256::from(123));
+            assert_eq!(ws.get_validator_weight(&target).unwrap(), 1);
+            assert_eq!(ws.get_account(&target).unwrap(), Some(target_account));
+        });
     }
 
     #[test]

@@ -596,6 +596,243 @@ triggered when a validator hasn't proposed a block for more than
 SlashType::Offline
 ```
 
+### Certified timeout accounting (Unreleased)
+
+The node retains the most recent independently verified timeout certificate in
+its local database, from either received signed view-change votes or its local
+signed timeout path. `Node::latest_timeout_certificate` retrieves that observation
+after process restart. Its signatures must be reverified against the applicable
+trusted roster; the local journal alone cannot change canonical state or justify
+suspension.
+
+The optional `offline_accounting_height` in genesis selects canonical accounting
+in unreleased source. Missing or null preserves legacy header/state behavior.
+An existing chain can schedule it only strictly above its current head, once;
+subsequent startup cannot change or remove it. Trusted snapshot import requires
+the identical schedule before writing state. Height zero is available for fresh
+isolated source tests. This is a protocol implementation under validation, not a
+completed network rollout or a claim that a published binary enables the rule.
+
+At and after the schedule, a rotated proposal carries the complete sequential
+view-change certificates in a distinct consensus `extra_data` envelope covered by
+the block hash and proposer seal. This does not restore deprecated block-level
+STARK settlement: STARK proofs remain system transactions. Timeout proofs use the
+existing 2 MiB consensus-message budget. Each proof requires distinct active
+address-bound PQ signatures with strictly greater than two-thirds weight, the
+same chain/height/view, and the actual parent hash as highest QC, including the
+genesis parent. Local votes require that parent to be finalized. Active view
+advances restart their timeout window; declared views must meet the protocol's
+configured delay. Proof quorum verification composes the epoch roster with the
+existing absolute voting penalties, preserving registered proposer scheduling and
+stored economic weights. An activated view cannot advance until its complete proof
+sequence has been retained and flushed. A failed write leaves the view retryable.
+At startup, only a complete sequence reverified against the current finalized
+parent and active roster restores a view; stale data cannot alter another round.
+Malformed current proofs fail startup before services start. Before this independent schedule, legacy view-change thresholds
+and timing remain unchanged.
+
+Production, import and fork replay share proof verification and trie accounting.
+They derive assignments from the parent's epoch-boundary Registry state, following
+fork ancestry when height indexes still refer to the old canonical branch. Proposal and proof preflight use that parent branch before side-fork metadata
+is retained. Confirmation votes, commit certificates, fork selection and finality
+use the target block's effective epoch identities and weights. A competing recovery
+or weight update cannot borrow the live branch's voting weight. Exactly two-thirds
+is insufficient in each path. A certificate arriving before its block can be
+retained only for the next height, within the consensus-message budget, as an
+authenticated current-roster quorum hint. Retention does not establish target
+quorum. A certificate that needs an unseen new roster is instead rechecked from
+its sync sidecar after that block is imported.
+After import, revalidate signatures, the actual target epoch and canonical hash
+before finalizing. A known header must match the claimed height; replaying an old
+certificate with a forged future height cannot replace the pending evidence.
+Synchronization also rechecks a supplied certificate after
+import makes that epoch state available; an unsuccessful precheck cannot silently
+discard valid evidence. Legacy finalized-view prechecks remain unchanged.
+An unchanged certificate already accepted by both the durable and in-memory
+finalized checkpoint is rechecked using its retained address-bound signer keys.
+Its canonical hash, stored header height and exact persisted certificate must
+match, and every signature is verified again. Later off-chain penalties cannot
+retroactively revoke that earlier decision. This does not authorize a new block,
+a side fork or a replacement certificate; those still need their applicable
+strict quorum. Historical sanction provenance for a cold importer remains a
+separate acceptance obligation.
+When a peer probes just beyond the current tip, replay a bounded pending-transaction
+prefix directly to that peer. Transactions first seen during block catch-up may
+have failed nonce checks, and duplicate gossip publication cannot deliver them
+again. Direct retries preserve sender nonce order, the existing per-burst limit,
+a per-peer cooldown and ordinary signature, balance and nonce validation. Only
+certified assigned opportunities increment that authority's consecutive counter;
+a valid proposal resets its own counter. Invalid, duplicated, incomplete or
+wrong-parent evidence cannot publish state changes. Counts live in canonical
+Registry storage, so later current-state changes do not overwrite historical
+roots. The existing event-loop idle/readiness gates precede timeout voting;
+absence of transactions is not itself evidence of a miss.
+
+At 100 consecutive certified assigned misses, canonical state queues suspension
+for the common epoch boundary. A later valid proposal resets the counter but
+cannot cancel an already triggered suspension. At the boundary the authority is
+excluded from consensus participation; its registered membership, stored weight,
+stake and balance are retained. No tokens are deducted or burned and no additional
+percentage weight reduction is applied. A boundary cannot publish an empty active
+roster; authenticated recovery must resolve that case before it can be committed.
+
+The Registry exposes `recoverOfflineValidator(address,uint64)` for recovery votes.
+The second argument is the suspension generation, included in the signed calldata
+so an old request cannot authorize a later suspension. Each vote requires a real
+registered root signature; an account's custom policy or session key cannot
+substitute for that root. The existing emergency-governance primary-algorithm
+restriction also applies when its separate schedule and immutable genesis
+fallback bindings are active. A height alone leaves the legacy opt-out unchanged. Voting reuses
+registered validators, stored weights and the existing strict greater-than-two-
+thirds governance quorum. Consensus suspension does not remove governance rights.
+Quorum approval queues recovery for the next common boundary, where the counter
+resets and participation resumes. Rejoining clears old availability status while
+retaining the monotonic generation to prevent recovery replay.
+
+In an atomic AA bundle, a later failed inner call rolls back an earlier recovery
+vote and its availability metadata; sender nonce and consumed gas still advance.
+A valid same-generation root retry can then queue recovery. A genuinely root-
+authorized session for the Registry remains insufficient for this root-only
+operation, even if its transaction passes ordinary session admission.
+
+The genuine-root AA regression covers D3, ML-DSA and SLH-DSA-SHA2-256f across
+configured emergency opt-in, failed-batch retry, and an ML-DSA session refusal.
+Fallback cases use genuine 64-byte keys and 49,856-byte signatures; altered
+signatures or sender identities reject at admission:
+
+```bash
+cargo test -p shell-pqvm aa_offline_recovery_root_emergency_and_failed_batch_rollback -- --nocapture
+```
+
+These component regressions start from a suspended validator. The native
+network regression below covers genuine 100-certificate accounting and epoch
+timing.
+
+A second component regression uses an account policy that verifies signatures
+from two pinned ML-DSA keys. Both keys pass transaction import validation.
+Only the registered root can queue recovery. A rejected recovery spends gas
+and advances the sender nonce while leaving the validator's suspension intact.
+The root can retry under the same policy and restore participation at the
+epoch boundary.
+
+A direct transaction signed by a registered SLH-DSA root can queue recovery
+before the emergency schedule activates. At the activation height and afterward,
+this recovery call requires an ML-DSA-65 root. A separate genesis-bound SLH-DSA
+governance key cannot authorize the recovery selector. The component regression
+reopens both the receipt and the state root at each tested height.
+
+```bash
+cargo test -p shell-pqvm custom_policy_signer_cannot_replace_offline_recovery_root -- --nocapture
+```
+
+`getValidatorOfflineState(address)` returns three ABI uint256 words:
+consecutive assigned misses, suspension generation and flags. Flag bits are 1
+for pending suspension, 2 for suspended participation, and 4 for approved recovery
+pending the boundary. Querying an older canonical root retains that root's state.
+Both selectors require the accounting schedule to be active.
+
+Physical process reopen and trusted snapshot acceptance cover counter, suspension
+and recovery at source heights 399, 400, 402, 405 and 407. A receiver that rolls
+back an unfinalized recovery boundary preflights the finalized epoch state and
+restores its effective roster alongside the canonical state, retaining unrelated
+absolute penalties. Missing epoch state rejects rollback before mutation.
+
+Genuinely signed preferred-fork acceptance also combines recovery and a weight
+update at boundary 400, rejects a lone exact-two-thirds voter/certificate, adopts
+with full quorum and checks renewed proposal eligibility. Rejected side proofs
+leave canonical state and metadata unchanged. See
+[the design record](adr/certified-offline-participation.md).
+
+The fresh native-network ML-DSA 3:1 profile below passes. Changing historical
+penalty context, other algorithm/configuration and AA combinations, release
+checks and public delivery remain outstanding. Full `make ci` is required before
+delivery; focused source checks do not establish those remaining behaviors.
+
+A genuine-signature component regression fills the complete timeout sequence to
+the 2 MiB limit. The first oversized sequence cannot advance the view or replace
+the last complete journal. A fresh node reconstructs the fitting journal, and an
+independent store imports and finalizes a fitting proposal while rejecting an
+oversized, genuinely sealed proposal without writes. The next height can retain
+new timeout evidence. This uses an in-memory backend and explicit Dev timestamps;
+it does not measure elapsed network time or replace physical restart acceptance.
+
+```bash
+cargo test -p shell-node canonical_timeouts_sequence_byte_budget_preserves_progress_and_recovery -- --nocapture
+```
+
+Focused source commands:
+
+```bash
+cargo test -p shell-node --features rocksdb timeout_certificate -- --nocapture
+cargo test -p shell-node --features rocksdb canonical_timeouts -- --nocapture
+cargo test -p shell-pqvm offline_recovery_requires -- --nocapture
+cargo test -p shell-pqvm direct_offline_recovery_slh_root_respects_emergency_activation -- --nocapture
+```
+
+The native acceptance entry additionally requires the CLI's `libp2p` feature
+and a built compatible source SDK in a sibling checkout:
+
+```bash
+cargo build -p shell-cli --bin shell-node --features rocksdb,libp2p
+npm --prefix ../shell-sdk run build
+SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-aa-registry.mjs --offline-participation
+```
+
+This entry creates its own encrypted ML-DSA keys, three isolated data directories
+and loopback ports. It starts one weight-3 producer and a nonauthority observer,
+leaving the weight-1 validator absent. Genuine pending transfers sustain assigned
+rounds until 100 certified misses and epoch suspension. The entry then submits
+root recovery, starts the recovered identity once and requires its confirmed
+proposal plus matching imported and historical state. The experiment uses actual
+wall-clock timeouts and a 45-minute acceptance window, rather than seeded counters
+or simulated height. In the tested fresh Dev profile, suspension commits at block
+400, root recovery becomes effective at block 410, and the returned validator
+proposes block 415. All three nodes agree on finality, block hash and state root
+through block 423; the old generation recovery fails and historical suspension
+state remains readable after recovery. All 421 demand transactions succeed.
+This requires unreleased source behavior and does not establish public release
+availability, network activation, production scale or other configurations.
+
+Run the same entry with `--offline-participation-slh` to use a registered
+SLH-DSA-SHA2-256f producer and recovery signer with an ML-DSA-65 returning
+validator. The debug fixture gives this profile 55 minutes to observe the 100
+certified misses and up to 10 minutes to import the fixed finalized prefix before
+starting the proposal check. These are local observation limits. The certified
+miss threshold and protocol timers are the same in both profiles. All three
+nodes must agree on the recovery receipt as well as the final block and state
+root.
+The isolated development acceptance completed this profile continuously:
+suspension at block 400, recovery effective at 410 and the returning validator's
+proposal at 411. All three nodes agreed through 418, including the recovery
+receipt and historical suspension; all 416 demand transactions succeeded. This
+is source validation for that configuration, not public release or activation.
+
+Concurrent direct-message traffic must also preserve healthy peer connections.
+An empty cancelled stream is a transport EOF, not an application message or a
+peer violation. Nonempty malformed data and oversized streams still use the
+existing rejection and ban paths. The focused real TCP regression is:
+
+```bash
+cargo test -p shell-network --features libp2p valid_direct_bursts -- --nocapture
+```
+
+The shorter `--pending-rejoin` mode uses the same fresh CLI/P2P setup to isolate
+pending-pool catch-up after twelve source blocks. It requires a genuine proposal
+from the joining validator and agreement between all three nodes. It does not
+exercise 100-miss suspension or governance recovery and cannot replace the full
+`--offline-participation` acceptance.
+
+The accounting regression uses genuine Dilithium signatures and independent
+producer/importer stores over 400 source-executed blocks with 100 assigned
+certificates, followed by real signed governance recovery transactions and renewed
+proposal participation. Process-reopen regressions cover pending proofs and the
+counter/suspension/recovery lifecycle in RocksDB. Trusted snapshots restore both
+boundary and pending head state; optional reuse of those signed public fixtures
+avoids repeating the generated lifecycle for additional recovery checks.
+Its development clock is advanced explicitly; it does not establish
+elapsed wall-clock time, P2P availability, production scale or other algorithms.
+
 ### SlashingConfig defaults
 
 | Field | Default | Description |

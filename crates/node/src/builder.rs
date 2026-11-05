@@ -155,32 +155,7 @@ impl<S: KvStore + 'static> NodeBuilder<S> {
             } else {
                 // Head state can already contain governance changes for the next
                 // epoch. Only the previous boundary determines active authorities.
-                let hash = node.chain_store.get_block_hash_by_number(boundary)?.ok_or_else(|| {
-                    NodeError::Startup(format!("authority recovery: canonical epoch boundary #{boundary} is unavailable"))
-                })?;
-                let header = node.chain_store.get_header_by_hash(&hash)?.ok_or_else(|| {
-                    NodeError::Startup(format!(
-                        "authority recovery: epoch boundary #{boundary} header is unavailable"
-                    ))
-                })?;
-                if header.number != boundary || header.hash() != hash {
-                    return Err(NodeError::Startup(format!("authority recovery: epoch boundary #{boundary} header does not match canonical history")));
-                }
-                let mut snapshot =
-                    WorldState::at_root_with_cache_mb(store.clone(), &header.state_root, cache_mb)?;
-                snapshot.validate().map_err(|error| NodeError::Startup(format!(
-                    "authority recovery: state at epoch boundary #{boundary} is unavailable; restore a snapshot retaining that epoch state: {error}"
-                )))?;
-                let validators = snapshot.get_validators()?;
-                if validators.is_empty() {
-                    return Err(NodeError::Startup(format!(
-                        "authority recovery: epoch boundary #{boundary} has an empty Registry"
-                    )));
-                }
-                let weights = validators
-                    .iter()
-                    .map(|address| snapshot.get_validator_weight(address))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let (validators, weights) = node.canonical_epoch_authorities(height)?;
                 node.consensus
                     .write()
                     .set_authorities_with_weights(validators, weights);

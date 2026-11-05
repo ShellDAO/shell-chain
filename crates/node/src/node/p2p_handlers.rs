@@ -74,14 +74,19 @@ impl<S: KvStore + 'static> Node<S> {
         }
 
         // Verify the attesting validator is a known authority.
-        let pubkey = self
-            .known_authorities
-            .read()
-            .get(&validator)
-            .cloned()
-            .ok_or_else(|| {
-                NodeError::Startup(format!("unknown attestation validator: {:?}", validator))
-            })?;
+        let mut context = None;
+        let known_key = self.known_authorities.read().get(&validator).cloned();
+        let pubkey = match known_key {
+            Some(key) => key,
+            None => {
+                let branch = self.authority_context_for_block(&stored_block)?;
+                let key = branch.public_keys.get(&validator).cloned().ok_or_else(|| {
+                    NodeError::Startup(format!("unknown attestation validator: {:?}", validator))
+                })?;
+                context = Some(branch);
+                key
+            }
+        };
 
         // Verify the attestation signature using the payload that was signed.
         let msg = attestation.own_signing_message();
@@ -106,7 +111,10 @@ impl<S: KvStore + 'static> Node<S> {
             ));
         }
 
-        let validator_weights = self.consensus.read().validator_weights();
+        let validator_weights = match context {
+            Some(context) => context.weights,
+            None => self.authority_context_for_block(&stored_block)?.weights,
+        };
         let attester_weight = validator_weights.get(&validator).copied().ok_or_else(|| {
             NodeError::Startup(format!(
                 "unknown active attestation validator: {validator:?}"
@@ -630,9 +638,99 @@ impl<S: KvStore + 'static> Node<S> {
             .collect()
     }
 
-    /// Verify a commit certificate independently of local canonical storage.
-    /// Block sync uses this before importing a view-changed finalized block;
-    /// finalization performs the canonical-target checks separately.
+    /// Retain a bounded current-roster quorum hint without authorizing finality.
+    /// The actual target-epoch identities and weights are rechecked after import.
+    pub(super) fn authenticate_early_commit_certificate(
+        &self,
+        block_hash: ShellHash,
+        cert: &[u8],
+    ) -> bool {
+        if cert.len() > shell_network::message::MAX_CONSENSUS_MESSAGE_SIZE {
+            return false;
+        }
+        let Some(signatures) = Self::decode_commit_certificate(cert) else {
+            return false;
+        };
+        let weights = self.consensus.read().validator_weights();
+        let total = weights.values().copied().fold(0u64, u64::saturating_add);
+        let Some(signed) = signatures.keys().try_fold(0u64, |sum, address| {
+            weights
+                .get(address)
+                .map(|weight| sum.saturating_add(*weight))
+        }) else {
+            return false;
+        };
+        if total == 0 || signed < FinalityState::strict_quorum_weight(total) {
+            return false;
+        }
+        !signatures.is_empty()
+            && signatures.iter().all(|(address, signature)| {
+                let Ok(Some(key)) = self.authority_pubkey(address) else {
+                    return false;
+                };
+                shell_crypto::infer_signature_type_from_address(&key, address)
+                    == Some(signature.sig_type)
+                    && shell_crypto::is_algorithm_allowed(signature.sig_type)
+                    && MultiVerifier
+                        .verify(&key, block_hash.as_bytes(), signature)
+                        .unwrap_or(false)
+            })
+    }
+
+    /// Revalidate an unchanged proof already accepted by a durable canonical checkpoint.
+    /// Later off-chain penalties cannot revoke that earlier finality decision. This
+    /// path cannot authorize a new block, a side fork, or a replacement certificate.
+    fn verify_retained_finalized_certificate(
+        &self,
+        block_number: u64,
+        block_hash: ShellHash,
+        cert: &[u8],
+        signatures: &HashMap<Address, shell_crypto::PQSignature>,
+    ) -> Option<bool> {
+        if !self.offline_accounting_active(block_number).ok()?
+            || block_number > self.finality.read().last_finalized_number()
+            || block_number > self.chain_store.get_finalized_number().ok()??
+            || self
+                .chain_store
+                .get_header_by_hash(&block_hash)
+                .ok()??
+                .number
+                != block_number
+            || self
+                .chain_store
+                .get_block_hash_by_number(block_number)
+                .ok()?
+                != Some(block_hash)
+            || self
+                .chain_store
+                .get_commit_certificate(&block_hash)
+                .ok()?
+                .as_deref()
+                != Some(cert)
+        {
+            return None;
+        }
+        let evidence = self.chain_store.get_block_signers(&block_hash).ok()?;
+        Some(
+            !signatures.is_empty()
+                && signatures.iter().all(|(address, signature)| {
+                    let Some(signer) = evidence.iter().find(|entry| entry.address == *address)
+                    else {
+                        return false;
+                    };
+                    shell_crypto::infer_signature_type_from_address(&signer.public_key, address)
+                        == Some(signature.sig_type)
+                        && shell_crypto::is_algorithm_allowed(signature.sig_type)
+                        && MultiVerifier
+                            .verify(&signer.public_key, block_hash.as_bytes(), signature)
+                            .unwrap_or(false)
+                }),
+        )
+    }
+
+    /// Verify signatures and target-epoch quorum. Activated blocks must already
+    /// be stored; legacy sync can preverify using its current consensus context.
+    /// Finalization separately requires the canonical target hash.
     pub(crate) fn verify_commit_certificate(
         &self,
         block_number: u64,
@@ -643,7 +741,26 @@ impl<S: KvStore + 'static> Node<S> {
             warn!(block_number, %block_hash, "FF.7: invalid commit certificate encoding");
             return false;
         };
-        let weights = self.consensus.read().validator_weights();
+        if let Some(valid) =
+            self.verify_retained_finalized_certificate(block_number, block_hash, cert, &signatures)
+        {
+            return valid;
+        }
+        let context = if self.offline_accounting_active(block_number).unwrap_or(true) {
+            let Ok(Some(block)) = self.chain_store.get_block_by_hash(&block_hash) else {
+                return false;
+            };
+            let Ok(context) = self.authority_context_for_block(&block) else {
+                return false;
+            };
+            Some(context)
+        } else {
+            None
+        };
+        let weights = context
+            .as_ref()
+            .map(|context| context.weights.clone())
+            .unwrap_or_else(|| self.consensus.read().validator_weights());
         let total_weight = weights.values().copied().fold(0u64, u64::saturating_add);
         if total_weight == 0 {
             warn!(block_number, %block_hash, "FF.7: certificate cannot be verified without active validator weight");
@@ -658,11 +775,10 @@ impl<S: KvStore + 'static> Node<S> {
                 warn!(block_number, %block_hash, %signer, "FF.7: certificate contains non-validator signer");
                 return false;
             };
-            let pubkey = self
-                .known_authorities
-                .read()
-                .get(&signer)
-                .cloned()
+            let pubkey = context
+                .as_ref()
+                .and_then(|context| context.public_keys.get(&signer).cloned())
+                .or_else(|| self.known_authorities.read().get(&signer).cloned())
                 .or_else(|| self.chain_store.get_pubkey(&signer).ok().flatten());
             let Some(pubkey) = pubkey else {
                 warn!(block_number, %block_hash, %signer, "FF.7: certificate signer pubkey unknown");
@@ -739,7 +855,15 @@ impl<S: KvStore + 'static> Node<S> {
         let evidence = self.commit_signer_evidence(&signatures, block_hash);
         self.chain_store
             .set_commit_certificate_with_signers(&block_hash, cert, &evidence)?;
-        let weights = self.consensus.read().validator_weights();
+        let weights = if self.offline_accounting_active(block_number)? {
+            let block = self
+                .chain_store
+                .get_block_by_hash(&block_hash)?
+                .ok_or_else(|| NodeError::Startup("certified branch block unavailable".into()))?;
+            self.authority_context_for_block(&block)?.weights
+        } else {
+            self.consensus.read().validator_weights()
+        };
         let signed_weight = signatures
             .keys()
             .filter_map(|signer| weights.get(signer).copied())
@@ -951,16 +1075,6 @@ impl<S: KvStore + 'static> Node<S> {
             ));
         }
 
-        let total_weight: u64 = self
-            .consensus
-            .read()
-            .validator_weights()
-            .values()
-            .copied()
-            .sum();
-        Ok(self
-            .consensus
-            .write()
-            .handle_view_change_message(msg, total_weight))
+        Ok(self.apply_observed_view_change(msg))
     }
 }
