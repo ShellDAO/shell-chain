@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Make `net_listening` report the live P2P transport's bound listeners instead of
+  a fixed `true`. RPC-only nodes return `false`; a bound listener with zero peers
+  returns `true`. Reuse the existing shared listener lifecycle and report
+  unavailable transport state as an RPC error. Includes a native signed
+  producer/follower test through disabled/enabled P2P and persistent reopen.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

@@ -25,7 +25,7 @@ pub trait NetApi {
     #[method(name = "version")]
     async fn version(&self) -> Result<String, jsonrpsee::types::ErrorObjectOwned>;
 
-    /// Returns true if the node is listening for connections.
+    /// Returns true while the P2P transport has a bound listener, even with no peers.
     #[method(name = "listening")]
     async fn listening(&self) -> Result<bool, jsonrpsee::types::ErrorObjectOwned>;
 

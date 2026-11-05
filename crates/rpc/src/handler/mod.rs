@@ -7088,10 +7088,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn net_listening_returns_true() {
-        let handler = setup();
-        let result = NetApiServer::listening(&handler).await.unwrap();
-        assert!(result);
+    async fn net_listening_tracks_shared_listeners_independently_of_peers() {
+        let info = Arc::new(std::sync::RwLock::new(
+            shell_network::LocalNodeInfo::default(),
+        ));
+        let handler = setup().with_local_node_info(Arc::clone(&info));
+        let observer = handler.clone();
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        assert!(!NetApiServer::listening(&observer).await.unwrap());
+        handler.peer_count.store(3, Ordering::Relaxed);
+        assert!(!NetApiServer::listening(&observer).await.unwrap());
+        info.write().unwrap().listen_addresses = vec![
+            "/ip4/127.0.0.1/tcp/12345".into(),
+            "/ip4/127.0.0.1/tcp/23456".into(),
+        ];
+        handler.peer_count.store(0, Ordering::Relaxed);
+        assert!(NetApiServer::listening(&observer).await.unwrap());
+        info.write().unwrap().listen_addresses.pop();
+        assert!(NetApiServer::listening(&observer).await.unwrap());
+        info.write().unwrap().listen_addresses.clear();
+        assert!(!NetApiServer::listening(&observer).await.unwrap());
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+        assert_eq!(handler.tx_pool.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn net_listening_reports_unavailable_transport_state() {
+        let info = Arc::new(std::sync::RwLock::new(
+            shell_network::LocalNodeInfo::default(),
+        ));
+        let handler = setup().with_local_node_info(Arc::clone(&info));
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        assert!(std::thread::spawn(move || {
+            let _guard = info.write().unwrap();
+            panic!("poison transport state");
+        })
+        .join()
+        .is_err());
+        assert_eq!(
+            NetApiServer::listening(&handler).await.unwrap_err().code(),
+            -32603
+        );
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
     }
 
     #[tokio::test]

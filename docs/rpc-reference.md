@@ -61,7 +61,7 @@ Returns the chain ID as a decimal string.
 listening() → bool
 ```
 
-Returns true if the node is listening for connections.
+Returns true while the P2P transport has a bound listener, even with no peers.
 
 ### net_peerCount
 ```

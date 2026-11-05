@@ -915,11 +915,38 @@ curl -s http://localhost:8545 \
 
 ### net_listening
 
-Returns whether the node is accepting connections. Always `true`.
+Returns whether the P2P transport currently has at least one bound listener.
+An RPC-only node, a transport before binding, or a closed transport returns
+`false`. A bound listener returns `true` even with zero connected peers. The
+value describes local P2P listening, rather than synchronization or consensus
+health; an HTTP RPC listener alone does not make it `true`.
 
 **Parameters:** None
 
-**Returns:** `Boolean` — `true`.
+**Returns:** `Boolean`. Unavailable transport state returns an RPC error.
+
+**Version:** This behavior is available in unreleased node source. Published
+v0.27.13 returns a fixed `true`, including when P2P is disabled, and cannot
+establish listener health.
+
+With Node.js 24 or later and Shell SDK 0.14.0-rc.3 or a compatible built SDK,
+run the native regression from a matching source checkout:
+
+```bash
+cargo build --locked -p shell-cli --features libp2p
+NODE_BIN=target/debug/shell-node SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-network-listening.mjs
+```
+
+The script creates encrypted test accounts and an isolated funded genesis.
+It compares raw and SDK requests with actual TCP connectivity, checks a bound
+listener without peers, then submits a signed transfer to independent
+producer/follower nodes. Import, finality, receipts and account state must agree.
+Physical database reopen with P2P disabled and enabled must preserve chain data
+while reporting the current listener state. Its nodes use distinct P2P identities,
+loopback dynamic ports and `--rpc-rate-limit 1000` for assertion bursts. Artifacts
+remain in the printed directory; failed assertions exit nonzero. Other algorithms,
+profiles and forced transport failures require separate qualification.
 
 ---
 

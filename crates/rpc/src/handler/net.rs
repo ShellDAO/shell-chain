@@ -38,7 +38,8 @@ impl<S: KvStore + 'static> NetApiServer for RpcHandler<S> {
     }
 
     async fn listening(&self) -> Result<bool, ErrorObjectOwned> {
-        Ok(true)
+        let info = self.local_node_info.read().map_err(internal_err)?;
+        Ok(!info.listen_addresses.is_empty())
     }
 
     async fn peer_count(&self) -> Result<String, ErrorObjectOwned> {
