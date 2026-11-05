@@ -178,6 +178,33 @@ fn append_filter_logs<S: KvStore + 'static>(
     Ok(())
 }
 
+impl<S: KvStore + 'static> RpcHandler<S> {
+    fn stored_block_transaction_count(
+        &self,
+        hash: Option<ShellHash>,
+    ) -> Result<Option<String>, ErrorObjectOwned> {
+        let Some(hash) = hash else { return Ok(None) };
+        match self
+            .chain_store
+            .get_block_transaction_count(&hash)
+            .map_err(internal_err)?
+        {
+            Some(count) => Ok(Some(hex_u64(count))),
+            None if self
+                .chain_store
+                .get_header_by_hash(&hash)
+                .map_err(internal_err)?
+                .is_some() =>
+            {
+                // Distinguish a known pruned body from an unknown block. Never
+                // invent a zero or a partial system-only count for that header.
+                Err(not_found_err("block body is unavailable"))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 #[jsonrpsee::core::async_trait]
 impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
     async fn block_number(&self) -> Result<String, ErrorObjectOwned> {
@@ -431,6 +458,39 @@ impl<S: KvStore + 'static> EthApiServer for RpcHandler<S> {
             );
             rpc
         }))
+    }
+
+    async fn get_block_transaction_count_by_hash(
+        &self,
+        hash: ShellHash,
+    ) -> Result<Option<String>, ErrorObjectOwned> {
+        self.stored_block_transaction_count(Some(hash))
+    }
+
+    async fn get_block_transaction_count_by_number(
+        &self,
+        number: String,
+    ) -> Result<Option<String>, ErrorObjectOwned> {
+        if matches!(parse_block_tag(&number)?, BlockTag::Pending) {
+            // Share the exact next-fee/nonce/gas-limited pseudo-block selection.
+            // Counting the whole pool would include ineligible transactions.
+            return EthApiServer::get_block_by_number(self, number, false)
+                .await?
+                .map(|block| {
+                    block
+                        .transactions
+                        .as_array()
+                        .map(|values| hex_u64(values.len() as u64))
+                        .ok_or_else(|| internal_err("invalid pending transaction array"))
+                })
+                .transpose();
+        }
+        let hash = match self.parse_block_number(&number)? {
+            Some(number) => self.chain_store.get_block_hash_by_number(number),
+            None => self.chain_store.get_head_hash(),
+        }
+        .map_err(internal_err)?;
+        self.stored_block_transaction_count(hash)
     }
 
     async fn get_transaction_by_hash(

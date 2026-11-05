@@ -7,7 +7,7 @@ shell-chain exposes the following JSON-RPC namespaces:
 
 - **`web3_`** (2 methods)
 - **`net_`** (3 methods)
-- **`eth_`** (33 methods)
+- **`eth_`** (35 methods)
 - **`debug_`** (2 methods)
 - **`trace_`** (2 methods)
 - **`evm_`** (5 methods)
@@ -156,6 +156,20 @@ get_block_by_hash(hash: ShellHash, full_txs: bool, ) → Option<RpcBlock>
 ```
 
 Returns a block by hash.
+
+### eth_getBlockTransactionCountByHash
+```
+get_block_transaction_count_by_hash(hash: ShellHash, ) → Option<String>
+```
+
+Returns the user and system transaction count of a retained block by hash.
+
+### eth_getBlockTransactionCountByNumber
+```
+get_block_transaction_count_by_number(number: String, ) → Option<String>
+```
+
+Returns a retained block's transaction count, or the pending candidate count.
 
 ### eth_getTransactionByHash
 ```

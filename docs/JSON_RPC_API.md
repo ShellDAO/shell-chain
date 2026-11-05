@@ -587,6 +587,55 @@ Returns a block by hash.
 
 ---
 
+### eth_getBlockTransactionCountByNumber / eth_getBlockTransactionCountByHash
+
+Unreleased node source adds the standard block transaction-count reads used by
+Ethereum-shaped tooling, including viem's `getBlockTransactionCount`. Published
+v0.27.13 returns method-not-found for these methods. The requests follow the
+[EIP-1474 count interface](https://eips.ethereum.org/EIPS/eip-1474#eth_getblocktransactioncountbynumber).
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"eth_getBlockTransactionCountByNumber","params":["latest"]}
+```
+
+The number variant accepts a canonical hexadecimal block quantity or `latest`,
+`earliest`, `safe`, `finalized`, or `pending`. The hash variant takes a 32-byte
+block hash. The result is a minimal hex quantity, or `null` for an unknown block.
+A stored block's count includes its user transactions and system
+transactions, such as gas and STARK rewards. Available side-fork bodies can be
+counted by hash without canonical transaction indexes; older bodies fall back to
+the existing separate system records. It is a block-local count; it is
+unrelated to an account nonce or `shell_transactionCount`'s chain-wide total.
+
+`pending` counts the same next-base-fee, nonce-ordered and gas-limited candidates
+as `eth_getBlockByNumber("pending", false)`, rather than every queued transaction.
+Future system transactions have not yet been materialized in that pseudo-block.
+A known header whose body is unavailable returns `-32001` instead of a fabricated
+zero or partial system-only count. Witness pruning alone does not prevent counting;
+the count does not load PQ witnesses or proof amendments. Queries do not write
+canonical state, pool entries or indexes, and require no schema migration.
+
+From a matching source checkout, with Node.js 24 or later and a compatible built
+Shell SDK, run the genuine producer/follower acceptance:
+
+```bash
+cargo build --locked -p shell-cli --features libp2p
+NODE_BIN=target/debug/shell-node SHELL_SDK_ENTRY=../shell-sdk/dist/index.js \
+  node tests/e2e/native-block-counts.mjs
+```
+
+The runner creates encrypted test keys, funds an isolated genesis and queues a
+signed transfer on a non-authority node. It checks both SDK variants, numeric
+and named tags, pending eligibility and rejection boundaries before a real P2P
+producer includes the transfer. Independent import, finality, historical counts
+and physical reopen must agree. Logs and temporary data are retained at the
+printed directory; any failed assertion exits nonzero. Its isolated nodes use
+`--rpc-rate-limit 1000` for the assertion burst; the normal server default is
+unchanged. Each live node has its own P2P identity. Other algorithms,
+profiles, reorgs and native body-pruning combinations need separate qualification.
+
+---
+
 ### eth_getTransactionByHash
 
 Returns a transaction by hash. Checks the mempool first, then on-chain storage.
@@ -1968,7 +2017,7 @@ Returns current consensus engine state.
 
 ## Method Summary
 
-For the canonical method list (currently 79 methods across `web3_`, `net_`, `eth_`, `debug_`, `trace_`, `evm_`, `shell_` namespaces), see `docs/rpc-reference.md`, which is auto-generated from `crates/rpc/src/api.rs`.
+For the canonical method list (currently 99 methods across `web3_`, `net_`, `eth_`, `debug_`, `trace_`, `evm_`, `shell_` namespaces), see `docs/rpc-reference.md`, which is auto-generated from `crates/rpc/src/api.rs`.
 
 ---
 

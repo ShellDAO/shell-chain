@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Add `eth_getBlockTransactionCountByNumber` and
+  `eth_getBlockTransactionCountByHash` for read-oriented clients. Count stored
+  user and system transactions without loading PQ witnesses; reuse the existing
+  pending candidate policy, return null for unknown blocks and explicitly reject
+  known blocks whose bodies are unavailable. Add genuine SDK/P2P/reopen coverage.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

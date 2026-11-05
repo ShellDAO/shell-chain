@@ -8158,6 +8158,23 @@ mod tests {
         // Still has standard Ethereum fields.
         assert_eq!(rpc.total_difficulty, "0x1");
         assert_eq!(rpc.nonce, "0x0000000000000000");
+        let pending_pool_before = handler.tx_pool.len();
+        let pending_count_before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let expected = EthApiServer::get_block_by_number(&handler, "pending".into(), false)
+            .await
+            .unwrap()
+            .map(|block| format!("0x{:x}", block.transactions.as_array().unwrap().len()));
+        assert_eq!(
+            EthApiServer::get_block_transaction_count_by_number(&handler, "pending".into())
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            pending_count_before
+        );
+        assert_eq!(handler.tx_pool.len(), pending_pool_before);
     }
 
     #[tokio::test]
@@ -8220,6 +8237,23 @@ mod tests {
         assert_eq!(rpc.base_fee_per_gas, "0x70");
         assert_eq!(rpc.transactions, serde_json::json!([]));
         assert_eq!(rpc.gas_used, "0x0");
+        let pending_pool_before = handler.tx_pool.len();
+        let pending_count_before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let expected = EthApiServer::get_block_by_number(&handler, "pending".into(), false)
+            .await
+            .unwrap()
+            .map(|block| format!("0x{:x}", block.transactions.as_array().unwrap().len()));
+        assert_eq!(
+            EthApiServer::get_block_transaction_count_by_number(&handler, "pending".into())
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            pending_count_before
+        );
+        assert_eq!(handler.tx_pool.len(), pending_pool_before);
     }
 
     #[tokio::test]
@@ -8363,6 +8397,23 @@ mod tests {
             serde_json::json!([oversized_hash, fit_hash])
         );
         assert_eq!(rpc.gas_used, "0xf618");
+        let pending_pool_before = handler.tx_pool.len();
+        let pending_count_before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let expected = EthApiServer::get_block_by_number(&handler, "pending".into(), false)
+            .await
+            .unwrap()
+            .map(|block| format!("0x{:x}", block.transactions.as_array().unwrap().len()));
+        assert_eq!(
+            EthApiServer::get_block_transaction_count_by_number(&handler, "pending".into())
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            pending_count_before
+        );
+        assert_eq!(handler.tx_pool.len(), pending_pool_before);
     }
 
     #[tokio::test]
@@ -8479,6 +8530,23 @@ mod tests {
             serde_json::json!([other_hash, sender_tx0_hash, sender_tx1_hash])
         );
         assert_eq!(rpc.gas_used, "0xf618");
+        let pending_pool_before = handler.tx_pool.len();
+        let pending_count_before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let expected = EthApiServer::get_block_by_number(&handler, "pending".into(), false)
+            .await
+            .unwrap()
+            .map(|block| format!("0x{:x}", block.transactions.as_array().unwrap().len()));
+        assert_eq!(
+            EthApiServer::get_block_transaction_count_by_number(&handler, "pending".into())
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            pending_count_before
+        );
+        assert_eq!(handler.tx_pool.len(), pending_pool_before);
     }
 
     #[tokio::test]
@@ -8496,6 +8564,23 @@ mod tests {
             .unwrap();
 
         assert!(rpc.is_none());
+        let pending_pool_before = handler.tx_pool.len();
+        let pending_count_before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let expected = EthApiServer::get_block_by_number(&handler, "pending".into(), false)
+            .await
+            .unwrap()
+            .map(|block| format!("0x{:x}", block.transactions.as_array().unwrap().len()));
+        assert_eq!(
+            EthApiServer::get_block_transaction_count_by_number(&handler, "pending".into())
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            pending_count_before
+        );
+        assert_eq!(handler.tx_pool.len(), pending_pool_before);
     }
 
     #[tokio::test]
@@ -8505,6 +8590,23 @@ mod tests {
             .await
             .unwrap();
         assert!(rpc.is_none());
+        let pending_pool_before = handler.tx_pool.len();
+        let pending_count_before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        let expected = EthApiServer::get_block_by_number(&handler, "pending".into(), false)
+            .await
+            .unwrap()
+            .map(|block| format!("0x{:x}", block.transactions.as_array().unwrap().len()));
+        assert_eq!(
+            EthApiServer::get_block_transaction_count_by_number(&handler, "pending".into())
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            pending_count_before
+        );
+        assert_eq!(handler.tx_pool.len(), pending_pool_before);
     }
 
     // ── Finality RPC tests ─────────────────────────────────────
@@ -11944,5 +12046,147 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), crate::error::FEATURE_NOT_ENABLED);
         assert!(err.message().contains("storage profile"));
+    }
+    #[tokio::test]
+    async fn block_transaction_counts_follow_canonical_tags_and_refuse_pruned_body() {
+        let handler = setup();
+        assert_eq!(
+            EthApiServer::get_block_transaction_count_by_number(&handler, "latest".into())
+                .await
+                .unwrap(),
+            None
+        );
+        let genesis = make_genesis_block();
+        handler.chain_store.put_block(&genesis).unwrap();
+        handler
+            .chain_store
+            .set_canonical(0, &genesis.hash())
+            .unwrap();
+        handler.chain_store.set_head(&genesis.hash()).unwrap();
+        assert_eq!(
+            EthApiServer::get_block_transaction_count_by_number(&handler, "earliest".into())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0x0")
+        );
+        let mut block = genesis.clone();
+        block.header.number = 1;
+        block.header.parent_hash = genesis.hash();
+        block.header.timestamp += 1;
+        let tx = SignedTransaction::new(
+            test_address(b"count-from"),
+            Transaction {
+                chain_id: 42,
+                nonce: 0,
+                max_priority_fee_per_gas: 0,
+                max_fee_per_gas: 0,
+                gas_limit: 21_000,
+                to: Some(test_address(b"count-to")),
+                value: U256::from(1u64),
+                data: Bytes::default(),
+                access_list: None,
+                tx_type: 2,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            },
+            shell_crypto::PQSignature::new(shell_crypto::SignatureType::Dilithium3, vec![]),
+        );
+        block.transactions.push(tx);
+        let reward = SystemTransaction::block_gas_reward(
+            42,
+            1,
+            0,
+            block.header.proposer,
+            U256::from(2u64),
+            genesis.hash(),
+        );
+        handler.chain_store.put_block(&block).unwrap();
+        handler
+            .chain_store
+            .put_system_transactions(&block.hash(), 1, &[reward])
+            .unwrap();
+        handler.chain_store.set_canonical(1, &block.hash()).unwrap();
+        handler.chain_store.set_head(&block.hash()).unwrap();
+        *handler.finalized_number.write() = 1;
+        let mut newer = genesis.clone();
+        newer.header.number = 2;
+        newer.header.parent_hash = block.hash();
+        newer.header.timestamp += 2;
+        handler.chain_store.put_block(&newer).unwrap();
+        handler.chain_store.set_canonical(2, &newer.hash()).unwrap();
+        handler.chain_store.set_head(&newer.hash()).unwrap();
+        let before = handler.chain_store.store().scan_prefix(b"").unwrap();
+        for tag in ["0x1", "safe", "finalized"] {
+            assert_eq!(
+                EthApiServer::get_block_transaction_count_by_number(&handler, tag.into())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("0x2")
+            );
+        }
+        assert_eq!(
+            EthApiServer::get_block_transaction_count_by_hash(&handler, block.hash())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0x2")
+        );
+        assert_eq!(
+            EthApiServer::get_block_transaction_count_by_number(&handler, "latest".into())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0x0")
+        );
+        assert_eq!(
+            EthApiServer::get_block_transaction_count_by_number(&handler, "0xffff".into())
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            EthApiServer::get_block_transaction_count_by_hash(
+                &handler,
+                ShellHash::from([0xff; 32])
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        for tag in ["bad-tag", "0x01", "0x10000000000000000"] {
+            assert_eq!(
+                EthApiServer::get_block_transaction_count_by_number(&handler, tag.into())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                -32602
+            );
+        }
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            before
+        );
+        handler.chain_store.delete_body(&block.hash()).unwrap();
+        let pruned = handler.chain_store.store().scan_prefix(b"").unwrap();
+        assert_eq!(
+            EthApiServer::get_block_transaction_count_by_hash(&handler, block.hash())
+                .await
+                .unwrap_err()
+                .code(),
+            -32001
+        );
+        assert_eq!(
+            EthApiServer::get_block_transaction_count_by_number(&handler, "0x1".into())
+                .await
+                .unwrap_err()
+                .code(),
+            -32001
+        );
+        assert_eq!(
+            handler.chain_store.store().scan_prefix(b"").unwrap(),
+            pruned
+        );
     }
 }

@@ -1430,6 +1430,32 @@ impl<S: KvStore> ChainStore<S> {
         Ok(Some(stripped.into_block(bundle)))
     }
 
+    /// Count regular and stored system transactions without loading PQ witnesses.
+    /// A missing stripped body returns None, even when its header is retained.
+    pub fn get_block_transaction_count(
+        &self,
+        hash: &ShellHash,
+    ) -> Result<Option<u64>, StorageError> {
+        let body: StrippedBlock = match self.store.get(&Self::body_key(hash))? {
+            Some(data) => decode_versioned(&data)?,
+            None => return Ok(None),
+        };
+        // Side-fork bodies intentionally lack canonical transaction indexes.
+        // Prefer the body; legacy bodies may only have separate system records.
+        let system_count = if body.system_transactions.is_empty() {
+            self.get_system_transactions(hash)?.len()
+        } else {
+            body.system_transactions.len()
+        };
+        let count = body
+            .transactions
+            .len()
+            .checked_add(system_count)
+            .and_then(|count| u64::try_from(count).ok())
+            .ok_or_else(|| StorageError::Codec("block transaction count overflow".into()))?;
+        Ok(Some(count))
+    }
+
     /// Get a block by its number.
     pub fn get_block_by_number(&self, number: u64) -> Result<Option<Block>, StorageError> {
         let hash_bytes = match self.store.get(&Self::number_key(number))? {
@@ -11392,6 +11418,70 @@ mod tests {
             db.get(prefix::ADDRESS_METADATA_UNDO_PRUNED_FINALIZED)
                 .unwrap(),
             Some(131u64.to_be_bytes().to_vec())
+        );
+    }
+    #[test]
+    fn block_transaction_count_uses_system_records_without_loading_witnesses() {
+        let store = Arc::new(MemoryDb::new());
+        let chain = ChainStore::new(store.clone());
+        let block = empty_block(1);
+        let hash = block.hash();
+        chain.put_block(&block).unwrap();
+        let reward = SystemTransaction::block_gas_reward(
+            42,
+            1,
+            0,
+            block.header.proposer,
+            U256::from(1u64),
+            block.header.parent_hash,
+        );
+        chain.put_system_transactions(&hash, 1, &[reward]).unwrap();
+        store
+            .put(
+                &ChainStore::<MemoryDb>::witness_key(&hash),
+                b"unreadable witness",
+            )
+            .unwrap();
+        let before = store.scan_prefix(b"").unwrap();
+        assert_eq!(chain.get_block_transaction_count(&hash).unwrap(), Some(1));
+        assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        store
+            .put(
+                &ChainStore::<MemoryDb>::system_txs_key(&hash),
+                b"invalid JSON",
+            )
+            .unwrap();
+        let bad = store.scan_prefix(b"").unwrap();
+        assert!(chain.get_block_transaction_count(&hash).is_err());
+        assert_eq!(store.scan_prefix(b"").unwrap(), bad);
+        chain.delete_body(&hash).unwrap();
+        assert!(chain.get_header_by_hash(&hash).unwrap().is_some());
+        assert_eq!(chain.get_block_transaction_count(&hash).unwrap(), None);
+        assert_eq!(
+            chain
+                .get_block_transaction_count(&ShellHash::from([0xff; 32]))
+                .unwrap(),
+            None
+        );
+        // Side-fork bodies have system transactions but no canonical tx index.
+        let mut side = empty_block(2);
+        side.system_transactions
+            .push(SystemTransaction::block_gas_reward(
+                42,
+                2,
+                0,
+                side.header.proposer,
+                U256::from(1u64),
+                side.header.parent_hash,
+            ));
+        chain.put_side_fork_block(&side).unwrap();
+        assert!(chain
+            .get_system_transactions(&side.hash())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            chain.get_block_transaction_count(&side.hash()).unwrap(),
+            Some(1)
         );
     }
 }

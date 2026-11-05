@@ -100,6 +100,20 @@ pub trait EthApi {
         full_txs: bool,
     ) -> Result<Option<RpcBlock>, jsonrpsee::types::ErrorObjectOwned>;
 
+    /// Returns the user and system transaction count of a retained block by hash.
+    #[method(name = "getBlockTransactionCountByHash")]
+    async fn get_block_transaction_count_by_hash(
+        &self,
+        hash: ShellHash,
+    ) -> Result<Option<String>, jsonrpsee::types::ErrorObjectOwned>;
+
+    /// Returns a retained block's transaction count, or the pending candidate count.
+    #[method(name = "getBlockTransactionCountByNumber")]
+    async fn get_block_transaction_count_by_number(
+        &self,
+        number: String,
+    ) -> Result<Option<String>, jsonrpsee::types::ErrorObjectOwned>;
+
     /// Returns a transaction by hash.
     #[method(name = "getTransactionByHash")]
     async fn get_transaction_by_hash(
