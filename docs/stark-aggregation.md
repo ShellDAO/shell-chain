@@ -57,30 +57,39 @@ registry state on producers, importers and historical replay.
 
 ## ProofAmendment Format
 
-```json
-{
-  "version": 1,
-  "block_hash": "0x...",
-  "block_number": 12345,
-  "proof": {
-    "batch_root": "0x...",
-    "batch_root_bytes": "...(hex)...",
-    "proof_bytes": "...(hex STARK proof)..."
-  },
-  "prover": "0x<PROVER_ADDRESS_64_HEX>",
-  "prover_signature": "...(hex PQ signature)..."
-}
-```
+The current source serializes the following JSON fields. Hashes, addresses and
+`prover_signature` use `0x`-prefixed hex; the proof's `batch_root_bytes` and
+`proof_bytes` use JSON byte arrays.
 
-Fields:
 | Field | Type | Description |
 |-------|------|-------------|
-| `version` | `u8` | Protocol version. Current: `1`. |
-| `block_hash` | `ShellHash` | Hash of the block this proof covers. |
-| `block_number` | `u64` | Height of the block (allows cheap range queries). |
-| `proof` | `SigBatchProof` | STARK batch commitment proof over all tx signatures. |
-| `prover` | `Address` (`0x` + 64 lowercase hex) | The prover's registered address. |
-| `prover_signature` | `Bytes` | PQ signature over `"proof-amendment" ‖ block_hash ‖ block_number_le ‖ proof.batch_root_bytes`. |
+| `version` | `u8` | Amendment version `1`. |
+| `block_hash` | `ShellHash` | Hash of the inclusive end block. |
+| `end_block` | `u64` | Inclusive end height; Rust field `block_number` (also accepted as a legacy JSON alias). |
+| `start_block` | optional `u64` | Inclusive start height. |
+| `source_hashes` | `Vec<ShellHash>` | Canonical hashes in source order. Legacy single-block payloads may omit the range fields. |
+| `proof.version` | `u8` | `SigBatchProof` version `2`. |
+| `proof.batch_root_bytes` | `[u8; 32]` | 32-byte accumulator root. |
+| `proof.n_sigs` | `usize` | Number of covered signature entries. |
+| `proof.proof_bytes` | `Vec<u8>` | Serialized Winterfell proof; empty only for a commitment-only payload. |
+| `prover` | `Address` (`0x` + 64 lowercase hex) | Address bound to the envelope's public key and algorithm. |
+| `prover_signature` | `Bytes` | Versioned envelope: authentication version, algorithm ID, two-byte big-endian public-key length, public key, PQ signature. |
+| `layer` | `u32` | Compression layer; defaults to `1`. |
+| `original_size`, `compressed_size` | optional `u64` | Source payload size and signed artifact size. |
+| `settlement_tx_hash` | optional `ShellHash` | Canonical settlement link, checked separately from prover authentication. |
+
+Use `ProofAmendment::sign_prover_authentication` to set the prover address,
+compressed size and authentication envelope. Its `signing_message()` uses the
+`shell-proof-amendment-auth-v1` domain and binds the block/source range, proof
+version/root/count/proof-bytes digest, prover, layer and compression metadata.
+A raw signature over the old short concatenation is invalid. Verify with
+`verify_prover_authentication` before treating the envelope as authentic;
+canonical source, registration activation and STARK proof checks still apply.
+
+The [Prover Guide example](PROVER_GUIDE.md#serialize-and-authenticate-an-amendment)
+runs serialization, genuine PQ authentication and changed-root rejection using
+the source API. Its commitment-only payload demonstrates the format and is not
+a submitted proof or a settlement.
 
 ---
 

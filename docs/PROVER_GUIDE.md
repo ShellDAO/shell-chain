@@ -76,7 +76,7 @@ Broadcast to network (contains Dilithium3 sigs in WitnessBundle)
             prove_sig_batch(entries) → SigBatchProof   ← Winterfell STARK
                   │
                   ▼
-            Wrap in ProofAmendment { block_hash, block_number, proof, prover, prover_sig }
+            Wrap in ProofAmendment and sign_prover_authentication()
                   │
                   ▼
             P2P broadcast → peers store at pa/<block_hash>
@@ -328,32 +328,84 @@ parse the setting without changing the actual proving order.
 
 ## ProofAmendment Lifecycle
 
-```
-prove_sig_batch()
-    │
-    └─► ProofAmendment {
-          version: 1,
-          block_hash,
-          block_number,
-          proof: SigBatchProof {
-            batch_root_bytes: [u8; 16],  // final accumulator (STARK public output)
-            n_sigs: usize,               // number of signatures covered
-            proof_bytes: Vec<u8>,        // raw Winterfell STARK proof
-          },
-          prover: Address,
-          prover_signature: Bytes,       // PQ sig over sha3(b"proof-amendment" ‖ block_hash ‖ block_number ‖ batch_root)
-        }
+The current source format uses amendment version `1` and `SigBatchProof`
+version `2`, with a **32-byte** `batch_root_bytes` accumulator. JSON serializes
+Rust's `block_number` field as `end_block`; `start_block` and `source_hashes`
+describe the contiguous source range. The amendment also carries `layer`,
+optional size metadata and an optional canonical settlement transaction link.
+
+`prover_signature` is a versioned authentication envelope containing the
+algorithm ID, public key and PQ signature. Use
+`ProofAmendment::sign_prover_authentication` and
+`verify_prover_authentication` from `shell-stark-prover`. The signing helper
+sets the prover address and compressed size. Its canonical
+`signing_message()` starts with `shell-proof-amendment-auth-v1` and binds the
+block identity, source range, proof version/root/count/proof-bytes digest,
+prover identity, layer and compression metadata. A raw signature over the old
+`sha3("proof-amendment" || block_hash || block_number || batch_root)` expression
+is not the current authentication format.
+
+### Serialize and authenticate an amendment
+
+This example targets the `0.27.14` development source. In a shell-chain source
+checkout, save the following as
+`crates/stark-prover/examples/amendment-authentication.rs` (create `examples`
+if needed), then run:
+
+```bash
+cargo run --locked -p shell-stark-prover --example amendment-authentication
 ```
 
-On receipt, the network:
-1. Checks `prover` is in `ProverRegistry`
-2. Verifies `prover_signature` with the PQ public key bound to the registered address
-3. Verifies the `SigBatchProof` (Winterfell STARK verification)
-4. Stores at `pa/<block_hash>`
-5. Deletes `w/<block_hash>` (after grace window)
+This example generates a temporary ML-DSA-65 key in memory, authenticates a
+commitment-only payload, checks a JSON roundtrip and rejects a changed root.
+It prints the public envelope without saving the private key. The placeholder
+hash, root and sizes demonstrate the format; an empty `proof_bytes` is not a
+STARK proof and cannot establish proof admission or earn a settlement reward.
+Use an actual generated proof and its canonical source metadata for submission.
 
-When `L2StarkMode=Active`, a proof challenge remains open for `T_c = 7200` blocks
-before the amendment lifecycle resolves to `RESOLVED` or `SLASHED`.
+```rust
+use shell_crypto::MlDsaSigner;
+use shell_primitives::{Address, ShellHash};
+use shell_stark_prover::{ProofAmendment, SigBatchProof, PROOF_AMENDMENT_VERSION};
+
+fn main() {
+    let signer = MlDsaSigner::generate();
+    let source_hash = ShellHash::from([0x11; 32]);
+    let mut amendment = ProofAmendment {
+        version: PROOF_AMENDMENT_VERSION,
+        block_hash: source_hash,
+        block_number: 42,
+        start_block: Some(42),
+        proof: SigBatchProof::commitment_only([0x22; 32], 1),
+        prover: Address::from([0; 32]), // filled by the signing helper
+        prover_signature: Vec::new().into(),
+        layer: 1,
+        source_hashes: vec![source_hash],
+        original_size: Some(4096),
+        compressed_size: None, // computed by the signing helper
+        settlement_tx_hash: None,
+    };
+    amendment.sign_prover_authentication(&signer).expect("sign");
+    let wire = amendment.to_json().expect("serialize");
+    let decoded = ProofAmendment::from_json(&wire).expect("deserialize");
+    assert_eq!(decoded, amendment);
+    decoded
+        .verify_prover_authentication()
+        .expect("authenticate");
+
+    let mut tampered = decoded.clone();
+    tampered.proof.batch_root_bytes[0] ^= 1;
+    assert!(tampered.verify_prover_authentication().is_err());
+    println!("{}", String::from_utf8(wire).expect("UTF-8"));
+}
+```
+
+Authentication alone does not verify the STARK proof or establish registration.
+Normal admission also checks the canonical source range and proof, and requires
+ProverRegistry membership when its activation rule applies. Accepted artifacts
+are stored under `pa/<block_hash>`; witness deletion follows the applicable
+settlement, retention and grace rules. Serializing an amendment does not publish
+it to P2P or settle it on chain.
 
 ---
 
