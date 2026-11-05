@@ -951,8 +951,9 @@ finality. A node configured to wait for transactions may stay idle.
 ### High memory usage
 
 - Switch from `--db memory` to `--db rocksdb` for production.
-- Choose a storage profile: `--storage-profile light` uses a fixed ~1 GB rolling window; `--storage-profile full` (default) keeps TX history forever but replaces PQ witnesses with compact STARK proofs.
-- Enable state-root pruning: `--pruning 1000` retains only the last 1,000 state roots. Note: the `light` profile sets its own `keep_recent` default (4096) only when `--pruning` is omitted; pass `--pruning N` explicitly to override.
+- Choose a storage profile: `--storage-profile light` enables rolling retention; `--storage-profile full` (default) retains transaction bodies and historical state. Witness deletion also requires verified proof coverage and the configured grace period.
+- For rolling state pruning, use `--storage-profile light --pruning 1000`. The limit is a retention target, not a fixed memory or disk cap. `--pruning 1000` alone leaves the default Full profile's historical state intact. Restart catch-up is fixed in the unreleased node source; earlier binaries may wait for another retention window after restart or a profile switch.
+- Check the effective profile and `keep_recent` using `shell_getStorageProfile`. Rolling pruning preserves required recovery state; with nonzero epoch lengths, it also retains the last finalized epoch boundary and newer state. See [storage profiles](https://www.shell.org/en/docs/storage-profiles).
 - Check mempool size via `shell_pendingCount` RPC.
 
 ### Metrics not appearing in Grafana
