@@ -293,6 +293,53 @@ shell-node wallet <create|balance|send|export> [OPTIONS]
 
 ---
 
+#### Authenticated RPC endpoints
+
+This client feature is new in the unreleased source. The published 0.27.13
+client does not read this setting; use a client containing the new transport.
+
+For `account`, `wallet balance/send`, and `tx` commands using `--rpc-url`, set
+`SHELL_RPC_API_KEY_FILE` to the path of a file containing the node's API key.
+The client reads it before each RPC request and sends `Authorization: Bearer
+<TOKEN>`, including automatic chain ID, nonce, fee, gas, and public-key queries
+made while signing. For example, with a key file provisioned by your operator:
+
+```bash
+chmod 600 rpc-api-key.txt
+SHELL_RPC_API_KEY_FILE=rpc-api-key.txt \
+  shell-node wallet balance <ADDRESS> --rpc-url https://rpc.example.org
+
+SHELL_RPC_API_KEY_FILE=rpc-api-key.txt \
+  shell-node --password-file keystore-password.txt wallet send \
+    --keystore wallet.json --to <ADDRESS> --value 43 \
+    --rpc-url https://rpc.example.org
+```
+
+The environment variable contains a **file path**, never the token itself. The
+file must be a regular UTF-8 file with one nonempty, non-whitespace ASCII token
+of at most 4096 bytes; one trailing LF or CRLF is permitted. Symbolic links,
+directories, unreadable files, and invalid contents fail before contacting the
+endpoint. Keep the file private and use HTTPS outside isolated loopback tests.
+Authenticated requests refuse redirects; provide the final RPC URL directly.
+An unset variable sends no bearer token. A missing or incorrect credential is
+still rejected by a protected server with HTTP 401. This client setting does
+not configure the server's `run --rpc-api-key` requirement.
+
+**Native regression:** Node.js 20 or later and a compatible `shell-node` built
+with RocksDB and libp2p are required. The script creates temporary encrypted test
+accounts and Dev1337 genesis funds, submits genuine signed 43/47-wei payments
+through API-key-protected independent nodes, checks authorization failures,
+fees, import, finality, complete receipts, and persistence after reopening. It
+retains its artifacts, stops its nodes, and exits nonzero on failure.
+
+```bash
+cargo build -p shell-cli --features libp2p
+NODE_BIN=target/debug/shell-node node tests/e2e/native-cli-auth.mjs
+```
+
+`CLI_BIN` can select a separate client binary while `NODE_BIN` supplies the
+native servers; record both versions when using this compatibility mode.
+
 ### 2.8 `backup` Subcommands
 
 Offline backup and restore for the RocksDB data directory:
@@ -360,6 +407,7 @@ Prints the binary version and build metadata.
 | Variable | Description |
 |----------|-------------|
 | `SHELL_KEYSTORE_PASSWORD` | Keystore password (only used when `--allow-env-password` is set) |
+| `SHELL_RPC_API_KEY_FILE` | Path to the bearer-token file for CLI account/wallet/tx RPC requests; see [authenticated endpoints](#authenticated-rpc-endpoints) |
 | `RUST_LOG` | Log filter (overridden by `--log-level`) |
 | `RUST_BACKTRACE` | Enable panic backtraces (`1` or `full`) |
 

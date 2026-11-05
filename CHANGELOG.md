@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Authenticate CLI wallet, account, and transaction RPC calls with
+  `SHELL_RPC_API_KEY_FILE`, including automatic signing queries. Read a regular
+  credential file without following symlinks, reject invalid or oversized tokens,
+  and refuse authenticated redirects without printing credentials. Include a
+  native signed two-node regression through authorization, fees, finality, and
+  persistent reopen.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed
