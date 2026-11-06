@@ -647,3 +647,80 @@ Design decision: reuse atomic prefix snapshots, native metadata undo and the
 existing crypto proof/runtime interfaces. Seal the finished view behind a
 read-only adapter so successful historical validation cannot write canonical
 state or substitute live registry/configuration values.
+
+## AIR membership in an activated native block body
+
+The `mldsa-body-proof.sh` entry point adds exact signed-envelope membership in
+[native block-commitment-v1](block-commitments.md). The verifier checks real
+BLAKE3 compression AIR certificates for the full leaf, every ordered path hash,
+and the final count-binding hash. It does not substitute a native digest for a
+certificate. Native core encoding helpers supply the same leaf, branch and root
+bytes used by block production; sender, signature algorithm/bytes, Embedded key
+or Reference mode, transaction fields and optional bundle bytes are bound.
+
+The general BLAKE3 container **v1** retains its 4096-byte limit and existing
+serialized proof meaning. The full body-leaf container **v2** permits at most
+16,384 bytes and 271 compression certificates; it reuses the unchanged
+compression AIR and standard chunk/tree/root routing. Internal-node and final
+root hashes use v1. Each profile rejects the other container version. These are
+local proof resource bounds, rather than transaction limits, gas rules or a
+network activation. At most 64 sibling/parent positions are accepted; odd nodes
+carry without consuming a sibling or certificate, and unused coverage rejects.
+
+`verify_body_bound_registered_signature` requires an explicitly activated child
+header captured in the sealed canonical parent view. It checks the frozen
+canonical number/hash/header, parent linkage and configuration, verifies exact
+body membership at the caller's expected index, then verifies the existing
+complete registered signature and committed parent account. Its immutable result
+exposes the exact proof-backed crypto verifier for native policy and execution.
+A caller cannot construct a verified result from serialized fields. A valid
+membership proof alone cannot enable an unscheduled profile or authenticate an
+arbitrary caller-selected header.
+
+Use the stable Rust toolchain and locked dependencies, plus the same RocksDB
+C/C++/libclang build prerequisites as the canonical-state regression. First
+create the two source/signature graphs, initial account-state checkpoints and
+legacy canonical fixture with the preceding documented entry points. The graphs
+must contain genuine generated signatures for their own test accounts; no
+personal key or public funds are needed. Supply their directories explicitly:
+
+```bash
+tests/e2e/mldsa-body-proof.sh prove first-graph.json second-graph state registered canonical body
+tests/e2e/mldsa-body-proof.sh verify first-graph.json second-graph state registered canonical body
+```
+
+`first-graph.json` can reference the first graph's checkpoint directories as
+previously described; `second-graph` is the independent second graph. `state`,
+`registered` and `canonical` are outputs of the account, registered and canonical
+regressions above. `body` must be a new output directory. Invalid arguments or
+any failed stage exit nonzero. Verify does not generate proofs. Prove resumes
+only by verifying matching complete saved inputs; a partial native fixture or
+malformed checkpoint is retained and refused.
+
+The new isolated fixture keeps the accepted initial state, executes an empty
+block followed by both original genuine transactions in one native batch, and
+records the v1 activation at height one. Both envelopes use Embedded mode, while
+the returning second account already has its key registered. The second leaf
+therefore includes the full key and signature and exceeds the old 4096-byte
+proof bound. Its two-member path contains the first transaction's sibling hash.
+The existing signature graphs and initial second-account proof are reused;
+changes in inclusion height/index/receipts do not require regenerating them.
+The final account state must equal the earlier two-transfer execution result.
+
+After persisting and reopening the batch, verification proves the second
+registered signature and its ordered membership against the captured header,
+re-executes the native batch with that exact crypto verifier for the second
+transaction, and compares state, gas and receipts. Historical writes remain in
+an isolated overlay whose commit to the sealed store is refused. The regression
+also checks a rejected second transaction after the first staged effects,
+advanced-current-nonce refusal, witness/key/mode/intent/index/count/path/version/
+coverage tampering, wrong headers and unscheduled or changed live context.
+
+This profile proves one exact public signed transaction's membership and
+registered signature against a **trusted local canonical header and parent**.
+It does not prove consensus, the header hash in AIR, signatures of all other
+body members, a private encoding, first-use registry authorization, arbitrary
+contracts or actual proof ingestion by a full node. The native batch fixture
+has no proposer seal or block reward settlement. Broader sequential account
+changes, full-node integration and the referenced public binary/network
+activation remain separate acceptance work.

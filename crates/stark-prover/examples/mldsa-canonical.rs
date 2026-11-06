@@ -32,6 +32,8 @@ struct OldContext {
 #[serde(deny_unknown_fields)]
 struct Context {
     version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    block_commitment_height: Option<u64>,
     genesis_root: [u8; 32],
     hashes: Vec<ShellHash>,
     parent_root: [u8; 32],
@@ -87,7 +89,8 @@ fn context(
             && c.receipts.len() == 2
             && c.genesis_root == root.state_root
             && c.first == signed(first, false)?
-            && c.second == signed(second, true)?
+            && matches!(c.block_commitment_height, None | Some(1))
+            && c.second == signed(second, c.block_commitment_height.is_none())?
             && c.first_key
                 == first
                     .expected
@@ -126,11 +129,21 @@ fn header(root: ShellHash) -> BlockHeader {
         witness_root: None,
     }
 }
-fn init(first: &LoadedEntry, second: &LoadedEntry, old: &Path, dir: &Path) -> Result<(), Error> {
+fn init(
+    first: &LoadedEntry,
+    second: &LoadedEntry,
+    old: &Path,
+    dir: &Path,
+    body: bool,
+) -> Result<(), Error> {
     first.verify()?;
     std::fs::create_dir_all(dir)?;
     if dir.join("canonical-source.json").try_exists()? {
-        context(first, second, old, dir)?;
+        let saved = context(first, second, old, dir)?;
+        ensure(
+            saved.block_commitment_height == body.then_some(1),
+            "fixture activation profile differs",
+        )?;
         return reopen(dir);
     }
     ensure(
@@ -139,17 +152,15 @@ fn init(first: &LoadedEntry, second: &LoadedEntry, old: &Path, dir: &Path) -> Re
     )?;
     let root: OldContext = read(&old.join("state-source.json"))?;
     let first_tx = signed(first, false)?;
-    let second_tx = signed(second, true)?;
+    let second_tx = signed(second, !body)?;
     let first_key = first
         .expected
-        .pubkey_mode
-        .pubkey_bytes()
+        .public_key()
         .ok_or("missing first key")?
         .to_vec();
     let second_key = second
         .expected
-        .pubkey_mode
-        .pubkey_bytes()
+        .public_key()
         .ok_or("missing second key")?
         .to_vec();
     let result;
@@ -168,9 +179,10 @@ fn init(first: &LoadedEntry, second: &LoadedEntry, old: &Path, dir: &Path) -> Re
             system_transactions: vec![],
             proposer_seal: None,
         };
-        let config: ChainConfig = serde_json::from_value(
-            serde_json::json!({"chain_id":10,"genesis_hash":genesis.hash(),"fee_accounting_activation_height":1,"native_address_context_height":1}),
-        )?;
+        let config: ChainConfig = serde_json::from_value(serde_json::json!({
+            "chain_id":10, "genesis_hash":genesis.hash(), "fee_accounting_activation_height":1,
+            "native_address_context_height":1, "block_commitment_height":body.then_some(1)
+        }))?;
         chain.put_pubkey(&second_tx.from, &second_key)?;
         chain.commit_genesis_block(&genesis, &config)?;
         ensure(
@@ -181,39 +193,64 @@ fn init(first: &LoadedEntry, second: &LoadedEntry, old: &Path, dir: &Path) -> Re
         let mut hashes = vec![previous.hash()];
         let mut receipts = Vec::new();
         let mut parent_root = root.state_root;
-        for tx in [&first_tx, &second_tx] {
+        // The activated fixture executes both accepted genuine signatures in one
+        // batch after an empty block, preserving the initial proved parent state.
+        let groups = if body {
+            vec![vec![], vec![&first_tx, &second_tx]]
+        } else {
+            vec![vec![&first_tx], vec![&second_tx]]
+        };
+        for group in groups {
             let overlay = Arc::new(OverlayStore::new(Arc::clone(&db)));
             let cs = ChainStore::new(Arc::clone(&overlay));
             let checkpoint = cs.address_metadata_checkpoint()?;
-            let mut world = WorldState::at_root(Arc::clone(&overlay), &previous.header.state_root)?;
-            validate_tx(tx, &mut world, &cs, &MultiVerifier, 10)?;
+            let world = WorldState::at_root(Arc::clone(&overlay), &previous.header.state_root)?;
             let mut h = header(previous.header.state_root);
             h.parent_hash = previous.hash();
             h.number = previous.number() + 1;
             h.timestamp = previous.header.timestamp + 1;
             let mut vm = ShellPqvm::new(ShellStateDb::new(world, cs), 10);
-            let executed = vm.execute_tx(tx, &h, 0, 0)?;
-            ensure(
-                executed.receipt.status == 1 && executed.receipt.tx_hash == tx.hash(),
-                "native transfer failed",
-            )?;
-            commit_pqvm_state(&executed, vm.state_db_mut())?;
+            let mut block_receipts = Vec::new();
+            let mut cumulative = 0;
+            for (index, tx) in group.iter().enumerate() {
+                let cs = ChainStore::new(Arc::clone(&overlay));
+                validate_tx(
+                    tx,
+                    vm.state_db_mut().world_state_mut(),
+                    &cs,
+                    &MultiVerifier,
+                    10,
+                )?;
+                let executed = vm.execute_tx(tx, &h, index as u32, cumulative)?;
+                ensure(
+                    executed.receipt.status == 1 && executed.receipt.tx_hash == tx.hash(),
+                    "native transfer failed",
+                )?;
+                cumulative = executed.receipt.cumulative_gas_used;
+                commit_pqvm_state(&executed, vm.state_db_mut())?;
+                block_receipts.push(executed.receipt);
+            }
             h.state_root = vm.state_db_mut().world_state_mut().state_root()?;
-            h.gas_used = executed.receipt.gas_used;
+            h.gas_used = cumulative;
+            let transactions: Vec<_> = group.into_iter().cloned().collect();
+            if body {
+                h.transactions_root = shell_core::block_body_root(&transactions, &[])?;
+                h.receipts_root = shell_core::block_receipts_root(&block_receipts);
+            }
             let b = Block {
                 header: h,
-                transactions: vec![tx.clone()],
+                transactions,
                 system_transactions: vec![],
                 proposer_seal: None,
             };
             let cs = ChainStore::new(Arc::clone(&overlay));
             cs.stage_address_metadata_undo(&b.hash(), &checkpoint)?;
-            cs.commit_canonical_block(&b, Some(std::slice::from_ref(&executed.receipt)))?;
+            cs.commit_canonical_block(&b, Some(&block_receipts))?;
             overlay.commit()?;
             if b.number() == 1 {
                 parent_root = *b.header.state_root.as_bytes();
             }
-            receipts.push(executed.receipt);
+            receipts.extend(block_receipts);
             hashes.push(b.hash());
             previous = b;
         }
@@ -239,6 +276,7 @@ fn init(first: &LoadedEntry, second: &LoadedEntry, old: &Path, dir: &Path) -> Re
         )?;
         result = Context {
             version: 1,
+            block_commitment_height: body.then_some(1),
             genesis_root: root.state_root,
             hashes,
             parent_root,
@@ -261,7 +299,10 @@ fn init(first: &LoadedEntry, second: &LoadedEntry, old: &Path, dir: &Path) -> Re
     reopen(dir)?;
     println!(
         "{}",
-        serde_json::json!({"mode":"init","actual_native_transfers":2,"actual_signature_validation":true,"first_key_registered_by_first_native_admission":true,"state_receipts_blocks_and_native_undo_persisted":true,"consensus_import_validated":false,"transaction_root_commitment_proved":false})
+        serde_json::json!({"mode":"init", "actual_native_transfers":2,
+        "actual_signature_validation":true, "native_batch":body, "native_block_commitments":body,
+        "state_receipts_blocks_and_native_undo_persisted":true, "consensus_import_validated":false,
+        "transaction_root_commitment_proved":false})
     );
     Ok(())
 }
@@ -300,6 +341,10 @@ fn prove(
     dir: &Path,
 ) -> Result<(), Error> {
     let c = context(first, second, old, dir)?;
+    ensure(
+        c.block_commitment_height.is_none(),
+        "legacy proof operation requires legacy fixture",
+    )?;
     let mut generated = 0;
     let path = dir.join("account.json");
     if !path.try_exists()? {
@@ -360,6 +405,10 @@ fn registered(g: &LoadedEntry, leaf: Blake3HashProof) -> RegisteredSignatureProo
 }
 fn verify(first: &LoadedEntry, second: &LoadedEntry, old: &Path, dir: &Path) -> Result<(), Error> {
     let c = context(first, second, old, dir)?;
+    ensure(
+        c.block_commitment_height.is_none(),
+        "legacy proof operation requires legacy fixture",
+    )?;
     let stores = RocksDbStore::open_all(dir.join("native-db"), None)?;
     let db = Arc::new(stores.state.clone());
     let before = db.scan_all()?;
@@ -447,6 +496,10 @@ fn rejections(
     dir: &Path,
 ) -> Result<(), Error> {
     let c = context(first, second, old, dir)?;
+    ensure(
+        c.block_commitment_height.is_none(),
+        "legacy proof operation requires legacy fixture",
+    )?;
     let stores = RocksDbStore::open_all(dir.join("native-db"), None)?;
     let original = stores.state.scan_all()?;
     let proof = registered(second, read(&dir.join("reference-leaf.json"))?);
@@ -561,20 +614,58 @@ fn reopen(dir: &Path) -> Result<(), Error> {
             "saved block/header/canonical mapping mismatch",
         )?;
         if i > 0 {
-            let expected = if i == 1 { &c.first } else { &c.second };
+            if c.block_commitment_height.is_some() {
+                let expected = if i == 1 {
+                    vec![]
+                } else {
+                    vec![c.first.clone(), c.second.clone()]
+                };
+                let expected_receipts = if i == 1 { vec![] } else { c.receipts.clone() };
+                ensure(
+                    block.transactions == expected
+                        && chain.get_receipts(&c.hashes[i])? == Some(expected_receipts),
+                    "saved activated native batch differs",
+                )?;
+                chain.verify_block_body_commitment(&block)?;
+                chain.verify_block_receipts_commitment(
+                    &block,
+                    &chain
+                        .get_receipts(&block.hash())?
+                        .ok_or("missing receipts")?,
+                )?;
+            } else {
+                let expected = if i == 1 { &c.first } else { &c.second };
+                ensure(
+                    block.transactions.as_slice() == std::slice::from_ref(expected)
+                        && chain.get_receipts(&c.hashes[i])?
+                            == Some(vec![c.receipts[i - 1].clone()]),
+                    "saved transaction/receipt mismatch",
+                )?;
+            }
             ensure(
-                block.transactions.as_slice() == std::slice::from_ref(expected)
-                    && block.header.parent_hash == c.hashes[i - 1]
-                    && chain.get_receipts(&c.hashes[i])? == Some(vec![c.receipts[i - 1].clone()]),
-                "saved transaction/receipt/ancestry mismatch",
+                block.header.parent_hash == c.hashes[i - 1],
+                "saved ancestry mismatch",
             )?;
         }
     }
+    ensure(
+        chain
+            .get_chain_config()?
+            .ok_or("missing config")?
+            .block_commitment_height
+            == c.block_commitment_height,
+        "saved activation schedule mismatch",
+    )?;
     let old = chain.canonical_parent_view(c.hashes[2], c.hashes[0])?;
     let parent = chain.canonical_parent_view(c.hashes[2], c.hashes[1])?;
     ensure(
         old.registered_key(&c.first.from)?.is_none()
-            && parent.registered_key(&c.first.from)? == Some(c.first_key)
+            && parent.registered_key(&c.first.from)?
+                == if c.block_commitment_height.is_some() {
+                    None
+                } else {
+                    Some(c.first_key)
+                }
             && parent.world_state()?.get_account(&c.second.from)? == Some(c.account),
         "persisted historical registry/account mismatch",
     )?;
@@ -595,20 +686,402 @@ fn reopen(dir: &Path) -> Result<(), Error> {
     );
     Ok(())
 }
+fn body_inputs(
+    first: &LoadedEntry,
+    second: &LoadedEntry,
+    old: &Path,
+    accepted: &Path,
+    dir: &Path,
+) -> Result<Context, Error> {
+    let c = context(first, second, old, dir)?;
+    let previous = context(first, second, old, accepted)?;
+    ensure(
+        c.block_commitment_height == Some(1)
+            && previous.block_commitment_height.is_none()
+            && c.genesis_root == previous.genesis_root
+            && c.current_root == previous.current_root
+            && c.parent_root == c.genesis_root
+            && c.second.tx == previous.second.tx
+            && c.second.signature == previous.second.signature
+            && c.second.from == previous.second.from,
+        "activated batch differs from accepted genuine inputs or native execution roots",
+    )?;
+    Ok(c)
+}
+fn body_prove(
+    first: &LoadedEntry,
+    second: &LoadedEntry,
+    old: &Path,
+    accepted: &Path,
+    dir: &Path,
+) -> Result<(), Error> {
+    use shell_stark_prover::body_membership::{
+        prove_transaction_body, verify_transaction_body, TransactionBodyProof,
+    };
+    let c = body_inputs(first, second, old, accepted, dir)?;
+    let stores = RocksDbStore::open_all(dir.join("native-db"), None)?;
+    let chain = ChainStore::new(Arc::new(stores.state));
+    let block = chain
+        .get_block_by_hash(&c.hashes[2])?
+        .ok_or("missing native batch")?;
+    let message = shell_core::block_body_leaf_message(&c.second, 1);
+    ensure(
+        message.len() > shell_stark_prover::blake3_hash::MAX_HASH_BYTES
+            && prove_hash(&message).is_err(),
+        "legacy proof bound must remain closed",
+    )?;
+    let source_path = dir.join("body-source.json");
+    let source = serde_json::json!({"version":1,"block":block,"receipts":c.receipts,
+        "parent_root":c.parent_root,"current_root":c.current_root,"leaf_index":1});
+    if !source_path.try_exists()? {
+        write(&source_path, &source)?;
+    }
+    ensure(
+        read::<serde_json::Value>(&source_path)? == source,
+        "saved body source differs from inputs",
+    )?;
+    let path = dir.join("body-proof.json");
+    let generated = !path.try_exists()?;
+    if generated {
+        write(&path, &prove_transaction_body(&block, 1)?)?;
+    }
+    let proof: TransactionBodyProof = read(&path)?;
+    verify_transaction_body(&proof, &block.header, &c.second, 1)?;
+    println!(
+        "{}",
+        serde_json::json!({"mode":"body-prove", "new_body_proof":generated,
+        "full_signed_leaf_bytes":message.len(), "leaf_compressions":proof.leaf.compressions.len(),
+        "parent_hashes":proof.parents.len(), "total_body_members":proof.path.total,
+        "signature_graphs_regenerated":0, "legacy4096_profile_still_refuses":true})
+    );
+    Ok(())
+}
+fn body_verify(
+    first: &LoadedEntry,
+    second: &LoadedEntry,
+    old: &Path,
+    accepted: &Path,
+    dir: &Path,
+    refusals: bool,
+) -> Result<(), Error> {
+    use shell_stark_prover::{
+        body_membership::{verify_transaction_body, TransactionBodyProof},
+        canonical_signature::verify_body_bound_registered_signature,
+    };
+    let c = body_inputs(first, second, old, accepted, dir)?;
+    let stores = RocksDbStore::open_all(dir.join("native-db"), None)?;
+    let db = Arc::new(stores.state.clone());
+    let before = db.scan_all()?;
+    let chain = ChainStore::new(db.clone());
+    let view = chain.canonical_parent_view(c.hashes[2], c.hashes[1])?;
+    let block = chain
+        .get_block_by_hash(&c.hashes[2])?
+        .ok_or("missing native batch")?;
+    let body: TransactionBodyProof = read(&dir.join("body-proof.json"))?;
+    let account: AccountStateProof = read(&old.join("second-account.json"))?;
+    let signature = registered(second, second.proof.leaf.clone());
+    if !refusals {
+        let token = verify_body_bound_registered_signature(
+            &view,
+            &block.header,
+            1,
+            &c.second,
+            &account,
+            &signature,
+            &body,
+        )?;
+        ensure(
+            token.membership().block_hash() == block.hash()
+                && token.membership().index() == 1
+                && token.membership().total() == 2
+                && token.signature().matches_transaction(&c.second),
+            "body-bound token mismatch",
+        )?;
+        let mut world = view.world_state()?;
+        validate_tx_for_import_at_block(
+            &c.second,
+            &mut world,
+            &ChainStore::new(view.store()),
+            token.signature(),
+            10,
+            None,
+            &block.header,
+        )?;
+        // Re-execute the real batch with the exact body-bound verifier on its
+        // second transaction. All writes stay inside a private historical overlay.
+        let replay = Arc::new(OverlayStore::new(view.store()));
+        let replay_chain = ChainStore::new(replay.clone());
+        let world = WorldState::at_root(replay.clone(), &view.parent().state_root)?;
+        let mut vm = ShellPqvm::new(ShellStateDb::new(world, replay_chain), 10);
+        let mut replayed = Vec::new();
+        let mut cumulative = 0;
+        for (index, transaction) in [&c.first, &c.second].into_iter().enumerate() {
+            let cs = ChainStore::new(replay.clone());
+            if index == 0 {
+                validate_tx_for_import_at_block(
+                    transaction,
+                    vm.state_db_mut().world_state_mut(),
+                    &cs,
+                    &MultiVerifier,
+                    10,
+                    None,
+                    &block.header,
+                )?;
+            } else {
+                validate_tx_for_import_at_block(
+                    transaction,
+                    vm.state_db_mut().world_state_mut(),
+                    &cs,
+                    token.signature(),
+                    10,
+                    None,
+                    &block.header,
+                )?;
+            }
+            let result = vm.execute_tx(transaction, &block.header, index as u32, cumulative)?;
+            cumulative = result.receipt.cumulative_gas_used;
+            commit_pqvm_state(&result, vm.state_db_mut())?;
+            replayed.push(result.receipt);
+        }
+        ensure(
+            replayed == c.receipts
+                && cumulative == block.header.gas_used
+                && vm.state_db_mut().world_state_mut().state_root()?
+                    == ShellHash::from(c.current_root),
+            "proof-backed native batch replay differs from persisted execution",
+        )?;
+        ChainStore::new(replay.clone()).verify_block_receipts_commitment(&block, &replayed)?;
+        ensure(
+            replay.commit().is_err(),
+            "historical proof replay committed into frozen parent",
+        )?;
+        // Reject a second transaction after the first has already staged effects.
+        let rollback = Arc::new(OverlayStore::new(view.store()));
+        let cs = ChainStore::new(rollback.clone());
+        let world = WorldState::at_root(rollback.clone(), &view.parent().state_root)?;
+        let mut vm = ShellPqvm::new(ShellStateDb::new(world, cs), 10);
+        validate_tx_for_import_at_block(
+            &c.first,
+            vm.state_db_mut().world_state_mut(),
+            &ChainStore::new(rollback.clone()),
+            &MultiVerifier,
+            10,
+            None,
+            &block.header,
+        )?;
+        let result = vm.execute_tx(&c.first, &block.header, 0, 0)?;
+        commit_pqvm_state(&result, vm.state_db_mut())?;
+        let mut bad = c.second.clone();
+        bad.tx.nonce += 1;
+        ensure(
+            validate_tx_for_import_at_block(
+                &bad,
+                vm.state_db_mut().world_state_mut(),
+                &ChainStore::new(rollback.clone()),
+                token.signature(),
+                10,
+                None,
+                &block.header,
+            )
+            .is_err(),
+            "invalid second batch transaction accepted",
+        )?;
+        drop(vm);
+        drop(rollback);
+        let mut current = WorldState::at_root(db.clone(), &ShellHash::from(c.current_root))?;
+        ensure(
+            validate_tx_for_import_at_block(
+                &c.second,
+                &mut current,
+                &chain,
+                token.signature(),
+                10,
+                None,
+                &block.header,
+            )
+            .is_err(),
+            "advanced nonce replay accepted",
+        )?;
+        ensure(
+            before == db.scan_all()?,
+            "body signature verification wrote base KV",
+        )?;
+        println!(
+            "{}",
+            serde_json::json!({"mode":"body-verify", "genuine_registered_Embedded_signature_and_body_AIR":true,
+            "native_import_policy_uses_body_bound_proof_verifier":true, "native_batch_transfers":2,
+            "current_nonce_replay_rejected":true, "proof_backed_native_batch_replayed":true,
+            "invalid_second_transaction_rolls_back":true, "historical_replay_commit_refused":true,
+            "base_KV_unchanged":true, "consensus_proved":false})
+        );
+        return Ok(());
+    }
+    let mut rejected = Vec::new();
+    for kind in [
+        "signature",
+        "embedded_key",
+        "reference_mode",
+        "intent",
+        "wrong_index",
+        "count",
+        "missing_sibling",
+        "extra_sibling",
+        "missing_parent",
+        "extra_parent",
+        "leaf_version",
+        "root_version",
+        "compression_counter",
+        "wrong_header",
+        "wrong_parent",
+    ] {
+        let mut changed = body.clone();
+        let mut signed = c.second.clone();
+        let mut header = block.header.clone();
+        let mut index = 1;
+        match kind {
+            "signature" => signed.signature.data[0] ^= 1,
+            "embedded_key" => {
+                if let PubkeyMode::Embedded(ref mut key) = signed.pubkey_mode {
+                    key[0] ^= 1;
+                }
+            }
+            "reference_mode" => signed.pubkey_mode = PubkeyMode::Reference,
+            "intent" => signed.tx.value += U256::from(1),
+            "wrong_index" => index = 0,
+            "count" => changed.path.total += 1,
+            "missing_sibling" => changed.path.siblings.clear(),
+            "extra_sibling" => changed.path.siblings.push(ShellHash::ZERO),
+            "missing_parent" => changed.parents.clear(),
+            "extra_parent" => changed.parents.push(changed.parents[0].clone()),
+            "leaf_version" => changed.leaf.version = 1,
+            "root_version" => changed.root.version = 2,
+            "compression_counter" => changed.leaf.compressions[0].input.counter += 1,
+            "wrong_header" => header.receipts_root = ShellHash::ZERO,
+            _ => header.parent_hash = ShellHash::ZERO,
+        }
+        ensure(
+            verify_body_bound_registered_signature(
+                &view, &header, index, &signed, &account, &signature, &changed,
+            )
+            .is_err(),
+            &format!("accepted {kind}"),
+        )?;
+        rejected.push(kind);
+    }
+    // A mathematically valid membership proof still needs the captured activation.
+    let copy = Arc::new(MemoryDb::new());
+    for (k, v) in &before {
+        copy.put(k, v)?;
+    }
+    let mutable = ChainStore::new(copy.clone());
+    let mut config = mutable.get_chain_config()?.ok_or("missing config")?;
+    config.block_commitment_height = None;
+    copy.put(b"CFG", &serde_json::to_vec(&config)?)?;
+    let unscheduled = mutable.canonical_parent_view(c.hashes[2], c.hashes[1])?;
+    verify_transaction_body(&body, &block.header, &c.second, 1)?;
+    ensure(
+        verify_body_bound_registered_signature(
+            &unscheduled,
+            &block.header,
+            1,
+            &c.second,
+            &account,
+            &signature,
+            &body,
+        )
+        .is_err(),
+        "unscheduled body profile accepted",
+    )?;
+    rejected.push("unscheduled_profile");
+    config.block_commitment_height = Some(3);
+    copy.put(b"CFG", &serde_json::to_vec(&config)?)?;
+    let before_activation = mutable.canonical_parent_view(c.hashes[2], c.hashes[1])?;
+    ensure(
+        verify_body_bound_registered_signature(
+            &before_activation,
+            &block.header,
+            1,
+            &c.second,
+            &account,
+            &signature,
+            &body,
+        )
+        .is_err(),
+        "body proof accepted before activation",
+    )?;
+    rejected.push("before_activation");
+    config.block_commitment_height = None;
+    copy.put(b"CFG", &serde_json::to_vec(&config)?)?;
+    // Later live registry/configuration changes cannot replace the frozen header/context.
+    let frozen = ChainStore::new(copy.clone()).canonical_parent_view(c.hashes[2], c.hashes[1])?;
+    // The unscheduled frozen view remains rejected even after the live schedule changes.
+    config.block_commitment_height = Some(1);
+    copy.put(b"CFG", &serde_json::to_vec(&config)?)?;
+    ensure(
+        verify_body_bound_registered_signature(
+            &frozen,
+            &block.header,
+            1,
+            &c.second,
+            &account,
+            &signature,
+            &body,
+        )
+        .is_err(),
+        "live activation leaked into frozen view",
+    )?;
+    rejected.push("live_schedule_substitution");
+    let valid = mutable.canonical_parent_view(c.hashes[2], c.hashes[1])?;
+    mutable.put_pubkey(&c.second.from, &c.first_key)?;
+    mutable.set_head(&c.hashes[0])?;
+    copy.put(b"CFG", b"bad")?;
+    copy.put(&[b"h/".as_slice(), c.hashes[2].as_bytes()].concat(), b"bad")?;
+    ensure(
+        mutable.get_header_by_hash(&c.hashes[2]).is_err(),
+        "live header corruption control did not reach the retained header",
+    )?;
+    let changed_live = copy.scan_all()?;
+    verify_body_bound_registered_signature(
+        &valid,
+        &block.header,
+        1,
+        &c.second,
+        &account,
+        &signature,
+        &body,
+    )?;
+    ensure(
+        changed_live == copy.scan_all()?,
+        "frozen body verification wrote changed live state",
+    )?;
+    ensure(before == db.scan_all()?, "refusals wrote original KV")?;
+    println!(
+        "{}",
+        serde_json::json!({"mode":"body-check-rejections", "rejected":rejected,
+        "base_KV_unchanged":true, "signature_graphs_regenerated":0})
+    );
+    Ok(())
+}
 fn main() -> Result<(), Error> {
     let a: Vec<_> = std::env::args().skip(1).collect();
-    ensure(a.len()==6,"usage: mldsa-canonical init|prove|verify|check-rejections|reopen first-graph second-graph old-state-dir registered-dir canonical-dir")?;
+    let body = a.first().is_some_and(|mode| mode.starts_with("body-"));
+    ensure(a.len() == if body { 7 } else { 6 }, "usage: mldsa-canonical operation first-graph second-graph old-state-dir registered-dir [accepted-canonical-dir] output-dir")?;
     let (first, _, _) = graph::load(Path::new(&a[1]))?;
     let (second, _, _) = graph::load(Path::new(&a[2]))?;
     let old = Path::new(&a[3]);
     let registered = Path::new(&a[4]);
-    let dir = Path::new(&a[5]);
+    let dir = Path::new(&a[if body { 6 } else { 5 }]);
     match a[0].as_str() {
-        "init" => init(&first, &second, old, dir),
+        "init" => init(&first, &second, old, dir, false),
         "prove" => prove(&first, &second, old, registered, dir),
         "verify" => verify(&first, &second, old, dir),
         "check-rejections" => rejections(&first, &second, old, dir),
         "reopen" => reopen(dir),
+        "body-init" => init(&first, &second, old, dir, true),
+        "body-prove" => body_prove(&first, &second, old, Path::new(&a[5]), dir),
+        "body-verify" => body_verify(&first, &second, old, Path::new(&a[5]), dir, false),
+        "body-check-rejections" => body_verify(&first, &second, old, Path::new(&a[5]), dir, true),
+        "body-reopen" => reopen(dir),
         _ => Err("unknown canonical proof operation".into()),
     }
 }

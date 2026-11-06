@@ -44,6 +44,8 @@ const CONSTRAINTS: usize = BOOLS + 4 + 1 + 32;
 const MAX_PROOF_BYTES: usize = 1_048_576;
 /// Development input bound; this does not define transaction limits or gas.
 pub const MAX_HASH_BYTES: usize = 4096;
+/// Separate body-leaf proof profile; not a native transaction size or gas limit.
+pub const MAX_BODY_HASH_BYTES: usize = 16_384;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -486,9 +488,10 @@ fn subtree(
 }
 fn hash_route(
     message: &[u8],
+    max_bytes: usize,
     mut compress: impl FnMut(CompressionInput) -> Result<[u32; 16], String>,
 ) -> Result<[u8; 32], String> {
-    if message.len() > MAX_HASH_BYTES {
+    if message.len() > max_bytes {
         return Err("BLAKE3 development input bound exceeded".into());
     }
     let words = subtree(
@@ -506,15 +509,29 @@ fn hash_route(
 }
 /// Prove a complete unkeyed 32-byte digest, including chunk/tree/root domains.
 pub fn prove_hash(message: &[u8]) -> Result<Blake3HashProof, String> {
+    prove_hash_profile(message, 1, MAX_HASH_BYTES)
+}
+
+/// A separately versioned bounded leaf profile. Compression certificates and
+/// standard BLAKE3 routing are identical; legacy v1 verification stays at 4096.
+pub(crate) fn prove_body_hash(message: &[u8]) -> Result<Blake3HashProof, String> {
+    prove_hash_profile(message, 2, MAX_BODY_HASH_BYTES)
+}
+
+fn prove_hash_profile(
+    message: &[u8],
+    version: u8,
+    max_bytes: usize,
+) -> Result<Blake3HashProof, String> {
     let mut compressions = Vec::new();
-    let output = hash_route(message, |input| {
+    let output = hash_route(message, max_bytes, |input| {
         let p = prove_compression(&input)?;
         let out = p.output().ok_or("missing compression output")?;
         compressions.push(p);
         Ok(out)
     })?;
     Ok(Blake3HashProof {
-        version: 1,
+        version,
         message: message.to_vec(),
         output,
         compressions,
@@ -523,17 +540,37 @@ pub fn prove_hash(message: &[u8]) -> Result<Blake3HashProof, String> {
 /// Bind expected bytes and digest, verify every compression and all fixed
 /// byte/chaining/tree routing. No native BLAKE3 computation substitutes here.
 pub fn verify_hash(p: &Blake3HashProof, message: &[u8], output: &[u8; 32]) -> Result<(), String> {
-    if p.version != 1
+    verify_hash_profile(p, message, output, 1, MAX_HASH_BYTES)
+}
+
+pub(crate) fn verify_body_hash(
+    p: &Blake3HashProof,
+    message: &[u8],
+    output: &[u8; 32],
+) -> Result<(), String> {
+    verify_hash_profile(p, message, output, 2, MAX_BODY_HASH_BYTES)
+}
+
+fn verify_hash_profile(
+    p: &Blake3HashProof,
+    message: &[u8],
+    output: &[u8; 32],
+    version: u8,
+    max_bytes: usize,
+) -> Result<(), String> {
+    if p.version != version
         || p.message != message
         || p.output != *output
-        || message.len() > MAX_HASH_BYTES
+        || message.len() > max_bytes
         || p.compressions.is_empty()
-        || p.compressions.len() > 67
+        || p.compressions.len() > max_bytes.div_ceil(64) + max_bytes.div_ceil(1024) - 1
+        || p.compressions.len()
+            != message.len().div_ceil(64).max(1) + message.len().div_ceil(1024).max(1) - 1
     {
         return Err("invalid BLAKE3 hash version, binding, size or coverage".into());
     }
     let mut index = 0;
-    let digest = hash_route(message, |input| {
+    let digest = hash_route(message, max_bytes, |input| {
         let child = p
             .compressions
             .get(index)
@@ -670,7 +707,7 @@ mod tests {
         ] {
             let msg: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
             let mut calls = 0;
-            let result = hash_route(&msg, |input| {
+            let result = hash_route(&msg, MAX_HASH_BYTES, |input| {
                 calls += 1;
                 Ok(route(&input, native))
             })
@@ -712,7 +749,8 @@ mod tests {
             ),
         ] {
             let msg: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
-            let result = hash_route(&msg, |input| Ok(route(&input, native))).unwrap();
+            let result =
+                hash_route(&msg, MAX_HASH_BYTES, |input| Ok(route(&input, native))).unwrap();
             let text: String = result.iter().map(|v| format!("{v:02x}")).collect();
             assert_eq!(text, hex);
         }
@@ -840,5 +878,28 @@ mod source_tests {
             blob.signing_hash(3).as_bytes(),
             blake3::hash(&expected).as_bytes()
         );
+    }
+}
+
+#[cfg(test)]
+mod body_profile_tests {
+    use super::*;
+    #[test]
+    fn legacy_bound_stays_closed_and_body_profile_has_separate_version() {
+        assert!(prove_hash(&vec![0; MAX_HASH_BYTES + 1]).is_err());
+        assert!(prove_body_hash(&vec![0; MAX_BODY_HASH_BYTES + 1]).is_err());
+        let message = b"body profile compatibility";
+        let legacy = prove_hash(message).unwrap();
+        let body = prove_body_hash(message).unwrap();
+        assert_eq!(legacy.version, 1);
+        assert_eq!(body.version, 2);
+        assert_eq!(legacy.output, body.output);
+        verify_hash(&legacy, message, &legacy.output).unwrap();
+        verify_body_hash(&body, message, &body.output).unwrap();
+        assert!(verify_hash(&body, message, &body.output).is_err());
+        assert!(verify_body_hash(&legacy, message, &legacy.output).is_err());
+        let mut changed = body.clone();
+        changed.compressions.push(changed.compressions[0].clone());
+        assert!(verify_body_hash(&changed, message, &body.output).is_err());
     }
 }

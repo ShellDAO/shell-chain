@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add complete AIR membership for exact native signed-body leaves and ordered
+  count-bound paths, with a separate bounded BLAKE3 container v2 for full
+  witnesses. Keep v1 proof bytes and its 4096-byte bound unchanged. Bind the
+  resulting registered signature to a frozen activated canonical child header,
+  and exercise native batch persistence, proof-backed historical execution and
+  rollback through `tests/e2e/mldsa-body-proof.sh`. Consensus/header proofs and
+  public network activation remain separate.
+
+
 - Optional native `block_commitment_height` rule: domain-separated, ordered,
   count-bound BLAKE3 commitments to exact signed transaction/system bodies and
   all execution receipts. Production seals these roots; import, historical

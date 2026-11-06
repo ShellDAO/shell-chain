@@ -43,6 +43,7 @@ pub mod amendment;
 pub mod availability;
 pub mod backlog;
 pub mod blake3_hash;
+pub mod body_membership;
 pub mod canonical_signature;
 pub mod keccak_permutation;
 pub mod metadata;

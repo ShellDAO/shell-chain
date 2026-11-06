@@ -109,3 +109,63 @@ pub fn verify_canonical_registered_signature<S: KvStore + 'static>(
         parent: view.parent().hash(),
     })
 }
+
+/// Full registered signature plus AIR membership at a frozen trusted canonical header.
+/// This still does not prove network consensus or the header's own hash in AIR.
+#[derive(Clone, Debug)]
+pub struct BodyBoundRegisteredSignature {
+    canonical: CanonicalRegisteredSignature,
+    membership: crate::body_membership::VerifiedBodyMembership,
+}
+impl BodyBoundRegisteredSignature {
+    pub fn signature(&self) -> &VerifiedRegisteredSignature {
+        self.canonical.signature()
+    }
+    pub fn canonical(&self) -> &CanonicalRegisteredSignature {
+        &self.canonical
+    }
+    pub fn membership(&self) -> &crate::body_membership::VerifiedBodyMembership {
+        &self.membership
+    }
+}
+/// Bind the independently expected transaction to an activated, snapshot-frozen
+/// child header before returning its proof-backed native crypto verifier.
+pub fn verify_body_bound_registered_signature<S: KvStore + 'static>(
+    view: &CanonicalParentView<S>,
+    header: &shell_core::BlockHeader,
+    index: u64,
+    signed: &SignedTransaction,
+    account: &AccountStateProof,
+    signature: &RegisteredSignatureProof,
+    body: &crate::body_membership::TransactionBodyProof,
+) -> Result<BodyBoundRegisteredSignature, String> {
+    if view
+        .config()
+        .block_commitment_height
+        .is_none_or(|height| header.number < height)
+        || view.parent().number.checked_add(1) != Some(header.number)
+        || header.parent_hash != view.parent().hash()
+    {
+        return Err("body signature requires the activated canonical child of this parent".into());
+    }
+    let chain = shell_storage::ChainStore::new(view.store());
+    let hash = header.hash();
+    if chain
+        .get_block_hash_by_number(header.number)
+        .map_err(|e| e.to_string())?
+        != Some(hash)
+        || chain
+            .get_header_by_hash(&hash)
+            .map_err(|e| e.to_string())?
+            .as_ref()
+            != Some(header)
+    {
+        return Err("body signature header is not captured canonical history".into());
+    }
+    let membership = crate::body_membership::verify_transaction_body(body, header, signed, index)?;
+    let canonical = verify_canonical_registered_signature(view, signed, account, signature)?;
+    Ok(BodyBoundRegisteredSignature {
+        canonical,
+        membership,
+    })
+}

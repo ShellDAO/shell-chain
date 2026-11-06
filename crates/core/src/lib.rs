@@ -10,7 +10,10 @@ mod witness;
 
 pub use account::Account;
 pub use block::{Block, BlockHeader, BlockSignerEvidence, StrippedBlock};
-pub use commitment::{block_body_root, block_receipts_root};
+pub use commitment::{
+    block_body_leaf_message, block_body_membership_path, block_body_parent_message,
+    block_body_root, block_body_root_message, block_receipts_root, BodyMembershipPath,
+};
 pub use fee::{
     calc_blob_gas_price, calc_excess_blob_gas, calculate_base_fee, effective_gas_price, miner_tip,
     BLOB_BASE_FEE_UPDATE_FRACTION, BLOB_GAS_PER_BLOB, INITIAL_BASE_FEE, MAX_BLOB_GAS_PER_BLOCK,

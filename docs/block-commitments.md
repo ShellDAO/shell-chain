@@ -111,3 +111,8 @@ production, import, persisted receipts and historical replay with activation
 boundaries and mutation refusals. These local checks do not establish public
 network activation, public binary availability, full signature proof membership
 or a replacement for consensus validation.
+
+The optional [full signed-body AIR membership profile](mldsa-transaction-source-proof.md#air-membership-in-an-activated-native-block-body)
+uses these exact native v1 bytes. Its separate 16 KiB hash-proof resource profile
+does not change this commitment format or activate any network. It still needs
+an authenticated header and independent native policy/execution checks.

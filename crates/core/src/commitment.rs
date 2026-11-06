@@ -7,64 +7,140 @@ use crate::{SignedTransaction, SystemTransaction, TransactionReceipt};
 const BODY_DOMAIN: &[u8] = b"SHELL_BODY_V1\0";
 const RECEIPT_DOMAIN: &[u8] = b"SHELL_RECEIPTS_V1\0";
 
-fn leaf(domain: &[u8], index: usize, kind: u8, value: &impl Encodable) -> ShellHash {
+fn leaf_message(domain: &[u8], index: u64, kind: u8, value: &impl Encodable) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(domain.len() + 10 + value.length());
     bytes.extend_from_slice(domain);
     bytes.push(0);
-    bytes.extend_from_slice(&(index as u64).to_be_bytes());
+    bytes.extend_from_slice(&index.to_be_bytes());
     bytes.push(kind);
     value.encode(&mut bytes);
-    blake3_hash(&bytes)
+    bytes
 }
-
-fn root(domain: &[u8], mut leaves: Vec<ShellHash>) -> ShellHash {
-    let count = leaves.len() as u64;
-    let mut bytes = Vec::with_capacity(domain.len() + 65);
-    while leaves.len() > 1 {
-        let next_len = leaves.len().div_ceil(2);
-        for index in 0..next_len {
-            let left = leaves[index * 2];
-            leaves[index] = match leaves.get(index * 2 + 1) {
-                Some(right) => {
-                    bytes.clear();
-                    bytes.extend_from_slice(domain);
-                    bytes.push(1);
-                    bytes.extend_from_slice(left.as_bytes());
-                    bytes.extend_from_slice(right.as_bytes());
-                    blake3_hash(&bytes)
-                }
-                None => left,
-            };
-        }
-        leaves.truncate(next_len);
-    }
+fn leaf(domain: &[u8], index: usize, kind: u8, value: &impl Encodable) -> ShellHash {
+    blake3_hash(&leaf_message(domain, index as u64, kind, value))
+}
+fn branch_message(domain: &[u8], left: ShellHash, right: ShellHash, bytes: &mut Vec<u8>) {
+    bytes.clear();
+    bytes.extend_from_slice(domain);
+    bytes.push(1);
+    bytes.extend_from_slice(left.as_bytes());
+    bytes.extend_from_slice(right.as_bytes());
+}
+fn count_message(domain: &[u8], count: u64, top: ShellHash, bytes: &mut Vec<u8>) {
     bytes.clear();
     bytes.extend_from_slice(domain);
     bytes.push(2);
     bytes.extend_from_slice(&count.to_be_bytes());
-    bytes.extend_from_slice(leaves.first().unwrap_or(&ShellHash::ZERO).as_bytes());
+    bytes.extend_from_slice(top.as_bytes());
+}
+fn reduce_level(domain: &[u8], leaves: &mut Vec<ShellHash>, bytes: &mut Vec<u8>) {
+    let next_len = leaves.len().div_ceil(2);
+    for index in 0..next_len {
+        let left = leaves[index * 2];
+        leaves[index] = match leaves.get(index * 2 + 1) {
+            Some(right) => {
+                branch_message(domain, left, *right, bytes);
+                blake3_hash(bytes)
+            }
+            None => left,
+        };
+    }
+    leaves.truncate(next_len);
+}
+fn root(domain: &[u8], mut leaves: Vec<ShellHash>) -> ShellHash {
+    let count = leaves.len() as u64;
+    let mut bytes = Vec::with_capacity(domain.len() + 65);
+    while leaves.len() > 1 {
+        reduce_level(domain, &mut leaves, &mut bytes);
+    }
+    count_message(
+        domain,
+        count,
+        leaves.first().copied().unwrap_or(ShellHash::ZERO),
+        &mut bytes,
+    );
     blake3_hash(&bytes)
 }
-
-/// Commit to exact canonical signed transaction RLP, followed by system wire byte-string RLP.
-/// Includes sender, authentication mode, key, signature and any AA bundle;
-/// deliberately does not use the witness-independent, potentially cached tx ID.
-pub fn block_body_root(
+fn body_leaves(
     transactions: &[SignedTransaction],
     system_transactions: &[SystemTransaction],
-) -> Result<ShellHash, serde_json::Error> {
+) -> Result<Vec<ShellHash>, serde_json::Error> {
     let mut leaves: Vec<_> = transactions
         .iter()
         .enumerate()
         .map(|(i, tx)| leaf(BODY_DOMAIN, i, 0, tx))
         .collect();
     for (i, tx) in system_transactions.iter().enumerate() {
-        // System transactions use the existing RLP byte-string envelope around
-        // their deterministic struct JSON wire encoding, exactly as Block does.
         let wire = tx.to_wire_bytes()?;
         leaves.push(leaf(BODY_DOMAIN, transactions.len() + i, 1, &wire));
     }
-    Ok(root(BODY_DOMAIN, leaves))
+    Ok(leaves)
+}
+/// Commit to exact signed transaction RLP, followed by system wire byte-string RLP.
+/// The witness-independent, potentially cached transaction ID is not used.
+pub fn block_body_root(
+    transactions: &[SignedTransaction],
+    system_transactions: &[SystemTransaction],
+) -> Result<ShellHash, serde_json::Error> {
+    Ok(root(
+        BODY_DOMAIN,
+        body_leaves(transactions, system_transactions)?,
+    ))
+}
+
+/// Ordered native v1 path; unpaired nodes are carried without a sibling.
+/// This is path data, not a verified result or proof of consensus.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BodyMembershipPath {
+    pub index: u64,
+    pub total: u64,
+    pub siblings: Vec<ShellHash>,
+}
+/// Construct a path for an ordinary transaction in the complete native body.
+pub fn block_body_membership_path(
+    transactions: &[SignedTransaction],
+    system_transactions: &[SystemTransaction],
+    index: usize,
+) -> Result<BodyMembershipPath, String> {
+    if index >= transactions.len() {
+        return Err("ordinary transaction index outside body".into());
+    }
+    let mut leaves = body_leaves(transactions, system_transactions).map_err(|e| e.to_string())?;
+    let total = leaves.len() as u64;
+    let mut cursor = index;
+    let mut siblings = Vec::new();
+    let mut bytes = Vec::new();
+    while leaves.len() > 1 {
+        if cursor % 2 == 1 {
+            siblings.push(leaves[cursor - 1]);
+        } else if cursor + 1 < leaves.len() {
+            siblings.push(leaves[cursor + 1]);
+        }
+        reduce_level(BODY_DOMAIN, &mut leaves, &mut bytes);
+        cursor /= 2;
+    }
+    Ok(BodyMembershipPath {
+        index: index as u64,
+        total,
+        siblings,
+    })
+}
+/// Exact native v1 ordinary signed-leaf bytes, shared with the block producer.
+pub fn block_body_leaf_message(transaction: &SignedTransaction, index: u64) -> Vec<u8> {
+    leaf_message(BODY_DOMAIN, index, 0, transaction)
+}
+/// Exact native v1 internal-node bytes.
+pub fn block_body_parent_message(left: ShellHash, right: ShellHash) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    branch_message(BODY_DOMAIN, left, right, &mut bytes);
+    bytes
+}
+/// Exact native v1 final count-binding bytes.
+pub fn block_body_root_message(total: u64, top: ShellHash) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    count_message(BODY_DOMAIN, total, top, &mut bytes);
+    bytes
 }
 
 /// Commit to all native receipts in execution order, including system receipts.
