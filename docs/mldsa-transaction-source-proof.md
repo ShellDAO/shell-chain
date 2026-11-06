@@ -265,3 +265,77 @@ its unchanged 16+32+32-byte layout. Link the ID proof to the same full sender
 and source/signature graph; keep witness exclusion distinct from authentication.
 No native hashing behavior, identifier format, cache semantics, consensus
 carrier or activation policy changes.
+
+## Authenticated batch entry and leaf
+
+The existing batch entry uses the **sender signing digest**, rather than the
+canonical transaction ID, as `msg_hash`. For Embedded keys its legacy
+`pk_hash` field contains the first 32 raw key bytes (rho for ML-DSA-65). It is
+neither the full raw-key digest nor the sender address. Reference entries use
+the full sender address instead; authenticating that mode still requires
+canonical registry/account evidence.
+
+The native mapping now lives in `SigBatchEntry::from_signed_transaction`.
+Node source reconstruction delegates to this same mapper; production, import
+and recovery retain the existing mapping and roots. The mapper itself does
+not verify a signature. Its existing native regression covers full-width
+Reference addresses, Embedded raw-key prefixes and short-key zero padding.
+
+Add an entry directory to prove its actual BLAKE3 leaf as well:
+
+```bash
+tests/e2e/mldsa-source-proof.sh prove proof-dir/source proof-dir/equation proof-dir/signature proof-dir/rejection proof-dir/sender proof-dir/id proof-dir/entry
+```
+
+This reuses the complete same-identity graph. `entry-source.json` saves the
+independently native-derived expected entry and leaf; `entry-leaf.json` saves
+the actual BLAKE3 proof. The new preimage is `msg_hash32 || pk_hash32`, exactly
+64 bytes, and needs one compression certificate. Existing files remain
+unchanged and no saved private key is needed.
+
+To independently reopen the full persisted graph without generating proofs:
+
+```bash
+tests/e2e/mldsa-source-proof.sh verify proof-dir/source proof-dir/equation proof-dir/signature proof-dir/rejection proof-dir/sender proof-dir/id proof-dir/entry
+```
+
+For an existing complete identified-sender checkpoint, run just the new stages:
+
+```bash
+cargo run --locked -p shell-stark-prover --example mldsa-source -- prove-entry proof-dir/source proof-dir/equation proof-dir/signature proof-dir/sender proof-dir/id proof-dir/entry
+cargo run --locked -p shell-stark-prover --example mldsa-source -- verify-entry proof-dir/source proof-dir/equation proof-dir/signature proof-dir/sender proof-dir/id proof-dir/entry
+cargo run --locked -p shell-stark-prover --example mldsa-source -- check-entry-rejections proof-dir/source proof-dir/equation proof-dir/signature proof-dir/sender proof-dir/id proof-dir/entry proof-dir/rejection
+```
+
+`verify_signature_entry` takes a `SignatureEntryProof`, expected signed
+transaction, full raw-key hash, canonical ID, native entry and leaf. It checks
+the exact Embedded entry mapping, the real leaf hash proof and the complete
+identified sender/source/signature graph. Native mapper and hash calls are
+producer controls; the verification predicate has no native cryptography
+fallback. Only success returns a `VerifiedSignatureEntry` snapshot with
+immutable getters for entry, leaf and transaction ID. The snapshot has no
+public constructor or deserializer; consumers must verify persisted proofs
+rather than trusting a serialized claim that an entry was verified.
+
+The regression changes proof versions, leaf message/output, compression
+coverage/arithmetic and the expected leaf. It rejects canonical-ID-as-message,
+full-key-hash/address-as-Embedded-identifier, Reference inputs and an honest
+valid ID certificate substituted for the leaf certificate. Changing the last
+raw-key byte preserves rho and therefore the native legacy entry and leaf;
+the complete predicate must still reject the full-key source mismatch.
+The honestly proved invalid altered-hint signature likewise retains its valid
+native entry, leaf and canonical ID, but must fail at
+`signature: final commitment`. A valid legacy leaf alone is insufficient
+authentication of a full key, signature or sender.
+
+This bounded public predicate covers the same ordinary type-0 ML-DSA-65
+Embedded envelope. It does not establish source order, an ordered multi-entry
+batch, canonical chain membership, registry absence/account authority,
+registered/rotated or Reference authorization, native AA, fees/resources,
+private proofs, settlement or node acceptance. Those remain separate work.
+
+Design decision: share the unchanged native mapper and preserve its legacy
+field meanings. Authenticate that entry with actual source/signature and
+BLAKE3 proofs, and expose a verified snapshot only after every check succeeds.
+No batch roots, transaction IDs, consensus carriers, gas or activation policy
+changes.

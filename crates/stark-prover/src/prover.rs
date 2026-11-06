@@ -33,13 +33,44 @@ use crate::{
 /// 128-bit f128 field elements (`lo`, `hi`) for the dual-accumulator STARK.
 #[derive(Debug, Clone)]
 pub struct SigBatchEntry {
-    /// First 32 bytes of the message hash (BLAKE3 of the transaction signing bytes).
+    /// The 32-byte sender signing hash, including native AA framing when present.
     pub msg_hash: [u8; 32],
-    /// First 32 bytes of the public key hash (BLAKE3 of the serialized pubkey).
+    /// Legacy key identifier: first at most 32 raw Embedded key bytes, zero padded;
+    /// Reference entries use the full sender address. This is not a full-key hash.
     pub pk_hash: [u8; 32],
 }
 
 impl SigBatchEntry {
+    /// Map the native sender signing digest and legacy key identifier.
+    ///
+    /// Embedded keys use their first at most 32 raw bytes, zero padded; Reference
+    /// keys use the full 32-byte sender address. This mapping does not verify a
+    /// signature or account authority. It preserves existing batch roots.
+    pub fn from_signed_transaction(tx: &shell_core::SignedTransaction) -> Self {
+        let mut msg_hash = [0u8; 32];
+        msg_hash.copy_from_slice(tx.sender_signing_hash().as_bytes());
+
+        let pk_hash = match &tx.pubkey_mode {
+            shell_core::PubkeyMode::Embedded(pk) => {
+                let mut h = [0u8; 32];
+                let copy_len = pk.len().min(32);
+                h[..copy_len].copy_from_slice(&pk[..copy_len]);
+                h
+            }
+            shell_core::PubkeyMode::Reference => {
+                // Use sender address bytes as pk identifier for Reference-mode txs.
+                // Addresses are 32 bytes in v0.23.0 (BLAKE3, not 20-byte Ethereum).
+                let mut h = [0u8; 32];
+                let addr = tx.from.0.as_slice();
+                let copy_len = addr.len().min(32);
+                h[..copy_len].copy_from_slice(&addr[..copy_len]);
+                h
+            }
+        };
+
+        Self { msg_hash, pk_hash }
+    }
+
     /// Compute the 256-bit BLAKE3 leaf: `BLAKE3(msg_hash ‖ pk_hash)`.
     pub fn to_leaf_bytes(&self) -> [u8; 32] {
         let mut input = [0u8; 64];

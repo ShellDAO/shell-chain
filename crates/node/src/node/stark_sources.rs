@@ -1,6 +1,6 @@
 //! Canonical STARK source-entry reconstruction.
 //!
-//! A single authoritative helper that converts a [`SignedTransaction`] into
+//! The shared [`SigBatchEntry::from_signed_transaction`] mapper converts a [`SignedTransaction`] into
 //! the corresponding [`SigBatchEntry`] used by the prover and validators.
 //! Every site that builds `SigBatchEntry` values – block production, block
 //! import, frontier back-log seeding, and amendment validation – **must**
@@ -10,42 +10,18 @@
 //! # Mapping rules
 //!
 //! * `msg_hash` – the 32-byte sender signing hash.
-//! * `pk_hash`  – for [`PubkeyMode::Embedded`], the first ≤32 bytes of the
-//!   inline public key; for [`PubkeyMode::Reference`], the 20-
-//!   byte sender address (32 bytes in v0.23.0+) zero-padded to 32 bytes.
-
-use shell_core::PubkeyMode;
+//! * `pk_hash`  – for [`shell_core::PubkeyMode::Embedded`], the first ≤32 bytes of the
+//!   inline public key, zero padded; for [`shell_core::PubkeyMode::Reference`],
+//!   the full 32-byte sender address.
 
 use super::{Block, SigBatchEntry, SignedTransaction};
 
 /// Derive a [`SigBatchEntry`] from a single signed transaction.
 ///
-/// This is the canonical definition of the tx → entry mapping.  All other
-/// entry-building code must call this function instead of reimplementing
-/// the mapping independently.
+/// Delegate to the shared native mapper. All node entry-building sites call
+/// this wrapper so block production, import and recovery share that definition.
 pub(crate) fn tx_to_sig_batch_entry(tx: &SignedTransaction) -> SigBatchEntry {
-    let mut msg_hash = [0u8; 32];
-    msg_hash.copy_from_slice(tx.sender_signing_hash().as_bytes());
-
-    let pk_hash = match &tx.pubkey_mode {
-        PubkeyMode::Embedded(pk) => {
-            let mut h = [0u8; 32];
-            let copy_len = pk.len().min(32);
-            h[..copy_len].copy_from_slice(&pk[..copy_len]);
-            h
-        }
-        PubkeyMode::Reference => {
-            // Use sender address bytes as pk identifier for Reference-mode txs.
-            // Addresses are 32 bytes in v0.23.0 (BLAKE3, not 20-byte Ethereum).
-            let mut h = [0u8; 32];
-            let addr = tx.from.0.as_slice();
-            let copy_len = addr.len().min(32);
-            h[..copy_len].copy_from_slice(&addr[..copy_len]);
-            h
-        }
-    };
-
-    SigBatchEntry { msg_hash, pk_hash }
+    SigBatchEntry::from_signed_transaction(tx)
 }
 
 /// Build the ordered [`SigBatchEntry`] list from a slice of transactions.
@@ -91,7 +67,7 @@ mod tests {
             blob_versioned_hashes: None,
         };
         let signed = SignedTransaction::new(
-            Address::from([0x22; 20]),
+            Address::from([0x22; 32]),
             tx,
             PQSignature::new(SignatureType::Dilithium3, vec![0xAA; 32]),
         );
@@ -99,5 +75,18 @@ mod tests {
         let entry = tx_to_sig_batch_entry(&signed);
         assert_eq!(entry.msg_hash, *signed.sender_signing_hash().as_bytes());
         assert_ne!(entry.msg_hash, *signed.hash().as_bytes());
+        assert_eq!(entry.pk_hash, [0x22; 32]);
+
+        let mut embedded = signed.clone();
+        let mut key = vec![0x33; 1952];
+        key[1951] = 0xff;
+        embedded.pubkey_mode = shell_core::PubkeyMode::Embedded(key);
+        let mapped = tx_to_sig_batch_entry(&embedded);
+        assert_eq!(mapped.msg_hash, entry.msg_hash);
+        assert_eq!(mapped.pk_hash, [0x33; 32]);
+        embedded.pubkey_mode = shell_core::PubkeyMode::Embedded(vec![0xaa; 17]);
+        let short = tx_to_sig_batch_entry(&embedded);
+        assert_eq!(&short.pk_hash[..17], &[0xaa; 17]);
+        assert_eq!(&short.pk_hash[17..], &[0; 15]);
     }
 }

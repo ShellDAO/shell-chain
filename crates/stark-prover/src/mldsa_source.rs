@@ -35,6 +35,85 @@ pub struct IdentifiedSenderSignatureProof {
     pub sender: DerivedSenderSignatureProof,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignatureEntryProof {
+    pub version: u8,
+    pub leaf: Blake3HashProof,
+    pub identified: IdentifiedSenderSignatureProof,
+}
+
+/// A verified snapshot of a caller-expected entry, leaf and transaction ID.
+/// Only complete proof verification constructs this value. It does not prove
+/// canonical chain membership, registry absence or account authority.
+#[derive(Clone, Debug)]
+pub struct VerifiedSignatureEntry {
+    entry: crate::SigBatchEntry,
+    leaf: [u8; 32],
+    transaction_id: [u8; 32],
+}
+
+impl VerifiedSignatureEntry {
+    pub fn entry(&self) -> &crate::SigBatchEntry {
+        &self.entry
+    }
+
+    pub fn leaf_bytes(&self) -> &[u8; 32] {
+        &self.leaf
+    }
+
+    pub fn transaction_id(&self) -> &[u8; 32] {
+        &self.transaction_id
+    }
+}
+
+/// Authenticate the existing Embedded batch-entry mapping and BLAKE3 leaf,
+/// together with the complete identified sender/source/signature predicate.
+/// The message identifier is the sender signing digest; the key identifier is
+/// the first 32 raw key bytes (rho), not the full-key hash or sender address.
+/// The native mapper/hash is not a verification fallback. Reference authority
+/// and ordered batch/chain acceptance remain outside this stateless predicate.
+pub fn verify_signature_entry(
+    proof: &SignatureEntryProof,
+    expected: &shell_core::SignedTransaction,
+    expected_public_key_hash: &[u8; 32],
+    expected_transaction_id: &[u8; 32],
+    expected_entry: &crate::SigBatchEntry,
+    expected_leaf: &[u8; 32],
+) -> Result<VerifiedSignatureEntry, String> {
+    if proof.version != 1 {
+        return Err("invalid signature entry proof version".into());
+    }
+    let key = expected
+        .pubkey_mode
+        .pubkey_bytes()
+        .ok_or("signature entry requires an Embedded key; registry authority is not proved")?;
+    if key.len() != 1952 {
+        return Err("invalid signature entry ML-DSA-65 key shape".into());
+    }
+    if expected_entry.msg_hash != proof.identified.sender.transaction.signing_hash.output
+        || expected_entry.pk_hash.as_slice() != &key[..32]
+    {
+        return Err("invalid signature entry message or legacy key identifier binding".into());
+    }
+    let mut preimage = [0u8; 64];
+    preimage[..32].copy_from_slice(&expected_entry.msg_hash);
+    preimage[32..].copy_from_slice(&expected_entry.pk_hash);
+    verify_hash(&proof.leaf, &preimage, expected_leaf)
+        .map_err(|e| format!("signature entry leaf: {e}"))?;
+    verify_identified_sender_signature(
+        &proof.identified,
+        expected,
+        expected_public_key_hash,
+        expected_transaction_id,
+    )?;
+    Ok(VerifiedSignatureEntry {
+        entry: expected_entry.clone(),
+        leaf: *expected_leaf,
+        transaction_id: *expected_transaction_id,
+    })
+}
+
 /// Bind the complete address-derived sender/signature predicate to an expected
 /// canonical transaction ID. This uses the native identity domain and full
 /// sender/signing-digest widths. Authentication witnesses remain excluded from

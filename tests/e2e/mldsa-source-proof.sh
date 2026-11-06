@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ ( $# -ne 5 && $# -ne 6 && $# -ne 7 ) || ( "$1" != "prove" && "$1" != "verify" ) ]]; then
-  echo "usage: $0 prove|verify source-dir equation-dir signature-dir rejection-dir [sender-dir [ID-dir]]" >&2
+if [[ ( $# -ne 5 && $# -ne 6 && $# -ne 7 && $# -ne 8 ) || ( "$1" != "prove" && "$1" != "verify" ) ]]; then
+  echo "usage: $0 prove|verify source-dir equation-dir signature-dir rejection-dir [sender-dir [ID-dir [entry-dir]]]" >&2
   exit 2
 fi
 mode="$1"
@@ -39,7 +39,12 @@ if [[ $# -ge 6 ]]; then
   stage derived-sender-rejections cargo run --locked -p shell-stark-prover --example mldsa-source -- check-derived-rejections "$source_dir" "$equation_dir" "$signature_dir" "$6"
 fi
 
-if [[ $# -eq 7 ]]; then
+if [[ $# -ge 7 ]]; then
   stage identified-sender cargo run --locked -p shell-stark-prover --example mldsa-source -- "$mode-identified" "$source_dir" "$equation_dir" "$signature_dir" "$6" "$7"
   stage identified-sender-rejections cargo run --locked -p shell-stark-prover --example mldsa-source -- check-identified-rejections "$source_dir" "$equation_dir" "$signature_dir" "$6" "$7" "$rejection_dir"
+fi
+
+if [[ $# -eq 8 ]]; then
+  stage authenticated-entry cargo run --locked -p shell-stark-prover --example mldsa-source -- "$mode-entry" "$source_dir" "$equation_dir" "$signature_dir" "$6" "$7" "$8"
+  stage authenticated-entry-rejections cargo run --locked -p shell-stark-prover --example mldsa-source -- check-entry-rejections "$source_dir" "$equation_dir" "$signature_dir" "$6" "$7" "$8" "$rejection_dir"
 fi
