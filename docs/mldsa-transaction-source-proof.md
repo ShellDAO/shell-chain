@@ -197,3 +197,71 @@ Design decision: retain the native algorithm-prefixed address format and
 existing signature-source composition. Keep the stateless address-derived
 predicate explicit so that registered/rotated authorization is not silently
 narrowed. No consensus IDs, activation heights, gas or proof carriers change.
+
+## Canonical transaction ID
+
+An ordinary canonical transaction ID is
+`BLAKE3(PQTX_ID_DOMAIN || from32 || sender_signing_hash32)`, where the identity
+domain is the existing 16-byte `PQTX_IDENTITY_V1`. This differs from the
+transaction's signing digest. To prove this ID as well, add an ID directory:
+
+```bash
+tests/e2e/mldsa-source-proof.sh prove proof-dir/source proof-dir/equation proof-dir/signature proof-dir/rejection proof-dir/sender proof-dir/id
+```
+
+The ID stage reuses the same source, full signature and derived-sender graph.
+It saves an independently expected ID in `id-source.json` and a real BLAKE3
+hash proof in `id-hash.json`. The new preimage is 80 bytes and needs two new
+compression certificates. Existing files are never overwritten. The native
+ID computed from a freshly loaded envelope is an independent producer control.
+
+To reopen the complete persisted graph without generating proofs:
+
+```bash
+tests/e2e/mldsa-source-proof.sh verify proof-dir/source proof-dir/equation proof-dir/signature proof-dir/rejection proof-dir/sender proof-dir/id
+```
+
+For an existing complete derived-sender checkpoint, run only the new stages:
+
+```bash
+cargo run --locked -p shell-stark-prover --example mldsa-source -- prove-identified proof-dir/source proof-dir/equation proof-dir/signature proof-dir/sender proof-dir/id
+cargo run --locked -p shell-stark-prover --example mldsa-source -- verify-identified proof-dir/source proof-dir/equation proof-dir/signature proof-dir/sender proof-dir/id
+cargo run --locked -p shell-stark-prover --example mldsa-source -- check-identified-rejections proof-dir/source proof-dir/equation proof-dir/signature proof-dir/sender proof-dir/id proof-dir/rejection
+```
+
+The production `verify_identified_sender_signature` takes an
+`IdentifiedSenderSignatureProof`, caller-expected `SignedTransaction`, full
+raw-key hash and independently expected canonical ID. It verifies the identity
+hash against the exact native domain, full `from` and signing digest carried by
+the source graph, then authenticates that digest through the complete derived
+sender/source/signature predicate. All checks must succeed. It does not accept
+`SignedTransaction::hash()` or the certificate's self-declared output as a
+substitute for either check.
+
+Authentication witnesses remain excluded from the ID. The regression verifies
+that changing Embedded to Reference preserves the native ID, while the proof
+predicate still rejects Reference because canonical registry authority is not
+proved. Likewise, the honestly proved invalid altered-hint signature retains
+the same valid canonical ID but must fail at `signature: final commitment`.
+A valid identity hash alone is insufficient authentication.
+
+Other checks change the expected ID, the upper address byte while retaining
+the last 20 bytes, the signing digest, domain, proof versions, output,
+compression coverage and compression arithmetic. A valid signing-hash
+certificate cannot replace the canonical-ID certificate. The regression also
+populates the native hash cache before changing the transaction nonce: even
+though the native cached value remains unchanged, the proof predicate must
+reject the changed canonical source.
+
+This proves a canonical ID's derivation, not membership in a canonical chain,
+source ordering, a transaction receipt or settlement. Registry/account state,
+registered/rotated authorization, Reference, AA/session framing, history,
+import/replay/rollback, fees/resources, private proofs and node integration
+remain outside this bounded public predicate. The qualified positive envelope
+is still the generated ordinary type-0 ML-DSA-65 transaction.
+
+Design decision: expose the existing native identity-domain constant and reuse
+its unchanged 16+32+32-byte layout. Link the ID proof to the same full sender
+and source/signature graph; keep witness exclusion distinct from authentication.
+No native hashing behavior, identifier format, cache semantics, consensus
+carrier or activation policy changes.

@@ -9,7 +9,8 @@ use shell_stark_prover::{
     mldsa_key::PublicKeyDecodeProof,
     mldsa_matrix::{MatrixPolynomialProof, MatrixProof},
     mldsa_source::{
-        verify_derived_sender_signature, verify_transaction_signature, DerivedSenderSignatureProof,
+        verify_derived_sender_signature, verify_identified_sender_signature,
+        verify_transaction_signature, DerivedSenderSignatureProof, IdentifiedSenderSignatureProof,
         TransactionSignatureProof,
     },
     mldsa_verification::{CompletionProof, EquationPipeline, Mldsa65VerificationProof},
@@ -368,18 +369,247 @@ fn derived_sender(
     );
     Ok(())
 }
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct IdSource {
+    version: u8,
+    transaction_id: [u8; 32],
+}
+fn identified_sender(
+    p: TransactionSignatureProof,
+    s: &Source,
+    id: &Identity,
+    args: &[std::ffi::OsString],
+) -> Result<(), Error> {
+    let mode = &args[0];
+    let sender_dir = Path::new(&args[4]);
+    let dir = Path::new(&args[5]);
+    let expected: SignedTransaction = read(&sender_dir.join("sender.json"))?;
+    let sender = DerivedSenderSignatureProof {
+        version: 1,
+        sender_address: read(&sender_dir.join("sender-address.json"))?,
+        transaction: p,
+    };
+    let proving = mode == "prove-identified";
+    let mut generated = 0;
+    if proving {
+        std::fs::create_dir_all(dir)?;
+        // Freshly deserialized native envelope: this is an independent producer
+        // control, never an acceptance path in the production verifier.
+        let control = IdSource {
+            version: 1,
+            transaction_id: *expected.hash().as_bytes(),
+        };
+        let path = dir.join("id-source.json");
+        if !path.try_exists()? {
+            write(&path, &control)?;
+        }
+        if read::<IdSource>(&path)? != control {
+            return Err("saved ID differs from native producer control".into());
+        }
+        let path = dir.join("id-hash.json");
+        if !path.try_exists()? {
+            let mut preimage = shell_core::PQTX_ID_DOMAIN.to_vec();
+            preimage.extend_from_slice(expected.from.as_bytes());
+            preimage.extend_from_slice(&sender.transaction.signing_hash.output);
+            eprintln!("Proving id-hash.json");
+            write(&path, &prove_hash(&preimage)?)?;
+            generated += 1;
+        }
+    }
+    let source: IdSource = read(&dir.join("id-source.json"))?;
+    if source.version != 1 {
+        return Err("invalid expected ID source version".into());
+    }
+    let proof = IdentifiedSenderSignatureProof {
+        version: 1,
+        transaction_id: read(&dir.join("id-hash.json"))?,
+        sender,
+    };
+    let verify = |p: &IdentifiedSenderSignatureProof, tx: &SignedTransaction, hash: &[u8; 32]| {
+        verify_identified_sender_signature(p, tx, &s.public_key_hash, hash)
+    };
+    verify(&proof, &expected, &source.transaction_id)?;
+    if mode == "check-identified-rejections" {
+        let mut cases = Vec::new();
+        let mut rejected =
+            |name: &str, result: Result<(), String>, phase: &str| -> Result<(), Error> {
+                let error = result
+                    .err()
+                    .ok_or_else(|| format!("{name}: changed identity accepted"))?;
+                if !error.starts_with(phase) {
+                    return Err(format!("{name}: {error}").into());
+                }
+                cases.push(serde_json::json!({"case":name,"error":error}));
+                Ok(())
+            };
+        for i in 0..7 {
+            let mut changed = proof.clone();
+            let name = match i {
+                0 => {
+                    changed.version = 2;
+                    "wrapper_version"
+                }
+                1 => {
+                    changed.transaction_id.version = 2;
+                    "ID_version"
+                }
+                2 => {
+                    changed.transaction_id.message[0] ^= 1;
+                    "ID_domain"
+                }
+                3 => {
+                    changed.transaction_id.output[31] ^= 1;
+                    "ID_digest"
+                }
+                4 => {
+                    changed.transaction_id.compressions.pop();
+                    "missing_compression"
+                }
+                5 => {
+                    changed
+                        .transaction_id
+                        .compressions
+                        .push(changed.transaction_id.compressions[0].clone());
+                    "extra_compression"
+                }
+                _ => {
+                    changed.transaction_id.compressions[0].operations[0] ^= 1;
+                    "compression_arithmetic"
+                }
+            };
+            rejected(
+                name,
+                verify(&changed, &expected, &source.transaction_id),
+                if i == 0 {
+                    "invalid identified sender"
+                } else {
+                    "transaction ID source:"
+                },
+            )?;
+        }
+        let mut hash = source.transaction_id;
+        hash[31] ^= 1;
+        rejected(
+            "expected_ID",
+            verify(&proof, &expected, &hash),
+            "transaction ID source:",
+        )?;
+        let mut changed = expected.clone();
+        changed.from.0[0] ^= 1;
+        rejected(
+            "full_width_from_preserving_last20bytes",
+            verify(&proof, &changed, &source.transaction_id),
+            "transaction ID source:",
+        )?;
+        let mut changed = proof.clone();
+        changed.sender.transaction.signing_hash.output[31] ^= 1;
+        rejected(
+            "sender_signing_digest",
+            verify(&changed, &expected, &source.transaction_id),
+            "transaction ID source:",
+        )?;
+        let honest = &proof.sender.transaction.signing_hash;
+        verify_hash(honest, &honest.message, &honest.output)?;
+        let mut changed = proof.clone();
+        changed.transaction_id = honest.clone();
+        rejected(
+            "honest_signing_hash_is_not_canonical_ID",
+            verify(&changed, &expected, &honest.output),
+            "transaction ID source:",
+        )?;
+        // Demonstrate why a cached native ID cannot replace source verification.
+        let mut cached = expected.clone();
+        let old = cached.hash();
+        cached.tx.nonce += 1;
+        if cached.hash() != old {
+            return Err("native cache control unexpectedly changed".into());
+        }
+        rejected(
+            "changed_nonce_after_native_hash_cached",
+            verify(&proof, &cached, &source.transaction_id),
+            "transaction source:",
+        )?;
+        let reference = SignedTransaction::new(
+            expected.from,
+            expected.tx.clone(),
+            expected.signature.clone(),
+        );
+        if reference.hash().as_bytes() != &source.transaction_id {
+            return Err("native Embedded/Reference ID changed".into());
+        }
+        rejected(
+            "same_ID_Reference_still_requires_registry",
+            verify(&proof, &reference, &source.transaction_id),
+            "derived sender requires",
+        )?;
+        // Authentication witnesses are excluded from the ID. Honest altered-hint
+        // computation keeps that valid ID but must fail full signature checking.
+        let bad_dir = Path::new(&args[6]);
+        let bad: Identity = read(&bad_dir.join("identity.json"))?;
+        if bad.version != 1
+            || bad.public_key != id.public_key
+            || bad.message != id.message
+            || bad.signature.len() != 3309
+            || bad.signature == id.signature
+            || bad.signature[..3248] != id.signature[..3248]
+        {
+            return Err("invalid honest altered-hint identity".into());
+        }
+        let altered = SignedTransaction::with_pubkey(
+            expected.from,
+            expected.tx.clone(),
+            PQSignature::new(SignatureType::MlDsa65, bad.signature),
+            id.public_key.clone(),
+        );
+        if altered.hash().as_bytes() != &source.transaction_id {
+            return Err("witness change unexpectedly altered canonical ID".into());
+        }
+        let mut changed = proof.clone();
+        changed.sender.transaction.signature.equation.signature =
+            read(&bad_dir.join("signature.json"))?;
+        changed.sender.transaction.signature.completion.finish =
+            read(&bad_dir.join("finish.json"))?;
+        changed.sender.transaction.signature.completion.commitment =
+            read(&bad_dir.join("commitment.json"))?;
+        rejected(
+            "honest_invalid_signature_retains_valid_ID",
+            verify(&changed, &altered, &source.transaction_id),
+            "signature: final commitment:",
+        )?;
+        println!(
+            "{}",
+            serde_json::json!({"mode":"check-identified-rejections","positive_full_graph_verified":true,"rejected":cases,"proofs_generated":0,"input_files_read_only":true,"native_witness_exclusion_control":true,"native_Embedded_Reference_ID_stability_control":true,"native_stale_cache_control":true})
+        );
+        return Ok(());
+    }
+    println!(
+        "{}",
+        serde_json::json!({"mode":mode.to_string_lossy(),"canonical_ID_sender_full_graph_verified":true,"transaction_id":source.transaction_id,"ID_preimage_bytes":proof.transaction_id.message.len(),"ID_compressions":proof.transaction_id.compressions.len(),"new_hash_certificates":generated,"prior_graph_reused":true,"native_ID_producer_control":proving,"native_acceptance_fallback":false,"registry_absence_proved":false,"account_authority_proved":false,"Reference_authority_proved":false,"canonical_chain_membership_proved":false,"private_witness":false,"node_integrated":false})
+    );
+    Ok(())
+}
 fn main() -> Result<(), Error> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() != 4 && args.len() != 5 {
-        return Err("usage: mldsa-source verify source-dir equation-dir signature-dir; mldsa-source check-rejections source-dir equation-dir signature-dir rejection-dir; mldsa-source prove-derived|verify-derived|check-derived-rejections source-dir equation-dir signature-dir sender-dir".into());
-    }
-    let mode = &args[0];
+    let mode = args.first().ok_or("missing mode")?;
+    let identified = mode == "prove-identified"
+        || mode == "verify-identified"
+        || mode == "check-identified-rejections";
     let derived =
         mode == "prove-derived" || mode == "verify-derived" || mode == "check-derived-rejections";
-    if (mode != "verify" && mode != "check-rejections" && !derived)
-        || ((mode == "check-rejections" || derived) != (args.len() == 5))
-    {
-        return Err("invalid mode arguments".into());
+    let expected_len = if mode == "check-identified-rejections" {
+        7
+    } else if identified {
+        6
+    } else if derived || mode == "check-rejections" {
+        5
+    } else if mode == "verify" {
+        4
+    } else {
+        return Err("unknown mode".into());
+    };
+    if args.len() != expected_len {
+        return Err("usage: mldsa-source verify source-dir equation-dir signature-dir; check-rejections source-dir equation-dir signature-dir rejection-dir; prove-derived|verify-derived|check-derived-rejections source-dir equation-dir signature-dir sender-dir; prove-identified|verify-identified source-dir equation-dir signature-dir sender-dir ID-dir; check-identified-rejections source-dir equation-dir signature-dir sender-dir ID-dir rejection-dir".into());
     }
     let source = Path::new(&args[1]);
     let eq = Path::new(&args[2]);
@@ -412,6 +642,9 @@ fn main() -> Result<(), Error> {
     };
     if p.signing_hash.output.as_slice() != id.message {
         return Err("saved signature message differs from the source signing digest".into());
+    }
+    if identified {
+        return identified_sender(p, &s, &id, &args);
     }
     if derived {
         return derived_sender(p, &s, &id, Path::new(&args[4]), mode);

@@ -27,6 +27,40 @@ pub struct DerivedSenderSignatureProof {
     pub transaction: TransactionSignatureProof,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentifiedSenderSignatureProof {
+    pub version: u8,
+    pub transaction_id: Blake3HashProof,
+    pub sender: DerivedSenderSignatureProof,
+}
+
+/// Bind the complete address-derived sender/signature predicate to an expected
+/// canonical transaction ID. This uses the native identity domain and full
+/// sender/signing-digest widths. Authentication witnesses remain excluded from
+/// the ID, but must still pass the complete signature predicate.
+///
+/// The caller supplies the expected ID independently. Neither a self-declared
+/// proof output nor SignedTransaction's cached native hash is an acceptance
+/// fallback. The inner predicate retains its stateless Embedded-only scope.
+pub fn verify_identified_sender_signature(
+    proof: &IdentifiedSenderSignatureProof,
+    expected: &shell_core::SignedTransaction,
+    expected_public_key_hash: &[u8; 32],
+    expected_transaction_id: &[u8; 32],
+) -> Result<(), String> {
+    if proof.version != 1 {
+        return Err("invalid identified sender proof version".into());
+    }
+    let mut preimage = Vec::with_capacity(shell_core::PQTX_ID_DOMAIN.len() + 64);
+    preimage.extend_from_slice(shell_core::PQTX_ID_DOMAIN);
+    preimage.extend_from_slice(expected.from.as_bytes());
+    preimage.extend_from_slice(&proof.sender.transaction.signing_hash.output);
+    verify_hash(&proof.transaction_id, &preimage, expected_transaction_id)
+        .map_err(|e| format!("transaction ID source: {e}"))?;
+    verify_derived_sender_signature(&proof.sender, expected, expected_public_key_hash)
+}
+
 /// Verify an address-derived Embedded sender and its ordinary ML-DSA-65
 /// transaction signature. The address preimage is exactly algo_id || raw key.
 ///
