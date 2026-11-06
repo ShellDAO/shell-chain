@@ -1,15 +1,23 @@
 //! Verify a complete same-identity public transaction-source/signature graph.
 
-use serde::{de::DeserializeOwned, Deserialize};
-use shell_core::Transaction;
-use shell_crypto::SignatureType;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use shell_core::{PubkeyMode, SignedTransaction, Transaction};
+use shell_crypto::{PQSignature, SignatureType};
+use shell_primitives::Address;
 use shell_stark_prover::{
+    blake3_hash::{prove_hash, verify_hash},
     mldsa_key::PublicKeyDecodeProof,
     mldsa_matrix::{MatrixPolynomialProof, MatrixProof},
-    mldsa_source::{verify_transaction_signature, TransactionSignatureProof},
+    mldsa_source::{
+        verify_derived_sender_signature, verify_transaction_signature, DerivedSenderSignatureProof,
+        TransactionSignatureProof,
+    },
     mldsa_verification::{CompletionProof, EquationPipeline, Mldsa65VerificationProof},
 };
-use std::{io::BufReader, path::Path};
+use std::{
+    io::{BufReader, BufWriter, Write},
+    path::Path,
+};
 type Error = Box<dyn std::error::Error>;
 #[derive(Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -179,14 +187,197 @@ fn rejections(
     );
     Ok(())
 }
+fn write<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let mut out = BufWriter::new(f);
+    serde_json::to_writer(&mut out, value)?;
+    out.flush()?;
+    out.get_ref().sync_all()?;
+    Ok(())
+}
+fn derived_sender(
+    p: TransactionSignatureProof,
+    s: &Source,
+    id: &Identity,
+    dir: &Path,
+    mode: &std::ffi::OsStr,
+) -> Result<(), Error> {
+    let proving = mode == "prove-derived";
+    let mut generated = 0;
+    if proving {
+        std::fs::create_dir_all(dir)?;
+        // Independent native producer control only. The production predicate
+        // below authenticates this address using the actual BLAKE3 certificate.
+        let expected = SignedTransaction::with_pubkey(
+            Address::from_public_key(&id.public_key, s.sig_type),
+            s.transaction.clone(),
+            PQSignature::new(SignatureType::MlDsa65, id.signature.clone()),
+            id.public_key.clone(),
+        );
+        let path = dir.join("sender.json");
+        if !path.try_exists()? {
+            write(&path, &expected)?;
+        }
+        if read::<SignedTransaction>(&path)? != expected {
+            return Err("saved sender differs from native producer control".into());
+        }
+        let path = dir.join("sender-address.json");
+        if !path.try_exists()? {
+            let mut preimage = vec![s.sig_type];
+            preimage.extend_from_slice(&id.public_key);
+            eprintln!("Proving sender-address.json");
+            write(&path, &prove_hash(&preimage)?)?;
+            generated += 1;
+        }
+    }
+    // sender.json is an explicit public caller expectation, not a from address
+    // supplied by the certificate. The library accepts this envelope directly.
+    let expected: SignedTransaction = read(&dir.join("sender.json"))?;
+    let proof = DerivedSenderSignatureProof {
+        version: 1,
+        sender_address: read(&dir.join("sender-address.json"))?,
+        transaction: p,
+    };
+    verify_derived_sender_signature(&proof, &expected, &s.public_key_hash)?;
+    if mode == "check-derived-rejections" {
+        let mut cases = Vec::new();
+        for i in 0..9 {
+            let mut changed = expected.clone();
+            let mut key_hash = s.public_key_hash;
+            let (name, phase) = match i {
+                0 => {
+                    changed.from.0[31] ^= 1;
+                    ("expected_from", "sender address source:")
+                }
+                1 => {
+                    let mut key = id.public_key.clone();
+                    key[1951] ^= 1;
+                    changed.pubkey_mode = PubkeyMode::Embedded(key);
+                    ("last_embedded_key_byte", "sender address source:")
+                }
+                2 => {
+                    changed.signature.sig_type = SignatureType::Dilithium3;
+                    ("algorithm", "invalid derived sender")
+                }
+                3 => {
+                    changed.pubkey_mode = PubkeyMode::Reference;
+                    ("Reference_registry_required", "derived sender requires")
+                }
+                4 => {
+                    changed.tx.tx_type = 0x7e;
+                    ("AA_sender", "unsupported derived sender")
+                }
+                5 => {
+                    changed.tx.nonce += 1;
+                    ("nonce", "transaction source:")
+                }
+                6 => {
+                    changed.signature.data[3308] ^= 1;
+                    ("signature", "signature:")
+                }
+                7 => {
+                    key_hash[31] ^= 1;
+                    ("raw_key_hash", "public key source:")
+                }
+                _ => {
+                    changed.signature.data.clear();
+                    ("short_signature", "invalid derived sender")
+                }
+            };
+            let error = verify_derived_sender_signature(&proof, &changed, &key_hash)
+                .err()
+                .ok_or("changed sender/source accepted")?;
+            if !error.starts_with(phase) {
+                return Err(format!("{name}: {error}").into());
+            }
+            cases.push(serde_json::json!({"case":name,"error":error}));
+        }
+        // An honest raw-key hash certificate is valid for its own unprefixed
+        // input. Even setting from to that digest cannot make it an address.
+        verify_hash(
+            &proof.transaction.public_key_hash,
+            &id.public_key,
+            &s.public_key_hash,
+        )?;
+        let mut changed = proof.clone();
+        changed.sender_address = proof.transaction.public_key_hash.clone();
+        let mut raw_sender = expected.clone();
+        raw_sender.from = Address::from(s.public_key_hash);
+        let error = verify_derived_sender_signature(&changed, &raw_sender, &s.public_key_hash)
+            .err()
+            .ok_or("honest raw-key hash substituted for address")?;
+        if !error.starts_with("sender address source:") {
+            return Err(error.into());
+        }
+        cases.push(serde_json::json!({"case":"honest_unprefixed_key_certificate","error":error}));
+        for i in 0..7 {
+            let mut changed = proof.clone();
+            let name = match i {
+                0 => {
+                    changed.version = 2;
+                    "wrapper_version"
+                }
+                1 => {
+                    changed.sender_address.version = 2;
+                    "address_version"
+                }
+                2 => {
+                    changed.sender_address.message[0] ^= 1;
+                    "algorithm_prefix"
+                }
+                3 => {
+                    changed.sender_address.output[31] ^= 1;
+                    "address_digest"
+                }
+                4 => {
+                    changed.sender_address.compressions.pop();
+                    "missing_compression"
+                }
+                5 => {
+                    changed
+                        .sender_address
+                        .compressions
+                        .push(changed.sender_address.compressions[0].clone());
+                    "extra_compression"
+                }
+                _ => {
+                    changed.sender_address.compressions[0].operations[0] ^= 1;
+                    "compression_arithmetic"
+                }
+            };
+            let error = verify_derived_sender_signature(&changed, &expected, &s.public_key_hash)
+                .err()
+                .ok_or("changed address proof accepted")?;
+            if i != 0 && !error.starts_with("sender address source:") {
+                return Err(error.into());
+            }
+            cases.push(serde_json::json!({"case":name,"error":error}));
+        }
+        println!(
+            "{}",
+            serde_json::json!({"mode":"check-derived-rejections","positive_full_graph_verified":true,"rejected":cases,"proofs_generated":0,"input_files_read_only":true})
+        );
+        return Ok(());
+    }
+    println!(
+        "{}",
+        serde_json::json!({"mode":mode.to_string_lossy(),"derived_Embedded_sender_full_graph_verified":true,"from":expected.from,"address_preimage_bytes":proof.sender_address.message.len(),"address_compressions":proof.sender_address.compressions.len(),"new_hash_certificates":generated,"source_signature_graph_reused":true,"expected_signed_transaction_file":"sender.json","native_address_producer_control":proving,"native_acceptance_fallback":false,"registry_absence_proved":false,"account_authority_proved":false,"registered_rotated_accounts_proved":false,"canonical_history_proved":false,"private_witness":false,"node_integrated":false})
+    );
+    Ok(())
+}
 fn main() -> Result<(), Error> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.len() != 4 && args.len() != 5 {
-        return Err("usage: mldsa-source verify source-dir equation-dir signature-dir; mldsa-source check-rejections source-dir equation-dir signature-dir rejection-dir".into());
+        return Err("usage: mldsa-source verify source-dir equation-dir signature-dir; mldsa-source check-rejections source-dir equation-dir signature-dir rejection-dir; mldsa-source prove-derived|verify-derived|check-derived-rejections source-dir equation-dir signature-dir sender-dir".into());
     }
     let mode = &args[0];
-    if (mode != "verify" && mode != "check-rejections")
-        || ((mode == "check-rejections") != (args.len() == 5))
+    let derived =
+        mode == "prove-derived" || mode == "verify-derived" || mode == "check-derived-rejections";
+    if (mode != "verify" && mode != "check-rejections" && !derived)
+        || ((mode == "check-rejections" || derived) != (args.len() == 5))
     {
         return Err("invalid mode arguments".into());
     }
@@ -221,6 +412,9 @@ fn main() -> Result<(), Error> {
     };
     if p.signing_hash.output.as_slice() != id.message {
         return Err("saved signature message differs from the source signing digest".into());
+    }
+    if derived {
+        return derived_sender(p, &s, &id, Path::new(&args[4]), mode);
     }
     verify(&p, &s, &id)?;
     if mode == "check-rejections" {

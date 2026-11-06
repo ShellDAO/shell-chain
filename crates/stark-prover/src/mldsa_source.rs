@@ -19,6 +19,54 @@ pub struct TransactionSignatureProof {
     pub signature: Mldsa65VerificationProof,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivedSenderSignatureProof {
+    pub version: u8,
+    pub sender_address: Blake3HashProof,
+    pub transaction: TransactionSignatureProof,
+}
+
+/// Verify an address-derived Embedded sender and its ordinary ML-DSA-65
+/// transaction signature. The address preimage is exactly algo_id || raw key.
+///
+/// This stateless predicate does not establish registry absence, current
+/// account authority or permission to register a key. Native registered/rotated
+/// accounts can retain an address derived from an earlier key and must follow
+/// their canonical registry/hash/activation rules instead of this predicate.
+/// Reference keys and native AA framing are outside this scope.
+pub fn verify_derived_sender_signature(
+    proof: &DerivedSenderSignatureProof,
+    expected: &shell_core::SignedTransaction,
+    expected_public_key_hash: &[u8; 32],
+) -> Result<(), String> {
+    if proof.version != 1 || expected.signature.sig_type != SignatureType::MlDsa65 {
+        return Err("invalid derived sender proof version or algorithm".into());
+    }
+    if expected.tx.tx_type > 3 || expected.aa_bundle.is_some() {
+        return Err("unsupported derived sender AA or outer transaction framing".into());
+    }
+    let key = expected
+        .pubkey_mode
+        .pubkey_bytes()
+        .ok_or("derived sender requires an Embedded key; registry authority is not proved")?;
+    if key.len() != 1952 || expected.signature.data.len() != 3309 {
+        return Err("invalid derived sender ML-DSA-65 shape".into());
+    }
+    let mut preimage = Vec::with_capacity(1 + key.len());
+    preimage.push(SignatureType::MlDsa65.as_u8());
+    preimage.extend_from_slice(key);
+    verify_hash(&proof.sender_address, &preimage, expected.from.as_bytes())
+        .map_err(|e| format!("sender address source: {e}"))?;
+    verify_transaction_signature(
+        &proof.transaction,
+        &expected.tx,
+        key,
+        &expected.signature.data,
+        expected_public_key_hash,
+    )
+}
+
 /// Verify both source hashes and a complete signature over this exact signing
 /// digest. There is no caller-supplied signing digest or native hash/signature
 /// fallback. Only outer transaction types 0..=3 are supported; AA sender

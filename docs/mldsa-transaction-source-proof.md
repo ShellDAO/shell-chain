@@ -101,7 +101,8 @@ controls, not fallback acceptance paths in this combined verifier.
 The existing batch-entry identifier mapping is preserved: Embedded entries use
 the raw key's first 32 bytes and Reference entries use the sender address. The
 full-key hash proof does not change those mappings, authenticate an account or
-prove address derivation. Transaction encoding and consensus activation are
+prove address derivation by itself. The optional derived-sender predicate below
+adds address derivation without changing those mappings. Transaction encoding and consensus activation are
 unchanged.
 
 ## Adversarial acceptance
@@ -131,3 +132,68 @@ caller expectations and derive the signature message only from a verified
 source hash. Reuse persisted checkpoints for the same identity. Do not change
 legacy identifiers, native AA framing, activation, gas or protocol carriers to
 make the development graph fit.
+
+## Address-derived Embedded sender
+
+To also prove the sender address, supply one additional output directory:
+
+```bash
+tests/e2e/mldsa-source-proof.sh prove proof-dir/source proof-dir/equation proof-dir/signature proof-dir/rejection proof-dir/sender
+```
+
+This resumes the same public source/signature graph and produces one new
+BLAKE3 hash certificate for `ML-DSA-65 algorithm byte || raw public key`.
+The preimage is 1,953 bytes; it differs from the 1,952-byte raw-key hash and
+requires its own compression certificates. No new secret key or signature is
+needed. `sender.json` records the public expected `SignedTransaction` with its
+full 32-byte `from`, Embedded key and signature. `sender-address.json` records
+the actual address hash proof. Existing valid files are reused; existing files
+are never overwritten.
+
+To independently reopen the complete graph without generating any proofs:
+
+```bash
+tests/e2e/mldsa-source-proof.sh verify proof-dir/source proof-dir/equation proof-dir/signature proof-dir/rejection proof-dir/sender
+```
+
+For a previously complete source/signature checkpoint, run just the new stages:
+
+```bash
+cargo run --locked -p shell-stark-prover --example mldsa-source -- prove-derived proof-dir/source proof-dir/equation proof-dir/signature proof-dir/sender
+cargo run --locked -p shell-stark-prover --example mldsa-source -- verify-derived proof-dir/source proof-dir/equation proof-dir/signature proof-dir/sender
+cargo run --locked -p shell-stark-prover --example mldsa-source -- check-derived-rejections proof-dir/source proof-dir/equation proof-dir/signature proof-dir/sender
+```
+
+The production `verify_derived_sender_signature` takes a
+`DerivedSenderSignatureProof`, a caller-expected `SignedTransaction` and the
+expected full raw-key hash. It requires ML-DSA-65, an Embedded key and ordinary
+outer framing. It verifies the prefix/key hash against the expected `from`,
+then the transaction source, raw-key hash and complete signature against that
+same envelope. The address comes from the caller expectation; accepting a
+certificate's self-declared address alone would not bind the sender. Native
+address hashing is only an independent producer control.
+
+This predicate covers address-derived senders such as initial Embedded
+registration. It does not prove that a registry entry is absent, that the
+account can register a key, or that the account has sufficient funds or the
+correct nonce. Native validation derives the address when no key is registered.
+Registered accounts instead resolve the canonical key and enforce stored
+key-hash and activation rules, including legacy raw-key hashes and activated
+algorithm-bound hashes. A rotated key may retain the original account address;
+this predicate must not replace those stateful rules or impose address
+rederivation on every Embedded transaction. Reference authorization, registry
+history, canonical state and native AA/session framing remain unfinished.
+
+The regression rejects changed expected `from`, the last Embedded-key byte,
+algorithm, nonce, signature, raw-key hash and malformed signature size. It also
+rejects Reference and AA inputs, wrong proof versions, algorithm prefix/digest
+changes, missing/extra compressions and changed compression arithmetic. An
+honest valid raw-key hash certificate is independently verified and then
+substituted for the address certificate with `from` set to its output; the
+combined predicate still rejects the missing algorithm domain. These checks
+exercise the complete persisted positive graph before adversarial cases.
+
+Design decision: retain the native algorithm-prefixed address format and
+existing signature-source composition. Keep the stateless address-derived
+predicate explicit so that registered/rotated authorization is not silently
+narrowed. No consensus IDs, activation heights, gas or proof carriers change.
