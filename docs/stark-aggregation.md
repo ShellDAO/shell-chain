@@ -17,6 +17,41 @@ P2P gossip. Peers store the amendment so future block importers can skip per-sig
 
 ---
 
+## Header batch source checks
+
+On import, a present `sig_aggregate_proof` must use `SigBatchProof` version 2.
+Its count must equal the block's user transaction count and its root must match
+the existing shared mapper over those transactions in their original order.
+These checks also apply to commitment-only headers, finalized imports, fork
+admission and preferred-fork replay, before the block can be persisted.
+System transactions are excluded, matching block production. An absent header
+claim retains its existing behavior.
+
+A full accumulator proof for a different batch is rejected even when its
+Winterfell proof is valid. This binding does not prove the PQ signature
+equations: native signature checks remain required. Complete transaction,
+header and proposer-seal AIR artifacts still have separate development
+verifiers and are not consumed by this header format.
+
+Run the signed production/import and persistence regression with:
+
+```bash
+tests/e2e/header-batch-source.sh
+```
+
+It requires the repository Rust toolchain and the C/C++ and libclang tooling
+used by its RocksDB feature. It generates temporary test accounts and databases,
+checks commitment-only and full proof claims, rejects unrelated batches and
+unsupported versions without storage changes, retains native signature
+rejection, and closes and reopens the imported native state and receipts.
+No pre-existing account keys or network funds are required; any failed
+assertion exits nonzero. The test prints the retained database directory.
+
+Design decision: bind the existing version-2 public inputs at the common import
+check, using the same source mapper as the producer and L1 amendment validation.
+This fixes acceptance of foreign claims without assigning full-signature
+semantics to the accumulator proof or selecting a new proof carrier or schedule.
+
 ## Registered prover activation
 
 The unreleased `prover_registry_height` schedule enables the canonical registry

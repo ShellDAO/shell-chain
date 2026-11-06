@@ -2185,6 +2185,7 @@ mod tests {
     }
 
     include!("block_commitment_tests.rs");
+    include!("header_batch_source_tests.rs");
 
     fn setup_node_with_authority(authority: Address) -> Node<MemoryDb> {
         setup_node_with_store(authority, Arc::new(MemoryDb::new()))

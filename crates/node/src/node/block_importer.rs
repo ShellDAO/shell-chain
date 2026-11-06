@@ -336,6 +336,27 @@ impl<S: KvStore + 'static> Node<S> {
                     )));
                 }
             };
+        // These inputs must come from this block, not from the prover's claim.
+        // Bind even commitment-only headers before any canonical/fork writes.
+        if sig_proof.version != shell_stark_prover::SIG_BATCH_PROOF_VERSION {
+            return Err(NodeError::Startup(format!(
+                "block {} STARK aggregate version mismatch",
+                block.number()
+            )));
+        }
+        if sig_proof.n_sigs != block.transactions.len() {
+            return Err(NodeError::Startup(format!(
+                "block {} STARK aggregate count mismatch",
+                block.number()
+            )));
+        }
+        let entries = stark_sources::block_to_sig_batch_entries(block);
+        if sig_proof.batch_root_bytes != compute_batch_root(&entries) {
+            return Err(NodeError::Startup(format!(
+                "block {} STARK aggregate root mismatch",
+                block.number()
+            )));
+        }
         if sig_proof.has_proof() {
             verify_sig_batch(&sig_proof).map_err(|error| {
                 NodeError::Startup(format!(

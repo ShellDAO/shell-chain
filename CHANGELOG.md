@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Bind header signature-batch claims to the imported block's exact ordered
+  user transaction count and legacy accumulator root, and require the existing
+  version 2 for full and commitment-only payloads. Reject foreign claims before
+  canonical/fork persistence; preserve native signature validation. The signed
+  regression `tests/e2e/header-batch-source.sh` includes native RocksDB reopen.
+  Full PQ proof ingestion remains separate from this accumulator binding.
+
 - Add full ML-DSA-65 proposer-seal AIR over the native 32-byte header hash,
   bound to the caller-selected authority and frozen canonical parent key. An
   immutable exact-tuple verifier connects to native WPoA seal validation.
