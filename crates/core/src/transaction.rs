@@ -1730,14 +1730,17 @@ impl SignedTransaction {
     /// embedded public key is later represented by an on-chain reference.
     /// Cached after first computation via `OnceLock`.
     pub fn hash(&self) -> ShellHash {
-        *self.tx_hash.get_or_init(|| {
-            let signing_hash = self.sender_signing_hash();
-            let mut preimage = Vec::with_capacity(PQTX_ID_DOMAIN.len() + 32 + 32);
-            preimage.extend_from_slice(PQTX_ID_DOMAIN);
-            preimage.extend_from_slice(self.from.as_ref());
-            preimage.extend_from_slice(signing_hash.as_bytes());
-            shell_primitives::blake3_hash(&preimage)
-        })
+        *self.tx_hash.get_or_init(|| self.uncached_hash())
+    }
+
+    /// Recompute the canonical ID from current fields, independent of the cache.
+    pub fn uncached_hash(&self) -> ShellHash {
+        let signing_hash = self.sender_signing_hash();
+        let mut preimage = Vec::with_capacity(PQTX_ID_DOMAIN.len() + 32 + 32);
+        preimage.extend_from_slice(PQTX_ID_DOMAIN);
+        preimage.extend_from_slice(self.from.as_ref());
+        preimage.extend_from_slice(signing_hash.as_bytes());
+        shell_primitives::blake3_hash(&preimage)
     }
 
     pub fn public_key(&self) -> Option<&[u8]> {

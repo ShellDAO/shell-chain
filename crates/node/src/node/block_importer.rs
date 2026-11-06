@@ -872,6 +872,7 @@ impl<S: KvStore + 'static> Node<S> {
         replay_store: Arc<shell_storage::OverlayStore<S>>,
     ) -> Result<(Vec<TransactionReceipt>, Vec<ProofAmendment>), NodeError> {
         let replay_cs = ChainStore::new(replay_store.clone());
+        replay_cs.verify_block_body_commitment(block)?;
         let metadata_checkpoint = replay_cs.address_metadata_checkpoint()?;
         if !Self::decode_system_extra(&block.header.extra_data)
             .map_err(|error| Self::classify_fork_error(block.hash(), error))?
@@ -1249,6 +1250,7 @@ impl<S: KvStore + 'static> Node<S> {
             world_state.state_root()?
         };
 
+        replay_cs.verify_block_receipts_commitment(block, &receipts)?;
         self.verify_import_logs_bloom(block, &receipts)
             .map_err(|error| Self::invalid_fork(block.hash(), error))?;
         if imported_state_root != block.header.state_root {
@@ -1714,6 +1716,7 @@ impl<S: KvStore + 'static> Node<S> {
     }
 
     fn import_block_inner(&self, block: Block, finalized_import: bool) -> Result<(), NodeError> {
+        self.chain_store.verify_block_body_commitment(&block)?;
         let block_store = self.block_store();
         let consensus = self.consensus_manager();
         let prover = self.prover_orchestrator();
@@ -2246,6 +2249,8 @@ impl<S: KvStore + 'static> Node<S> {
             ws.state_root()
                 .map_err(|e| NodeError::Startup(format!("state_root for empty block: {e}")))?
         };
+        ChainStore::new(import_store.clone())
+            .verify_block_receipts_commitment(&block, &receipts)?;
         self.verify_import_logs_bloom(&block, &receipts)?;
         if imported_state_root != block.header.state_root {
             return Err(NodeError::Startup(format!(

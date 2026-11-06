@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Optional native `block_commitment_height` rule: domain-separated, ordered,
+  count-bound BLAKE3 commitments to exact signed transaction/system bodies and
+  all execution receipts. Production seals these roots; import, historical
+  replay, reorg publication and restoration validate them before publication.
+  Schedule persistence and trusted snapshot/startup checks preserve legacy
+  defaults. The byte format and rationale are in `docs/block-commitments.md`.
+  No public activation height is selected.
+
 - Add bounded read-only canonical parent views for registered signature proofs, freezing authorization metadata and configuration before native undo. Verify historical Reference transactions after current-state changes without writing canonical storage; consensus and body-membership proofs remain separate requirements.
 
 - Add proof-backed registered-account ML-DSA-65 key binding and an exact crypto verifier for native transaction validation. Cover Embedded/Reference retained addresses, tagged-key activation, native transfer persistence and rollback in the development regression; registry canonicality and network activation remain separate requirements.

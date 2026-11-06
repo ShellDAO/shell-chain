@@ -506,6 +506,13 @@ impl<S: KvStore + 'static> Node<S> {
             }
         }
 
+        if self.chain_store.block_commitments_enabled(block.number())? {
+            block.header.transactions_root =
+                shell_core::block_body_root(&block.transactions, &block.system_transactions)
+                    .map_err(|e| NodeError::Startup(format!("body commitment encoding: {e}")))?;
+            block.header.receipts_root = shell_core::block_receipts_root(&receipts);
+        }
+
         // Sign the block with the proposer's key.
         consensus.sign_block(&mut block, signer)?;
 

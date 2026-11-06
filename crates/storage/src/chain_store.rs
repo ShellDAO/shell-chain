@@ -114,6 +114,9 @@ pub struct ChainConfig {
     /// First block using full native address identities in contract execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_address_context_height: Option<u64>,
+    /// First block requiring native block-commitment-v1 body and receipt roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_commitment_height: Option<u64>,
     /// First block emitting full indexed validator-change events, including native AA calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_validator_events_height: Option<u64>,
@@ -657,6 +660,7 @@ impl<S: KvStore> ChainStore<S> {
         block: &Block,
         signers: &[BlockSignerEvidence],
     ) -> Result<(), StorageError> {
+        self.verify_block_body_commitment(block)?;
         let block_hash = block.hash();
         let mut batch = WriteBatch::new();
         Self::append_block_parts(&mut batch, block, false);
@@ -744,6 +748,7 @@ impl<S: KvStore> ChainStore<S> {
     }
 
     fn put_block_parts(&self, block: &Block, index_transactions: bool) -> Result<(), StorageError> {
+        self.verify_block_body_commitment(block)?;
         let mut batch = WriteBatch::new();
         Self::append_block_parts(&mut batch, block, index_transactions);
         self.store.write_batch(batch)
@@ -900,6 +905,7 @@ impl<S: KvStore> ChainStore<S> {
         }
 
         for block in new_chain {
+            self.verify_block_body_commitment(block)?;
             let block_hash = block.hash();
             Self::append_transaction_indexes(&mut batch, block, &block_hash);
             self.append_system_transactions(
@@ -1156,6 +1162,7 @@ impl<S: KvStore> ChainStore<S> {
         restore_witness: bool,
         validate_legacy: impl FnOnce(&Block) -> Result<(), StorageError>,
     ) -> Result<(), StorageError> {
+        self.verify_block_body_commitment(block)?;
         let overlay = Arc::new(crate::OverlayStore::new(self.store.clone()));
         let staged = ChainStore::new(overlay.clone());
         if !staged.has_body(&block.hash())? {
@@ -1183,6 +1190,7 @@ impl<S: KvStore> ChainStore<S> {
         block: &Block,
         validate_legacy: impl FnOnce(&Block) -> Result<(), StorageError>,
     ) -> Result<(), StorageError> {
+        self.verify_block_body_commitment(block)?;
         let hash = block.hash();
         let (body, bundle) = StrippedBlock::split(block);
         let retained = self.store.get(&Self::body_key(&hash))?.ok_or_else(|| {
@@ -1208,7 +1216,9 @@ impl<S: KvStore> ChainStore<S> {
             let header = self
                 .get_header_by_hash(&hash)?
                 .ok_or_else(|| StorageError::InvalidInput("missing local witness header".into()))?;
-            if header
+            if self.block_commitments_enabled(block.number())? {
+                // The complete body was checked against the locally hash-bound header above.
+            } else if header
                 .witness_root
                 .is_none_or(|root| root == ShellHash::ZERO)
             {
@@ -1320,6 +1330,7 @@ impl<S: KvStore> ChainStore<S> {
     /// PQ signature bundles, making it suitable for back-fill without overwriting
     /// any witness or proof data that may already be present.
     pub fn put_body_only(&self, block: &shell_core::Block) -> Result<(), StorageError> {
+        self.verify_block_body_commitment(block)?;
         let hash = block.hash();
         let (stripped, _bundle) = shell_core::StrippedBlock::split(block);
         let body_bytes = encode_rlp(&stripped);
@@ -1496,6 +1507,15 @@ impl<S: KvStore> ChainStore<S> {
         block_hash: &ShellHash,
         receipts: &[TransactionReceipt],
     ) -> Result<(), StorageError> {
+        if let Some(header) = self.get_header_by_hash(block_hash)? {
+            if self.block_commitments_enabled(header.number)?
+                && shell_core::block_receipts_root(receipts) != header.receipts_root
+            {
+                return Err(StorageError::InvalidInput(
+                    "block receipts commitment mismatch".into(),
+                ));
+            }
+        }
         let data = encode_rlp_list(receipts);
         self.store.put(&Self::receipts_key(block_hash), &data)
     }
@@ -1536,12 +1556,81 @@ impl<S: KvStore> ChainStore<S> {
         Ok(())
     }
 
+    /// Whether the explicitly persisted native block-commitment-v1 rule applies.
+    pub fn block_commitments_enabled(&self, number: u64) -> Result<bool, StorageError> {
+        Ok(self
+            .get_chain_config()?
+            .and_then(|c| c.block_commitment_height)
+            .is_some_and(|height| number >= height))
+    }
+
+    /// Check the body before retaining or restoring any incoming data.
+    pub fn verify_block_body_commitment(&self, block: &Block) -> Result<(), StorageError> {
+        if self.block_commitments_enabled(block.number())?
+            && shell_core::block_body_root(&block.transactions, &block.system_transactions)
+                .map_err(|error| StorageError::Codec(error.to_string()))?
+                != block.header.transactions_root
+        {
+            return Err(StorageError::InvalidInput(
+                "block body commitment mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check deterministic execution output before canonical publication.
+    pub fn verify_block_receipts_commitment(
+        &self,
+        block: &Block,
+        receipts: &[TransactionReceipt],
+    ) -> Result<(), StorageError> {
+        if self.block_commitments_enabled(block.number())? {
+            let hashes: Vec<_> = block
+                .transactions
+                .iter()
+                .map(shell_core::SignedTransaction::uncached_hash)
+                .chain(
+                    block
+                        .system_transactions
+                        .iter()
+                        .map(SystemTransaction::hash),
+                )
+                .collect();
+            if receipts.len() != hashes.len()
+                || receipts
+                    .iter()
+                    .zip(hashes)
+                    .enumerate()
+                    .any(|(i, (r, hash))| {
+                        r.tx_hash != hash
+                            || r.block_number != block.number()
+                            || r.tx_index as usize != i
+                    })
+                || shell_core::block_receipts_root(receipts) != block.header.receipts_root
+            {
+                return Err(StorageError::InvalidInput(
+                    "block receipts commitment mismatch".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Build the batch containing all canonical block artifacts.
     fn canonical_block_batch(
         &self,
         block: &Block,
         receipts: Option<&[TransactionReceipt]>,
     ) -> Result<WriteBatch, StorageError> {
+        self.verify_block_body_commitment(block)?;
+        if self.block_commitments_enabled(block.number())? {
+            self.verify_block_receipts_commitment(
+                block,
+                receipts.ok_or_else(|| {
+                    StorageError::InvalidInput("committed receipts are required".into())
+                })?,
+            )?;
+        }
         let block_hash = block.hash();
         let mut batch = WriteBatch::new();
 
@@ -1664,6 +1753,18 @@ impl<S: KvStore> ChainStore<S> {
                 "stored chain configuration cannot be changed".into(),
             ));
         }
+        if config.block_commitment_height == Some(0)
+            && (!block.transactions.is_empty()
+                || !block.system_transactions.is_empty()
+                || block.header.transactions_root
+                    != shell_core::block_body_root(&[], &[])
+                        .map_err(|error| StorageError::Codec(error.to_string()))?
+                || block.header.receipts_root != shell_core::block_receipts_root(&[]))
+        {
+            return Err(StorageError::InvalidInput(
+                "genesis block commitments mismatch".into(),
+            ));
+        }
         let genesis_hash = block.hash();
         let config_bytes =
             serde_json::to_vec(config).map_err(|e| StorageError::Serialization(e.to_string()))?;
@@ -1679,6 +1780,12 @@ impl<S: KvStore> ChainStore<S> {
             genesis_hash.as_bytes().to_vec(),
         );
         batch.put(prefix::CHAIN_CONFIG.to_vec(), config_bytes);
+        if config.block_commitment_height == Some(0) {
+            batch.put(
+                Self::receipts_key(&genesis_hash),
+                encode_rlp_list::<TransactionReceipt>(&[]),
+            );
+        }
 
         self.store.write_batch(batch)
     }
@@ -2212,6 +2319,11 @@ impl<S: KvStore> ChainStore<S> {
                 desired.pq_address_bounds_height,
             ),
             (
+                "block commitments",
+                stored.block_commitment_height,
+                desired.block_commitment_height,
+            ),
+            (
                 "native address context",
                 stored.native_address_context_height,
                 desired.native_address_context_height,
@@ -2596,6 +2708,9 @@ impl<S: KvStore> ChainStore<S> {
             pq_address_bounds_height: self
                 .get_chain_config()?
                 .and_then(|config| config.pq_address_bounds_height),
+            block_commitment_height: self
+                .get_chain_config()?
+                .and_then(|config| config.block_commitment_height),
             native_address_context_height: self
                 .get_chain_config()?
                 .and_then(|config| config.native_address_context_height),
@@ -2671,6 +2786,7 @@ impl<S: KvStore> ChainStore<S> {
         let trusted_native_registry_view = trusted.native_registry_view_height;
         let trusted_pq_address_bounds = trusted.pq_address_bounds_height;
         let trusted_native_address_context = trusted.native_address_context_height;
+        let trusted_block_commitment = trusted.block_commitment_height;
         let trusted_native_validator_events = trusted.native_validator_events_height;
         let trusted_prover_registry = trusted.prover_registry_height;
         let trusted_algorithm_proposal_staging = trusted.algorithm_proposal_staging_height;
@@ -2841,6 +2957,7 @@ impl<S: KvStore> ChainStore<S> {
                     || config.native_registry_view_height != trusted_native_registry_view
                     || config.pq_address_bounds_height != trusted_pq_address_bounds
                     || config.native_address_context_height != trusted_native_address_context
+                    || config.block_commitment_height != trusted_block_commitment
                     || config.native_validator_events_height != trusted_native_validator_events
                     || config.prover_registry_height != trusted_prover_registry
                     || config.algorithm_proposal_staging_height
@@ -3108,6 +3225,15 @@ impl<S: KvStore> ChainStore<S> {
         }
         if snapshot_chain_config
             .as_ref()
+            .and_then(|config| config.block_commitment_height)
+            != trusted_block_commitment
+        {
+            return Err(StorageError::State(
+                "snapshot is missing the trusted block commitment activation".into(),
+            ));
+        }
+        if snapshot_chain_config
+            .as_ref()
             .and_then(|config| config.native_address_context_height)
             != trusted_native_address_context
         {
@@ -3355,6 +3481,7 @@ impl<S: KvStore> ChainStore<S> {
             native_registry_view_height: trusted_native_registry_view,
             pq_address_bounds_height: trusted_pq_address_bounds,
             native_address_context_height: trusted_native_address_context,
+            block_commitment_height: trusted_block_commitment,
             native_validator_events_height: trusted_native_validator_events,
             prover_registry_height: trusted_prover_registry,
             algorithm_proposal_staging_height: trusted_algorithm_proposal_staging,
@@ -4047,9 +4174,9 @@ impl<S: KvStore> ChainStore<OverlayStore<S>> {
         block: &Block,
         receipts: Option<&[TransactionReceipt]>,
     ) -> Result<(), StorageError> {
+        let batch = self.canonical_block_batch(block, receipts)?;
         self.stage_genesis_metadata_checkpoint(block)?;
         self.stage_address_metadata_undo(&block.hash(), &BTreeMap::new())?;
-        let batch = self.canonical_block_batch(block, receipts)?;
         self.store.commit_with_batch(batch)
     }
 
@@ -4070,6 +4197,10 @@ impl<S: KvStore> ChainStore<OverlayStore<S>> {
             ));
         }
 
+        for (block, receipts) in new_chain.iter().zip(new_chain_receipts) {
+            self.verify_block_body_commitment(block)?;
+            self.verify_block_receipts_commitment(block, receipts)?;
+        }
         let mut batch =
             self.reorg_batch(old_chain, new_chain, stale_canonical_numbers, new_head)?;
         for (block, receipts) in new_chain.iter().zip(new_chain_receipts) {
@@ -5290,6 +5421,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            block_commitment_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -5343,6 +5475,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            block_commitment_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -5382,6 +5515,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5411,6 +5545,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5472,6 +5607,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5501,6 +5637,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5562,6 +5699,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5591,6 +5729,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5651,6 +5790,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5680,6 +5820,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -5785,6 +5926,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5819,6 +5961,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -5885,6 +6028,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: trusted_height,
@@ -5914,6 +6058,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(6),
@@ -5983,6 +6128,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -6015,6 +6161,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: Some(0),
@@ -6083,6 +6230,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_identity_height: None,
@@ -6115,6 +6263,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_identity_height: None,
@@ -6183,6 +6332,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6215,6 +6365,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6329,6 +6480,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6361,6 +6513,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6430,6 +6583,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6462,6 +6616,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6531,6 +6686,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6563,6 +6719,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_deprecation_height: None,
@@ -6627,6 +6784,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_session_deprecation_height: None,
@@ -6659,6 +6817,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_session_deprecation_height: None,
@@ -6727,6 +6886,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 session_registered_root_height: trusted_height,
@@ -6759,6 +6919,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 session_registered_root_height: Some(6),
@@ -6983,6 +7144,51 @@ mod tests {
     }
 
     #[test]
+    fn block_commitment_snapshot_mismatch_is_rejected_before_writes() {
+        for (trusted_height, include_config) in [(None, true), (Some(5), true), (Some(5), false)] {
+            let store = Arc::new(MemoryDb::new());
+            let cs = ChainStore::new(Arc::clone(&store));
+            let trusted: ChainConfig = serde_json::from_value(serde_json::json!({
+                "chain_id": 1337, "genesis_hash": ShellHash::ZERO,
+                "block_commitment_height": trusted_height
+            }))
+            .unwrap();
+            cs.put_chain_config(&trusted).unwrap();
+            let before = store.scan_prefix(b"").unwrap();
+            let mut untrusted = trusted;
+            untrusted.block_commitment_height = Some(6);
+            let metadata = crate::SnapshotMetadata::new(
+                1337,
+                0,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+                ShellHash::ZERO,
+            );
+            let mut bytes = Vec::new();
+            let mut writer = crate::SnapshotWriter::new(&mut bytes, metadata).unwrap();
+            writer.write_entry(b"untrusted-key", b"value").unwrap();
+            if include_config {
+                writer
+                    .write_entry(
+                        prefix::CHAIN_CONFIG,
+                        &serde_json::to_vec(&untrusted).unwrap(),
+                    )
+                    .unwrap();
+            }
+            writer.finalize().unwrap();
+            let error = cs
+                .import_snapshot(std::io::Cursor::new(bytes), 1337, &ShellHash::ZERO)
+                .unwrap_err();
+            assert!(error.to_string().contains(if include_config {
+                "does not match the trusted chain"
+            } else {
+                "missing the trusted block commitment activation"
+            }));
+            assert_eq!(store.scan_prefix(b"").unwrap(), before);
+        }
+    }
+
+    #[test]
     fn native_address_context_snapshot_mismatch_is_rejected_before_writes() {
         for (trusted_height, include_config) in [(None, true), (Some(5), true), (Some(5), false)] {
             let store = Arc::new(MemoryDb::new());
@@ -7140,6 +7346,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 paymaster_registered_root_height: None,
@@ -7172,6 +7379,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 paymaster_registered_root_height: None,
@@ -7246,6 +7454,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7275,6 +7484,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7613,6 +7823,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7642,6 +7853,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -7713,6 +7925,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            block_commitment_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -7849,6 +8062,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: None,
@@ -8788,6 +9002,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            block_commitment_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -9413,6 +9628,7 @@ mod tests {
                 native_registry_view_height: None,
                 pq_address_bounds_height: None,
                 native_address_context_height: None,
+                block_commitment_height: None,
                 native_validator_events_height: None,
                 prover_registry_height: None,
                 algorithm_proposal_staging_height: quorum_activation,
@@ -9679,6 +9895,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            block_commitment_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -9753,6 +9970,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            block_commitment_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -11099,6 +11317,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            block_commitment_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -11145,6 +11364,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            block_commitment_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,

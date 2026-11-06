@@ -101,7 +101,7 @@ pub fn initialize_genesis<S: KvStore + 'static>(
         genesis_extra_data.extend_from_slice(commitment.as_ref());
     }
 
-    let header = BlockHeader {
+    let mut header = BlockHeader {
         parent_hash: ShellHash::ZERO,
         state_root,
         transactions_root: ShellHash::ZERO,
@@ -122,6 +122,11 @@ pub fn initialize_genesis<S: KvStore + 'static>(
         witness_root: None,
     };
 
+    if config.block_commitment_height == Some(0) {
+        header.transactions_root = shell_core::block_body_root(&[], &[])
+            .map_err(|e| GenesisError::StateInit(e.to_string()))?;
+        header.receipts_root = shell_core::block_receipts_root(&[]);
+    }
     let block = Block {
         header,
         transactions: vec![],
@@ -156,6 +161,7 @@ pub fn initialize_genesis<S: KvStore + 'static>(
                 native_registry_view_height: config.native_registry_view_height,
                 pq_address_bounds_height: config.pq_address_bounds_height,
                 native_address_context_height: config.native_address_context_height,
+                block_commitment_height: config.block_commitment_height,
                 native_validator_events_height: config.native_validator_events_height,
                 prover_registry_height: config.prover_registry_height,
                 algorithm_proposal_staging_height: config.algorithm_proposal_staging_height,
@@ -453,6 +459,7 @@ mod tests {
             native_registry_view_height: None,
             pq_address_bounds_height: None,
             native_address_context_height: None,
+            block_commitment_height: None,
             native_validator_events_height: None,
             prover_registry_height: None,
             algorithm_proposal_staging_height: None,
@@ -476,6 +483,39 @@ mod tests {
             economics: None,
             alloc,
             boot_nodes: vec![],
+        }
+    }
+
+    #[test]
+    fn block_commitment_genesis_zero_is_explicit_and_persisted() {
+        let legacy = test_genesis();
+        let old = initialize_genesis(&legacy, std::sync::Arc::new(MemoryDb::new())).unwrap();
+        for activation in [None, Some(0), Some(1)] {
+            let mut config = legacy.clone();
+            config.block_commitment_height = activation;
+            let store = std::sync::Arc::new(MemoryDb::new());
+            let block = initialize_genesis(&config, store.clone()).unwrap();
+            let chain = ChainStore::new(store);
+            assert_eq!(
+                chain
+                    .get_chain_config()
+                    .unwrap()
+                    .unwrap()
+                    .block_commitment_height,
+                activation
+            );
+            assert_eq!(block.hash() == old.hash(), activation != Some(0));
+            if activation == Some(0) {
+                assert_eq!(
+                    block.header.transactions_root,
+                    shell_core::block_body_root(&[], &[]).unwrap()
+                );
+                assert_eq!(
+                    block.header.receipts_root,
+                    shell_core::block_receipts_root(&[])
+                );
+                assert_ne!(block.header.transactions_root, ShellHash::ZERO);
+            }
         }
     }
 

@@ -774,3 +774,13 @@ and a quorum certificate's signer subset cannot establish machine availability;
 `uptime` remains null until an availability measurement and its observation
 source are defined. The RPC does not reinterpret production counts as votes
 cast. This method is not present in node v0.27.6 or the current testnet.
+
+### Optional native body and receipt commitments
+
+The persisted `block_commitment_height` schedule enables native
+[block-commitment-v1](block-commitments.md) inclusively at the selected height.
+The producer commits the exact ordered signed body and system transactions plus
+all execution receipts before sealing. Import and historical replay reject
+inconsistent body or receipt roots before canonical publication. An omitted
+schedule preserves legacy behavior; this implementation does not select a public
+network activation height.

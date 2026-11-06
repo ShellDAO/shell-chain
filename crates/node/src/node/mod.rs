@@ -2184,6 +2184,8 @@ mod tests {
         SignedTransaction::with_pubkey(from, tx, sig, pubkey)
     }
 
+    include!("block_commitment_tests.rs");
+
     fn setup_node_with_authority(authority: Address) -> Node<MemoryDb> {
         setup_node_with_store(authority, Arc::new(MemoryDb::new()))
     }
@@ -3723,6 +3725,15 @@ mod tests {
 
     #[test]
     fn stateful_preferred_fork_is_replayed_and_adopted_atomically() {
+        stateful_preferred_fork_roundtrip(None);
+    }
+
+    #[test]
+    fn block_commitment_stateful_side_fork_replay_and_atomic_adoption() {
+        stateful_preferred_fork_roundtrip(Some(2));
+    }
+
+    fn stateful_preferred_fork_roundtrip(commitment_height: Option<u64>) {
         for activation in [None, Some(1), Some(2)] {
             let (node, proposer_signer) = setup_node();
             let proposer = node.config.proposer_address.unwrap();
@@ -3777,6 +3788,7 @@ mod tests {
                         native_registry_view_height: None,
                         pq_address_bounds_height: None,
                         native_address_context_height: None,
+                        block_commitment_height: commitment_height,
                         native_validator_events_height: None,
                         prover_registry_height: None,
                         algorithm_proposal_staging_height: None,
@@ -3854,7 +3866,11 @@ mod tests {
             );
             let error = node.import_block(invalid, &MultiVerifier).unwrap_err();
             assert!(
-                error.to_string().contains("side-fork tx validation"),
+                error.to_string().contains(if commitment_height.is_some() {
+                    "body commitment mismatch"
+                } else {
+                    "side-fork tx validation"
+                }),
                 "{error}"
             );
             assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
@@ -3884,6 +3900,33 @@ mod tests {
                 .values()
                 .copied()
                 .fold(0u64, u64::saturating_add);
+            if commitment_height.is_some() {
+                let mut wrong_receipts = side_two.clone();
+                wrong_receipts.header.receipts_root = ShellHash::ZERO;
+                wrong_receipts.proposer_seal = Some(
+                    proposer_signer
+                        .sign(wrong_receipts.header.hash().as_bytes())
+                        .unwrap(),
+                );
+                let bad_hash = wrong_receipts.hash();
+                node.import_block(wrong_receipts, &MultiVerifier).unwrap();
+                node.fork_choice
+                    .write()
+                    .update_attested_weight(&bad_hash, total_weight);
+                let bad_plan = node.preferred_fork_plan().unwrap().unwrap();
+                let before = node.store.scan_prefix(b"").unwrap();
+                let root = current_state_root(&node);
+                let error = node.adopt_preferred_fork(&bad_plan).unwrap_err();
+                assert!(
+                    error.to_string().contains("receipts commitment mismatch"),
+                    "{error}"
+                );
+                assert_eq!(node.store.scan_prefix(b"").unwrap(), before);
+                assert_eq!(current_state_root(&node), root);
+                node.fork_choice
+                    .write()
+                    .update_attested_weight(&bad_hash, 0);
+            }
             node.fork_choice
                 .write()
                 .update_attested_weight(&side_two_hash, total_weight);
@@ -3934,6 +3977,11 @@ mod tests {
                     .chain_store
                     .get_receipts(&block.hash())
                     .unwrap()
+                    .unwrap();
+                assert_eq!(produced, replayed);
+                assert_eq!(produced, received);
+                node.chain_store
+                    .verify_block_receipts_commitment(block, &replayed)
                     .unwrap();
                 assert_eq!(produced[0].logs.len(), 1);
                 assert_eq!(
@@ -5652,6 +5700,7 @@ mod tests {
                             native_registry_view_height: None,
                             pq_address_bounds_height: None,
                             native_address_context_height: None,
+                            block_commitment_height: None,
                             native_validator_events_height: None,
                             prover_registry_height: None,
                             algorithm_proposal_staging_height: None,
@@ -5817,6 +5866,7 @@ mod tests {
                             native_registry_view_height: None,
                             pq_address_bounds_height: None,
                             native_address_context_height: None,
+                            block_commitment_height: None,
                             native_validator_events_height: None,
                             prover_registry_height: None,
                             algorithm_proposal_staging_height: None,
@@ -5931,6 +5981,7 @@ mod tests {
                         native_registry_view_height: None,
                         pq_address_bounds_height: None,
                         native_address_context_height: None,
+                        block_commitment_height: None,
                         native_validator_events_height: None,
                         prover_registry_height: None,
                         algorithm_proposal_staging_height: None,

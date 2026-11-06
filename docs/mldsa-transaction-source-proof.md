@@ -632,8 +632,11 @@ checkpoint files; incomplete fixture recovery remains unqualified.
 This establishes authorization context from a **trusted local canonical store**.
 The transaction remains an independently expected input. It does not prove
 network consensus, canonical block-body membership or a key-rotation lifecycle.
-The current native producer leaves transaction/receipt roots zero; a header
-alone therefore does not authenticate these transaction bodies. The fixture
+The default legacy producer leaves transaction/receipt roots zero; a header
+alone therefore does not authenticate those transaction bodies. The optional
+[native block-commitment-v1 rule](block-commitments.md) binds full bodies and
+receipts after its explicitly scheduled height. This proof view does not yet
+verify membership in those roots or establish consensus authentication. The fixture
 stores runtime results through canonical storage APIs and does not claim full
 node consensus import or block reward settlement. No new commitment, carrier,
 gas policy or activation schedule is selected by this view. Cryptographic chain
