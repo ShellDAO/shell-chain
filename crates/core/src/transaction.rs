@@ -346,6 +346,12 @@ impl Transaction {
     ///            rlp(access_list) || sig_type || tx_type`
     /// For blob transactions (tx_type == 3), appends: `max_fee_per_blob_gas(8B) || blob_hash_0(32B) || ...`
     pub fn signing_hash(&self, sig_type: u8) -> ShellHash {
+        shell_primitives::blake3_hash(&self.signing_payload(sig_type))
+    }
+
+    /// Exact existing PQ signing preimage, shared with source-proof construction.
+    /// This encodes the outer transaction; native AA sender framing is separate.
+    pub fn signing_payload(&self, sig_type: u8) -> Vec<u8> {
         let blob_extra = if self.tx_type == 3 {
             8 + self
                 .blob_versioned_hashes
@@ -393,7 +399,7 @@ impl Transaction {
                 }
             }
         }
-        shell_primitives::blake3_hash(&preimage)
+        preimage
     }
 
     /// Compute the default transaction hash using the Dilithium/ML-DSA domain byte.

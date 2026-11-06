@@ -41,6 +41,7 @@ pub mod air;
 pub mod amendment;
 pub mod availability;
 pub mod backlog;
+pub mod blake3_hash;
 pub mod keccak_permutation;
 pub mod metadata;
 pub mod mldsa_challenge;
