@@ -1,4 +1,4 @@
-//! Public, byte-oriented SHAKE128/256 sponge proofs over the Keccak AIR.
+//! Public, byte-oriented SHAKE128/256 and Keccak-256 proofs over the Keccak AIR.
 //!
 //! Padding, XOR absorption, all permutation links and rate extraction are
 //! constrained. Public messages/states are bounded development inputs, not
@@ -40,12 +40,21 @@ const MAX_PROOF_BYTES: usize = 1_048_576;
 pub enum ShakeKind {
     Shake128,
     Shake256,
+    /// Legacy Keccak-256: rate 136, suffix 0x01, exactly 32 output bytes.
+    Keccak256,
 }
 impl ShakeKind {
     pub fn rate(self) -> usize {
         match self {
             Self::Shake128 => 168,
-            Self::Shake256 => 136,
+            Self::Shake256 | Self::Keccak256 => 136,
+        }
+    }
+
+    fn suffix(self) -> u8 {
+        match self {
+            Self::Shake128 | Self::Shake256 => 0x1f,
+            Self::Keccak256 => 0x01,
         }
     }
 }
@@ -86,7 +95,11 @@ impl Inputs {
 impl ToElements<BaseElement> for Inputs {
     fn to_elements(&self) -> Vec<BaseElement> {
         let mut result = vec![
-            BaseElement::new(u64::from_le_bytes(*b"SHKSP001") as u128),
+            BaseElement::new(u64::from_le_bytes(if self.kind == ShakeKind::Keccak256 {
+                *b"KECSP001"
+            } else {
+                *b"SHKSP001"
+            }) as u128),
             BaseElement::new(self.kind.rate() as u128),
             BaseElement::new(self.message.len() as u128),
             BaseElement::new(self.output.len() as u128),
@@ -111,6 +124,9 @@ impl ToElements<BaseElement> for Inputs {
 }
 
 fn schedule(kind: ShakeKind, message: usize, output: usize) -> Result<(usize, usize), String> {
+    if kind == ShakeKind::Keccak256 && output != 32 {
+        return Err("Keccak-256 requires exactly 32 output bytes".into());
+    }
     if message > MAX_SHAKE_MESSAGE_BYTES || output > MAX_SHAKE_OUTPUT_BYTES {
         return Err("SHAKE development message/output resource bound exceeded".into());
     }
@@ -181,7 +197,15 @@ impl Air for SpongeAir {
     fn new(info: TraceInfo, inputs: Inputs, options: ProofOptions) -> Self {
         assert_eq!(info, TraceInfo::new(TRACE_WIDTH, inputs.trace_length()));
         let degrees = (0..CONSTRAINTS)
-            .map(|i| TransitionConstraintDegree::new(if i < 5 || i == 7 { 3 } else { 2 }))
+            .map(|i| {
+                TransitionConstraintDegree::new(
+                    if (i < 8 && inputs.kind.suffix() & (1 << i) != 0) || i == 7 {
+                        3
+                    } else {
+                        2
+                    },
+                )
+            })
             .collect();
         Self {
             context: AirContext::new(info, degrees, TRACE_WIDTH, options),
@@ -197,7 +221,7 @@ impl Air for SpongeAir {
         let r = frame.current();
         for bit in 0..8 {
             let mut block = r[MESSAGE + bit];
-            if bit < 5 {
+            if self.inputs.kind.suffix() & (1 << bit) != 0 {
                 block = xor(block, r[DOMAIN]);
             }
             if bit == 7 {
@@ -317,7 +341,7 @@ pub fn prove_shake(
                 let index = step * rate + offset;
                 let mut value = message.get(index).copied().unwrap_or(0);
                 if index == message.len() {
-                    value ^= 0x1f;
+                    value ^= kind.suffix();
                 }
                 if step == absorbs - 1 && offset == rate - 1 {
                     value ^= 0x80;
@@ -422,6 +446,27 @@ pub fn verify_shake(
     Ok(())
 }
 
+/// Prove the legacy Keccak-256 used by the native account trie. SHAKE proof
+/// transcripts and their existing serialized bytes retain their original tag.
+pub fn prove_keccak256(message: &[u8]) -> Result<ShakeProof, String> {
+    prove_shake(ShakeKind::Keccak256, message, 32)
+}
+
+/// Verify every padding/absorption/output relation and complete permutation.
+/// No native Keccak hash is evaluated as an acceptance fallback.
+pub fn verify_keccak256(
+    proof: &ShakeProof,
+    expected_message: &[u8],
+    expected_output: &[u8; 32],
+) -> Result<(), String> {
+    verify_shake(
+        proof,
+        ShakeKind::Keccak256,
+        expected_message,
+        expected_output,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +488,10 @@ mod tests {
                 let mut h = Shake256::default();
                 h.update(message);
                 h.finalize_xof().read(&mut out);
+            }
+            ShakeKind::Keccak256 => {
+                use sha3::Digest;
+                out.copy_from_slice(&sha3::Keccak256::digest(message));
             }
         }
         out

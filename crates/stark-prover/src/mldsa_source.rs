@@ -51,6 +51,7 @@ pub struct VerifiedSignatureEntry {
     entry: crate::SigBatchEntry,
     leaf: [u8; 32],
     transaction_id: [u8; 32],
+    sender: [u8; 32],
 }
 
 impl VerifiedSignatureEntry {
@@ -64,6 +65,10 @@ impl VerifiedSignatureEntry {
 
     pub fn transaction_id(&self) -> &[u8; 32] {
         &self.transaction_id
+    }
+
+    pub fn sender(&self) -> &[u8; 32] {
+        &self.sender
     }
 }
 
@@ -150,6 +155,7 @@ pub fn verify_signature_entry(
         entry: expected_entry.clone(),
         leaf: *expected_leaf,
         transaction_id: *expected_transaction_id,
+        sender: *expected.from.as_bytes(),
     })
 }
 

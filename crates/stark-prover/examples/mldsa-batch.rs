@@ -1,124 +1,20 @@
 //! Verify a real ordered native batch over complete authenticated entry graphs.
+#[path = "common/mldsa_batch.rs"]
+mod graph;
 #[path = "common/mldsa_source.rs"]
 mod source;
+use graph::{load, paths};
 use serde::{Deserialize, Serialize};
-use shell_core::SignedTransaction;
 use shell_crypto::{MlDsaSigner, MlDsaVerifier, PQSignature, SignatureType, Signer, Verifier};
 use shell_stark_prover::{
     blake3_hash::{verify_transaction_signing_hash, Blake3HashProof},
     compute_batch_root,
-    mldsa_source::{
-        verify_authenticated_sig_batch, verify_signature_entry, DerivedSenderSignatureProof,
-        IdentifiedSenderSignatureProof, SignatureEntryProof, VerifiedSignatureEntry,
-    },
+    mldsa_source::{verify_authenticated_sig_batch, verify_signature_entry},
     prove_sig_batch, verify_sig_batch, SigBatchEntry, SigBatchProof,
 };
-use source::{load_transaction_proof, read, write, EntrySource, Error, IdSource, Identity, Source};
-use std::{
-    io::Write,
-    path::{Path, PathBuf},
-};
+use source::{read, write, Error, Identity, Source};
+use std::{io::Write, path::Path};
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GraphPaths {
-    version: u8,
-    source: PathBuf,
-    equation: PathBuf,
-    signature: PathBuf,
-    sender: PathBuf,
-    id: PathBuf,
-    entry: PathBuf,
-    rejection: PathBuf,
-}
-fn paths(path: &Path) -> Result<GraphPaths, Error> {
-    if path.is_dir() {
-        return Ok(GraphPaths {
-            version: 1,
-            source: path.join("source"),
-            equation: path.join("equation"),
-            signature: path.join("signature"),
-            sender: path.join("sender"),
-            id: path.join("id"),
-            entry: path.join("entry"),
-            rejection: path.join("rejection"),
-        });
-    }
-    let mut p: GraphPaths = read(path)?;
-    if p.version != 1 {
-        return Err("invalid graph path manifest version".into());
-    }
-    let base = path.parent().ok_or("missing manifest parent")?;
-    for field in [
-        &mut p.source,
-        &mut p.equation,
-        &mut p.signature,
-        &mut p.sender,
-        &mut p.id,
-        &mut p.entry,
-        &mut p.rejection,
-    ] {
-        *field = base.join(&*field);
-    }
-    Ok(p)
-}
-struct LoadedEntry {
-    proof: SignatureEntryProof,
-    expected: SignedTransaction,
-    key_hash: [u8; 32],
-    id: [u8; 32],
-    entry: SigBatchEntry,
-    leaf: [u8; 32],
-    identity: Identity,
-    paths: GraphPaths,
-}
-impl LoadedEntry {
-    fn verify(&self) -> Result<VerifiedSignatureEntry, String> {
-        verify_signature_entry(
-            &self.proof,
-            &self.expected,
-            &self.key_hash,
-            &self.id,
-            &self.entry,
-            &self.leaf,
-        )
-    }
-}
-fn load(path: &Path) -> Result<LoadedEntry, Error> {
-    let p = paths(path)?;
-    let (transaction, s, identity) = load_transaction_proof(&p.source, &p.equation, &p.signature)?;
-    let expected = read(&p.sender.join("sender.json"))?;
-    let id: IdSource = read(&p.id.join("id-source.json"))?;
-    let entry: EntrySource = read(&p.entry.join("entry-source.json"))?;
-    if id.version != 1 || entry.version != 1 {
-        return Err("invalid expected ID/entry version".into());
-    }
-    Ok(LoadedEntry {
-        proof: SignatureEntryProof {
-            version: 1,
-            leaf: read(&p.entry.join("entry-leaf.json"))?,
-            identified: IdentifiedSenderSignatureProof {
-                version: 1,
-                transaction_id: read(&p.id.join("id-hash.json"))?,
-                sender: DerivedSenderSignatureProof {
-                    version: 1,
-                    sender_address: read(&p.sender.join("sender-address.json"))?,
-                    transaction,
-                },
-            },
-        },
-        expected,
-        key_hash: s.public_key_hash,
-        id: id.transaction_id,
-        entry: SigBatchEntry {
-            msg_hash: entry.msg_hash,
-            pk_hash: entry.pk_hash,
-        },
-        leaf: entry.leaf,
-        identity,
-        paths: p,
-    })
-}
 fn init_second(template: &Path, dir: &Path) -> Result<(), Error> {
     let p = paths(template)?;
     let original: Source = read(&p.source.join("source.json"))?;
@@ -261,11 +157,11 @@ fn report(mode: &std::ffi::OsStr, source: &BatchSource, proof: &SigBatchProof, g
     );
 }
 fn run(mode: &std::ffi::OsStr, first: &Path, second: &Path, dir: &Path) -> Result<(), Error> {
-    let first = load(first)?;
-    let second = load(second)?;
+    let (first, first_identity, first_paths) = load(first)?;
+    let (second, second_identity, _) = load(second)?;
     let verified = vec![first.verify()?, second.verify()?];
     if first.id == second.id
-        || first.identity.public_key[..32] == second.identity.public_key[..32]
+        || first_identity.public_key[..32] == second_identity.public_key[..32]
         || first.leaf == second.leaf
     {
         return Err(
@@ -526,13 +422,13 @@ fn run(mode: &std::ffi::OsStr, first: &Path, second: &Path, dir: &Path) -> Resul
             ),
             "batch accumulator:",
         )?;
-        let bad: Identity = read(&first.paths.rejection.join("identity.json"))?;
+        let bad: Identity = read(&first_paths.rejection.join("identity.json"))?;
         if bad.version != 1
-            || bad.public_key != first.identity.public_key
-            || bad.message != first.identity.message
+            || bad.public_key != first_identity.public_key
+            || bad.message != first_identity.message
             || bad.signature.len() != 3309
-            || bad.signature == first.identity.signature
-            || bad.signature[..3248] != first.identity.signature[..3248]
+            || bad.signature == first_identity.signature
+            || bad.signature[..3248] != first_identity.signature[..3248]
         {
             return Err("invalid honest altered-hint control".into());
         }
@@ -558,21 +454,21 @@ fn run(mode: &std::ffi::OsStr, first: &Path, second: &Path, dir: &Path) -> Resul
             .transaction
             .signature
             .equation
-            .signature = read(&first.paths.rejection.join("signature.json"))?;
+            .signature = read(&first_paths.rejection.join("signature.json"))?;
         changed
             .identified
             .sender
             .transaction
             .signature
             .completion
-            .finish = read(&first.paths.rejection.join("finish.json"))?;
+            .finish = read(&first_paths.rejection.join("finish.json"))?;
         changed
             .identified
             .sender
             .transaction
             .signature
             .completion
-            .commitment = read(&first.paths.rejection.join("commitment.json"))?;
+            .commitment = read(&first_paths.rejection.join("commitment.json"))?;
         reject(
             &mut cases,
             "honest_invalid_signature_preserves_valid_native_batch_root",
@@ -600,7 +496,7 @@ fn main() -> Result<(), Error> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let mode = args.first().ok_or("missing mode")?;
     if mode == "verify-entry" && args.len() == 2 {
-        let loaded = load(Path::new(&args[1]))?;
+        let (loaded, _, _) = load(Path::new(&args[1]))?;
         let verified = loaded.verify()?;
         println!(
             "{}",

@@ -17,6 +17,7 @@ tracing.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+alloy-rlp.workspace = true
 
 [features]
 # Enable the real recursive (L2) prover implementation.
@@ -25,5 +26,6 @@ serde_json.workspace = true
 recursive = []
 
 [dev-dependencies]
+shell-storage = { path = "../storage", features = ["rocksdb"] }
 sha3 = { workspace = true }
 criterion = { workspace = true }

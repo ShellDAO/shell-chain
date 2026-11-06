@@ -37,6 +37,7 @@
 //! Proof options are tuned for fast verification: 28 queries, blowup 8,
 //! grinding 16, no field extension.
 
+pub mod account_state;
 pub mod air;
 pub mod amendment;
 pub mod availability;

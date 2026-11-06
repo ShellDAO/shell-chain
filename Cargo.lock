@@ -6518,6 +6518,7 @@ dependencies = [
 name = "shell-stark-prover"
 version = "0.27.14"
 dependencies = [
+ "alloy-rlp",
  "blake3",
  "criterion",
  "serde",
@@ -6526,6 +6527,7 @@ dependencies = [
  "shell-core",
  "shell-crypto",
  "shell-primitives",
+ "shell-storage",
  "thiserror 2.0.18",
  "tracing",
  "winterfell",

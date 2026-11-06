@@ -438,3 +438,68 @@ proof format. Share the fold between native and authenticated callers, feeding
 only already-proved leaves to the latter. Verify complete source/signature graphs
 before issuing entry snapshots, and bind their exact ordered IDs/root as caller
 expectations. No legacy roots, gas, protocol carriers or activation rules change.
+
+## Native account state and the signed batch
+
+`AccountStateProof` authenticates membership or absence of a native account
+under an independently expected state root. The account key is legacy
+Keccak-256 of the **full 32-byte sender address**. The witness contains real
+Keccak AIR certificates for that key and every referenced hashed MPT node.
+Verification checks the original native account RLP, compact nibble paths,
+branch/extension/leaf routing and exact node coverage. Inline children are
+consumed from their parent. The native empty trie has an explicitly proved
+empty RLP root. Native hashing or the native trie verifier is not an acceptance
+fallback.
+
+Keccak-256 uses rate 136, suffix `0x01` and exactly 32 output bytes. It has a
+separate proof transcript tag from SHAKE. Existing SHAKE128/256 tags, padding,
+public inputs and saved certificates retain their original meaning. A valid
+SHAKE256 certificate for the same bytes cannot substitute for Keccak-256.
+
+`verify_account_bound_sig_batch` joins account witnesses to the exact full
+senders in immutable `VerifiedSignatureEntry` snapshots, the actual native
+batch proof and the expected ordered canonical IDs/root. Only success returns
+immutable account snapshots. They authenticate the complete account record,
+including nonce, balance, key hash and custom-validator field.
+
+Run the persisted regression from the repository root:
+
+```bash
+mkdir -p proof-dir
+tests/e2e/mldsa-account-state-proof.sh prove proof-dir/first proof-dir/second proof-dir/batch proof-dir/state
+tests/e2e/mldsa-account-state-proof.sh verify proof-dir/first proof-dir/second proof-dir/batch proof-dir/state
+```
+
+This needs the repository's Rust and native RocksDB build prerequisites. It
+requires no RPC server, funds, personal paths or saved private keys. A missing
+batch is built using the preceding two-identity regression; generating both
+signature graphs from an empty directory can take several hours. Existing valid
+source/hash/matrix/signature/batch certificates are reused. A version-1 first
+graph path manifest is accepted as in the preceding section.
+
+The new native fixture creates its own RocksDB database in `state/native-db`.
+It commits actual account roots and native MPT proof nodes, then changes the
+first account's nonce, balance and custom-validator field. Separate processes
+reopen the old and current roots. Historical reads must preserve every native
+state KV entry and the current account. Keep this database with the proof
+checkpoints when resuming; partial fixture recovery is unqualified and existing
+records are never overwritten.
+
+`state-source.json` records the independently native-derived roots, full
+addresses, accounts and raw proof nodes. Five account witnesses cover two real
+signed senders, absence at a branch, absence at a mismatched leaf, and the empty
+root. Content-addressed `hash-*.json` certificates are shared across paths.
+`boundary-*.json` covers lengths 0, 3, 135, 136 and 137; independent native
+implementations check the Keccak outputs. An honest SHAKE certificate and an
+honestly hashed malformed RLP node are retained as rejection controls. The
+verify command generates no proofs. Each stage exits nonzero on failure.
+
+This establishes account state under the supplied root, plus its binding to
+the two complete public signature graphs and native batch. The root's canonical
+chain membership remains an independent requirement. The native public-key
+registry is stored in a separate KV table and is **not** committed by the
+account trie root. Account membership or absence therefore does not establish
+registry absence, Reference/rotated-key authorization, account authority or
+custom-validator execution. Those links, canonical replay/import/rollback,
+private/recursive proofs and node activation remain separate work. No native
+state commitment, root format, consensus carrier, gas or activation rule changes.
