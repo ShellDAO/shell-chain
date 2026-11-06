@@ -25,4 +25,5 @@ serde_json.workspace = true
 recursive = []
 
 [dev-dependencies]
+sha3 = { workspace = true }
 criterion = { workspace = true }

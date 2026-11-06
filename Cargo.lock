@@ -6522,6 +6522,7 @@ dependencies = [
  "criterion",
  "serde",
  "serde_json",
+ "sha3 0.10.9",
  "shell-core",
  "shell-crypto",
  "shell-primitives",

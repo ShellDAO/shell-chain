@@ -41,6 +41,7 @@ pub mod air;
 pub mod amendment;
 pub mod availability;
 pub mod backlog;
+pub mod keccak_permutation;
 pub mod metadata;
 pub mod mldsa_decode;
 pub mod mldsa_key;
