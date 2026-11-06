@@ -55,6 +55,20 @@ pub struct VerifiedSignatureEntry {
 }
 
 impl VerifiedSignatureEntry {
+    pub(crate) fn from_verified_parts(
+        entry: crate::SigBatchEntry,
+        leaf: [u8; 32],
+        transaction_id: [u8; 32],
+        sender: [u8; 32],
+    ) -> Self {
+        Self {
+            entry,
+            leaf,
+            transaction_id,
+            sender,
+        }
+    }
+
     pub fn entry(&self) -> &crate::SigBatchEntry {
         &self.entry
     }

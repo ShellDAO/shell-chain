@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add proof-backed registered-account ML-DSA-65 key binding and an exact crypto verifier for native transaction validation. Cover Embedded/Reference retained addresses, tagged-key activation, native transfer persistence and rollback in the development regression; registry canonicality and network activation remain separate requirements.
+
 ## [0.27.14] — 2026-10-24 — PQ batch gas boundary
 
 ### Fixed

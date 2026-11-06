@@ -503,3 +503,76 @@ registry absence, Reference/rotated-key authorization, account authority or
 custom-validator execution. Those links, canonical replay/import/rollback,
 private/recursive proofs and node activation remain separate work. No native
 state commitment, root format, consensus carrier, gas or activation rule changes.
+
+
+## Registered account key proofs and native execution
+
+`verify_registered_signature_entry` combines an already verified account
+snapshot with the complete ordinary ML-DSA-65 source/signature, canonical
+transaction ID and native Embedded or Reference leaf. It proves the account's
+legacy raw key hash, or its algorithm-tagged `algorithm byte || raw key` hash.
+A retained sender address need not be derived from the current key. The bounded
+profile rejects absent accounts, zero key hashes and custom validators.
+
+`VerifiedRegisteredSignature` implements the existing crypto `Verifier` trait.
+It returns true only for the exact proved key, signing digest, algorithm and
+signature bytes. It never invokes a native signature verifier as a fallback.
+`matches_transaction` also compares the sender, unsigned fields, witness mode
+and signature without trusting the transaction's cached ID. The returned entry
+can feed the existing authenticated native batch verifier.
+
+This value is a cryptographic result, **not an authorization ticket**. Before
+using it, callers must bind its account root and transaction to their independently
+trusted parent state. Native transaction policy must still read the actual
+registry and chain configuration and enforce key conflicts, tagged-key activation,
+algorithm lifecycle, nonce, funds, fees and resource rules. Neither account MPT
+proofs nor this crypto adapter commit the separate registry KV index or prove
+canonical chain membership. A tagged-key proof remains mathematically valid
+before activation; native policy must reject its unauthorized use then.
+
+Run the complete local regression after the preceding account-state producer:
+
+```bash
+tests/e2e/mldsa-registered-proof.sh prove proof-dir/first proof-dir/second proof-dir/state proof-dir/registered
+tests/e2e/mldsa-registered-proof.sh verify proof-dir/first proof-dir/second proof-dir/state proof-dir/registered
+```
+
+The Rust/native RocksDB prerequisites and version-1 first-graph manifest support
+are the same as above. Inputs contain self-created public development accounts;
+no RPC, funds or retained private key is needed. Existing source, signature,
+address, ID and Embedded-leaf proofs are reused after checking their exact native
+preimages. Only changed MPT hashes and the Reference leaf require new proofs.
+The verify command generates no proofs, and every stage exits nonzero on failure.
+Keep generated databases and checkpoint files together; partial fixture recovery
+is not qualified and existing records are not overwritten.
+
+Six cases combine original legacy-key, retained-address legacy-key and
+retained-address tagged-key accounts with Embedded and Reference modes. Each
+verified proof supplies crypto verification to actual native admission and
+candidate-block import validation. A separately initialized local genesis,
+registry and explicit configuration supply the trusted policy context. The
+regression executes a real transfer, checks the receipt, nonce, sender fee/value
+debit and full-address recipient balance, commits it, closes RocksDB and reopens
+the receipt and current/historical roots. Saved execution records bind the exact
+transaction witness, public key, parent account/root and configuration. Resume
+checks this binding and read-only native import policy before reopening state;
+foreign saved records fail. A shared local storage column permits
+one overlay commit for this fixture's account/registry/receipt writes. A batch
+that executes its first transaction and then fails nonce validation discards
+all staged writes. Refusal controls use actual missing/conflicting registry
+entries, default-disabled and pre-activation tagged keys, plus altered proof/source inputs.
+Actual MPT snapshots for absent, unbound and custom-validator accounts must
+fail this bounded profile. An insufficient-funds first-use transaction must
+fail without registering its key.
+The missing-registry original Embedded case instead verifies native first-use
+registration; failed controls must not change the base database.
+
+Design decision: keep cryptographic key binding and native policy separate,
+reuse the native `Verifier` interface and transaction executor, and add only a
+development dependency on the runtime for the regression. No new registry root,
+consensus carrier, gas rule or activation schedule is introduced. Retained-address
+state fixtures do not prove a key-rotation transaction lifecycle. Candidate
+import validation and isolated transaction persistence do not establish full
+consensus block import/replay or block reward settlement. Automatic node wiring,
+canonical historical registry authentication, other algorithms/AA/private proofs,
+public release and network activation remain separate acceptance.

@@ -6526,6 +6526,7 @@ dependencies = [
  "sha3 0.10.9",
  "shell-core",
  "shell-crypto",
+ "shell-pqvm",
  "shell-primitives",
  "shell-storage",
  "thiserror 2.0.18",
