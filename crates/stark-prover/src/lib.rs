@@ -52,6 +52,7 @@ pub mod mldsa_inverse;
 pub mod mldsa_key;
 pub mod mldsa_matrix;
 pub mod mldsa_ntt;
+pub mod mldsa_source;
 pub mod mldsa_verification;
 pub mod proof;
 pub mod prover;
