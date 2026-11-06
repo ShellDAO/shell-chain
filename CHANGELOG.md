@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add full ML-DSA-65 proposer-seal AIR over the native 32-byte header hash,
+  bound to the caller-selected authority and frozen canonical parent key. An
+  immutable exact-tuple verifier connects to native WPoA seal validation.
+  `tests/e2e/mldsa-seal-proof.sh` persists a fresh signed native fixture and
+  resumes its public signature graph while reusing transaction/body proofs.
+  Authority selection/history and full-node proof ingestion remain separate;
+  no penalty policy, settlement carrier or network activation changes.
+
 - Add bounded AIR verification of the exact native 424-byte header hash and
   nested variable-field commitments. Bind a verified registered signature/body
   result to an independently expected block hash and reuse its crypto verifier

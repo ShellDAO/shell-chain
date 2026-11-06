@@ -104,6 +104,35 @@ pub struct EntrySource {
     pub leaf: [u8; 32],
 }
 
+/// Load the raw-message signature graph, independently of transaction framing.
+pub fn load_signature_proof(
+    matrix: &Path,
+    eq: &Path,
+    sig: &Path,
+) -> Result<(Mldsa65VerificationProof, Identity), Error> {
+    let id: Identity = read(&matrix.join("identity.json"))?;
+    if id.version != 1
+        || id.public_key.len() != 1952
+        || id.signature.len() != 3309
+        || id.message.len() > shell_stark_prover::mldsa_verification::MAX_MESSAGE_BYTES
+    {
+        return Err("invalid signature identity/shape".into());
+    }
+    if read::<Identity>(&eq.join("identity.json"))? != id
+        || read::<Identity>(&sig.join("identity.json"))? != id
+    {
+        return Err("source/equation/signature identities differ".into());
+    }
+    Ok((
+        Mldsa65VerificationProof {
+            version: 1,
+            equation: equation(matrix, eq)?,
+            completion: completion(sig)?,
+        },
+        id,
+    ))
+}
+
 pub fn load_transaction_proof(
     source: &Path,
     eq: &Path,
@@ -112,28 +141,23 @@ pub fn load_transaction_proof(
     let id: Identity = read(&source.join("identity.json"))?;
     let s: Source = read(&source.join("source.json"))?;
     if id.version != 1
-        || s.version != 1
         || id.public_key.len() != 1952
         || id.signature.len() != 3309
+        || s.version != 1
         || id.message.len() != 32
         || s.sig_type != SignatureType::MlDsa65.as_u8()
     {
         return Err("invalid source identity/shape/algorithm".into());
     }
-    if read::<Identity>(&eq.join("identity.json"))? != id
-        || read::<Identity>(&sig.join("identity.json"))? != id
-    {
-        return Err("source/equation/signature identities differ".into());
+    let (signature, verified_id) = load_signature_proof(source, eq, sig)?;
+    if verified_id != id {
+        return Err("source identity changed while loading".into());
     }
     let p = TransactionSignatureProof {
         version: 1,
         signing_hash: read(&source.join("transaction-hash.json"))?,
         public_key_hash: read(&source.join("public-key-hash.json"))?,
-        signature: Mldsa65VerificationProof {
-            version: 1,
-            equation: equation(source, eq)?,
-            completion: completion(sig)?,
-        },
+        signature,
     };
     if p.signing_hash.output.as_slice() != id.message {
         return Err("saved signature message differs from the source signing digest".into());

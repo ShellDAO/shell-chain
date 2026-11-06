@@ -5,8 +5,9 @@ mod graph;
 mod source;
 use graph::LoadedEntry;
 use serde::{Deserialize, Serialize};
+use shell_consensus::{ConsensusEngine, PoaConfig, WPoaConfig, WPoaEngine};
 use shell_core::{Account, Block, BlockHeader, PubkeyMode, SignedTransaction, TransactionReceipt};
-use shell_crypto::MultiVerifier;
+use shell_crypto::{MlDsaSigner, MultiVerifier, SignatureType, Signer, Verifier};
 use shell_pqvm::{
     commit_pqvm_state, validate_tx, validate_tx_for_import_at_block, ShellPqvm, ShellStateDb,
 };
@@ -34,6 +35,8 @@ struct Context {
     version: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     block_commitment_height: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seal_key: Option<Vec<u8>>,
     genesis_root: [u8; 32],
     hashes: Vec<ShellHash>,
     parent_root: [u8; 32],
@@ -129,19 +132,25 @@ fn header(root: ShellHash) -> BlockHeader {
         witness_root: None,
     }
 }
+fn seal_engine(proposer: Address) -> WPoaEngine {
+    let mut config = WPoaConfig::from_poa(PoaConfig::new(vec![proposer], 1));
+    config.chain_id = 10;
+    WPoaEngine::new(config, Arc::new(MultiVerifier))
+}
 fn init(
     first: &LoadedEntry,
     second: &LoadedEntry,
     old: &Path,
     dir: &Path,
     body: bool,
+    seal: bool,
 ) -> Result<(), Error> {
     first.verify()?;
     std::fs::create_dir_all(dir)?;
     if dir.join("canonical-source.json").try_exists()? {
         let saved = context(first, second, old, dir)?;
         ensure(
-            saved.block_commitment_height == body.then_some(1),
+            saved.block_commitment_height == body.then_some(1) && saved.seal_key.is_some() == seal,
             "fixture activation profile differs",
         )?;
         return reopen(dir);
@@ -163,6 +172,11 @@ fn init(
         .public_key()
         .ok_or("missing second key")?
         .to_vec();
+    let signer = seal.then(MlDsaSigner::generate);
+    let seal_key = signer.as_ref().map(|s| s.public_key().to_vec());
+    let proposer = seal_key
+        .as_ref()
+        .map(|key| Address::from_public_key(key, SignatureType::MlDsa65.as_u8()));
     let result;
     {
         let original = RocksDbStore::open_all(old.join("native-db"), None)?;
@@ -184,6 +198,15 @@ fn init(
             "native_address_context_height":1, "block_commitment_height":body.then_some(1)
         }))?;
         chain.put_pubkey(&second_tx.from, &second_key)?;
+        if let (Some(address), Some(key)) = (proposer, &seal_key) {
+            ensure(
+                address != first_tx.from
+                    && address != second_tx.from
+                    && Some(address) != second_tx.tx.to,
+                "fixture proposer collides with transfer parties",
+            )?;
+            chain.put_pubkey(&address, key)?;
+        }
         chain.commit_genesis_block(&genesis, &config)?;
         ensure(
             chain.get_pubkey(&first_tx.from)?.is_none(),
@@ -209,6 +232,9 @@ fn init(
             h.parent_hash = previous.hash();
             h.number = previous.number() + 1;
             h.timestamp = previous.header.timestamp + 1;
+            if let Some(address) = proposer {
+                h.proposer = address;
+            }
             let mut vm = ShellPqvm::new(ShellStateDb::new(world, cs), 10);
             let mut block_receipts = Vec::new();
             let mut cumulative = 0;
@@ -237,15 +263,37 @@ fn init(
                 h.transactions_root = shell_core::block_body_root(&transactions, &[])?;
                 h.receipts_root = shell_core::block_receipts_root(&block_receipts);
             }
-            let b = Block {
+            let mut b = Block {
                 header: h,
                 transactions,
                 system_transactions: vec![],
                 proposer_seal: None,
             };
+            if let Some(signer) = &signer {
+                let engine = seal_engine(b.header.proposer);
+                engine.verify_header(&b.header)?;
+                engine.verify_header_for_finalized_import(&b.header, &previous.header)?;
+                engine.sign_block(&mut b, signer)?;
+                engine.verify_seal(
+                    &b.header,
+                    b.proposer_seal.as_ref().ok_or("missing generated seal")?,
+                    signer.public_key(),
+                    &MultiVerifier,
+                )?;
+            }
             let cs = ChainStore::new(Arc::clone(&overlay));
             cs.stage_address_metadata_undo(&b.hash(), &checkpoint)?;
             cs.commit_canonical_block(&b, Some(&block_receipts))?;
+            if let Some(signer) = &signer {
+                cs.put_block_signers(
+                    &b.hash(),
+                    &[shell_core::BlockSignerEvidence {
+                        address: b.header.proposer,
+                        public_key: signer.public_key().to_vec(),
+                        signature: b.proposer_seal.clone().ok_or("missing generated seal")?,
+                    }],
+                )?;
+            }
             overlay.commit()?;
             if b.number() == 1 {
                 parent_root = *b.header.state_root.as_bytes();
@@ -277,6 +325,7 @@ fn init(
         result = Context {
             version: 1,
             block_commitment_height: body.then_some(1),
+            seal_key,
             genesis_root: root.state_root,
             hashes,
             parent_root,
@@ -614,6 +663,26 @@ fn reopen(dir: &Path) -> Result<(), Error> {
             "saved block/header/canonical mapping mismatch",
         )?;
         if i > 0 {
+            if let Some(key) = &c.seal_key {
+                let proposer = Address::from_public_key(key, SignatureType::MlDsa65.as_u8());
+                let seal = block
+                    .proposer_seal
+                    .as_ref()
+                    .ok_or("persisted seal absent")?;
+                let engine = seal_engine(proposer);
+                engine.verify_header(&block.header)?;
+                engine.verify_seal(&block.header, seal, key, &MultiVerifier)?;
+                ensure(
+                    chain.get_pubkey(&proposer)?.as_ref() == Some(key)
+                        && chain.get_block_signers(&block.hash())?
+                            == vec![shell_core::BlockSignerEvidence {
+                                address: proposer,
+                                public_key: key.clone(),
+                                signature: seal.clone(),
+                            }],
+                    "persisted proposer key or signer evidence mismatch",
+                )?;
+            }
             if c.block_commitment_height.is_some() {
                 let expected = if i == 1 {
                     vec![]
@@ -682,7 +751,7 @@ fn reopen(dir: &Path) -> Result<(), Error> {
     )?;
     println!(
         "{}",
-        serde_json::json!({"mode":"reopen","actual_RocksDB_closed_and_reopened":true,"canonical_header_receipt_state_and_registry_history_verified":true,"base_KV_unchanged":true})
+        serde_json::json!({"mode":"reopen","actual_RocksDB_closed_and_reopened":true,"canonical_header_receipt_state_and_registry_history_verified":true,"base_KV_unchanged":true,"native_proposer_seals_and_signer_evidence":c.seal_key.is_some()})
     );
     Ok(())
 }
@@ -1257,22 +1326,471 @@ fn header_checkpoint(
     );
     Ok(())
 }
+fn copy_checkpoint(input: &Path, output: &Path) -> Result<(), Error> {
+    use std::io::Write;
+    let bytes = std::fs::read(input)?;
+    if output.try_exists()? {
+        ensure(std::fs::read(output)? == bytes, "reused checkpoint differs")?;
+    } else {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    Ok(())
+}
+fn seal_checkpoint(
+    first: &LoadedEntry,
+    second: &LoadedEntry,
+    args: &[String],
+) -> Result<(), Error> {
+    use shell_stark_prover::{
+        body_membership::{verify_transaction_body, TransactionBodyProof},
+        header_hash::{verify_header_hash, BlockHeaderProof},
+        proposer_seal::{verify_canonical_proposer_seal, ProposerSealProof},
+    };
+    let mode = args[0].as_str();
+    let old = Path::new(&args[3]);
+    let accepted = Path::new(&args[5]);
+    let original_body = Path::new(&args[6]);
+    let original_header = Path::new(&args[7]);
+    let out = Path::new(&args[8]);
+    let body_dir = out.join("body");
+    let header_dir = out.join("header");
+    let matrix_dir = out.join("matrix");
+    let original = body_inputs(first, second, old, accepted, original_body)?;
+    ensure(
+        original.seal_key.is_none(),
+        "input must be the original unsealed body checkpoint",
+    )?;
+    if mode == "seal-init" {
+        let resolved = if out.try_exists()? {
+            out.canonicalize()?
+        } else {
+            out.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .canonicalize()?
+                .join(out.file_name().ok_or("missing seal directory")?)
+        };
+        for path in [
+            &args[1], &args[2], &args[3], &args[4], &args[5], &args[6], &args[7],
+        ] {
+            let input = Path::new(path).canonicalize()?;
+            ensure(
+                !resolved.starts_with(&input) && !input.starts_with(&resolved),
+                "seal output overlaps read-only input",
+            )?;
+        }
+        for manifest in [&args[1], &args[2]] {
+            let graph = graph::paths(Path::new(manifest))?;
+            for path in [
+                &graph.source,
+                &graph.equation,
+                &graph.signature,
+                &graph.sender,
+                &graph.id,
+                &graph.entry,
+            ] {
+                let input = path.canonicalize()?;
+                ensure(
+                    !resolved.starts_with(&input) && !input.starts_with(&resolved),
+                    "seal output overlaps a graph manifest input",
+                )?;
+            }
+        }
+        std::fs::create_dir_all(out)?;
+        init(first, second, old, &body_dir, true, true)?;
+    }
+    let c = body_inputs(first, second, old, accepted, &body_dir)?;
+    let key = c.seal_key.as_ref().ok_or("sealed fixture key absent")?;
+    let proposer = Address::from_public_key(key, SignatureType::MlDsa65.as_u8());
+    let stores = RocksDbStore::open_all(body_dir.join("native-db"), None)?;
+    let db = Arc::new(stores.state.clone());
+    let before = db.scan_all()?;
+    let chain = ChainStore::new(db.clone());
+    let block = chain
+        .get_block_by_hash(&c.hashes[2])?
+        .ok_or("missing sealed batch")?;
+    let seal = block
+        .proposer_seal
+        .as_ref()
+        .ok_or("missing persisted seal")?;
+    ensure(
+        block.header.proposer == proposer
+            && block.header.parent_hash == c.hashes[1]
+            && chain.get_pubkey(&proposer)?.as_ref() == Some(key),
+        "sealed key/header/parent mismatch",
+    )?;
+    let identity = source::Identity {
+        version: 1,
+        public_key: key.clone(),
+        message: c.hashes[2].as_bytes().to_vec(),
+        signature: seal.data.clone(),
+    };
+    let declaration = serde_json::json!({"version":1,"chain_id":10,"parent":c.hashes[1],"expected_hash":c.hashes[2],
+        "proposer":proposer,"authorities":[proposer],"weights":[1],"penalties":[],"selector_trust":"isolated fixed canonical setup"});
+    let source_path = out.join("seal-source.json");
+    if mode == "seal-init" {
+        std::fs::create_dir_all(&matrix_dir)?;
+        std::fs::create_dir_all(&header_dir)?;
+        if !matrix_dir.join("identity.json").try_exists()? {
+            write(&matrix_dir.join("identity.json"), &identity)?;
+        }
+        if !source_path.try_exists()? {
+            write(&source_path, &declaration)?;
+        }
+        copy_checkpoint(
+            &original_body.join("body-proof.json"),
+            &body_dir.join("body-proof.json"),
+        )?;
+    }
+    ensure(
+        read::<source::Identity>(&matrix_dir.join("identity.json"))? == identity
+            && read::<serde_json::Value>(&source_path)? == declaration,
+        "saved seal identity/authority context differs",
+    )?;
+    let body: TransactionBodyProof = read(&body_dir.join("body-proof.json"))?;
+    verify_transaction_body(&body, &block.header, &c.second, 1)?;
+    let header_path = header_dir.join("header-proof.json");
+    if mode == "seal-init" {
+        let previous_source: serde_json::Value = read(&original_header.join("header-source.json"))?;
+        let previous_header: BlockHeader =
+            serde_json::from_value(previous_source["header"].clone())?;
+        ensure(
+            previous_source["expected_hash"] == serde_json::to_value(original.hashes[2])?,
+            "original header identity differs",
+        )?;
+        let mut proof: BlockHeaderProof = read(&original_header.join("header-proof.json"))?;
+        verify_header_hash(&proof, &previous_header, &original.hashes[2])?;
+        ensure(
+            previous_header.logs_bloom == block.header.logs_bloom
+                && previous_header.extra_data == block.header.extra_data
+                && previous_header.sig_aggregate_proof == block.header.sig_aggregate_proof,
+            "nested header inputs differ; no regeneration fallback",
+        )?;
+        if !header_path.try_exists()? {
+            proof.canonical = prove_hash(
+                &block.header.canonical_encode_with_field_hashes(
+                    proof.logs_bloom.output.into(),
+                    proof.extra_data.output.into(),
+                    proof
+                        .sig_aggregate_proof
+                        .as_ref()
+                        .map_or(ShellHash::ZERO, |p| p.output.into()),
+                ),
+            )?;
+            write(&header_path, &proof)?;
+        }
+        let source_path = header_dir.join("header-source.json");
+        let source =
+            serde_json::json!({"version":1,"header":block.header,"expected_hash":c.hashes[2]});
+        if !source_path.try_exists()? {
+            write(&source_path, &source)?;
+        }
+        ensure(
+            read::<serde_json::Value>(&source_path)? == source,
+            "saved sealed header differs",
+        )?;
+    }
+    let header: BlockHeaderProof = read(&header_path)?;
+    verify_header_hash(&header, &block.header, &c.hashes[2])?;
+    ensure(
+        before == db.scan_all()?,
+        "seal checkpoint read/prove wrote base KV",
+    )?;
+    if mode == "seal-init" {
+        println!(
+            "{}",
+            serde_json::json!({"mode":mode,"fresh_public_seal_identity_persisted":true,
+            "seal_message_bytes":32,"proposer":proposer,"header_hash":c.hashes[2],
+            "reused_body_certificates":93,"reused_nested_header_certificates":2,"outer_header_compressions":header.canonical.compressions.len(),
+            "old_signature_account_body_graphs_regenerated":0,"consensus_proved":false})
+        );
+        return Ok(());
+    }
+    if mode == "seal-reopen" {
+        drop(chain);
+        drop(db);
+        drop(stores);
+        return reopen(&body_dir);
+    }
+    let (signature, saved) =
+        source::load_signature_proof(&matrix_dir, &out.join("equation"), &out.join("signature"))?;
+    ensure(
+        saved == identity,
+        "seal signature graph differs from persisted native identity",
+    )?;
+    let mut proof = ProposerSealProof {
+        version: 1,
+        header,
+        signature,
+    };
+    let engine = seal_engine(proposer);
+    engine.verify_header(&block.header)?;
+    engine.verify_seal(&block.header, seal, key, &MultiVerifier)?;
+    let expected_proposer = engine.proposer_for_block(block.number());
+    // Capture the real persisted parent in a separate live-store control, then
+    // corrupt its mutable key/config/head/header before proof verification.
+    let copy = Arc::new(MemoryDb::new());
+    for (k, v) in &before {
+        copy.put(k, v)?;
+    }
+    let mutable = ChainStore::new(copy.clone());
+    let view = mutable.canonical_parent_view(c.hashes[2], c.hashes[1])?;
+    mutable.put_pubkey(&proposer, &[0; 1952])?;
+    mutable.set_head(&ShellHash::ZERO)?;
+    let mut config = mutable.get_chain_config()?.ok_or("missing live config")?;
+    config.chain_id = 11;
+    config.block_commitment_height = None;
+    copy.put(b"CFG", &serde_json::to_vec(&config)?)?;
+    copy.put(
+        &[b"h/".as_slice(), c.hashes[2].as_bytes()].concat(),
+        &[0xff],
+    )?;
+    ensure(
+        mutable.get_pubkey(&proposer)?.as_ref() != Some(key)
+            && mutable.get_header_by_hash(&c.hashes[2]).is_err(),
+        "live corruption control did not hit keys/header",
+    )?;
+    let changed_live = copy.scan_all()?;
+    let token = verify_canonical_proposer_seal(
+        &view,
+        &block.header,
+        &c.hashes[2],
+        &expected_proposer,
+        10,
+        seal,
+        &proof,
+    )?;
+    ensure(
+        token.hash() == c.hashes[2] && token.proposer() == proposer && token.chain_id() == 10,
+        "seal token identity differs",
+    )?;
+    engine.verify_seal(&block.header, seal, key, &token)?;
+    ensure(
+        seal_engine(Address::ZERO)
+            .verify_header(&block.header)
+            .is_err(),
+        "foreign native selector accepted",
+    )?;
+    if mode == "seal-check-invalid" {
+        let bad: source::Identity = read(&out.join("rejection/identity.json"))?;
+        ensure(
+            bad.version == 1
+                && bad.public_key == identity.public_key
+                && bad.message == identity.message
+                && bad.signature.len() == 3309
+                && bad.signature[..3248] == identity.signature[..3248]
+                && bad.signature != identity.signature,
+            "honest invalid seal source differs from expected hint-only mutation",
+        )?;
+        proof.signature.equation.signature = read(&out.join("rejection/signature.json"))?;
+        proof.signature.completion.finish = read(&out.join("rejection/finish.json"))?;
+        proof.signature.completion.commitment = read(&out.join("rejection/commitment.json"))?;
+        let bad_seal = shell_crypto::PQSignature::new(SignatureType::MlDsa65, bad.signature);
+        let error = verify_canonical_proposer_seal(
+            &view,
+            &block.header,
+            &c.hashes[2],
+            &expected_proposer,
+            10,
+            &bad_seal,
+            &proof,
+        )
+        .err()
+        .ok_or("honestly proved invalid seal accepted")?;
+        ensure(
+            error.starts_with("final commitment:"),
+            "invalid seal rejected before its honest final computation",
+        )?;
+        ensure(
+            !MultiVerifier.verify(key, c.hashes[2].as_bytes(), &bad_seal)?,
+            "native invalid seal control returned true",
+        )?;
+        ensure(
+            changed_live == mutable.store().scan_all()? && before == db.scan_all()?,
+            "invalid seal verification wrote state",
+        )?;
+        println!(
+            "{}",
+            serde_json::json!({"mode":mode,"same_native_seal_key_and_raw_message":true,
+            "canonical_altered_hint_and_equation_verified":true,"honest_changed_commitment_rejected":true,
+            "production_canonical_seal_entry_rejected":true,"native_invalid_seal_control":false,
+            "rejection":error,"base_KV_unchanged":true,"proofs_generated":0})
+        );
+        return Ok(());
+    }
+    let mut rejected = vec!["foreign_native_selector"];
+    let mut changed_seal = seal.clone();
+    changed_seal.data[0] ^= 1;
+    let mut changed_key = key.clone();
+    changed_key[0] ^= 1;
+    let mut changed_message = c.hashes[2].as_bytes().to_vec();
+    changed_message[0] ^= 1;
+    for (name, result) in [
+        (
+            "token_key",
+            token.verify(&changed_key, c.hashes[2].as_bytes(), seal)?,
+        ),
+        ("token_message", token.verify(key, &changed_message, seal)?),
+        (
+            "token_seal",
+            token.verify(key, c.hashes[2].as_bytes(), &changed_seal)?,
+        ),
+    ] {
+        ensure(!result, "changed token tuple accepted")?;
+        rejected.push(name);
+    }
+    for kind in [
+        "expected_hash",
+        "selected_proposer",
+        "chain_id",
+        "algorithm",
+        "seal_shape",
+        "seal_bytes",
+        "parent",
+        "header_version",
+        "signature_version",
+        "container_version",
+    ] {
+        let mut h = block.header.clone();
+        let mut hash = c.hashes[2];
+        let mut selected = expected_proposer;
+        let mut id = 10;
+        let mut seal = seal.clone();
+        match kind {
+            "expected_hash" => hash = ShellHash::ZERO,
+            "selected_proposer" => selected = Address::ZERO,
+            "chain_id" => id = 11,
+            "algorithm" => seal.sig_type = SignatureType::Dilithium3,
+            "seal_shape" => {
+                seal.data.pop();
+            }
+            "seal_bytes" => seal.data[0] ^= 1,
+            "parent" => h.parent_hash = ShellHash::ZERO,
+            "header_version" => proof.header.version = 2,
+            "signature_version" => proof.signature.version = 2,
+            _ => proof.version = 2,
+        }
+        ensure(
+            verify_canonical_proposer_seal(&view, &h, &hash, &selected, id, &seal, &proof).is_err(),
+            &format!("accepted seal {kind}"),
+        )?;
+        proof.version = 1;
+        proof.header.version = 1;
+        proof.signature.version = 1;
+        rejected.push(kind);
+    }
+    // The accepted transaction graph has a different key/message/signature and
+    // must never stand in for the genuine header-seal graph.
+    let signature = std::mem::replace(
+        &mut proof.signature,
+        second.proof.identified.sender.transaction.signature.clone(),
+    );
+    ensure(
+        verify_canonical_proposer_seal(
+            &view,
+            &block.header,
+            &c.hashes[2],
+            &expected_proposer,
+            10,
+            seal,
+            &proof,
+        )
+        .is_err(),
+        "transaction graph substituted for seal",
+    )?;
+    proof.signature = signature;
+    rejected.push("transaction_graph_substitution");
+    for kind in [
+        "missing_parent_key",
+        "short_parent_key",
+        "wrong_parent_key",
+        "unscheduled",
+        "before_activation",
+    ] {
+        let copy = Arc::new(MemoryDb::new());
+        for (k, v) in &before {
+            copy.put(k, v)?;
+        }
+        let mutable = ChainStore::new(copy.clone());
+        if kind == "missing_parent_key" {
+            copy.delete(&[b"pk/".as_slice(), proposer.as_bytes()].concat())?;
+        } else if kind == "short_parent_key" {
+            mutable.put_pubkey(&proposer, &[0; 8])?;
+        } else if kind == "wrong_parent_key" {
+            mutable.put_pubkey(&proposer, &[0; 1952])?;
+        } else {
+            let mut config = mutable.get_chain_config()?.ok_or("missing config")?;
+            config.block_commitment_height = if kind == "unscheduled" { None } else { Some(3) };
+            copy.put(b"CFG", &serde_json::to_vec(&config)?)?;
+        }
+        let invalid = mutable.canonical_parent_view(c.hashes[2], c.hashes[1])?;
+        ensure(
+            verify_canonical_proposer_seal(
+                &invalid,
+                &block.header,
+                &c.hashes[2],
+                &expected_proposer,
+                10,
+                seal,
+                &proof,
+            )
+            .is_err(),
+            &format!("accepted {kind}"),
+        )?;
+        rejected.push(kind);
+    }
+    ensure(
+        view.store().put(b"CFG", &[]).is_err()
+            && changed_live == mutable.store().scan_all()?
+            && before == db.scan_all()?,
+        "seal verification mutated trusted or frozen/live control stores",
+    )?;
+    println!(
+        "{}",
+        serde_json::json!({"mode":"seal-verify","genuine_full_MLDSA65_header_seal_AIR":true,
+        "native_WPoA_verify_seal_consumed_proof_token":true,"native_selector_checked":true,
+        "frozen_parent_key_survives_live_key_config_head_header_changes":true,"sealed_writes_refused":true,
+        "base_KV_unchanged":true,"rejected":rejected,"consensus_proved":false})
+    );
+    drop(chain);
+    drop(db);
+    drop(stores);
+    body_verify(
+        first,
+        second,
+        old,
+        accepted,
+        &body_dir,
+        false,
+        Some(&proof.header),
+    )?;
+    Ok(())
+}
 fn main() -> Result<(), Error> {
     let a: Vec<_> = std::env::args().skip(1).collect();
+    let seal = a.first().is_some_and(|mode| mode.starts_with("seal-"));
     let header = a.first().is_some_and(|mode| mode.starts_with("header-"));
-    let body = header || a.first().is_some_and(|mode| mode.starts_with("body-"));
-    ensure(a.len() == if header { 8 } else if body { 7 } else { 6 }, "usage: mldsa-canonical operation first-graph second-graph old-state-dir registered-dir [accepted-canonical-dir] output-dir")?;
+    let body = seal || header || a.first().is_some_and(|mode| mode.starts_with("body-"));
+    ensure(a.len() == if seal { 9 } else if header { 8 } else if body { 7 } else { 6 }, "usage: mldsa-canonical operation first-graph second-graph old-state-dir registered-dir [accepted-canonical-dir] output-dir")?;
     let (first, _, _) = graph::load(Path::new(&a[1]))?;
     let (second, _, _) = graph::load(Path::new(&a[2]))?;
     let old = Path::new(&a[3]);
     let registered = Path::new(&a[4]);
     let dir = Path::new(&a[if body { 6 } else { 5 }]);
     match a[0].as_str() {
-        "init" => init(&first, &second, old, dir, false),
+        "init" => init(&first, &second, old, dir, false, false),
         "prove" => prove(&first, &second, old, registered, dir),
         "verify" => verify(&first, &second, old, dir),
         "check-rejections" => rejections(&first, &second, old, dir),
         "reopen" => reopen(dir),
+        "seal-init" | "seal-verify" | "seal-check-invalid" | "seal-reopen" => {
+            seal_checkpoint(&first, &second, &a)
+        }
         "header-prove" | "header-verify" | "header-check-rejections" => header_checkpoint(
             &first,
             &second,
@@ -1283,7 +1801,7 @@ fn main() -> Result<(), Error> {
             &a[0],
         ),
         "header-reopen" => reopen(dir),
-        "body-init" => init(&first, &second, old, dir, true),
+        "body-init" => init(&first, &second, old, dir, true, false),
         "body-prove" => body_prove(&first, &second, old, Path::new(&a[5]), dir),
         "body-verify" => body_verify(&first, &second, old, Path::new(&a[5]), dir, false, None),
         "body-check-rejections" => {

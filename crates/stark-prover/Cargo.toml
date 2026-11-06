@@ -27,6 +27,7 @@ shell-storage = { path = "../storage" }
 recursive = []
 
 [dev-dependencies]
+shell-consensus.workspace = true
 shell-pqvm = { path = "../pqvm" }
 shell-storage = { path = "../storage", features = ["rocksdb"] }
 sha3 = { workspace = true }

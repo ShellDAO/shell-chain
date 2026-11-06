@@ -736,7 +736,8 @@ and the complete 424-byte canonical encoding. Verification authenticates every
 nested hash before accepting the outer hash; native BLAKE3 is not a fallback.
 
 The shared core encoder preserves the exact native layout: `SHELL_BLOCK_HDR`
-with one trailing zero byte, four roots, the bloom digest, four little-endian
+with one trailing zero byte, the parent hash, state root, transaction root and
+receipt root, the bloom digest, four little-endian
 u64 fields (number, gas limit, gas used, timestamp), extra-data digest, full
 32-byte proposer, aggregate digest, little-endian base fee, withdrawals and
 parent-beacon roots, little-endian blob gas used and excess blob gas, then the
@@ -786,3 +787,67 @@ hashes, retain v1 proof bounds, and compose immutable verified results instead
 of introducing another signature or registry verifier. The expected header
 identity remains a caller input, so an untrusted proof cannot select its own
 canonical history or consensus anchor.
+
+
+## Genuine proposer seal AIR in a trusted canonical setup
+
+`mldsa-seal-proof.sh` proves the native proposer's ML-DSA-65 signature over the
+**32-byte header hash**. This is a different message and key from the earlier
+transaction fixtures. It generates a fresh test validator, signs native headers
+through `WPoaEngine::sign_block`, persists blocks, receipts, undo and exact
+`BlockSignerEvidence`, then saves only the public key, message and signature.
+The private key exists only while creating that fixture and is never saved.
+
+The isolated setup has one fixed authority of weight one and no penalties or
+view changes. Its authority configuration is an independently trusted test
+input. `verify_canonical_proposer_seal` checks the caller's expected chain ID
+and selected proposer, obtains the raw key from the sealed canonical parent,
+checks the captured activated child/header identity, verifies the complete
+header hash AIR, then verifies every stage of the full raw-message signature
+AIR. It returns an immutable exact-tuple crypto verifier. The real native
+`WPoaEngine::verify_seal` consumes that verifier, with no native signature
+fallback. A registry key alone does not establish validator membership.
+
+Use the stable Rust toolchain, locked dependencies, RocksDB C/C++/libclang build
+prerequisites, and the self-created source/account/body/header checkpoints from
+the preceding sections. No personal key or public funds are required:
+
+```bash
+tests/e2e/mldsa-seal-proof.sh prove first-graph.json second-graph state registered canonical body header seal
+tests/e2e/mldsa-seal-proof.sh verify first-graph.json second-graph state registered canonical body header seal
+```
+
+`seal` must be a separate new output directory. Prove persists the signed native
+fixture and public identity, resumes the thirty matrix coordinates, equation
+and completion, then verifies in a separate process and reopens RocksDB. Verify
+generates nothing. Each failed stage exits nonzero and preserves its inputs and
+diagnostics. The identity must remain unchanged across resumes; partial files
+are retained and refused. Interrupted fixture creation before its complete
+source record remains unqualified and is never silently reset.
+
+Original transaction signatures, account proofs and all ninety-three body
+certificates are reused. The new proposer and ancestry require a new outer
+header proof; unchanged nested field certificates are copied and verified,
+rather than regenerated. The completed seal predicate is exercised alongside
+registered signature/body/header verification and the actual historical native
+batch, including receipts, gas, state, rollback, advanced-nonce refusal and
+refused historical commit. The seal controls reject changed key/message/seal,
+algorithm, selected authority, chain/hash/parent, missing or changed parent key,
+proof versions, transaction-graph substitution and inactive schedules. A live
+key/config/head/header corruption control must preserve the frozen result and
+leave both the original database and the changed live control unchanged.
+
+This source profile proves the **cryptographic seal under trusted canonical
+key and selector context**. Native selector checks are exercised outside AIR;
+weighted validator-set history, penalties, view changes, quorum/finality and
+full consensus are not proved here. It does not alter unresolved historical
+penalty rules or activate a network. Actual proof ingestion by the full node,
+broader authority lifecycles and public package/binary acceptance remain open.
+The fixture has no native block reward settlement; this is not a production
+throughput or compact/recursive/private-proof qualification.
+
+Design decision: reuse the existing raw-message ML-DSA graph and native
+consensus verifier interface, freeze the existing registry index, and share
+canonical child checks. Keep proof inputs distinct from the caller's trusted
+authority selection; do not add a new authority-history carrier or reinterpret
+later penalty observations as earlier consensus state.

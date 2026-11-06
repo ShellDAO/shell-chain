@@ -59,6 +59,7 @@ pub mod mldsa_ntt;
 pub mod mldsa_source;
 pub mod mldsa_verification;
 pub mod proof;
+pub mod proposer_seal;
 pub mod prover;
 pub mod prover_health;
 pub mod recursive_air;

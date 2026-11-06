@@ -140,6 +140,20 @@ pub fn verify_body_bound_registered_signature<S: KvStore + 'static>(
     signature: &RegisteredSignatureProof,
     body: &crate::body_membership::TransactionBodyProof,
 ) -> Result<BodyBoundRegisteredSignature, String> {
+    canonical_child_hash(view, header)?;
+    let membership = crate::body_membership::verify_transaction_body(body, header, signed, index)?;
+    let canonical = verify_canonical_registered_signature(view, signed, account, signature)?;
+    Ok(BodyBoundRegisteredSignature {
+        canonical,
+        membership,
+    })
+}
+
+/// Resolve the activated child exclusively against the captured canonical view.
+pub(crate) fn canonical_child_hash<S: KvStore + 'static>(
+    view: &CanonicalParentView<S>,
+    header: &shell_core::BlockHeader,
+) -> Result<ShellHash, String> {
     if view
         .config()
         .block_commitment_height
@@ -163,12 +177,7 @@ pub fn verify_body_bound_registered_signature<S: KvStore + 'static>(
     {
         return Err("body signature header is not captured canonical history".into());
     }
-    let membership = crate::body_membership::verify_transaction_body(body, header, signed, index)?;
-    let canonical = verify_canonical_registered_signature(view, signed, account, signature)?;
-    Ok(BodyBoundRegisteredSignature {
-        canonical,
-        membership,
-    })
+    Ok(hash)
 }
 
 /// Complete registered/body predicate bound by AIR to a caller-selected hash.
