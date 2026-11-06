@@ -724,3 +724,65 @@ contracts or actual proof ingestion by a full node. The native batch fixture
 has no proposer seal or block reward settlement. Broader sequential account
 changes, full-node integration and the referenced public binary/network
 activation remain separate acceptance work.
+
+
+## AIR binding of the native header hash
+
+The optional `mldsa-header-proof.sh` stage extends the preceding body profile.
+It proves the existing native block hash and binds it to an **independently
+expected hash**. `BlockHeaderProof` contains real BLAKE3 compression AIR proofs
+for raw `logs_bloom`, raw `extra_data`, an optional raw `sig_aggregate_proof`,
+and the complete 424-byte canonical encoding. Verification authenticates every
+nested hash before accepting the outer hash; native BLAKE3 is not a fallback.
+
+The shared core encoder preserves the exact native layout: `SHELL_BLOCK_HDR`
+with one trailing zero byte, four roots, the bloom digest, four little-endian
+u64 fields (number, gas limit, gas used, timestamp), extra-data digest, full
+32-byte proposer, aggregate digest, little-endian base fee, withdrawals and
+parent-beacon roots, little-endian blob gas used and excess blob gas, then the
+witness root. All hash fields are 32 bytes. An absent aggregate commits zero;
+a present empty aggregate commits BLAKE3(empty), which differs. An absent
+witness root commits zero and has the same hash meaning as a present zero root.
+Hash equivalence does not imply serialized-header equality.
+
+This development profile uses the unchanged v1 hash container and limits each
+raw variable field to 4096 bytes, refusing larger inputs. These are proof
+resource limits; they do not change native block limits, hash bytes, chain
+rules, the settlement carrier or activation. Hashing an aggregate proves its
+bytes, rather than the aggregate's signature or settlement semantics.
+
+After completing the body checkpoint above, run:
+
+```bash
+tests/e2e/mldsa-header-proof.sh prove first-graph.json second-graph state registered canonical body header
+tests/e2e/mldsa-header-proof.sh verify first-graph.json second-graph state registered canonical body header
+```
+
+Use the same prerequisites, self-created test accounts and saved inputs as the
+body regression. `header` is a new checkpoint directory. Prove generates only
+header hash certificates and resumes only with matching saved source/hash;
+verify generates nothing. The rejection stage mutates each field, the expected
+hash, proof framing/coverage/counter/AIR data and oversized variable fields.
+Both return nonzero on any failed stage and retain
+diagnostics. Existing signature, account and body certificates are reused.
+The independent verify process compares the saved source and expected hash
+with the retained native canonical header, proves the registered signature
+and body membership, then calls `bind_registered_signature_header`. Its
+immutable result exposes the exact crypto verifier used to execute the second
+transaction of the historical native batch. The regression compares both
+receipts, cumulative gas and state root, rejects current-nonce replay and a
+failing second transaction, refuses overlay commit, checks the base store is
+unchanged, and reopens the persisted native fixture.
+
+The caller must independently authenticate the expected hash and historical
+state/configuration. This extends the trusted canonical-state profile with
+header-hash AIR; it does not establish proposer authorization, consensus,
+signatures of every body member, a recursive/compact/private proof, first-use
+key registration or actual full-node proof ingestion. Public package/binary
+acceptance and network activation remain separate work.
+
+Design decision: share the native fixed layout through authenticated field
+hashes, retain v1 proof bounds, and compose immutable verified results instead
+of introducing another signature or registry verifier. The expected header
+identity remains a caller input, so an untrusted proof cannot select its own
+canonical history or consensus anchor.

@@ -763,6 +763,7 @@ fn body_verify(
     accepted: &Path,
     dir: &Path,
     refusals: bool,
+    header_proof: Option<&shell_stark_prover::header_hash::BlockHeaderProof>,
 ) -> Result<(), Error> {
     use shell_stark_prover::{
         body_membership::{verify_transaction_body, TransactionBodyProof},
@@ -797,12 +798,41 @@ fn body_verify(
                 && token.signature().matches_transaction(&c.second),
             "body-bound token mismatch",
         )?;
+        let anchored = header_proof
+            .map(|proof| {
+                shell_stark_prover::canonical_signature::bind_registered_signature_header(
+                    token.clone(),
+                    &block.header,
+                    proof,
+                    &c.hashes[2],
+                )
+            })
+            .transpose()?;
+        let verifier = anchored
+            .as_ref()
+            .map_or(token.signature(), |p| p.signature());
+        if let Some(p) = &anchored {
+            ensure(
+                p.header().hash() == c.hashes[2] && p.body().membership().index() == 1,
+                "header-bound token mismatch",
+            )?;
+            ensure(
+                shell_stark_prover::canonical_signature::bind_registered_signature_header(
+                    token.clone(),
+                    &block.header,
+                    header_proof.unwrap(),
+                    &ShellHash::ZERO,
+                )
+                .is_err(),
+                "unrelated expected header accepted",
+            )?;
+        }
         let mut world = view.world_state()?;
         validate_tx_for_import_at_block(
             &c.second,
             &mut world,
             &ChainStore::new(view.store()),
-            token.signature(),
+            verifier,
             10,
             None,
             &block.header,
@@ -832,7 +862,7 @@ fn body_verify(
                     transaction,
                     vm.state_db_mut().world_state_mut(),
                     &cs,
-                    token.signature(),
+                    verifier,
                     10,
                     None,
                     &block.header,
@@ -878,7 +908,7 @@ fn body_verify(
                 &bad,
                 vm.state_db_mut().world_state_mut(),
                 &ChainStore::new(rollback.clone()),
-                token.signature(),
+                verifier,
                 10,
                 None,
                 &block.header,
@@ -894,7 +924,7 @@ fn body_verify(
                 &c.second,
                 &mut current,
                 &chain,
-                token.signature(),
+                verifier,
                 10,
                 None,
                 &block.header,
@@ -912,7 +942,7 @@ fn body_verify(
             "native_import_policy_uses_body_bound_proof_verifier":true, "native_batch_transfers":2,
             "current_nonce_replay_rejected":true, "proof_backed_native_batch_replayed":true,
             "invalid_second_transaction_rolls_back":true, "historical_replay_commit_refused":true,
-            "base_KV_unchanged":true, "consensus_proved":false})
+            "base_KV_unchanged":true, "header_hash_AIR":anchored.is_some(), "consensus_proved":false})
         );
         return Ok(());
     }
@@ -1062,10 +1092,176 @@ fn body_verify(
     );
     Ok(())
 }
+fn header_refusals(
+    proof: &shell_stark_prover::header_hash::BlockHeaderProof,
+    header: &BlockHeader,
+    hash: &ShellHash,
+) -> Result<(), Error> {
+    use shell_stark_prover::header_hash::verify_header_hash;
+    let mut rejected = Vec::new();
+    ensure(
+        verify_header_hash(proof, header, &ShellHash::ZERO).is_err(),
+        "wrong expected header accepted",
+    )?;
+    rejected.push("expected_hash".to_string());
+    let value = serde_json::to_value(header)?;
+    let mut fields: Vec<String> = value
+        .as_object()
+        .ok_or("header object absent")?
+        .keys()
+        .cloned()
+        .collect();
+    if !fields.iter().any(|f| f == "witness_root") {
+        fields.push("witness_root".into());
+    }
+    for field in fields {
+        let mut changed = value.clone();
+        let old = &changed[&field];
+        changed[&field] = if let Some(n) = old.as_u64() {
+            serde_json::json!(n ^ 1)
+        } else if field == "witness_root" && old.is_null() {
+            serde_json::json!(format!("0x{}", "01".repeat(32)))
+        } else if let Some(bytes) = old.as_str() {
+            let mut bytes = bytes.to_string();
+            if bytes.len() == 2 {
+                bytes.push_str("01");
+            } else {
+                let bit = if &bytes[2..3] == "0" { "1" } else { "0" };
+                bytes.replace_range(2..3, bit);
+            }
+            serde_json::json!(bytes)
+        } else {
+            serde_json::json!("0x01")
+        };
+        let header: BlockHeader = serde_json::from_value(changed)?;
+        ensure(
+            verify_header_hash(proof, &header, hash).is_err(),
+            &format!("header field {field} accepted"),
+        )?;
+        rejected.push(format!("field_{field}"));
+    }
+    for kind in [
+        "version",
+        "canonical_version",
+        "nested_version",
+        "missing_compression",
+        "extra_compression",
+        "counter",
+        "operation",
+        "proof_bytes",
+        "aggregate_presence",
+    ] {
+        let mut p = proof.clone();
+        match kind {
+            "version" => p.version += 1,
+            "canonical_version" => p.canonical.version += 1,
+            "nested_version" => p.logs_bloom.version = 2,
+            "missing_compression" => {
+                p.canonical.compressions.pop();
+            }
+            "extra_compression" => p
+                .canonical
+                .compressions
+                .push(p.canonical.compressions[0].clone()),
+            "counter" => p.canonical.compressions[0].input.counter += 1,
+            "operation" => p.extra_data.compressions[0].operations[0] ^= 1,
+            "proof_bytes" => p.canonical.compressions[0].proof_bytes[0] ^= 1,
+            _ => p.sig_aggregate_proof = Some(p.extra_data.clone()),
+        }
+        ensure(
+            verify_header_hash(&p, header, hash).is_err(),
+            &format!("header proof {kind} accepted"),
+        )?;
+        rejected.push(kind.to_string());
+    }
+    for field in ["logs_bloom", "extra_data", "sig_aggregate_proof"] {
+        let mut changed = value.clone();
+        changed[field] = serde_json::json!(format!("0x{}", "00".repeat(4097)));
+        let header: BlockHeader = serde_json::from_value(changed)?;
+        ensure(
+            verify_header_hash(proof, &header, hash).is_err(),
+            "overbound field accepted",
+        )?;
+        rejected.push(format!("overbound_{field}"));
+    }
+    println!(
+        "{}",
+        serde_json::json!({"mode":"header-check-rejections", "rejected":rejected,
+        "certificates_regenerated":0,"consensus_proved":false})
+    );
+    Ok(())
+}
+fn header_checkpoint(
+    first: &LoadedEntry,
+    second: &LoadedEntry,
+    old: &Path,
+    accepted: &Path,
+    body_dir: &Path,
+    output: &Path,
+    mode: &str,
+) -> Result<(), Error> {
+    use shell_stark_prover::header_hash::{
+        prove_header_hash, verify_header_hash, BlockHeaderProof,
+    };
+    let c = body_inputs(first, second, old, accepted, body_dir)?;
+    let stores = RocksDbStore::open_all(body_dir.join("native-db"), None)?;
+    let db = Arc::new(stores.state.clone());
+    let before = db.scan_all()?;
+    let chain = ChainStore::new(db.clone());
+    let header = chain
+        .get_header_by_hash(&c.hashes[2])?
+        .ok_or("missing native header")?;
+    let source = serde_json::json!({"version":1,"header":header,"expected_hash":c.hashes[2]});
+    let source_path = output.join("header-source.json");
+    let proof_path = output.join("header-proof.json");
+    let generate = mode == "header-prove";
+    let generated = generate && !proof_path.try_exists()?;
+    if generate {
+        std::fs::create_dir_all(output)?;
+        if !source_path.try_exists()? {
+            write(&source_path, &source)?;
+        }
+        ensure(
+            read::<serde_json::Value>(&source_path)? == source,
+            "saved header source differs",
+        )?;
+        if generated {
+            write(&proof_path, &prove_header_hash(&header)?)?;
+        }
+    }
+    ensure(
+        read::<serde_json::Value>(&source_path)? == source,
+        "header source/hash differs from retained native fixture",
+    )?;
+    let proof: BlockHeaderProof = read(&proof_path)?;
+    verify_header_hash(&proof, &header, &c.hashes[2])?;
+    if mode == "header-check-rejections" {
+        header_refusals(&proof, &header, &c.hashes[2])?;
+        ensure(before == db.scan_all()?, "header refusals wrote base KV")?;
+        return Ok(());
+    }
+    ensure(before == db.scan_all()?, "header hashing wrote base KV")?;
+    // Release RocksDB before the existing native history regression opens it.
+    drop(chain);
+    drop(db);
+    drop(stores);
+    body_verify(first, second, old, accepted, body_dir, false, Some(&proof))?;
+    println!(
+        "{}",
+        serde_json::json!({"mode":if generate {"header-prove"} else {"header-verify"},
+        "new_header_proof":generated,"header_hash_AIR":true,"canonical_bytes":proof.canonical.message.len(),
+        "expected_hash":c.hashes[2],"compression_certificates":proof.canonical.compressions.len()
+            + proof.logs_bloom.compressions.len() + proof.extra_data.compressions.len()
+            + proof.sig_aggregate_proof.as_ref().map_or(0, |p| p.compressions.len()),
+        "signature_graphs_regenerated":0,"body_certificates_regenerated":0,"consensus_proved":false})
+    );
+    Ok(())
+}
 fn main() -> Result<(), Error> {
     let a: Vec<_> = std::env::args().skip(1).collect();
-    let body = a.first().is_some_and(|mode| mode.starts_with("body-"));
-    ensure(a.len() == if body { 7 } else { 6 }, "usage: mldsa-canonical operation first-graph second-graph old-state-dir registered-dir [accepted-canonical-dir] output-dir")?;
+    let header = a.first().is_some_and(|mode| mode.starts_with("header-"));
+    let body = header || a.first().is_some_and(|mode| mode.starts_with("body-"));
+    ensure(a.len() == if header { 8 } else if body { 7 } else { 6 }, "usage: mldsa-canonical operation first-graph second-graph old-state-dir registered-dir [accepted-canonical-dir] output-dir")?;
     let (first, _, _) = graph::load(Path::new(&a[1]))?;
     let (second, _, _) = graph::load(Path::new(&a[2]))?;
     let old = Path::new(&a[3]);
@@ -1077,10 +1273,22 @@ fn main() -> Result<(), Error> {
         "verify" => verify(&first, &second, old, dir),
         "check-rejections" => rejections(&first, &second, old, dir),
         "reopen" => reopen(dir),
+        "header-prove" | "header-verify" | "header-check-rejections" => header_checkpoint(
+            &first,
+            &second,
+            old,
+            Path::new(&a[5]),
+            dir,
+            Path::new(&a[7]),
+            &a[0],
+        ),
+        "header-reopen" => reopen(dir),
         "body-init" => init(&first, &second, old, dir, true),
         "body-prove" => body_prove(&first, &second, old, Path::new(&a[5]), dir),
-        "body-verify" => body_verify(&first, &second, old, Path::new(&a[5]), dir, false),
-        "body-check-rejections" => body_verify(&first, &second, old, Path::new(&a[5]), dir, true),
+        "body-verify" => body_verify(&first, &second, old, Path::new(&a[5]), dir, false, None),
+        "body-check-rejections" => {
+            body_verify(&first, &second, old, Path::new(&a[5]), dir, true, None)
+        }
         "body-reopen" => reopen(dir),
         _ => Err("unknown canonical proof operation".into()),
     }

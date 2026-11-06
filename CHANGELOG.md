@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add bounded AIR verification of the exact native 424-byte header hash and
+  nested variable-field commitments. Bind a verified registered signature/body
+  result to an independently expected block hash and reuse its crypto verifier
+  for native historical batch execution. Preserve existing header bytes and
+  optional-field normalization; `tests/e2e/mldsa-header-proof.sh` reuses prior
+  signature/account/body checkpoints. Consensus and full-node proof ingestion
+  remain separate requirements.
+
 - Add complete AIR membership for exact native signed-body leaves and ordered
   count-bound paths, with a separate bounded BLAKE3 container v2 for full
   witnesses. Keep v1 proof bytes and its 4096-byte bound unchanged. Bind the

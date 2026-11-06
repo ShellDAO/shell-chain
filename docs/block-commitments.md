@@ -116,3 +116,9 @@ The optional [full signed-body AIR membership profile](mldsa-transaction-source-
 uses these exact native v1 bytes. Its separate 16 KiB hash-proof resource profile
 does not change this commitment format or activate any network. It still needs
 an authenticated header and independent native policy/execution checks.
+
+The optional [native header hash AIR binding](mldsa-transaction-source-proof.md#air-binding-of-the-native-header-hash)
+authenticates the existing 424-byte header hash and its nested variable-field
+hashes using real compression certificates. It changes neither native root
+format nor header hash meaning. The expected hash and canonical historical
+state still require independent authentication; hashing is not consensus.

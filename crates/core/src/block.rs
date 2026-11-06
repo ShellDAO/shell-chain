@@ -196,6 +196,25 @@ impl BlockHeader {
     /// The total output is always 16 + 11*32 + 7*8 = 424 bytes.
     pub fn canonical_encode(&self) -> Vec<u8> {
         use shell_primitives::blake3_hash;
+        self.canonical_encode_with_field_hashes(
+            blake3_hash(self.logs_bloom.as_ref()),
+            blake3_hash(self.extra_data.as_ref()),
+            self.sig_aggregate_proof
+                .as_ref()
+                .map_or(ShellHash::ZERO, |p| blake3_hash(p.as_ref())),
+        )
+    }
+
+    /// Encode using already authenticated variable-field commitments.
+    /// Callers must verify each supplied digest against the corresponding raw
+    /// field, including the zero commitment for an absent aggregate. This
+    /// shared layout lets AIR verification avoid native hashing as a fallback.
+    pub fn canonical_encode_with_field_hashes(
+        &self,
+        logs_bloom_hash: ShellHash,
+        extra_data_hash: ShellHash,
+        signature_hash: ShellHash,
+    ) -> Vec<u8> {
         // 16 domain + 11 * 32-byte fields + 7 * 8-byte u64 fields
         let mut out = Vec::with_capacity(16 + 11 * 32 + 7 * 8);
         out.extend_from_slice(BLOCK_HASH_DOMAIN);
@@ -204,20 +223,16 @@ impl BlockHeader {
         out.extend_from_slice(self.transactions_root.as_bytes());
         out.extend_from_slice(self.receipts_root.as_bytes());
         // logs_bloom is variable-length: commit as BLAKE3(bytes)
-        out.extend_from_slice(blake3_hash(self.logs_bloom.as_ref()).as_bytes());
+        out.extend_from_slice(logs_bloom_hash.as_bytes());
         out.extend_from_slice(&self.number.to_le_bytes());
         out.extend_from_slice(&self.gas_limit.to_le_bytes());
         out.extend_from_slice(&self.gas_used.to_le_bytes());
         out.extend_from_slice(&self.timestamp.to_le_bytes());
         // extra_data is variable-length: commit as BLAKE3(bytes)
-        out.extend_from_slice(blake3_hash(self.extra_data.as_ref()).as_bytes());
+        out.extend_from_slice(extra_data_hash.as_bytes());
         out.extend_from_slice(self.proposer.0.as_slice());
         // sig_aggregate_proof: BLAKE3(proof) or ShellHash::ZERO if absent
-        let proof_hash = match &self.sig_aggregate_proof {
-            Some(p) => blake3_hash(p.as_ref()),
-            None => ShellHash::ZERO,
-        };
-        out.extend_from_slice(proof_hash.as_bytes());
+        out.extend_from_slice(signature_hash.as_bytes());
         out.extend_from_slice(&self.base_fee_per_gas.to_le_bytes());
         out.extend_from_slice(self.withdrawals_root.as_bytes());
         out.extend_from_slice(self.parent_beacon_block_root.as_bytes());

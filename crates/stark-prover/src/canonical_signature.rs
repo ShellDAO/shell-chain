@@ -1,5 +1,6 @@
 //! Registered signature verification against a sealed trusted-store parent.
-//! This is local canonical context, not a consensus or block-body proof.
+//! Base verification uses local canonical context. Additional bindings prove
+//! body membership and header hashing; consensus authentication remains external.
 use crate::{
     account_state::{verify_account_state, AccountStateProof},
     registered_signature::{
@@ -168,4 +169,38 @@ pub fn verify_body_bound_registered_signature<S: KvStore + 'static>(
         canonical,
         membership,
     })
+}
+
+/// Complete registered/body predicate bound by AIR to a caller-selected hash.
+/// Canonical state and consensus authentication still rely on the trusted view.
+#[derive(Clone, Debug)]
+pub struct HeaderBoundRegisteredSignature {
+    body: BodyBoundRegisteredSignature,
+    header: crate::header_hash::VerifiedHeaderHash,
+}
+impl HeaderBoundRegisteredSignature {
+    pub fn signature(&self) -> &VerifiedRegisteredSignature {
+        self.body.signature()
+    }
+    pub fn body(&self) -> &BodyBoundRegisteredSignature {
+        &self.body
+    }
+    pub fn header(&self) -> &crate::header_hash::VerifiedHeaderHash {
+        &self.header
+    }
+}
+
+/// Extend an already verified predicate; there is no unchecked signature token
+/// constructor. Expected hash selection must be independent of the proof.
+pub fn bind_registered_signature_header(
+    body: BodyBoundRegisteredSignature,
+    header: &shell_core::BlockHeader,
+    proof: &crate::header_hash::BlockHeaderProof,
+    expected_hash: &ShellHash,
+) -> Result<HeaderBoundRegisteredSignature, String> {
+    if body.membership().block_hash() != *expected_hash {
+        return Err("body and expected header identities differ".into());
+    }
+    let header = crate::header_hash::verify_header_hash(proof, header, expected_hash)?;
+    Ok(HeaderBoundRegisteredSignature { body, header })
 }
