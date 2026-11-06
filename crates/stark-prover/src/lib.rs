@@ -45,6 +45,7 @@ pub mod keccak_permutation;
 pub mod metadata;
 pub mod mldsa_challenge;
 pub mod mldsa_decode;
+pub mod mldsa_inverse;
 pub mod mldsa_key;
 pub mod mldsa_matrix;
 pub mod mldsa_ntt;
