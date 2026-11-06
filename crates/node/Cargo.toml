@@ -44,3 +44,7 @@ rocksdb = ["shell-storage/rocksdb"]
 # development environments where the real recursive prover is not yet wired in.
 # Default builds do NOT enable this feature.
 stub-l2-verifier = []
+
+[[example]]
+name = "mldsa-node-replay"
+required-features = ["rocksdb"]

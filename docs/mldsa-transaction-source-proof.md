@@ -851,3 +851,60 @@ consensus verifier interface, freeze the existing registry index, and share
 canonical child checks. Keep proof inputs distinct from the caller's trusted
 authority selection; do not add a new authority-history carrier or reinterpret
 later penalty observations as earlier consensus state.
+
+
+## Native Node historical sender-proof replay
+
+`Node::replay_canonical_transactions_with_proof` consumes a complete ordered
+`CanonicalSignatureBatchProof` for a retained canonical block. Version 1 covers
+one to sixteen ordinary registered ML-DSA-65 senders with default accounts at
+the parent; AA, parent custom validators, first-use keys, other algorithms and
+pruned witnesses are rejected.
+Every transaction has its own account-MPT and complete registered
+source/signature proof. Missing, extra or differently ordered proofs fail.
+
+The expected tip and block are caller trust anchors. The node captures its
+canonical parent, keys, configuration, native body and witnesses before proof
+verification. The native body commitment must match that captured source.
+Canonical storage and this source selection remain trusted; this interface does
+not prove body membership, proposer consensus or validator history in AIR.
+Only successful complete verification creates the immutable batch verifier.
+It accepts the exact proved key/message/signature tuples, with no native sender
+signature fallback, in both batch and sequential native replay validation.
+
+Replay uses the existing Node execution engine in a bounded private overlay.
+Native authorization, nonce, balance, fees, resource limits, gas reward,
+receipts, bloom and state root checks still apply. The original store and live
+algorithm policy must remain unchanged. This profile accepts only native gas
+reward system transactions; proof reward settlements require their separate
+canonical verification path.
+
+After the two-account and account-state stages above, run from the repository
+root with an existing output parent directory:
+
+```bash
+tests/e2e/mldsa-node-replay.sh prove proof-dir/first proof-dir/second proof-dir/state proof-dir/node
+tests/e2e/mldsa-node-replay.sh verify proof-dir/first proof-dir/second proof-dir/state proof-dir/node
+```
+
+The entry requires the Rust, C/C++ and libclang prerequisites for native
+RocksDB. It reuses the exact saved transaction graphs and account certificates.
+It creates a fresh single-authority, weight-one native Node fixture, submits the
+two real transactions, produces and imports a block including its actual gas
+reward, then advances the tip. Its temporary proposer key is discarded after
+signing and is never saved or printed. `leader-db`, `native-db` and `context.json`
+retain the native chain; `result.json` records the independently checked replay
+receipts and root. `native-source.json` records the persisted block, receipts,
+sender value/fee/nonce changes and native recipient/proposer balances for
+independent inspection. Keep these with the input checkpoints. Existing files are
+validated rather than overwritten; partial fixture recovery is unqualified.
+`verify` generates no proofs, replays through the public Node API, checks
+refusals and reopens the persisted native state. Failure exits nonzero.
+
+Design decision: use a separate typed retained-history proof entry and the
+existing native replay engine. A proved sender batch supplies only its sender
+crypto predicate; it cannot skip native execution or authorize another source.
+Default block admission and network/amendment proof formats retain their current
+behavior. Fresh-block/P2P proof reception, proof-backed proposer seals and
+selector/penalty/quorum history remain open, along with public release and
+network activation.

@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add an explicit retained-history Node replay API that verifies every sender's
+  complete registered ML-DSA-65 proof at one frozen canonical parent. Immutable
+  exact-tuple results feed both native batch and sequential sender checks;
+  native execution, fees, gas reward, receipts and state roots remain required.
+  `tests/e2e/mldsa-node-replay.sh` reuses prior transaction/account graphs with
+  actual Node production, import and native database reopen. Canonical source
+  storage remains trusted; network proof transport and consensus proof are
+  separate requirements.
+
 - Bind header signature-batch claims to the imported block's exact ordered
   user transaction count and legacy accumulator root, and require the existing
   version 2 for full and commitment-only payloads. Reject foreign claims before

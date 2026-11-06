@@ -44,6 +44,7 @@ pub mod availability;
 pub mod backlog;
 pub mod blake3_hash;
 pub mod body_membership;
+pub mod canonical_batch;
 pub mod canonical_signature;
 pub mod header_hash;
 pub mod keccak_permutation;

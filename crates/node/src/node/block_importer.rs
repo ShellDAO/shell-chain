@@ -1,5 +1,41 @@
 use super::*;
+use shell_stark_prover::canonical_batch::{
+    verify_canonical_signature_batch, CanonicalSignatureBatchProof, VerifiedCanonicalSignatureBatch,
+};
 use std::borrow::Cow;
+
+/// Result of explicit retained-history transaction replay. Canonical context is
+/// locally trusted; this does not admit a new block or prove proposer consensus.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CanonicalProofReplay {
+    pub tip: ShellHash,
+    pub block: ShellHash,
+    pub parent: ShellHash,
+    pub state_root: ShellHash,
+    pub receipts: Vec<TransactionReceipt>,
+    pub proved_sender_signatures: usize,
+}
+
+struct ReplaySignatureVerifier<'a>(Option<&'a VerifiedCanonicalSignatureBatch>);
+impl Verifier for ReplaySignatureVerifier<'_> {
+    fn verify(
+        &self,
+        key: &[u8],
+        message: &[u8],
+        signature: &shell_crypto::PQSignature,
+    ) -> Result<bool, shell_crypto::CryptoError> {
+        match self.0 {
+            Some(proof) => proof.verify(key, message, signature),
+            None => MultiVerifier.verify(key, message, signature),
+        }
+    }
+    fn sig_type(&self) -> shell_crypto::SignatureType {
+        match self.0 {
+            Some(proof) => proof.sig_type(),
+            None => MultiVerifier.sig_type(),
+        }
+    }
+}
 
 pub(super) struct LegacyReplay<S: KvStore> {
     target: ShellHash,
@@ -43,13 +79,14 @@ fn validate_import_tx_in_current_state<S: KvStore + 'static>(
     chain_store: &ChainStore<S>,
     chain_id: u64,
     validation_header: &BlockHeader,
+    verifier: &impl Verifier,
 ) -> Result<(), TxValidationError> {
     let tx_for_validation = tx_for_import_validation(tx, validation_pubkeys, chain_store)?;
     validate_tx_for_import_at_block(
         tx_for_validation.as_ref(),
         world_state,
         chain_store,
-        &MultiVerifier,
+        verifier,
         chain_id,
         None,
         validation_header,
@@ -880,18 +917,97 @@ impl<S: KvStore + 'static> Node<S> {
     ) -> Result<(Vec<TransactionReceipt>, Vec<ProofAmendment>), NodeError> {
         let validation_registry = registry.clone();
         with_algorithm_registry_override(&validation_registry, || {
-            let result = self.replay_fork_block_inner(block, parent_state_root, replay_store);
+            let result = self.replay_fork_block_inner(block, parent_state_root, replay_store, None);
             *registry = shell_crypto::with_algorithm_registry_mut(|current| current.clone());
             result
         })
     }
 
-    fn replay_fork_block_inner(
+    /// Fully prove every sender before executing the retained block through the
+    /// native replay engine. Both batch and sequential sender crypto use only
+    /// immutable exact-tuple proof results. The overlay cannot publish writes.
+    /// Native policy, execution, fees, reward, receipts and roots still apply.
+    pub fn replay_canonical_transactions_with_proof(
+        &self,
+        expected_tip: ShellHash,
+        expected_block: ShellHash,
+        proof: &CanonicalSignatureBatchProof,
+    ) -> Result<CanonicalProofReplay, NodeError> {
+        let header = self
+            .chain_store
+            .get_header_by_hash(&expected_block)?
+            .ok_or_else(|| NodeError::Startup("proof replay header unavailable".into()))?;
+        let view = self
+            .chain_store
+            .canonical_parent_view(expected_tip, header.parent_hash)?;
+        if view.config().chain_id != self.config.chain_id {
+            return Err(NodeError::Startup(
+                "proof replay chain identity mismatch".into(),
+            ));
+        }
+        let frozen_chain = ChainStore::new(view.store());
+        let block = frozen_chain
+            .get_block_by_hash(&expected_block)?
+            .ok_or_else(|| NodeError::Startup("proof replay captured body unavailable".into()))?;
+        if block
+            .system_transactions
+            .iter()
+            .any(|tx| tx.kind != SystemTxKind::BlockGasReward)
+        {
+            return Err(NodeError::Startup(
+                "proof replay settlement profile unsupported".into(),
+            ));
+        }
+        self.verify_import_economics(
+            &block,
+            &Block {
+                header: view.parent().clone(),
+                transactions: vec![],
+                system_transactions: vec![],
+                proposer_seal: None,
+            },
+        )?;
+        self.verify_incoming_witness_root(&block)?;
+        self.verify_import_sig_aggregate_proof(&block)?;
+        let verified = verify_canonical_signature_batch(&view, &block, proof)
+            .map_err(|e| NodeError::Startup(format!("canonical sender proof: {e}")))?;
+        let state = view.world_state()?;
+        let registry = load_algorithm_registry(&state)
+            .map_err(|e| NodeError::Startup(format!("proof replay algorithm registry: {e}")))?;
+        let overlay = Arc::new(OverlayStore::new(view.store()).with_write_limit(64 * 1024 * 1024)?);
+        let (receipts, settlements) = with_algorithm_registry_override(&registry, || {
+            self.replay_fork_block_inner(&block, view.parent().state_root, overlay, Some(&verified))
+        })?;
+        if !settlements.is_empty() {
+            return Err(NodeError::Startup(
+                "proof replay unexpected settlement".into(),
+            ));
+        }
+        Ok(CanonicalProofReplay {
+            tip: verified.tip(),
+            block: verified.block(),
+            parent: verified.parent(),
+            state_root: block.header.state_root,
+            receipts,
+            proved_sender_signatures: verified.len(),
+        })
+    }
+
+    fn replay_fork_block_inner<T: KvStore + 'static>(
         &self,
         block: &Block,
         parent_state_root: ShellHash,
-        replay_store: Arc<shell_storage::OverlayStore<S>>,
+        replay_store: Arc<shell_storage::OverlayStore<T>>,
+        signature_proof: Option<&VerifiedCanonicalSignatureBatch>,
     ) -> Result<(Vec<TransactionReceipt>, Vec<ProofAmendment>), NodeError> {
+        if signature_proof.is_some_and(|proof| {
+            !proof.matches_block(block) || proof.chain_id() != self.config.chain_id
+        }) {
+            return Err(Self::invalid_fork(
+                block.hash(),
+                "proof replay exact block mismatch",
+            ));
+        }
         let replay_cs = ChainStore::new(replay_store.clone());
         replay_cs.verify_block_body_commitment(block)?;
         let metadata_checkpoint = replay_cs.address_metadata_checkpoint()?;
@@ -1036,17 +1152,26 @@ impl<S: KvStore + 'static> Node<S> {
                     })
                 })
                 .collect::<Vec<_>>();
-            batch_verifier
-                .verify_batch_all(&verify_items)
-                .map_err(|error| {
-                    Self::invalid_fork(
-                        block.hash(),
-                        format!(
-                            "block {} batch signature verification failed: {error}",
-                            block.number()
-                        ),
-                    )
-                })?;
+            let crypto_result = if let Some(proof) = signature_proof {
+                verify_items.iter().try_for_each(|item| {
+                    if proof.verify(item.pubkey, item.message, item.signature)? {
+                        Ok(())
+                    } else {
+                        Err(shell_crypto::CryptoError::VerificationFailed)
+                    }
+                })
+            } else {
+                batch_verifier.verify_batch_all(&verify_items)
+            };
+            crypto_result.map_err(|error| {
+                Self::invalid_fork(
+                    block.hash(),
+                    format!(
+                        "block {} batch signature verification failed: {error}",
+                        block.number()
+                    ),
+                )
+            })?;
 
             let replay_ws = WorldState::at_root(replay_store.clone(), &parent_state_root)?;
             let state_db = ShellStateDb::new(replay_ws, ChainStore::new(replay_store.clone()));
@@ -1124,6 +1249,7 @@ impl<S: KvStore + 'static> Node<S> {
                     &replay_cs,
                     self.config.chain_id,
                     &block.header,
+                    &ReplaySignatureVerifier(signature_proof),
                 )
                 .map_err(|error| {
                     Self::invalid_fork(
@@ -2106,6 +2232,7 @@ impl<S: KvStore + 'static> Node<S> {
                     &import_cs,
                     self.config.chain_id,
                     &block.header,
+                    &MultiVerifier,
                 )
                 .map_err(|error| {
                     NodeError::Startup(format!(
@@ -2780,6 +2907,7 @@ mod tests {
                 number: 1,
                 ..BlockHeader::default()
             },
+            &MultiVerifier,
         )
         .unwrap_err();
         assert!(matches!(error, TxValidationError::SignatureInvalid));

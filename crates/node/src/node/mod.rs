@@ -1,6 +1,7 @@
 //! Running node with event loop and block production.
 
 mod block_importer;
+pub use block_importer::CanonicalProofReplay;
 mod block_producer;
 mod chain_state_machine;
 mod challenge_lifecycle;

@@ -21,7 +21,7 @@ pub mod validator_store;
 pub use error::NodeError;
 pub use historical_sync::{PeerCapabilityTracker, SyncStatus};
 pub use metrics::Metrics;
-pub use node::Node;
+pub use node::{CanonicalProofReplay, Node};
 pub use prover_service::{ProverConfig, ProverService, ProverServiceHandle, ProvingPriority};
 pub use pruning::{PruningConfig, StateRootTracker, StorageProfile};
 pub use reorg::{ReorgEngine, ReorgResult};
