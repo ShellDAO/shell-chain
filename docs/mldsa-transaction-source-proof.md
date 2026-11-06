@@ -339,3 +339,102 @@ field meanings. Authenticate that entry with actual source/signature and
 BLAKE3 proofs, and expose a verified snapshot only after every check succeeds.
 No batch roots, transaction IDs, consensus carriers, gas or activation policy
 changes.
+
+## Actual authenticated ordered batch
+
+`verify_authenticated_sig_batch` verifies the existing native `SigBatchAir`
+accumulator over `VerifiedSignatureEntry` snapshots. It requires a nonempty
+batch, the current native proof version, exact count, unique transaction IDs,
+exact caller-expected ID order and independently expected root. It folds the
+already-proved full leaf bytes using the same little-endian f128 conversion
+and dual accumulator as the native batch. It then verifies the actual native
+STARK proof. Native BLAKE3 and signature functions are not acceptance fallbacks.
+The existing commitment-only/native entry APIs and on-chain proof layout remain
+unchanged.
+
+One regression entry builds two complete real signature graphs and the native
+batch proof:
+
+```bash
+mkdir -p proof-dir
+tests/e2e/mldsa-batch-proof.sh prove proof-dir/first proof-dir/second proof-dir/batch
+```
+
+This is sustained CPU work and may take several hours from an empty checkpoint.
+The second identity is a newly generated ML-DSA-65 account with a distinct key,
+rho, sender address, canonical ID and leaf. Its private key exists only while
+signing in memory and is never saved or printed. Both accounts sign the same
+canonical outer payload; their native canonical IDs still differ because the
+full sender is included. The exact transaction-hash certificate is copied only
+after verifying the identical payload and algorithm bytes. Key hashes,
+matrices, transforms, equation, completion, address, ID and leaf certificates
+are specific to the second identity and must be generated for it.
+
+The script saves and verifies the first new matrix coordinate before resuming
+all remaining coordinates. Each stage records its exit status. Completed valid
+files are reused, and existing files are never overwritten. All public source
+records, individual certificates, expected order/root and native proof/control
+files persist across processes. Interrupted partial-file recovery remains
+unqualified.
+
+For complete existing checkpoints, independently verify without generating
+proofs:
+
+```bash
+tests/e2e/mldsa-batch-proof.sh verify proof-dir/first proof-dir/second proof-dir/batch
+```
+
+A graph directory contains `source`, `equation`, `signature`, `sender`, `id`,
+`entry` and `rejection` subdirectories produced by the source regression entry.
+Alternatively, a version-1 JSON path manifest can point to existing graph
+components without moving or regenerating them. Paths are relative to that
+manifest's directory:
+
+```json
+{
+  "version": 1,
+  "source": "first/source",
+  "equation": "first/equation",
+  "signature": "first/signature",
+  "sender": "first/sender",
+  "id": "first/id",
+  "entry": "first/entry",
+  "rejection": "first/rejection"
+}
+```
+
+Pass that JSON file as the first graph argument to reuse a complete existing
+graph. The producer verifies it before initializing the new account. Direct
+batch-only entries are also available:
+
+```bash
+cargo run --locked -p shell-stark-prover --example mldsa-batch -- prove proof-dir/first proof-dir/second proof-dir/batch
+cargo run --locked -p shell-stark-prover --example mldsa-batch -- verify proof-dir/first proof-dir/second proof-dir/batch
+cargo run --locked -p shell-stark-prover --example mldsa-batch -- check-rejections proof-dir/first proof-dir/second proof-dir/batch
+```
+
+`batch-source.json` holds independent expected IDs/root; `batch-proof.json`
+holds the actual native accumulator proof. Four additional honest native
+proofs cover reversed, duplicated, dropped and foreign-leaf inputs. Their
+native accumulator calculations verify for their own statements. The combined
+predicate must still reject them against the expected authenticated source
+context. A reversed batch also succeeds against its separately reversed
+expected context, demonstrating order binding without a fixed expected result.
+Other refusals cover empty/count/version/ID/root changes, corrupted proof bytes
+and a correct commitment with no STARK proof. An honestly proved invalid
+signature can retain the same native leaf and batch root; full entry verification
+must reject it at the final signature commitment before a verified snapshot
+exists.
+
+These checks cover two distinct ordinary type-0 pure ML-DSA-65 Embedded
+identities in this public development path. The caller must supply the expected
+canonical source context: this predicate does not prove chain membership,
+canonical registry/account state, transaction execution, fees/resources,
+Reference/rotated authorization, AA, persistence/import/replay settlement,
+private/compact proofs or node activation. Those remain separate acceptance.
+
+Design decision: reuse the unchanged native accumulator, field conversion and
+proof format. Share the fold between native and authenticated callers, feeding
+only already-proved leaves to the latter. Verify complete source/signature graphs
+before issuing entry snapshots, and bind their exact ordered IDs/root as caller
+expectations. No legacy roots, gas, protocol carriers or activation rules change.

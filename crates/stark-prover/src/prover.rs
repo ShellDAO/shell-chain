@@ -83,10 +83,7 @@ impl SigBatchEntry {
     ///
     /// `lo = u128::from_le_bytes(leaf[0..16])`, `hi = u128::from_le_bytes(leaf[16..32])`.
     pub fn to_field_elements(&self) -> (BaseElement, BaseElement) {
-        let leaf = self.to_leaf_bytes();
-        let lo = u128::from_le_bytes(leaf[0..16].try_into().unwrap());
-        let hi = u128::from_le_bytes(leaf[16..32].try_into().unwrap());
-        (BaseElement::new(lo), BaseElement::new(hi))
+        leaf_to_field_elements(&self.to_leaf_bytes())
     }
 }
 
@@ -253,10 +250,22 @@ impl Prover for SigBatchProverImpl {
 /// Callers can compare the returned bytes against `proof.batch_root_bytes` to
 /// verify that a proof covers exactly the canonical entries they expect.
 pub fn compute_batch_root(entries: &[SigBatchEntry]) -> [u8; 32] {
+    compute_leaf_root(entries.iter().map(SigBatchEntry::to_leaf_bytes))
+}
+
+fn leaf_to_field_elements(leaf: &[u8; 32]) -> (BaseElement, BaseElement) {
+    let lo = u128::from_le_bytes(leaf[0..16].try_into().unwrap());
+    let hi = u128::from_le_bytes(leaf[16..32].try_into().unwrap());
+    (BaseElement::new(lo), BaseElement::new(hi))
+}
+
+// Shared native field conversion and ordered accumulator. Authenticated callers
+// supply already-proved leaf bytes, so this helper performs no native hashing.
+pub(crate) fn compute_leaf_root(leaves: impl IntoIterator<Item = [u8; 32]>) -> [u8; 32] {
     let mut acc_lo = BaseElement::ZERO;
     let mut acc_hi = BaseElement::ZERO;
-    for entry in entries {
-        let (lo, hi) = entry.to_field_elements();
+    for leaf in leaves {
+        let (lo, hi) = leaf_to_field_elements(&leaf);
         acc_lo = acc_lo.exp(3u32.into()) + lo;
         acc_hi = acc_hi.exp(3u32.into()) + hi;
     }

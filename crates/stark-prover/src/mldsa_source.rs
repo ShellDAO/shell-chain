@@ -67,6 +67,45 @@ impl VerifiedSignatureEntry {
     }
 }
 
+/// Verify the actual native accumulator over fully verified entry snapshots.
+/// Count, unique canonical transaction IDs, exact caller-expected order and root
+/// must agree. Leaf bytes come only from successful complete signature-entry
+/// verification; native hashing is not a fallback. This does not establish that
+/// the caller's expected source list belongs to a canonical chain or account
+/// state, and does not change the existing native proof format or activation.
+pub fn verify_authenticated_sig_batch(
+    proof: &crate::SigBatchProof,
+    entries: &[VerifiedSignatureEntry],
+    expected_transaction_ids: &[[u8; 32]],
+    expected_batch_root: &[u8; 32],
+) -> Result<(), String> {
+    if proof.version != crate::proof::SIG_BATCH_PROOF_VERSION {
+        return Err("invalid authenticated batch proof version".into());
+    }
+    if entries.is_empty()
+        || entries.len() != expected_transaction_ids.len()
+        || proof.n_sigs != entries.len()
+    {
+        return Err("invalid authenticated batch source count".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (index, (entry, expected_id)) in entries.iter().zip(expected_transaction_ids).enumerate() {
+        if entry.transaction_id() != expected_id {
+            return Err(format!(
+                "authenticated batch source order or ID mismatch at {index}"
+            ));
+        }
+        if !seen.insert(*entry.transaction_id()) {
+            return Err("duplicate authenticated batch transaction ID".into());
+        }
+    }
+    let root = crate::prover::compute_leaf_root(entries.iter().map(|entry| *entry.leaf_bytes()));
+    if root != *expected_batch_root || proof.batch_root_bytes != *expected_batch_root {
+        return Err("authenticated batch root does not match verified ordered sources".into());
+    }
+    crate::verify_sig_batch(proof).map_err(|error| format!("batch accumulator: {error}"))
+}
+
 /// Authenticate the existing Embedded batch-entry mapping and BLAKE3 leaf,
 /// together with the complete identified sender/source/signature predicate.
 /// The message identifier is the sender signing digest; the key identifier is

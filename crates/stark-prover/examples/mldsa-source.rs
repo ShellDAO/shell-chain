@@ -1,87 +1,21 @@
 //! Verify a complete same-identity public transaction-source/signature graph.
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use shell_core::{PubkeyMode, SignedTransaction, Transaction};
+use shell_core::{PubkeyMode, SignedTransaction};
 use shell_crypto::{PQSignature, SignatureType};
 use shell_primitives::Address;
 use shell_stark_prover::{
     blake3_hash::{prove_hash, verify_hash},
-    mldsa_key::PublicKeyDecodeProof,
-    mldsa_matrix::{MatrixPolynomialProof, MatrixProof},
     mldsa_source::{
         verify_derived_sender_signature, verify_identified_sender_signature,
         verify_signature_entry, verify_transaction_signature, DerivedSenderSignatureProof,
         IdentifiedSenderSignatureProof, SignatureEntryProof, TransactionSignatureProof,
     },
-    mldsa_verification::{CompletionProof, EquationPipeline, Mldsa65VerificationProof},
     SigBatchEntry,
 };
-use std::{
-    io::{BufReader, BufWriter, Write},
-    path::Path,
-};
-type Error = Box<dyn std::error::Error>;
-#[derive(Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct Identity {
-    version: u8,
-    public_key: Vec<u8>,
-    message: Vec<u8>,
-    signature: Vec<u8>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Source {
-    version: u8,
-    transaction: Transaction,
-    sig_type: u8,
-    public_key_hash: [u8; 32],
-}
-fn read<T: DeserializeOwned>(path: &Path) -> Result<T, Error> {
-    Ok(serde_json::from_reader(BufReader::new(
-        std::fs::File::open(path)?,
-    ))?)
-}
-fn equation(source: &Path, dir: &Path) -> Result<EquationPipeline, Error> {
-    let key: PublicKeyDecodeProof = read(&dir.join("key.json"))?;
-    let mut polynomials = Vec::new();
-    for row in 0..6 {
-        for column in 0..5 {
-            polynomials.push(read::<MatrixPolynomialProof>(
-                &source.join(format!("a-{row}-{column}.json")),
-            )?);
-        }
-    }
-    Ok(EquationPipeline {
-        matrix: MatrixProof {
-            version: 1,
-            rho: key.decoded.rho.clone(),
-            polynomials,
-        },
-        key,
-        signature: read(&dir.join("signature.json"))?,
-        challenge: read(&dir.join("challenge.json"))?,
-        z_ntt: (0..5)
-            .map(|i| read(&dir.join(format!("z-{i}.json"))))
-            .collect::<Result<_, _>>()?,
-        t1_ntt: (0..6)
-            .map(|i| read(&dir.join(format!("t-{i}.json"))))
-            .collect::<Result<_, _>>()?,
-        c_ntt: read(&dir.join("c-ntt.json"))?,
-        equation: read(&dir.join("equation.json"))?,
-        inverse: (0..6)
-            .map(|i| read(&dir.join(format!("inverse-{i}.json"))))
-            .collect::<Result<_, _>>()?,
-    })
-}
-fn completion(dir: &Path) -> Result<CompletionProof, Error> {
-    Ok(CompletionProof {
-        finish: read(&dir.join("finish.json"))?,
-        tr: read(&dir.join("tr.json"))?,
-        mu: read(&dir.join("mu.json"))?,
-        commitment: read(&dir.join("commitment.json"))?,
-    })
-}
+use std::path::Path;
+#[path = "common/mldsa_source.rs"]
+mod source;
+use source::{load_transaction_proof, read, write, EntrySource, Error, IdSource, Identity, Source};
 fn verify(p: &TransactionSignatureProof, s: &Source, id: &Identity) -> Result<(), String> {
     verify_transaction_signature(
         p,
@@ -187,17 +121,6 @@ fn rejections(
         "{}",
         serde_json::json!({"mode":"check-rejections","full_joint_positive_verified":true,"rejected":cases,"proofs_generated":0,"input_files_read_only":true})
     );
-    Ok(())
-}
-fn write<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    let mut out = BufWriter::new(f);
-    serde_json::to_writer(&mut out, value)?;
-    out.flush()?;
-    out.get_ref().sync_all()?;
     Ok(())
 }
 fn derived_sender(
@@ -369,12 +292,6 @@ fn derived_sender(
         serde_json::json!({"mode":mode.to_string_lossy(),"derived_Embedded_sender_full_graph_verified":true,"from":expected.from,"address_preimage_bytes":proof.sender_address.message.len(),"address_compressions":proof.sender_address.compressions.len(),"new_hash_certificates":generated,"source_signature_graph_reused":true,"expected_signed_transaction_file":"sender.json","native_address_producer_control":proving,"native_acceptance_fallback":false,"registry_absence_proved":false,"account_authority_proved":false,"registered_rotated_accounts_proved":false,"canonical_history_proved":false,"private_witness":false,"node_integrated":false})
     );
     Ok(())
-}
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct IdSource {
-    version: u8,
-    transaction_id: [u8; 32],
 }
 fn identified_sender(
     p: TransactionSignatureProof,
@@ -589,14 +506,6 @@ fn identified_sender(
         serde_json::json!({"mode":mode.to_string_lossy(),"canonical_ID_sender_full_graph_verified":true,"transaction_id":source.transaction_id,"ID_preimage_bytes":proof.transaction_id.message.len(),"ID_compressions":proof.transaction_id.compressions.len(),"new_hash_certificates":generated,"prior_graph_reused":true,"native_ID_producer_control":proving,"native_acceptance_fallback":false,"registry_absence_proved":false,"account_authority_proved":false,"Reference_authority_proved":false,"canonical_chain_membership_proved":false,"private_witness":false,"node_integrated":false})
     );
     Ok(())
-}
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct EntrySource {
-    version: u8,
-    msg_hash: [u8; 32],
-    pk_hash: [u8; 32],
-    leaf: [u8; 32],
 }
 fn signature_entry(
     p: TransactionSignatureProof,
@@ -903,38 +812,11 @@ fn main() -> Result<(), Error> {
     if args.len() != expected_len {
         return Err("usage: mldsa-source verify source-dir equation-dir signature-dir; check-rejections source-dir equation-dir signature-dir rejection-dir; prove-derived|verify-derived|check-derived-rejections source-dir equation-dir signature-dir sender-dir; prove-identified|verify-identified source-dir equation-dir signature-dir sender-dir ID-dir; check-identified-rejections source-dir equation-dir signature-dir sender-dir ID-dir rejection-dir; prove-entry|verify-entry source-dir equation-dir signature-dir sender-dir ID-dir entry-dir; check-entry-rejections source-dir equation-dir signature-dir sender-dir ID-dir entry-dir rejection-dir".into());
     }
-    let source = Path::new(&args[1]);
-    let eq = Path::new(&args[2]);
-    let sig = Path::new(&args[3]);
-    let id: Identity = read(&source.join("identity.json"))?;
-    let s: Source = read(&source.join("source.json"))?;
-    if id.version != 1
-        || s.version != 1
-        || id.public_key.len() != 1952
-        || id.signature.len() != 3309
-        || id.message.len() != 32
-        || s.sig_type != SignatureType::MlDsa65.as_u8()
-    {
-        return Err("invalid source identity/shape/algorithm".into());
-    }
-    if read::<Identity>(&eq.join("identity.json"))? != id
-        || read::<Identity>(&sig.join("identity.json"))? != id
-    {
-        return Err("source/equation/signature identities differ".into());
-    }
-    let p = TransactionSignatureProof {
-        version: 1,
-        signing_hash: read(&source.join("transaction-hash.json"))?,
-        public_key_hash: read(&source.join("public-key-hash.json"))?,
-        signature: Mldsa65VerificationProof {
-            version: 1,
-            equation: equation(source, eq)?,
-            completion: completion(sig)?,
-        },
-    };
-    if p.signing_hash.output.as_slice() != id.message {
-        return Err("saved signature message differs from the source signing digest".into());
-    }
+    let (p, s, id) = load_transaction_proof(
+        Path::new(&args[1]),
+        Path::new(&args[2]),
+        Path::new(&args[3]),
+    )?;
     if entry {
         return signature_entry(p, &s, &id, &args);
     }
