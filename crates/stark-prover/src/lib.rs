@@ -42,6 +42,7 @@ pub mod amendment;
 pub mod availability;
 pub mod backlog;
 pub mod metadata;
+pub mod mldsa_ntt;
 pub mod proof;
 pub mod prover;
 pub mod prover_health;
