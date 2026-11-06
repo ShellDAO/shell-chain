@@ -43,6 +43,7 @@ pub mod availability;
 pub mod backlog;
 pub mod metadata;
 pub mod mldsa_decode;
+pub mod mldsa_key;
 pub mod mldsa_ntt;
 pub mod proof;
 pub mod prover;
