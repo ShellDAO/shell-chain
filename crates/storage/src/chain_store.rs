@@ -300,7 +300,7 @@ fn decode_witness_bundle(data: &[u8]) -> Result<shell_core::WitnessBundle, Stora
 
 /// Key prefixes for chain store data. All keys are prefixed to avoid
 /// collisions when sharing a single [`KvStore`] instance.
-mod prefix {
+pub(crate) mod prefix {
     pub const HEADER_BY_HASH: &[u8] = b"h/";
     pub const BODY_BY_HASH: &[u8] = b"b/";
     /// Witness bundle (PQ signatures) key prefix — separate from body.

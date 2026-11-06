@@ -1,4 +1,5 @@
 mod body_pruner;
+mod canonical_parent;
 mod chain_store;
 mod error;
 mod kv_store;
@@ -16,6 +17,7 @@ mod world_state;
 mod rocks_db;
 
 pub use body_pruner::{BodyPruneResult, BodyPruner, DEFAULT_BODY_RETENTION};
+pub use canonical_parent::{CanonicalParentStore, CanonicalParentView};
 pub use chain_store::{
     AlgorithmVotingWindow, BlockAvailability, ChainConfig, ChainStore, GuardianConfig,
     L2AggregationJob, L2InputIndex, L2JobStatus, L2JobStore, ProofAmendmentStore, RecoveryProposal,

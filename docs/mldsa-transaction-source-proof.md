@@ -576,3 +576,71 @@ import validation and isolated transaction persistence do not establish full
 consensus block import/replay or block reward settlement. Automatic node wiring,
 canonical historical registry authentication, other algorithms/AA/private proofs,
 public release and network activation remain separate acceptance.
+
+
+## Trusted canonical parent context
+
+`ChainStore::canonical_parent_view(expected_tip, expected_parent)` selects a
+retained parent under an independently trusted local tip. One bounded consistent
+snapshot captures the head, configuration schedule, address-keyed metadata,
+canonical number mappings, selected headers/bodies/witnesses and undo journals.
+It checks header hashes, contiguous ancestry, canonical mappings and the stored
+genesis identity before rewinding native address metadata privately. The limit
+is 128 blocks and 64 MiB; every rewound block needs its retained body and complete
+undo journal, including an empty journal when no address metadata changed.
+Unavailable history or snapshot support fails without using current keys.
+
+The result exposes a sealed read-only store. Callers cannot commit it, alter
+frozen keys, or resample live mutable namespaces. Content-addressed trie-node
+reads remain backing-store reads; pruning them can cause an availability error.
+The captured configuration schedule is applied at the requested validation
+height; address metadata, rather than configuration history, is rewound. This
+is a bounded native validation view, not a general historical database export.
+
+`verify_canonical_registered_signature` resolves the account and registered key
+from this view and verifies the complete existing registered signature proof.
+It binds the result to the captured tip and parent, rejects a foreign chain ID,
+unsupported outer framing and oversized signing sources, and builds expected
+native IDs without copying a caller's cached transaction hash. A key first
+registered after this parent cannot authorize the registered-only profile there.
+First-use Embedded transactions retain their separate derived-address/native
+validation path. Native nonce, funds, activation and lifecycle policy must still
+run against this same view before using the result.
+
+After the preceding producers, run:
+
+```bash
+tests/e2e/mldsa-canonical-proof.sh prove proof-dir/first proof-dir/second proof-dir/state proof-dir/registered proof-dir/canonical
+tests/e2e/mldsa-canonical-proof.sh verify proof-dir/first proof-dir/second proof-dir/state proof-dir/registered proof-dir/canonical
+```
+
+The Rust/native RocksDB prerequisites and graph-manifest support are unchanged.
+The fixture uses the two existing genuine public signatures. Native validation
+and execution produce two actual transfers, persist their roots, receipts,
+canonical storage records and native undo journals, and reopen them in separate
+processes. The first key starts absent and is registered by its first Embedded
+transaction; the second key is already registered and its transaction uses
+Reference mode. Verification proves the second account at the first block's
+root even after its current nonce advances, and rejects the later first-use key
+at genesis. It checks native import policy with the proof-backed verifier,
+frozen key/head/configuration behavior, refusal controls and unchanged base KV.
+Only changed account-path hashes and the second Reference leaf need new proofs;
+valid source/signature certificates are reused. Every stage exits nonzero on
+failure, and verify generates no proofs. Keep the native database with its
+checkpoint files; incomplete fixture recovery remains unqualified.
+
+This establishes authorization context from a **trusted local canonical store**.
+The transaction remains an independently expected input. It does not prove
+network consensus, canonical block-body membership or a key-rotation lifecycle.
+The current native producer leaves transaction/receipt roots zero; a header
+alone therefore does not authenticate these transaction bodies. The fixture
+stores runtime results through canonical storage APIs and does not claim full
+node consensus import or block reward settlement. No new commitment, carrier,
+gas policy or activation schedule is selected by this view. Cryptographic chain
+membership, full node integration, broader profiles and public activation
+remain open.
+
+Design decision: reuse atomic prefix snapshots, native metadata undo and the
+existing crypto proof/runtime interfaces. Seal the finished view behind a
+read-only adapter so successful historical validation cannot write canonical
+state or substitute live registry/configuration values.
