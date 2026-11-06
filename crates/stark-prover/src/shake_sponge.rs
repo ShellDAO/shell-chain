@@ -1,0 +1,637 @@
+//! Public, byte-oriented SHAKE128/256 sponge proofs over the Keccak AIR.
+//!
+//! Padding, XOR absorption, all permutation links and rate extraction are
+//! constrained. Public messages/states are bounded development inputs, not
+//! private or compact attestations, nor a complete PQ signature verifier.
+
+use serde::{Deserialize, Serialize};
+use winterfell::{
+    crypto::{hashers::Blake3_256, DefaultRandomCoin, MerkleTree},
+    math::{fields::f128::BaseElement, FieldElement, StarkField, ToElements},
+    matrix::ColMatrix,
+    verify, AcceptableOptions, Air, AirContext, Assertion, CompositionPoly, CompositionPolyTrace,
+    DefaultConstraintCommitment, DefaultConstraintEvaluator, DefaultTraceLde, EvaluationFrame,
+    PartitionOptions, Proof, ProofOptions, Prover, StarkDomain, TraceInfo, TracePolyTable,
+    TraceTable, TransitionConstraintDegree,
+};
+
+use crate::prover::default_proof_options;
+
+use crate::keccak_permutation::{
+    prove_keccak_permutation, verify_keccak_permutation, KeccakPermutationProof,
+};
+
+pub const MAX_SHAKE_MESSAGE_BYTES: usize = 4096;
+pub const MAX_SHAKE_OUTPUT_BYTES: usize = 4096;
+const BEFORE: usize = 0;
+const MESSAGE: usize = 8;
+const ABSORBED: usize = 16;
+const PERMUTED: usize = 24;
+const OUTPUT: usize = 32;
+const DOMAIN: usize = 40;
+const TERMINAL: usize = 41;
+const EMIT: usize = 42;
+const TRACE_WIDTH: usize = 43;
+const CONSTRAINTS: usize = 16;
+const MAX_PROOF_BYTES: usize = 1_048_576;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShakeKind {
+    Shake128,
+    Shake256,
+}
+impl ShakeKind {
+    pub fn rate(self) -> usize {
+        match self {
+            Self::Shake128 => 168,
+            Self::Shake256 => 136,
+        }
+    }
+}
+
+/// Compositional sponge proof. The bridge AIR checks padding/absorption/output;
+/// every complete permutation has its own Keccak-f1600 proof.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShakeProof {
+    pub version: u8,
+    pub kind: ShakeKind,
+    pub message: Vec<u8>,
+    pub output: Vec<u8>,
+    pub permutations: Vec<KeccakPermutationProof>,
+    pub sponge_proof_bytes: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct Endpoints {
+    input: [u64; 25],
+    output: [u64; 25],
+}
+#[derive(Clone)]
+struct Inputs {
+    kind: ShakeKind,
+    message: Vec<u8>,
+    output: Vec<u8>,
+    steps: Vec<Endpoints>,
+}
+impl Inputs {
+    fn slots(&self) -> usize {
+        (self.steps.len() * 200).next_power_of_two()
+    }
+    fn trace_length(&self) -> usize {
+        self.slots() * 2
+    }
+}
+impl ToElements<BaseElement> for Inputs {
+    fn to_elements(&self) -> Vec<BaseElement> {
+        let mut result = vec![
+            BaseElement::new(u64::from_le_bytes(*b"SHKSP001") as u128),
+            BaseElement::new(self.kind.rate() as u128),
+            BaseElement::new(self.message.len() as u128),
+            BaseElement::new(self.output.len() as u128),
+            BaseElement::new(self.steps.len() as u128),
+        ];
+        result.extend(
+            self.message
+                .iter()
+                .chain(&self.output)
+                .map(|&v| BaseElement::new(v.into())),
+        );
+        for step in &self.steps {
+            result.extend(
+                step.input
+                    .iter()
+                    .chain(&step.output)
+                    .map(|&v| BaseElement::new(v.into())),
+            );
+        }
+        result
+    }
+}
+
+fn schedule(kind: ShakeKind, message: usize, output: usize) -> Result<(usize, usize), String> {
+    if message > MAX_SHAKE_MESSAGE_BYTES || output > MAX_SHAKE_OUTPUT_BYTES {
+        return Err("SHAKE development message/output resource bound exceeded".into());
+    }
+    let absorbs = message / kind.rate() + 1;
+    Ok((
+        absorbs,
+        absorbs + output.div_ceil(kind.rate()).saturating_sub(1),
+    ))
+}
+fn byte(lanes: &[u64; 25], index: usize) -> u8 {
+    lanes[index / 8].to_le_bytes()[index % 8]
+}
+fn bits(row: &mut [BaseElement], column: usize, byte: u8) {
+    for bit in 0..8 {
+        row[column + bit] = BaseElement::new(((byte >> bit) & 1).into());
+    }
+}
+
+// Fixed public routing and bit extraction only. The XOR, domain suffix and
+// terminal padding relations are evaluated inside the bridge AIR below.
+fn public_rows(inputs: &Inputs) -> Vec<Vec<BaseElement>> {
+    let mut rows = vec![vec![BaseElement::ZERO; TRACE_WIDTH]; inputs.slots()];
+    let rate = inputs.kind.rate();
+    let absorbs = inputs.message.len() / rate + 1;
+    for (step, endpoints) in inputs.steps.iter().enumerate() {
+        let previous = if step == 0 {
+            [0; 25]
+        } else {
+            inputs.steps[step - 1].output
+        };
+        for offset in 0..200 {
+            let row = &mut rows[step * 200 + offset];
+            bits(row, BEFORE, byte(&previous, offset));
+            bits(row, ABSORBED, byte(&endpoints.input, offset));
+            bits(row, PERMUTED, byte(&endpoints.output, offset));
+            if step < absorbs && offset < rate {
+                let index = step * rate + offset;
+                bits(
+                    row,
+                    MESSAGE,
+                    inputs.message.get(index).copied().unwrap_or(0),
+                );
+                row[DOMAIN] = BaseElement::new(u128::from(index == inputs.message.len()));
+                row[TERMINAL] =
+                    BaseElement::new(u128::from(step == absorbs - 1 && offset == rate - 1));
+            }
+            if step >= absorbs - 1 && offset < rate {
+                let index = (step - (absorbs - 1)) * rate + offset;
+                if let Some(&value) = inputs.output.get(index) {
+                    row[EMIT] = BaseElement::ONE;
+                    bits(row, OUTPUT, value);
+                }
+            }
+        }
+    }
+    rows
+}
+struct SpongeAir {
+    context: AirContext<BaseElement>,
+    inputs: Inputs,
+}
+fn xor<E: FieldElement>(a: E, b: E) -> E {
+    a + b - (a * b + a * b)
+}
+impl Air for SpongeAir {
+    type BaseField = BaseElement;
+    type PublicInputs = Inputs;
+    fn new(info: TraceInfo, inputs: Inputs, options: ProofOptions) -> Self {
+        assert_eq!(info, TraceInfo::new(TRACE_WIDTH, inputs.trace_length()));
+        let degrees = (0..CONSTRAINTS)
+            .map(|i| TransitionConstraintDegree::new(if i < 5 || i == 7 { 3 } else { 2 }))
+            .collect();
+        Self {
+            context: AirContext::new(info, degrees, TRACE_WIDTH, options),
+            inputs,
+        }
+    }
+    fn evaluate_transition<E: FieldElement + From<BaseElement>>(
+        &self,
+        frame: &EvaluationFrame<E>,
+        _periodic: &[E],
+        result: &mut [E],
+    ) {
+        let r = frame.current();
+        for bit in 0..8 {
+            let mut block = r[MESSAGE + bit];
+            if bit < 5 {
+                block = xor(block, r[DOMAIN]);
+            }
+            if bit == 7 {
+                block = xor(block, r[TERMINAL]);
+            }
+            result[bit] = r[ABSORBED + bit] - xor(r[BEFORE + bit], block);
+            result[8 + bit] = r[EMIT] * (r[OUTPUT + bit] - r[PERMUTED + bit]);
+        }
+    }
+    fn get_assertions(&self) -> Vec<Assertion<BaseElement>> {
+        let rows = public_rows(&self.inputs);
+        (0..TRACE_WIDTH)
+            .map(|col| Assertion::sequence(col, 0, 2, rows.iter().map(|r| r[col]).collect()))
+            .collect()
+    }
+    fn context(&self) -> &AirContext<BaseElement> {
+        &self.context
+    }
+}
+fn trace(inputs: &Inputs) -> TraceTable<BaseElement> {
+    let mut trace = TraceTable::new(TRACE_WIDTH, inputs.trace_length());
+    for (slot, row) in public_rows(inputs).into_iter().enumerate() {
+        trace.update_row(slot * 2, &row);
+        trace.update_row(slot * 2 + 1, &row);
+    }
+    // The last unused odd row is the only unconstrained trace padding row.
+    let mut hash = blake3::Hasher::new_derive_key("Shell-Chain SHAKE sponge trace padding v1");
+    for value in inputs.to_elements() {
+        hash.update(&value.as_int().to_le_bytes());
+    }
+    let mut bytes = [0u8; 16 * TRACE_WIDTH];
+    hash.finalize_xof().fill(&mut bytes);
+    let row: Vec<_> = bytes
+        .chunks_exact(16)
+        .map(|v| BaseElement::new(u128::from_le_bytes(v.try_into().expect("16 bytes"))))
+        .collect();
+    trace.update_row(inputs.trace_length() - 1, &row);
+    trace
+}
+
+type Hasher = Blake3_256<BaseElement>;
+type Commitment = MerkleTree<Hasher>;
+type Coin = DefaultRandomCoin<Hasher>;
+
+struct SpongeProver {
+    inputs: Inputs,
+    options: ProofOptions,
+}
+
+impl Prover for SpongeProver {
+    type BaseField = BaseElement;
+    type Air = SpongeAir;
+    type Trace = TraceTable<BaseElement>;
+    type HashFn = Hasher;
+    type VC = Commitment;
+    type RandomCoin = Coin;
+    type TraceLde<E: FieldElement<BaseField = BaseElement>> =
+        DefaultTraceLde<E, Hasher, Commitment>;
+    type ConstraintCommitment<E: FieldElement<BaseField = BaseElement>> =
+        DefaultConstraintCommitment<E, Hasher, Commitment>;
+    type ConstraintEvaluator<'a, E: FieldElement<BaseField = BaseElement>> =
+        DefaultConstraintEvaluator<'a, SpongeAir, E>;
+
+    fn get_pub_inputs(&self, _trace: &Self::Trace) -> Inputs {
+        self.inputs.clone()
+    }
+
+    fn options(&self) -> &ProofOptions {
+        &self.options
+    }
+
+    fn new_trace_lde<E: FieldElement<BaseField = BaseElement>>(
+        &self,
+        info: &TraceInfo,
+        trace: &ColMatrix<BaseElement>,
+        domain: &StarkDomain<BaseElement>,
+        partitions: PartitionOptions,
+    ) -> (Self::TraceLde<E>, TracePolyTable<E>) {
+        DefaultTraceLde::new(info, trace, domain, partitions)
+    }
+
+    fn new_evaluator<'a, E: FieldElement<BaseField = BaseElement>>(
+        &self,
+        air: &'a SpongeAir,
+        random: Option<winterfell::AuxRandElements<E>>,
+        coefficients: winterfell::ConstraintCompositionCoefficients<E>,
+    ) -> Self::ConstraintEvaluator<'a, E> {
+        DefaultConstraintEvaluator::new(air, random, coefficients)
+    }
+
+    fn build_constraint_commitment<E: FieldElement<BaseField = BaseElement>>(
+        &self,
+        trace: CompositionPolyTrace<E>,
+        columns: usize,
+        domain: &StarkDomain<BaseElement>,
+        partitions: PartitionOptions,
+    ) -> (Self::ConstraintCommitment<E>, CompositionPoly<E>) {
+        DefaultConstraintCommitment::new(trace, columns, domain, partitions)
+    }
+}
+
+/// Prove a bounded byte-oriented SHAKE computation, including all sponge links.
+pub fn prove_shake(
+    kind: ShakeKind,
+    message: &[u8],
+    output_bytes: usize,
+) -> Result<ShakeProof, String> {
+    let (absorbs, total) = schedule(kind, message.len(), output_bytes)?;
+    let rate = kind.rate();
+    let mut state = [0u64; 25];
+    let mut permutations = Vec::with_capacity(total);
+    let mut steps = Vec::with_capacity(total);
+    let mut output = Vec::with_capacity(output_bytes);
+    for step in 0..total {
+        if step < absorbs {
+            for offset in 0..rate {
+                let index = step * rate + offset;
+                let mut value = message.get(index).copied().unwrap_or(0);
+                if index == message.len() {
+                    value ^= 0x1f;
+                }
+                if step == absorbs - 1 && offset == rate - 1 {
+                    value ^= 0x80;
+                }
+                state[offset / 8] ^= u64::from(value) << (8 * (offset % 8));
+            }
+        }
+        let permutation = prove_keccak_permutation(&state)?;
+        let end = permutation
+            .rounds
+            .last()
+            .ok_or("missing Keccak round")?
+            .output;
+        steps.push(Endpoints {
+            input: state,
+            output: end,
+        });
+        state = end;
+        permutations.push(permutation);
+        if step >= absorbs - 1 {
+            for offset in 0..rate.min(output_bytes - output.len()) {
+                output.push(byte(&state, offset));
+            }
+        }
+    }
+    let inputs = Inputs {
+        kind,
+        message: message.to_vec(),
+        output: output.clone(),
+        steps,
+    };
+    let prover = SpongeProver {
+        inputs: inputs.clone(),
+        options: default_proof_options(),
+    };
+    let inner = prover
+        .prove(trace(&inputs))
+        .map_err(|e| format!("SHAKE sponge proof: {e:?}"))?;
+    Ok(ShakeProof {
+        version: 1,
+        kind,
+        message: message.to_vec(),
+        output,
+        permutations,
+        sponge_proof_bytes: inner.to_bytes(),
+    })
+}
+
+/// Verify the sponge AIR and every full permutation with caller-bound endpoints.
+/// Does not evaluate a native SHAKE hash, padding XOR or Keccak permutation.
+pub fn verify_shake(
+    proof: &ShakeProof,
+    kind: ShakeKind,
+    expected_message: &[u8],
+    expected_output: &[u8],
+) -> Result<(), String> {
+    let (_, total) = schedule(kind, expected_message.len(), expected_output.len())?;
+    if proof.version != 1
+        || proof.kind != kind
+        || proof.message != expected_message
+        || proof.output != expected_output
+        || proof.permutations.len() != total
+        || proof.sponge_proof_bytes.is_empty()
+        || proof.sponge_proof_bytes.len() > MAX_PROOF_BYTES
+        || proof.permutations.iter().any(|p| {
+            p.version != 1
+                || p.rounds.len() != 24
+                || p.proof_bytes.is_empty()
+                || p.proof_bytes.len() > MAX_PROOF_BYTES
+        })
+    {
+        return Err("invalid SHAKE version, endpoints, step count or payload shape".into());
+    }
+    let steps: Vec<_> = proof
+        .permutations
+        .iter()
+        .map(|p| Endpoints {
+            input: p.input,
+            output: p.rounds[23].output,
+        })
+        .collect();
+    let inputs = Inputs {
+        kind,
+        message: proof.message.clone(),
+        output: proof.output.clone(),
+        steps,
+    };
+    let inner = Proof::from_bytes(&proof.sponge_proof_bytes)
+        .map_err(|e| format!("SHAKE sponge proof decode: {e:?}"))?;
+    if inner.trace_info() != &TraceInfo::new(TRACE_WIDTH, inputs.trace_length()) {
+        return Err("unexpected SHAKE sponge trace layout".into());
+    }
+    verify::<SpongeAir, Hasher, Coin, Commitment>(
+        inner,
+        inputs.clone(),
+        &AcceptableOptions::OptionSet(vec![default_proof_options()]),
+    )
+    .map_err(|e| format!("SHAKE sponge verification: {e:?}"))?;
+    for (p, endpoints) in proof.permutations.iter().zip(inputs.steps) {
+        verify_keccak_permutation(p, &endpoints.input, &endpoints.output)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha3::{
+        digest::{ExtendableOutput, Update, XofReader},
+        Shake128, Shake256,
+    };
+    use std::sync::OnceLock;
+
+    fn native(kind: ShakeKind, message: &[u8], len: usize) -> Vec<u8> {
+        let mut out = vec![0; len];
+        match kind {
+            ShakeKind::Shake128 => {
+                let mut h = Shake128::default();
+                h.update(message);
+                h.finalize_xof().read(&mut out);
+            }
+            ShakeKind::Shake256 => {
+                let mut h = Shake256::default();
+                h.update(message);
+                h.finalize_xof().read(&mut out);
+            }
+        }
+        out
+    }
+    fn cases() -> &'static Vec<ShakeProof> {
+        static CASES: OnceLock<Vec<ShakeProof>> = OnceLock::new();
+        CASES.get_or_init(|| {
+            [
+                (ShakeKind::Shake256, vec![], 0),
+                (ShakeKind::Shake256, vec![0xa5; 135], 137),
+                (ShakeKind::Shake256, vec![0x12; 136], 136),
+                (ShakeKind::Shake128, vec![0x34; 168], 169),
+                (ShakeKind::Shake128, vec![], 32),
+            ]
+            .into_iter()
+            .map(|(kind, message, len)| {
+                let p = prove_shake(kind, &message, len).unwrap();
+                assert_eq!(p.output, native(kind, &message, len));
+                p
+            })
+            .collect()
+        })
+    }
+    fn inputs(p: &ShakeProof) -> Inputs {
+        Inputs {
+            kind: p.kind,
+            message: p.message.clone(),
+            output: p.output.clone(),
+            steps: p
+                .permutations
+                .iter()
+                .map(|x| Endpoints {
+                    input: x.input,
+                    output: x.rounds[23].output,
+                })
+                .collect(),
+        }
+    }
+    #[test]
+    fn empty_last_byte_exact_rate_and_extended_outputs_real_proofs() {
+        for p in cases() {
+            verify_shake(
+                p,
+                p.kind,
+                &p.message,
+                &native(p.kind, &p.message, p.output.len()),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            cases()
+                .iter()
+                .map(|p| p.permutations.len())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 2, 3, 1]
+        );
+        let p = &cases()[1];
+        let restored: ShakeProof = serde_json::from_slice(&serde_json::to_vec(p).unwrap()).unwrap();
+        verify_shake(&restored, p.kind, &p.message, &p.output).unwrap();
+        let expected = [
+            0x7f, 0x9c, 0x2b, 0xa4, 0xe8, 0x8f, 0x82, 0x7d, 0x61, 0x60, 0x45, 0x50, 0x76, 0x05,
+            0x85, 0x3e, 0xd7, 0x3b, 0x80, 0x93, 0xf6, 0xef, 0xbc, 0x88, 0xeb, 0x1a, 0x6e, 0xac,
+            0xfa, 0x66, 0xef, 0x26,
+        ];
+        assert_eq!(cases()[4].output, expected);
+    }
+    #[test]
+    fn suffix_collision_and_exact_rate_get_correct_extra_blocks() {
+        let p = &cases()[1];
+        assert_eq!(byte(&p.permutations[0].input, 135), 0x1f ^ 0x80);
+        let p = &cases()[2];
+        let previous = p.permutations[0].rounds[23].output;
+        let next = p.permutations[1].input;
+        assert_eq!(byte(&previous, 0) ^ byte(&next, 0), 0x1f);
+        assert_eq!(byte(&previous, 135) ^ byte(&next, 135), 0x80);
+        for i in 136..200 {
+            assert_eq!(byte(&previous, i), byte(&next, i));
+        }
+        let p = &cases()[3];
+        assert_eq!(p.permutations[2].input, p.permutations[1].rounds[23].output);
+    }
+    #[test]
+    fn changed_message_output_capacity_and_squeeze_links_reject() {
+        let p = &cases()[1];
+        let mut bad = p.clone();
+        bad.message[0] ^= 1;
+        assert!(verify_shake(&bad, bad.kind, &bad.message, &bad.output).is_err());
+        let mut bad = p.clone();
+        bad.output[136] ^= 1;
+        assert!(verify_shake(&bad, bad.kind, &bad.message, &bad.output).is_err());
+        let mut bad = p.clone();
+        bad.permutations[0].input[24] ^= 1u64 << 63;
+        assert!(verify_shake(&bad, bad.kind, &bad.message, &bad.output).is_err());
+        let mut bad = p.clone();
+        bad.permutations[1].input[0] ^= 1;
+        assert!(verify_shake(&bad, bad.kind, &bad.message, &bad.output).is_err());
+        let mut bad = p.clone();
+        bad.permutations.swap(0, 1);
+        assert!(verify_shake(&bad, bad.kind, &bad.message, &bad.output).is_err());
+        let mut bad = p.clone();
+        bad.permutations[0].rounds[11].theta[24] ^= 1;
+        assert!(verify_shake(&bad, bad.kind, &bad.message, &bad.output)
+            .unwrap_err()
+            .contains("Keccak verification"));
+    }
+    #[test]
+    fn variant_endpoint_shape_version_and_payload_guards() {
+        let p = &cases()[4];
+        assert!(verify_shake(p, ShakeKind::Shake256, &p.message, &p.output).is_err());
+        let mut bad = p.clone();
+        bad.kind = ShakeKind::Shake256;
+        assert!(verify_shake(&bad, bad.kind, &bad.message, &bad.output).is_err());
+        assert!(verify_shake(p, p.kind, b"changed", &p.output).is_err());
+        assert!(verify_shake(p, p.kind, &p.message, &[0; 32]).is_err());
+        let mut bad = p.clone();
+        bad.version = 2;
+        assert!(verify_shake(&bad, bad.kind, &bad.message, &bad.output).is_err());
+        let mut bad = p.clone();
+        bad.permutations.clear();
+        assert!(verify_shake(&bad, bad.kind, &bad.message, &bad.output).is_err());
+        let mut bad = p.clone();
+        bad.permutations.push(p.permutations[0].clone());
+        assert!(verify_shake(&bad, bad.kind, &bad.message, &bad.output).is_err());
+        let mut bad = p.clone();
+        bad.permutations[0].rounds.pop();
+        assert!(verify_shake(&bad, bad.kind, &bad.message, &bad.output).is_err());
+        let mut bad = p.clone();
+        bad.sponge_proof_bytes
+            .truncate(bad.sponge_proof_bytes.len() / 2);
+        assert!(verify_shake(&bad, bad.kind, &bad.message, &bad.output).is_err());
+        let mut bad = p.clone();
+        bad.sponge_proof_bytes = vec![0; MAX_PROOF_BYTES + 1];
+        assert!(verify_shake(&bad, bad.kind, &bad.message, &bad.output).is_err());
+        let mut bad = p.clone();
+        bad.sponge_proof_bytes = p.permutations[0].proof_bytes.clone();
+        assert!(verify_shake(&bad, bad.kind, &bad.message, &bad.output)
+            .unwrap_err()
+            .contains("layout"));
+    }
+    #[test]
+    fn resource_bounds_are_checked_before_any_proving() {
+        for kind in [ShakeKind::Shake128, ShakeKind::Shake256] {
+            assert!(prove_shake(kind, &vec![0; MAX_SHAKE_MESSAGE_BYTES + 1], 1).is_err());
+            assert!(prove_shake(kind, &[], MAX_SHAKE_OUTPUT_BYTES + 1).is_err());
+            let (_, total) =
+                schedule(kind, MAX_SHAKE_MESSAGE_BYTES, MAX_SHAKE_OUTPUT_BYTES).unwrap();
+            assert!(total <= 61);
+            assert!((total * 200).next_power_of_two() * 2 <= 32768);
+        }
+    }
+    fn residuals(air: &SpongeAir, row: &[BaseElement]) -> Vec<BaseElement> {
+        let mut out = vec![BaseElement::ZERO; CONSTRAINTS];
+        air.evaluate_transition(
+            &EvaluationFrame::from_rows(row.to_vec(), row.to_vec()),
+            &[],
+            &mut out,
+        );
+        out
+    }
+    #[test]
+    fn bridge_constraints_bind_raw_bits_padding_capacity_and_emission() {
+        let inputs = inputs(&cases()[1]);
+        let rows = public_rows(&inputs);
+        let air = SpongeAir::new(
+            TraceInfo::new(TRACE_WIDTH, inputs.trace_length()),
+            inputs,
+            default_proof_options(),
+        );
+        assert!(rows
+            .iter()
+            .all(|r| residuals(&air, r).iter().all(|&x| x == BaseElement::ZERO)));
+        for (slot, col) in [
+            (135, DOMAIN),
+            (135, TERMINAL),
+            (0, MESSAGE),
+            (199, ABSORBED + 7),
+            (200, BEFORE),
+            (200, ABSORBED),
+            (200, OUTPUT),
+        ] {
+            let mut row = rows[slot].clone();
+            row[col] = BaseElement::ONE - row[col];
+            assert!(
+                residuals(&air, &row)
+                    .iter()
+                    .any(|&x| x != BaseElement::ZERO),
+                "slot {slot} col {col}"
+            );
+        }
+        assert_eq!(air.get_assertions().len(), TRACE_WIDTH);
+    }
+}

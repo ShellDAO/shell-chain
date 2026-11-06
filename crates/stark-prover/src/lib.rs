@@ -51,6 +51,7 @@ pub mod prover;
 pub mod prover_health;
 pub mod recursive_air;
 pub mod scheduler;
+pub mod shake_sponge;
 pub mod state_machine;
 
 pub use amendment::{
