@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add bounded, resumable complete sender-proof uploads through opt-in admin RPC.
+  Persist chunks, progress and verification results; run full sender proof and
+  native historical replay in a single background worker. The HTTP regression
+  covers interrupted native-database uploads, restart, corrupt proofs and
+  canonical-state isolation. This operator interface preserves ordinary block
+  admission, P2P/amendment formats and proof settlement rules.
+
 - Add an explicit retained-history Node replay API that verifies every sender's
   complete registered ML-DSA-65 proof at one frozen canonical parent. Immutable
   exact-tuple results feed both native batch and sequential sender checks;

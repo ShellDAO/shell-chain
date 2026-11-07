@@ -10,6 +10,7 @@ pub mod admin;
 #[allow(clippy::double_must_use)]
 pub mod api;
 pub mod auth;
+pub mod canonical_proof_control;
 pub mod dev_control;
 pub mod error;
 pub mod filter;
@@ -25,9 +26,12 @@ pub mod tls_proxy;
 pub mod types;
 
 pub use admin::{AdminApiServer, NodeInfo, PeerInfo};
+pub use canonical_proof_control::{CanonicalProofControl, DynCanonicalProofControl};
 pub use dev_control::{DevRpcControl, DynDevRpcControl};
 pub use handler::RpcHandler;
-pub use server::{start_rpc_server, RpcConfig, RpcServerHandle};
+pub use server::{
+    start_rpc_server, start_rpc_server_with_proof_control, RpcConfig, RpcServerHandle,
+};
 pub use subscriptions::{BlockEvent, SubscriptionTracker, SyncStatus};
 pub use tls::TlsConfig;
 pub use tls_proxy::TlsProxyHandle;

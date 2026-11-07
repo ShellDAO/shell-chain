@@ -6,6 +6,50 @@ use super::*;
 
 #[jsonrpsee::core::async_trait]
 impl<S: KvStore + 'static> AdminApiServer for RpcHandler<S> {
+    async fn begin_canonical_proof(
+        &self,
+        manifest: shell_storage::CanonicalProofManifest,
+    ) -> Result<shell_storage::CanonicalProofUploadStatus, ErrorObjectOwned> {
+        self.canonical_proof_backend()?
+            .begin(manifest)
+            .map_err(proof_error)
+    }
+    async fn append_canonical_proof(
+        &self,
+        id: ShellHash,
+        index: u32,
+        chunk: Bytes,
+    ) -> Result<shell_storage::CanonicalProofUploadStatus, ErrorObjectOwned> {
+        self.canonical_proof_backend()?
+            .append(id, index, chunk)
+            .map_err(proof_error)
+    }
+    async fn canonical_proof_status(
+        &self,
+        id: ShellHash,
+    ) -> Result<shell_storage::CanonicalProofUploadStatus, ErrorObjectOwned> {
+        self.canonical_proof_backend()?
+            .status(id)
+            .map_err(proof_error)
+    }
+    async fn get_canonical_proof_chunk(
+        &self,
+        id: ShellHash,
+        index: u32,
+    ) -> Result<Bytes, ErrorObjectOwned> {
+        self.canonical_proof_backend()?
+            .chunk(id, index)
+            .map_err(proof_error)
+    }
+    async fn verify_canonical_proof(
+        &self,
+        id: ShellHash,
+        recheck: Option<bool>,
+    ) -> Result<shell_storage::CanonicalProofUploadStatus, ErrorObjectOwned> {
+        self.canonical_proof_backend()?
+            .verify(id, recheck.unwrap_or(false))
+            .map_err(proof_error)
+    }
     async fn node_info(&self) -> Result<NodeInfo, ErrorObjectOwned> {
         let block_height = self
             .chain_store
@@ -56,4 +100,15 @@ impl<S: KvStore + 'static> AdminApiServer for RpcHandler<S> {
             "admin_addPeer not yet implemented; use --bootnodes at startup",
         ))
     }
+}
+
+impl<S: KvStore + 'static> RpcHandler<S> {
+    fn canonical_proof_backend(&self) -> Result<crate::DynCanonicalProofControl, ErrorObjectOwned> {
+        self.canonical_proof_control.clone().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32601, "canonical proof intake unavailable", None::<()>)
+        })
+    }
+}
+fn proof_error(error: String) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(-32000, error, None::<()>)
 }

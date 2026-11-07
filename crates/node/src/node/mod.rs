@@ -3,6 +3,7 @@
 mod block_importer;
 pub use block_importer::CanonicalProofReplay;
 mod block_producer;
+mod canonical_proof_rpc;
 mod chain_state_machine;
 mod challenge_lifecycle;
 mod dev_rpc;
@@ -240,6 +241,7 @@ pub struct Node<S: KvStore + 'static> {
     pub config: NodeConfig,
     pub store: Arc<S>,
     pub chain_store: Arc<ChainStore<S>>,
+    canonical_proof_uploads: Arc<shell_storage::CanonicalProofUploadStore<S>>,
     legacy_replay: parking_lot::Mutex<Option<block_importer::LegacyReplay<S>>>,
     legacy_backfill_dependency: parking_lot::Mutex<Option<u64>>,
     pub world_state: Arc<RwLock<WorldState<S>>>,
@@ -997,10 +999,13 @@ impl<S: KvStore + 'static> Node<S> {
             consensus.write().restore_penalty_state(penalties);
         }
 
+        let canonical_proof_uploads =
+            Arc::new(shell_storage::CanonicalProofUploadStore::new(store.clone()));
         let node = Self {
             config,
             store,
             chain_store,
+            canonical_proof_uploads,
             legacy_replay: parking_lot::Mutex::new(None),
             legacy_backfill_dependency: parking_lot::Mutex::new(None),
             world_state,

@@ -1,5 +1,6 @@
 mod body_pruner;
 mod canonical_parent;
+mod canonical_proof_upload;
 mod chain_store;
 mod error;
 mod kv_store;
@@ -18,6 +19,11 @@ mod rocks_db;
 
 pub use body_pruner::{BodyPruneResult, BodyPruner, DEFAULT_BODY_RETENTION};
 pub use canonical_parent::{CanonicalParentStore, CanonicalParentView};
+pub use canonical_proof_upload::{
+    CanonicalProofManifest, CanonicalProofUploadState, CanonicalProofUploadStatus,
+    CanonicalProofUploadStore, CANONICAL_PROOF_CACHE_PREFIX, CANONICAL_PROOF_CHUNK_BYTES,
+    MAX_CANONICAL_PROOF_BYTES, MAX_CANONICAL_PROOF_CACHE_BYTES, MAX_CANONICAL_PROOF_OBJECTS,
+};
 pub use chain_store::{
     AlgorithmVotingWindow, BlockAvailability, ChainConfig, ChainStore, GuardianConfig,
     L2AggregationJob, L2InputIndex, L2JobStatus, L2JobStore, ProofAmendmentStore, RecoveryProposal,

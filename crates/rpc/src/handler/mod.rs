@@ -82,6 +82,7 @@ pub struct RpcHandler<S: KvStore + 'static> {
     peer_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Optional runtime dev-control handle for Hardhat/Foundry compatibility.
     dev_control: Option<DynDevRpcControl>,
+    canonical_proof_control: Option<crate::DynCanonicalProofControl>,
     /// Admin context: RPC listen address and local P2P identity strings.
     /// Used by `admin_nodeInfo` and `admin_peers`.
     /// `admin_rpc_addr`   — HTTP/RPC listen address (e.g. "127.0.0.1:8545").
@@ -125,6 +126,7 @@ impl<S: KvStore + 'static> Clone for RpcHandler<S> {
             filter_registry: Arc::clone(&self.filter_registry),
             peer_count: Arc::clone(&self.peer_count),
             dev_control: self.dev_control.clone(),
+            canonical_proof_control: self.canonical_proof_control.clone(),
             admin_rpc_addr: self.admin_rpc_addr.clone(),
             local_node_info: Arc::clone(&self.local_node_info),
             witness_store: self.witness_store.clone(),
@@ -173,6 +175,7 @@ impl<S: KvStore + 'static> RpcHandler<S> {
             filter_registry: Arc::new(FilterRegistry::new()),
             peer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dev_control: None,
+            canonical_proof_control: None,
             admin_rpc_addr: String::new(),
             local_node_info: Arc::new(std::sync::RwLock::new(
                 shell_network::LocalNodeInfo::default(),
@@ -311,6 +314,14 @@ impl<S: KvStore + 'static> RpcHandler<S> {
     /// Set the runtime dev-control surface for `evm_*` RPC methods.
     pub fn with_dev_control(mut self, dev_control: DynDevRpcControl) -> Self {
         self.dev_control = Some(dev_control);
+        self
+    }
+
+    pub fn with_canonical_proof_control(
+        mut self,
+        control: crate::DynCanonicalProofControl,
+    ) -> Self {
+        self.canonical_proof_control = Some(control);
         self
     }
 

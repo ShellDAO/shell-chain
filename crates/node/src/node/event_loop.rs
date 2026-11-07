@@ -471,7 +471,7 @@ impl<S: KvStore + 'static> Node<S> {
         network: &mut dyn NetworkService,
     ) -> Result<(), NodeError> {
         use shell_network::{NetworkEvent, NetworkMessage};
-        use shell_rpc::{start_rpc_server, BlockEvent};
+        use shell_rpc::{start_rpc_server_with_proof_control, BlockEvent};
         use tokio::time::{interval, Duration};
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -567,7 +567,7 @@ impl<S: KvStore + 'static> Node<S> {
 
         let rpc_handle = if self.config.rpc_enabled {
             Some(
-                start_rpc_server(
+                start_rpc_server_with_proof_control(
                     self.config.rpc.clone(),
                     self.chain_store.clone(),
                     self.world_state.clone(),
@@ -605,6 +605,7 @@ impl<S: KvStore + 'static> Node<S> {
                             parking_lot::RwLock<dyn shell_consensus::ConsensusEngine>,
                         >), // W.6: wire consensus engine for shell_consensusInfo
                     Some(Arc::new(self.amendment_store.clone())), // STK.4: wire proof amendment store
+                    Some(self.clone() as Arc<dyn shell_rpc::CanonicalProofControl>),
                 )
                 .await
                 .map_err(|e| NodeError::Startup(format!("RPC: {e}")))?,

@@ -55,6 +55,35 @@ pub struct PeerInfo {
 /// Admin namespace RPC API trait.
 #[rpc(server, namespace = "admin")]
 pub trait AdminApi {
+    #[method(name = "beginCanonicalProof")]
+    async fn begin_canonical_proof(
+        &self,
+        manifest: shell_storage::CanonicalProofManifest,
+    ) -> Result<shell_storage::CanonicalProofUploadStatus, jsonrpsee::types::ErrorObjectOwned>;
+    #[method(name = "appendCanonicalProof")]
+    async fn append_canonical_proof(
+        &self,
+        id: shell_primitives::ShellHash,
+        index: u32,
+        chunk: shell_primitives::Bytes,
+    ) -> Result<shell_storage::CanonicalProofUploadStatus, jsonrpsee::types::ErrorObjectOwned>;
+    #[method(name = "canonicalProofStatus")]
+    async fn canonical_proof_status(
+        &self,
+        id: shell_primitives::ShellHash,
+    ) -> Result<shell_storage::CanonicalProofUploadStatus, jsonrpsee::types::ErrorObjectOwned>;
+    #[method(name = "getCanonicalProofChunk")]
+    async fn get_canonical_proof_chunk(
+        &self,
+        id: shell_primitives::ShellHash,
+        index: u32,
+    ) -> Result<shell_primitives::Bytes, jsonrpsee::types::ErrorObjectOwned>;
+    #[method(name = "verifyCanonicalProof")]
+    async fn verify_canonical_proof(
+        &self,
+        id: shell_primitives::ShellHash,
+        recheck: Option<bool>,
+    ) -> Result<shell_storage::CanonicalProofUploadStatus, jsonrpsee::types::ErrorObjectOwned>;
     /// Returns static metadata about this node.
     #[method(name = "nodeInfo")]
     async fn node_info(&self) -> Result<NodeInfo, jsonrpsee::types::ErrorObjectOwned>;

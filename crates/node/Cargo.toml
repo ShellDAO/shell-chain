@@ -48,3 +48,7 @@ stub-l2-verifier = []
 [[example]]
 name = "mldsa-node-replay"
 required-features = ["rocksdb"]
+
+[[example]]
+name = "mldsa-rpc-proof"
+required-features = ["rocksdb"]

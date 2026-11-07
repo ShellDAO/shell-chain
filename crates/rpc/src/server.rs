@@ -266,6 +266,54 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
     consensus_engine: Option<Arc<parking_lot::RwLock<dyn ConsensusEngine>>>,
     proof_amendment_store: Option<Arc<shell_storage::ProofAmendmentStore<S>>>,
 ) -> Result<RpcServerHandle, Box<dyn std::error::Error + Send + Sync>> {
+    start_rpc_server_with_proof_control(
+        config,
+        chain_store,
+        world_state,
+        tx_pool,
+        chain_id,
+        tx_broadcast,
+        block_events,
+        proposer_signer,
+        proposer_address,
+        finalized_number,
+        finality,
+        peer_count,
+        dev_control,
+        admin_p2p_context,
+        witness_store,
+        storage_profile_info,
+        consensus_engine,
+        proof_amendment_store,
+        None,
+    )
+    .await
+}
+
+/// Standard server with an optional node proof receiver. Existing admin
+/// namespace opt-in and API-key exposure checks apply to all proof methods.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_rpc_server_with_proof_control<S: KvStore + 'static>(
+    config: RpcConfig,
+    chain_store: Arc<ChainStore<S>>,
+    world_state: Arc<parking_lot::RwLock<WorldState<S>>>,
+    tx_pool: Arc<TxPool>,
+    chain_id: u64,
+    tx_broadcast: Option<tokio::sync::mpsc::Sender<SignedTransaction>>,
+    block_events: tokio::sync::broadcast::Sender<BlockEvent>,
+    proposer_signer: Option<Arc<dyn Signer>>,
+    proposer_address: Option<Address>,
+    finalized_number: Arc<parking_lot::RwLock<u64>>,
+    finality: Arc<parking_lot::RwLock<FinalityState>>,
+    peer_count: Arc<std::sync::atomic::AtomicUsize>,
+    dev_control: Option<DynDevRpcControl>,
+    admin_p2p_context: Option<Arc<std::sync::RwLock<shell_network::LocalNodeInfo>>>,
+    witness_store: Option<Arc<WitnessStore<S>>>,
+    storage_profile_info: Option<crate::types::StorageProfileInfo>,
+    consensus_engine: Option<Arc<parking_lot::RwLock<dyn ConsensusEngine>>>,
+    proof_amendment_store: Option<Arc<shell_storage::ProofAmendmentStore<S>>>,
+    canonical_proof_control: Option<crate::DynCanonicalProofControl>,
+) -> Result<RpcServerHandle, Box<dyn std::error::Error + Send + Sync>> {
     let restrict_governance_signing = proposer_signer.is_some()
         && config.has_api_namespace("shell")
         && config.api_key.is_none()
@@ -315,6 +363,9 @@ pub async fn start_rpc_server<S: KvStore + 'static>(
         finality,
     )
     .with_peer_count(peer_count);
+    if let Some(control) = canonical_proof_control {
+        handler = handler.with_canonical_proof_control(control);
+    }
     if let Some(dev_control) = dev_control {
         handler = handler.with_dev_control(dev_control);
     }

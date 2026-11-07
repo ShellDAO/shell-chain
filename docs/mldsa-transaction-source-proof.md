@@ -908,3 +908,81 @@ Default block admission and network/amendment proof formats retain their current
 behavior. Fresh-block/P2P proof reception, proof-backed proposer seals and
 selector/penalty/quorum history remain open, along with public release and
 network activation.
+
+## Resumable operator proof intake
+
+The optional `admin` namespace exposes the complete retained-history sender
+proof flow over JSON-RPC. It uses the same real Node verifier and private replay
+engine described above. Ordinary RPC defaults exclude `admin`; remote admin
+listeners require the existing Bearer API key configuration. Configure the
+namespace and API key through the normal node RPC options. Keep the key private.
+
+The methods are:
+
+| Method | Positional parameters | Result |
+| --- | --- | --- |
+| `admin_beginCanonicalProof` | manifest | Immutable upload identity and progress |
+| `admin_appendCanonicalProof` | proof ID, chunk index, hex bytes | Persisted progress |
+| `admin_canonicalProofStatus` | proof ID | Progress, worker state and saved result/error |
+| `admin_getCanonicalProofChunk` | proof ID, chunk index | Retained hex bytes |
+| `admin_verifyCanonicalProof` | proof ID, optional recheck Boolean | Current worker state |
+
+A version-1 manifest contains `version`, `chainId`, `genesisHash`, `blockHash`,
+`totalBytes` and `payloadHash`. The payload is the exact UTF-8 JSON encoding of
+`CanonicalSignatureBatchProof`; `payloadHash` is BLAKE3 of those bytes. The
+returned ID also binds the version, chain, genesis, block, size and payload hash.
+The node checks its actual canonical source and supported activation/profile
+before allocating an upload. A changed canonical source is refused again before
+verification and after replay.
+
+Upload consecutive chunks of exactly 262144 raw bytes, with a shorter final
+chunk when needed. JSON carries each chunk as `0x` hex. Identical retransmission
+is idempotent; conflicting data, skipped indexes and wrong lengths fail without
+changing progress. Chunk data and progress commit in the same database batch.
+Resume from the returned `nextChunk` after a restart. These limits keep chunk
+requests below 2 MiB; they do not raise consensus-message limits.
+
+The receiver reserves at most 256 MiB per payload, 512 MiB across all payloads,
+and eight objects. Partial, successful and rejected uploads keep their
+reservations and bytes; there is no automatic eviction or deletion. Status
+metadata is separate from canonical transaction state, and receipts are limited
+to 8 MiB. A full cache refuses new uploads. Budget disk and memory for the raw
+payloads, decoded proof graph and one full verifier, in addition to the chain.
+
+`verifyCanonicalProof` starts one background blocking worker per node. Poll
+status until `verified` or `rejected`; HTTP success and `ready`/`verifying` do not
+mean proof acceptance. Whole-payload hashing precedes decoding and complete
+sender verification. Only successful real Node execution produces a saved
+replay result. A duplicate request shares the running job. After interruption,
+a persisted `verifying` job is fully reclaimed when explicitly requested.
+Completed results are returned from the cache unless `recheck` is `true`; an
+explicit recheck clears the prior result/error and runs the complete verifier
+again. Saved receipts are informational and never construct a verified crypto
+token or authorize settlement, pruning or another source.
+
+After the native Node fixture above, run with a new output directory and an
+existing parent:
+
+```bash
+tests/e2e/mldsa-rpc-proof.sh produce proof-dir/first proof-dir/second proof-dir/state proof-dir/node proof-dir/rpc
+tests/e2e/mldsa-rpc-proof.sh verify proof-dir/first proof-dir/second proof-dir/state proof-dir/node proof-dir/rpc
+```
+
+The entry uses the same Rust/C++/libclang prerequisites. It clones the retained
+native fixture into its own database and runs an authenticated loopback HTTP
+server with the real Node backend. The receiver has no signer or block-producing
+role. It reuses genuine signatures and existing graph certificates, interrupts
+and resumes an upload, checks independent native receipts, rejects corrupt AIR
+with otherwise genuine signatures, and reopens the saved result and bytes.
+`verify` requests a full new verification of the retained valid payload.
+`payload.json`, `corrupt-payload.json`, `context.json`, `native-db`,
+`rpc-result.json` and `recheck-result.json` are retained; failures exit nonzero.
+For a preparation or first-server interruption before any chunks were uploaded,
+`resume` with the same arguments reuses the prepared files and starts acceptance
+without regenerating graphs. After a later failure, keep the artifacts and use
+the RPC progress methods to recover the upload. Completed outputs use `verify`.
+Keep all inputs and artifacts.
+
+This operator interface does not alter `ProofAmendment`, P2P, fresh block
+admission, proposer seals, consensus proof rewards or activation schedules.
+Those consumers and public release/network acceptance remain separate work.
