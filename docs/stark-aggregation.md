@@ -244,6 +244,22 @@ receipts. The existing 256 MiB global checkpoint and per-payload bounds apply;
 multi-sender load, full validator-selection AIR, other algorithms and network
 activation are not established by this local profile.
 
+After a completed full run, execute
+`tests/e2e/mldsa-full-proof.sh consecutive output` to continue with its retained
+genuinely signed second block. This creates separate local stores and a fresh
+genesis receiver; it rechecks common key-dependent certificates, generates the
+new signature/message-dependent proofs, and checks two full native peer imports,
+finality, independent receipts/accounts and cold historical replay. Private keys
+are not required for the continuation. The single-authority test submits the
+retained proposer signature as a genuine vote over the same block hash.
+
+The two-job profile shares immutable certificate bytes through checked one-hop
+references. Its 256 MiB global checkpoint quota and 512 MiB transport-cache quota
+remain unchanged. Donor source/certificates must remain byte-for-byte intact;
+corrupt reference recovery must refuse before generating new proofs or writing
+native state. `verify output` rechecks the consecutive result when present.
+This bounded two-job case does not establish indefinite capacity or eviction.
+
 ## Registered prover activation
 
 The unreleased `prover_registry_height` schedule enables the canonical registry

@@ -421,6 +421,65 @@ impl CanonicalProductionSource {
         Ok(())
     }
 
+    /// Only public-key-dependent mathematical inputs can cross source boundaries.
+    /// This selects an untrusted candidate; checkpoint verification still checks AIR.
+    pub fn can_reuse_component_from(&self, donor: &Self, name: &str) -> bool {
+        if self.chain_id() != donor.chain_id() || self.genesis_hash() != donor.genesis_hash() {
+            return false;
+        }
+        let (key, old_key, suffix, tagged) = if let Some(suffix) = name.strip_prefix("proposer-") {
+            let (Some(key), Some(old_key)) = (&self.input.proposer_key, &donor.input.proposer_key)
+            else {
+                return false;
+            };
+            (key, old_key, suffix, false)
+        } else if let Some(sender) = name.strip_prefix("sender-") {
+            let Some((index, suffix)) = sender.split_once('-') else {
+                return false;
+            };
+            let Ok(index) = index.parse::<usize>() else {
+                return false;
+            };
+            let (Some(source), Some(old)) = (
+                self.input.senders.get(index),
+                donor.input.senders.get(index),
+            ) else {
+                return false;
+            };
+            (
+                &source.key,
+                &old.key,
+                suffix,
+                source.account.pq_pubkey_hash != blake3_hash(&source.key)
+                    && old.account.pq_pubkey_hash != blake3_hash(&old.key),
+            )
+        } else {
+            return false;
+        };
+        if key != old_key {
+            return false;
+        }
+        if suffix == "tagged-key" {
+            return tagged;
+        }
+        if suffix == "key-hash" {
+            return name.starts_with("sender-");
+        }
+        if matches!(suffix, "key" | "tr") {
+            return true;
+        }
+        if let Some(row) = suffix.strip_prefix("t1-") {
+            return row.parse::<usize>().is_ok_and(|row| row < 6);
+        }
+        if let Some(pair) = suffix.strip_prefix("matrix-") {
+            if let Some((row, col)) = pair.split_once('-') {
+                return row.parse::<usize>().is_ok_and(|row| row < 6)
+                    && col.parse::<usize>().is_ok_and(|col| col < 5);
+            }
+        }
+        false
+    }
+
     /// All new and reused components are cryptographically checked. Pauses publish
     /// only durable components, never an incomplete final proof or verified token.
     pub fn produce<J: KvStore>(
@@ -834,6 +893,58 @@ mod recovery_tests {
     use shell_storage::{OverlayStore, StorageError};
     fn fixture() -> (Arc<MemoryDb>, CanonicalProductionSource) {
         fixture_profile(false)
+    }
+    #[test]
+    fn donor_selection_only_shares_equal_public_key_inputs() {
+        let (_, mut donor) = fixture_profile(true);
+        // Input-selection fixture only; actual signed successor execution is in the runtime.
+        let mut next = CanonicalProductionSource {
+            input: serde_json::from_slice(donor.identity()).unwrap(),
+            identity: vec![],
+        };
+        next.input.block.header.number += 1;
+        next.input.block.transactions[0].tx.nonce += 1;
+        for prefix in ["sender-0", "proposer"] {
+            for suffix in ["key", "matrix-0-0", "matrix-5-4", "t1-0", "t1-5", "tr"] {
+                assert!(next.can_reuse_component_from(&donor, &format!("{prefix}-{suffix}")));
+            }
+            for suffix in [
+                "signature",
+                "challenge",
+                "equation",
+                "z-0",
+                "c-ntt",
+                "inverse-0",
+                "finish",
+                "mu",
+                "commitment",
+                "account",
+                "signing-hash",
+                "id",
+                "leaf",
+                "header",
+                "matrix-6-0",
+                "matrix-0-5",
+                "t1-6",
+            ] {
+                assert!(
+                    !next.can_reuse_component_from(&donor, &format!("{prefix}-{suffix}")),
+                    "{suffix}"
+                );
+            }
+        }
+        assert!(next.can_reuse_component_from(&donor, "sender-0-key-hash"));
+        assert!(!next.can_reuse_component_from(&donor, "sender-0-tagged-key"));
+        assert!(!next.can_reuse_component_from(&donor, "proposer-key-hash"));
+        let mut bytes = vec![SignatureType::MlDsa65.as_u8()];
+        bytes.extend_from_slice(&donor.input.senders[0].key);
+        donor.input.senders[0].account.pq_pubkey_hash = blake3_hash(&bytes);
+        next.input.senders[0].account.pq_pubkey_hash = blake3_hash(&bytes);
+        assert!(next.can_reuse_component_from(&donor, "sender-0-tagged-key"));
+        next.input.senders[0].key[0] ^= 1;
+        next.input.proposer_key.as_mut().unwrap()[0] ^= 1;
+        assert!(!next.can_reuse_component_from(&donor, "sender-0-key"));
+        assert!(!next.can_reuse_component_from(&donor, "proposer-matrix-0-0"));
     }
     fn fixture_profile(full: bool) -> (Arc<MemoryDb>, CanonicalProductionSource) {
         // Storage-context fixture only; real native execution is exercised by the runtime regression.

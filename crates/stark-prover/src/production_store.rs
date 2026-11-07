@@ -55,6 +55,7 @@ pub struct ProductionProgress {
     pub newly_proved: usize,
     pub reused: usize,
 }
+type ComponentReuse<'a> = dyn Fn(&str) -> Result<Option<Vec<u8>>, String> + 'a;
 
 /// The caller must exclusively own this separate job store. No chain writes are made.
 /// Every reused certificate is decoded and verified against the current inputs.
@@ -65,6 +66,7 @@ pub struct ProductionStore<'a, S: KvStore> {
     added: usize,
     reused: usize,
     interrupt: Option<&'a dyn Fn() -> bool>,
+    reuse: Option<&'a ComponentReuse<'a>>,
 }
 impl<'a, S: KvStore> ProductionStore<'a, S> {
     pub fn open(
@@ -159,11 +161,18 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
             added: 0,
             reused: 0,
             interrupt: None,
+            reuse: None,
         })
     }
     /// Stop between mathematical certificates; already committed bytes remain immutable.
     pub fn with_interrupt(mut self, check: &'a dyn Fn() -> bool) -> Self {
         self.interrupt = Some(check);
+        self
+    }
+    /// An input-matched donor supplies only untrusted certificate bytes. The
+    /// ordinary component verifier must succeed before any checkpoint is written.
+    pub fn with_reuse(mut self, reuse: &'a ComponentReuse<'a>) -> Self {
+        self.reuse = Some(reuse);
         self
     }
     pub(crate) fn matches_source(&self, source: &[u8]) -> bool {
@@ -211,10 +220,20 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
         if self.index.components.len() >= MAX_COMPONENTS {
             return Err(failure("production component count limit"));
         }
-        eprintln!("Proving {name}");
-        let p = prove()?;
+        let donor = self.reuse.map(|reuse| reuse(name)).transpose()?.flatten();
+        let borrowed = donor.is_some();
+        let remaining = MAX_CHECKPOINT_BYTES - self.progress().checkpoint_bytes;
+        let p = if let Some(bytes) = donor {
+            if bytes.len() > remaining {
+                return Err(failure("production reused checkpoint quota exceeded"));
+            }
+            serde_json::from_slice(&bytes).map_err(failure)?
+        } else {
+            eprintln!("Proving {name}");
+            prove()?
+        };
         verify(&p)?;
-        let bytes = bounded_json(&p, MAX_CHECKPOINT_BYTES - self.progress().checkpoint_bytes)?;
+        let bytes = bounded_json(&p, remaining)?;
         let mut next = self.index.clone();
         next.components.insert(
             name.into(),
@@ -229,8 +248,13 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
         self.store.write_batch(batch).map_err(failure)?;
         self.store.flush().map_err(failure)?;
         self.index = next;
-        self.added += 1;
-        eprintln!("Persisted {name}");
+        if borrowed {
+            self.reused += 1;
+            eprintln!("Borrowed and reverified {name}");
+        } else {
+            self.added += 1;
+            eprintln!("Persisted {name}");
+        }
         Ok(p)
     }
 }
@@ -273,6 +297,60 @@ pub fn bounded_json(value: &impl Serialize, limit: usize) -> Result<Vec<u8>, Pro
 mod tests {
     use super::*;
     use shell_storage::MemoryDb;
+    #[test]
+    fn donor_is_verified_before_atomic_publication_and_never_reproved() {
+        let mut db = FailingBatch {
+            inner: MemoryDb::new(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        };
+        drop(ProductionStore::open(&mut db, b"new source", None).unwrap());
+        let before = db.scan_all().unwrap();
+        let donor = |_: &str| Ok(Some(b"7".to_vec()));
+        {
+            let mut job = ProductionStore::open(&mut db, b"new source", None)
+                .unwrap()
+                .with_reuse(&donor);
+            assert!(job
+                .checkpoint::<u32>(
+                    "key",
+                    || panic!("must not reprove donor"),
+                    |_| Err("bad AIR".into())
+                )
+                .is_err());
+            assert_eq!(job.progress().components, 0);
+        }
+        assert_eq!(db.scan_all().unwrap(), before);
+        db.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let mut job = ProductionStore::open(&mut db, b"new source", None)
+                .unwrap()
+                .with_reuse(&donor);
+            assert!(job
+                .checkpoint::<u32>("key", || panic!("must not reprove donor"), |_| Ok(()))
+                .is_err());
+            assert_eq!(job.progress().reused, 0);
+        }
+        assert_eq!(db.scan_all().unwrap(), before);
+        db.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut job = ProductionStore::open(&mut db, b"new source", None)
+            .unwrap()
+            .with_reuse(&donor);
+        assert_eq!(
+            job.checkpoint::<u32>(
+                "key",
+                || panic!("must not reprove donor"),
+                |n| if *n == 7 {
+                    Ok(())
+                } else {
+                    Err("wrong input".into())
+                }
+            )
+            .unwrap(),
+            7
+        );
+        assert_eq!(job.progress().reused, 1);
+        assert_eq!(job.progress().newly_proved, 0);
+    }
     #[test]
     fn pause_reopen_reverify_and_reject_altered_sources_and_checkpoints() {
         let mut db = MemoryDb::new();

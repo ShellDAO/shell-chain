@@ -15,6 +15,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Reverify and reuse equal-public-key mathematical certificates across bounded
+  canonical production jobs. Store immutable one-hop references without increasing
+  checkpoint quotas, and exercise two consecutive full-proof native peer imports.
+
 - Add opt-in version 2 canonical signature proofs with full ML-DSA-65 proposer
   seal/header AIR, durable captured signer evidence, resumed production and
   exact-tuple consumption through native consensus import. Preserve version 1

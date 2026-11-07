@@ -511,6 +511,355 @@ pub(super) fn snapshot_full(out: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+pub(super) fn snapshot_consecutive(out: &Path) -> Result<(), Error> {
+    let stores = RocksDbStore::open_all(out.join("network-consecutive/provider/db"), None)?;
+    let rows = stores
+        .state
+        .scan_prefix(b"local/canonical-production/v1/")?;
+    let bytes = rows
+        .iter()
+        .filter(|(k, _)| k != b"local/canonical-production/v1/bytes")
+        .map(|(k, v)| (k.len() + v.len()) as u64)
+        .sum::<u64>();
+    let recorded = stores
+        .state
+        .get(b"local/canonical-production/v1/bytes")?
+        .ok_or("missing global counter")?;
+    ensure(
+        recorded.as_slice() == bytes.to_be_bytes() && bytes <= 256 * 1024 * 1024,
+        "consecutive global quota/accounting mismatch",
+    )?;
+    let rows: Vec<_> = rows
+        .into_iter()
+        .map(|(k, v)| json!({"key":hex::encode(k),"hash":blake3_hash(&v),"bytes":v.len()}))
+        .collect();
+    println!(
+        "{}",
+        json!({"native_digest":canonical_digest(&stores.state)?,"physical_checkpoint_bytes":bytes,"rows":rows})
+    );
+    Ok(())
+}
+
+pub(super) async fn consecutive(out: &Path, pause: bool) -> Result<(), Error> {
+    let network = out.join("network-consecutive");
+    let c: fixture::Context = read(&out.join("context.json"))?;
+    let later: Block = read(&out.join("later-block.json"))?;
+    if !network.exists() {
+        ensure(
+            pause && out.join("full-result.json").exists(),
+            "completed full run required",
+        )?;
+        prepare_from(
+            out,
+            "network-consecutive",
+            &out.join("network-full/provider/db"),
+        )?;
+        // The single-authority fixture's existing proposer signature covers exactly
+        // the native vote message (the block hash). No new signing key is required.
+        let stores = RocksDbStore::open_all(network.join("provider/db"), None)?;
+        let node = fixture::node(Arc::new(stores.state), c.authority, &c.authority_key)?;
+        if node.chain_store.get_head_hash()? == Some(c.block) {
+            node.import_block(later.clone(), &MultiVerifier)?;
+        }
+        ensure(
+            node.chain_store.get_head_hash()? == Some(later.hash()),
+            "retained successor did not become native source",
+        )?;
+        let mut round = shell_consensus::wpoa_state::WPoaRound::new(
+            later.number(),
+            0,
+            node.consensus.read().validator_weights(),
+        );
+        let _ = round.on_block_proposed(later.hash(), c.authority);
+        *node.wpoa_round.lock() = Some(round);
+        node.handle_wpoa_vote(
+            c.authority,
+            later.hash(),
+            later.number(),
+            later
+                .proposer_seal
+                .clone()
+                .ok_or("missing signed successor seal")?,
+        )
+        .ok_or("genuine successor quorum vote failed")?;
+        ensure(
+            node.finality.read().last_finalized_number() == 2,
+            "genuine same-message successor vote failed",
+        )?;
+        write(
+            &network.join("vote.json"),
+            &json!({"existing_genuine_proposer_signature_used_as_same_hash_vote":true,"finalized":2}),
+        )?;
+    }
+    {
+        let stores = RocksDbStore::open_all(network.join("provider/db"), None)?;
+        let chain = ChainStore::new(Arc::new(stores.state));
+        let source = shell_stark_prover::canonical_producer::CanonicalProductionSource::capture(
+            &chain,
+            later.hash(),
+            later.hash(),
+        )?;
+        let path = network.join("source2-capture.json");
+        if !path.exists() {
+            write(&path, &serde_json::from_slice::<Value>(source.identity())?)?;
+        }
+    }
+    ensure(
+        !network.join("complete.json").exists(),
+        "consecutive result exists; use verify",
+    )?;
+    if !pause {
+        ensure(
+            network.join("paused.json").exists(),
+            "consecutive pause missing",
+        )?;
+    }
+    let faults = Arc::new(Faults::default());
+    let provider = Live::start(
+        &network.join("provider/db"),
+        &c,
+        vec![],
+        false,
+        true,
+        Some(faults.clone()),
+    )
+    .await?;
+    let receiver = Live::start(
+        &network.join("receiver/db"),
+        &c,
+        vec![provider.dial()],
+        true,
+        false,
+        None,
+    )
+    .await?;
+    let provider_node = provider.node.clone();
+    let result=async {
+        let deadline=tokio::time::Instant::now()+Duration::from_secs(6*60*60);
+        let mut last_progress=tokio::time::Instant::now();let mut prior=None;
+        loop {
+            ensure(!provider.task.is_finished() && !receiver.task.is_finished(),"consecutive node exited")?;
+            let components=checkpoint_components(provider.node.store.as_ref(),later.hash())?;
+            let production=provider.call("admin_canonicalProofProduction",json!([later.hash()])).await?;
+            ensure(production["status"]["state"]!="failed",&format!("consecutive production failed: {production}"))?;
+            let admission=receiver.call("admin_canonicalProofAdmission",json!([later.hash()])).await?;
+            let receiver_height=receiver.node.chain_store.get_head_block()?.ok_or("receiver head absent")?.number();
+            let state=(components,production["status"]["state"].clone(),admission["status"]["state"].clone(),receiver_height,receiver.node.finality.read().last_finalized_number());
+            if prior.as_ref()!=Some(&state) {
+                prior=Some(state);last_progress=tokio::time::Instant::now();
+                let progress=json!({"components":components,"production":production["status"],"admission":admission,"receiver_height":receiver_height,"finalized":receiver.node.finality.read().last_finalized_number()});
+                let tmp=network.join("progress.tmp");std::fs::write(&tmp,serde_json::to_vec(&progress)?)?;std::fs::rename(tmp,network.join("progress.json"))?;
+                println!("consecutive components={components}; admission={}",admission["status"]["state"]);
+            }
+            if pause && components>0 {ensure(receiver_height<2,"partial second graph imported")?;break;}
+            ensure(admission["status"]["state"]!="failed",&format!("consecutive admission failed: {admission}"))?;
+            if admission["status"]["state"]=="complete" && receiver.node.finality.read().last_finalized_number()==2 {
+                let control:Value=read(&out.join("later-control.json"))?;
+                ensure(components==118 && production["status"]["state"]=="complete" && production["status"]["reused"].as_u64().unwrap_or(0)>=77,"consecutive common certificates not reused")?;
+                ensure(receiver.node.chain_store.get_head_hash()?==Some(later.hash()) && *receiver.node.finality.read().last_finalized_hash()==later.hash()
+                    && accounts(receiver.node.store.clone(),&later)?==control["accounts"]
+                    && receiver.node.chain_store.get_receipts(&later.hash())?.map(serde_json::to_value).transpose()?==Some(control["receipts"].clone()),"consecutive native outputs/finality mismatch")?;
+                for block in [c.block,later.hash()] {
+                    let status=receiver.call("admin_canonicalProofAdmission",json!([block])).await?;
+                    ensure(status["nativeCanonical"]==true && status["status"]["state"]=="complete","both targets must be proof-admitted")?;
+                    let manifest:CanonicalProofManifest=serde_json::from_value(status["status"]["manifest"].clone())?;
+                    let cache=shell_storage::CanonicalProofUploadStore::new(receiver.node.store.clone());
+                    ensure(cache.status(&manifest.id())?.result.as_ref().is_some_and(|r|r["proved_proposer_signature"]==true),"consecutive native import omitted proposer AIR")?;
+                    if block==later.hash() {
+                        let bytes=cache.payload(&manifest.id())?;
+                        use std::io::Write;
+                        let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(network.join("source2-proof.json"))?;file.write_all(&bytes)?;file.sync_all()?;
+                        write(&network.join("source2-manifest.json"),&manifest)?;
+                    }
+                }
+                write(&network.join("complete.json"),&json!({"production":production["status"],"admission":admission,"both_full_proof_admitted":true,"native_outputs_match":true,"finalized":2,"served_chunks":faults.chunks.load(Ordering::SeqCst)}))?;
+                break;
+            }
+            ensure(tokio::time::Instant::now()<deadline && last_progress.elapsed()<Duration::from_secs(1800),"consecutive proof exceeded progress bound")?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Ok::<_,Error>(())
+    }.await;
+    let receiver_stop = receiver.stop().await;
+    let provider_stop = provider.stop().await;
+    result?;
+    receiver_stop?;
+    provider_stop?;
+    if pause {
+        let production = provider_node
+            .canonical_production_status(later.hash())?
+            .ok_or("second production status missing")?;
+        ensure(
+            production["status"]["state"] == "paused"
+                && production["status"]["components"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0 && n < 118),
+            "second producer did not durably pause",
+        )?;
+        write(&network.join("paused.json"), &production)?;
+    }
+    Ok(())
+}
+
+pub(super) fn verify_consecutive(out: &Path) -> Result<(), Error> {
+    let network = out.join("network-consecutive");
+    ensure(
+        network.join("complete.json").exists(),
+        "consecutive import incomplete",
+    )?;
+    let c: fixture::Context = read(&out.join("context.json"))?;
+    let later: Block = read(&out.join("later-block.json"))?;
+    let stores = RocksDbStore::open_all(network.join("receiver/db"), None)?;
+    let store = Arc::new(stores.state);
+    let node = fixture::node(store.clone(), c.authority, &c.authority_key)?;
+    let before = digest(store.as_ref())?;
+    let mut replays = Vec::new();
+    for (block, path, control) in [
+        (
+            c.block,
+            out.join("job/proof.json"),
+            out.join("control.json"),
+        ),
+        (
+            later.hash(),
+            network.join("source2-proof.json"),
+            out.join("later-control.json"),
+        ),
+    ] {
+        let proof: shell_stark_prover::canonical_batch::CanonicalSignatureBatchProof = read(&path)?;
+        let result = node.replay_canonical_transactions_with_proof(later.hash(), block, &proof)?;
+        let control: Value = read(&control)?;
+        ensure(
+            result.proved_proposer_signature
+                && result.proved_sender_signatures == 1
+                && result.state_root.to_string()
+                    == control["state_root"].as_str().unwrap_or_default()
+                && serde_json::to_value(&result.receipts)? == control["receipts"],
+            "consecutive cold replay output mismatch",
+        )?;
+        replays.push(result);
+    }
+    ensure(
+        digest(store.as_ref())? == before,
+        "consecutive cold replay wrote state",
+    )?;
+    let mut path = network.join("verified.json");
+    let mut index = 2;
+    while path.exists() {
+        path = network.join(format!("verified-{index}.json"));
+        index += 1;
+    }
+    write(
+        &path,
+        &json!({"replays":replays,"native_unchanged":true,"current_head":later.hash()}),
+    )
+}
+
+pub(super) async fn bad_consecutive_reference(out: &Path) -> Result<(), Error> {
+    let network = out.join("network-consecutive-bad");
+    ensure(
+        out.join("network-consecutive/complete.json").exists(),
+        "consecutive result required",
+    )?;
+    prepare_from(
+        out,
+        "network-consecutive-bad",
+        &out.join("network-consecutive/provider/db"),
+    )?;
+    let c: fixture::Context = read(&out.join("context.json"))?;
+    let later: Block = read(&out.join("later-block.json"))?;
+    let before = {
+        let stores = RocksDbStore::open_all(network.join("provider/db"), None)?;
+        let store = &stores.state;
+        let prefix = b"local/canonical-production/v1/";
+        let component = [
+            prefix.as_slice(),
+            b"certificates/",
+            later.hash().as_bytes(),
+            b"/production/component/sender-0-key",
+        ]
+        .concat();
+        let raw = store.get(&component)?.ok_or("shared component absent")?;
+        let marker = b"\0canonical-certificate/v1/";
+        let mut reference: Value = serde_json::from_slice(
+            raw.strip_prefix(marker)
+                .ok_or("component not a shared reference")?,
+        )?;
+        let mut hash = reference["hash"]
+            .as_str()
+            .ok_or("reference hash missing")?
+            .as_bytes()
+            .to_vec();
+        hash[2] = if hash[2] == b'0' { b'1' } else { b'0' };
+        reference["hash"] = json!(String::from_utf8(hash)?);
+        let damaged = [
+            marker.as_slice(),
+            serde_json::to_vec(&reference)?.as_slice(),
+        ]
+        .concat();
+        let record = [prefix.as_slice(), b"record/", later.hash().as_bytes()].concat();
+        let prior = store.get(&record)?.ok_or("second record missing")?;
+        let mut status: Value = serde_json::from_slice(&prior)?;
+        status["state"] = json!("paused");
+        let changed = serde_json::to_vec(&status)?;
+        let counter = [prefix.as_slice(), b"bytes"].concat();
+        let bytes = u64::from_be_bytes(
+            store
+                .get(&counter)?
+                .ok_or("counter absent")?
+                .try_into()
+                .map_err(|_| "counter width")?,
+        );
+        let total = bytes
+            .checked_sub((raw.len() + prior.len()) as u64)
+            .and_then(|n| n.checked_add((damaged.len() + changed.len()) as u64))
+            .ok_or("fault accounting overflow")?;
+        let native = canonical_digest(store)?;
+        let mut batch = shell_storage::WriteBatch::new();
+        batch.put(component, damaged);
+        batch.put(record, changed);
+        batch.put(counter, total.to_be_bytes().to_vec());
+        store.write_batch(batch)?;
+        store.flush()?;
+        ensure(
+            canonical_digest(store)? == native,
+            "reference fault changed native data",
+        )?;
+        native
+    };
+    let provider = Live::start(&network.join("provider/db"), &c, vec![], false, true, None).await?;
+    let observer = Live::start(
+        &network.join("receiver/db"),
+        &c,
+        vec![provider.dial()],
+        true,
+        false,
+        None,
+    )
+    .await?;
+    let result=async {
+        let deadline=tokio::time::Instant::now()+Duration::from_secs(180);
+        loop {
+            ensure(!provider.task.is_finished(),"damaged provider exited unexpectedly")?;
+            let status=provider.call("admin_canonicalProofProduction",json!([later.hash()])).await?;
+            if status["status"]["state"]=="failed" {
+                ensure(status["status"]["error"].as_str().is_some_and(|e|e.contains("reference integrity mismatch")),"unexpected reference refusal")?;
+                ensure(canonical_digest(provider.node.store.as_ref())?==before,"failed production changed native provider")?;
+                write(&network.join("refused.json"),&json!({"production":status["status"],"failed_provider_native_unchanged":true,"ready_payloads_are_not_checkpoint_authorization":true}))?;break;
+            }
+            ensure(tokio::time::Instant::now()<deadline,"damaged reference did not refuse")?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok::<_,Error>(())
+    }.await;
+    let observer_stop = observer.stop().await;
+    let provider_stop = provider.stop().await;
+    result?;
+    observer_stop?;
+    provider_stop?;
+    Ok(())
+}
+
 /// Advance through an explicitly separate ordinary native successor, then
 /// replay the full proof at its historical parent without changing current state.
 pub(super) fn history_full(out: &Path, advance: bool) -> Result<(), Error> {

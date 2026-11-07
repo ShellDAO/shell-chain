@@ -115,3 +115,36 @@ a correct outer hash and genuine raw signatures, invalid envelopes and an
 unauthorized header must refuse without native writes. Full validator-selection
 AIR, other proposer algorithms, multi-sender load and full fork/amendment
 acceptance remain separate work.
+
+## Consecutive full jobs
+
+For equal registered ML-DSA-65 keys at the same sender position or proposer role,
+the next job may borrow public-key decoding, matrix expansion, scaled public-key
+NTTs and public-key hashing certificates. Every borrowed certificate runs its
+ordinary full AIR verifier against the new job's inputs before publication.
+Signature/message-dependent graphs, account witnesses, transaction identities
+and headers are always bound to their own source. A donor status is informational;
+it cannot create a verified token or bypass native source restoration.
+
+Old inline certificates remain immutable and readable. Equal certificate bytes
+in a later job use a versioned one-hop reference to an indexed retained job's
+inline component, with exact length and hash checked on reads. Missing, changed,
+malformed, chained or cyclic targets fail closed. The component index, reference
+and physical quota counter are committed in one storage batch. The per-job logical
+bound and global physical checkpoint bound stay 256 MiB; the two-job limit and
+separate 512 MiB proof transport cache also stay unchanged. This adds no eviction
+or indefinite retention policy. Reading new reference records requires a reader
+that implements this storage format; older inline source/proof encodings are
+preserved, not rewritten.
+
+`tests/e2e/mldsa-full-proof.sh consecutive output` continues a completed full-run
+output using its retained genuine signed second block and public certificates.
+It reconstructs a fresh genesis receiver, proves and imports both full targets,
+compares native execution/finality and cold-replays both proofs without writes.
+For this single-authority fixture, the retained proposer's genuine block-hash
+signature is also submitted as a vote on the identical hash; no private key is
+recovered and no new signature is fabricated. A real shutdown/restart rechecks
+shared and local checkpoints. A separate damaged-reference copy must fail
+production without changing the provider's native state even when valid ready
+transport payloads remain cached. Independent observers may still accept those
+valid payloads; production checkpoint integrity is not a consensus invalidation.

@@ -22,6 +22,18 @@ const PREFIX: &[u8] = b"local/canonical-production/v1/";
 const MAX_JOBS: usize = 2;
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
 const DATA_CEILING: u64 = MAX_BYTES - 64 * 1024;
+const REFERENCE: &[u8] = b"\0canonical-certificate/v1/";
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CertificateReference {
+    version: u8,
+    block: ShellHash,
+    bytes: usize,
+    hash: ShellHash,
+}
+fn certificate_prefix(hash: ShellHash) -> Vec<u8> {
+    key(&[b"certificates/".as_slice(), hash.as_bytes(), b"/"].concat())
+}
 fn key(suffix: &[u8]) -> Vec<u8> {
     [PREFIX, suffix].concat()
 }
@@ -235,7 +247,8 @@ impl<S: KvStore> CanonicalProductionStore<S> {
         ProductionJob {
             store: self.store.clone(),
             lock: self.lock.clone(),
-            prefix: key(&[b"certificates/".as_slice(), hash.as_bytes(), b"/"].concat()),
+            block: hash,
+            prefix: certificate_prefix(hash),
         }
     }
 }
@@ -243,11 +256,52 @@ impl<S: KvStore> CanonicalProductionStore<S> {
 struct ProductionJob<S: KvStore> {
     store: Arc<S>,
     lock: Arc<parking_lot::Mutex<Option<u64>>>,
+    block: ShellHash,
     prefix: Vec<u8>,
+}
+impl<S: KvStore> ProductionJob<S> {
+    fn resolve(&self, k: &[u8], bytes: Vec<u8>) -> Result<Vec<u8>, StorageError> {
+        if !k.starts_with(b"production/component/") {
+            return Ok(bytes);
+        }
+        let Some(encoded) = bytes.strip_prefix(REFERENCE) else {
+            return Ok(bytes);
+        };
+        if encoded.len() > 1024 {
+            return Err(error("production certificate reference size limit"));
+        }
+        let reference: CertificateReference = serde_json::from_slice(encoded).map_err(error)?;
+        let owner = CanonicalProductionStore {
+            store: self.store.clone(),
+            lock: self.lock.clone(),
+        };
+        if reference.version != 1
+            || reference.block == self.block
+            || reference.bytes > MAX_BYTES as usize
+            || !owner.ids()?.contains(&reference.block)
+        {
+            return Err(error("invalid production certificate reference target"));
+        }
+        let target = self
+            .store
+            .get(&[certificate_prefix(reference.block).as_slice(), k].concat())?
+            .ok_or_else(|| error("missing production certificate reference target"))?;
+        // References always terminate at immutable inline bytes; no chains or cycles.
+        if target.starts_with(REFERENCE)
+            || target.len() != reference.bytes
+            || blake3_hash(&target) != reference.hash
+        {
+            return Err(error("production certificate reference integrity mismatch"));
+        }
+        Ok(target)
+    }
 }
 impl<S: KvStore> KvStore for ProductionJob<S> {
     fn get(&self, k: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        self.store.get(&[self.prefix.as_slice(), k].concat())
+        self.store
+            .get(&[self.prefix.as_slice(), k].concat())?
+            .map(|bytes| self.resolve(k, bytes))
+            .transpose()
     }
     fn put(&self, k: &[u8], v: &[u8]) -> Result<(), StorageError> {
         let mut b = WriteBatch::new();
@@ -263,16 +317,21 @@ impl<S: KvStore> KvStore for ProductionJob<S> {
     fn scan_prefix(&self, p: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
         self.store
             .scan_prefix(&[self.prefix.as_slice(), p].concat())
-            .map(|rows| {
+            .and_then(|rows| {
                 rows.into_iter()
-                    .map(|(k, v)| (k[self.prefix.len()..].to_vec(), v))
+                    .map(|(k, v)| {
+                        let local = k[self.prefix.len()..].to_vec();
+                        Ok((local.clone(), self.resolve(&local, v)?))
+                    })
                     .collect()
             })
     }
     fn visit_all(&self, visitor: &mut EntryVisitor<'_>) -> Result<(), StorageError> {
         self.store
             .visit_prefix_range(&self.prefix, &self.prefix, None, false, &mut |k, v| {
-                visitor(&k[self.prefix.len()..], v)?;
+                let local = &k[self.prefix.len()..];
+                let bytes = self.resolve(local, v.to_vec())?;
+                visitor(local, &bytes)?;
                 Ok(true)
             })
     }
@@ -287,7 +346,41 @@ impl<S: KvStore> KvStore for ProductionJob<S> {
                     {
                         return Err(error("immutable production certificate conflict"));
                     }
-                    changes.push(([self.prefix.as_slice(), k].concat(), v.clone()));
+                    let physical = [self.prefix.as_slice(), k].concat();
+                    let mut value = v.clone();
+                    if k.starts_with(b"production/component/") {
+                        if let Some(existing) = self.store.get(&physical)? {
+                            // Preserve an existing inline certificate or reference exactly.
+                            value = existing;
+                        } else {
+                            let owner = CanonicalProductionStore {
+                                store: self.store.clone(),
+                                lock: self.lock.clone(),
+                            };
+                            for donor in owner.ids()? {
+                                if donor == self.block {
+                                    continue;
+                                }
+                                if self
+                                    .store
+                                    .get(&[certificate_prefix(donor).as_slice(), k].concat())?
+                                    .is_some_and(|bytes| {
+                                        !bytes.starts_with(REFERENCE) && bytes == *v
+                                    })
+                                {
+                                    let reference = CertificateReference {
+                                        version: 1,
+                                        block: donor,
+                                        bytes: v.len(),
+                                        hash: blake3_hash(v),
+                                    };
+                                    value = [REFERENCE, encode(&reference)?.as_slice()].concat();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    changes.push((physical, value));
                 }
                 WriteBatchOp::Delete { .. } => {
                     return Err(error("canonical production checkpoint deletion refused"))
@@ -425,11 +518,41 @@ impl<S: KvStore + 'static> Node<S> {
                 .save(&status)
                 .map_err(|e| e.to_string())?;
             let mut kv = self.canonical_production.job(status.block_hash);
+            let mut donors = Vec::new();
+            for hash in self.canonical_production.ids().map_err(|e| e.to_string())? {
+                if hash == status.block_hash {
+                    continue;
+                }
+                if let Some(record) = self
+                    .canonical_production
+                    .status(hash)
+                    .map_err(|e| e.to_string())?
+                {
+                    if record.state == CanonicalProductionState::Complete {
+                        donors.push((hash, self.restore_canonical_job(&record)?));
+                    }
+                }
+            }
+            let reuse = |name: &str| -> Result<Option<Vec<u8>>, String> {
+                for (hash, donor) in &donors {
+                    if source.can_reuse_component_from(donor, name) {
+                        let bytes = self
+                            .canonical_production
+                            .job(*hash)
+                            .get(&[b"production/component/", name.as_bytes()].concat())
+                            .map_err(|e| e.to_string())?
+                            .ok_or_else(|| "matching donor certificate missing".to_string())?;
+                        return Ok(Some(bytes));
+                    }
+                }
+                Ok(None)
+            };
             let interrupt =
                 || cancel.load(Ordering::Acquire) || !self.prover_ready.load(Ordering::Acquire);
             let mut job = ProductionStore::open(&mut kv, source.identity(), limit)
                 .map_err(|e| e.to_string())?
-                .with_interrupt(&interrupt);
+                .with_interrupt(&interrupt)
+                .with_reuse(&reuse);
             let result = source.produce(&mut job);
             let progress = job.progress();
             spent = progress.newly_proved;
@@ -620,6 +743,64 @@ fn cancellation_budget_exhausted(budget: Option<NonZeroUsize>, used: usize) -> b
 mod tests {
     use super::*;
     use shell_storage::MemoryDb;
+    #[test]
+    fn one_hop_references_deduplicate_and_refuse_changed_missing_or_cyclic_targets() {
+        let db = Arc::new(MemoryDb::new());
+        db.put(b"HEAD", b"native anchor").unwrap();
+        let owner = CanonicalProductionStore::new(db.clone());
+        let first = ShellHash::from([1; 32]);
+        let second = ShellHash::from([2; 32]);
+        {
+            let mut guard = owner.lock.lock();
+            owner
+                .write_locked(
+                    vec![(key(b"jobs"), encode(&vec![first, second]).unwrap())],
+                    &mut guard,
+                    DATA_CEILING,
+                )
+                .unwrap();
+        }
+        let a = owner.job(first);
+        let b = owner.job(second);
+        let k = b"production/component/key";
+        let certificate = vec![7u8; 4096];
+        a.put(k, &certificate).unwrap();
+        let original = db.get(&[a.prefix.as_slice(), k].concat()).unwrap().unwrap();
+        b.put(k, &certificate).unwrap();
+        let physical = [b.prefix.as_slice(), k].concat();
+        let reference = db.get(&physical).unwrap().unwrap();
+        assert!(reference.starts_with(REFERENCE) && reference.len() < 256);
+        assert_eq!(b.get(k).unwrap().unwrap(), certificate);
+        assert_eq!(
+            db.get(&[a.prefix.as_slice(), k].concat()).unwrap().unwrap(),
+            original
+        );
+        let total = owner.checked_total(&mut None).unwrap();
+        assert!(total < 5000);
+        b.put(k, &certificate).unwrap();
+        assert_eq!(owner.checked_total(&mut None).unwrap(), total);
+        let target = [a.prefix.as_slice(), k].concat();
+        db.put(&target, &vec![8u8; 4096]).unwrap();
+        assert!(b.get(k).is_err());
+        db.delete(&target).unwrap();
+        assert!(b.get(k).is_err());
+        db.put(&target, &reference).unwrap();
+        assert!(b.get(k).is_err());
+        db.put(&target, &original).unwrap();
+        let bad = CertificateReference {
+            version: 1,
+            block: second,
+            bytes: 4096,
+            hash: blake3_hash(&certificate),
+        };
+        db.put(
+            &physical,
+            &[REFERENCE, encode(&bad).unwrap().as_slice()].concat(),
+        )
+        .unwrap();
+        assert!(b.get(k).is_err());
+        assert_eq!(db.get(b"HEAD").unwrap().unwrap(), b"native anchor");
+    }
     #[test]
     fn namespaces_are_immutable_and_global_accounting_rejects_tampering() {
         let db = Arc::new(MemoryDb::new());

@@ -432,6 +432,13 @@ fn main() -> Result<(), Error> {
         }
         "full-verify" => admission_runtime::verify_full(out),
         "full-snapshot" => admission_runtime::snapshot_full(out),
+        "consecutive-pause" | "consecutive-resume" => tokio::runtime::Runtime::new()?.block_on(
+            admission_runtime::consecutive(out, args[0] == "consecutive-pause"),
+        ),
+        "consecutive-verify" => admission_runtime::verify_consecutive(out),
+        "consecutive-snapshot" => admission_runtime::snapshot_consecutive(out),
+        "consecutive-bad-reference" => tokio::runtime::Runtime::new()?
+            .block_on(admission_runtime::bad_consecutive_reference(out)),
         "full-history" | "full-history-verify" => {
             admission_runtime::history_full(out, args[0] == "full-history")
         }

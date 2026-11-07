@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ $# != 2 || ( $1 != run && $1 != verify ) ]]; then
-  echo "usage: $0 run|verify output" >&2
+if [[ $# != 2 || ( $1 != run && $1 != verify && $1 != consecutive ) ]]; then
+  echo "usage: $0 run|consecutive|verify output" >&2
   exit 2
 fi
 cd "$(dirname "$0")/../.."

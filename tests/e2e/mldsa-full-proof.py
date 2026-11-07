@@ -10,12 +10,13 @@ import datetime
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
 
 mode, raw_fixture, raw_output = sys.argv[1:]
-assert mode in ("run", "verify")
+assert mode in ("run", "verify", "consecutive")
 fixture, out = map(lambda p: Path(p).resolve(), (raw_fixture, raw_output))
 
 def now():
@@ -65,10 +66,46 @@ def history_verify():
 
 if mode == "verify":
     assert (out / "network-full/complete.json").exists(), "full peer import incomplete"
-    if (out / "network-full/history-verified.json").exists():
+    if (out / "network-consecutive/complete.json").exists():
+        run("consecutive-verify", [fixture, "consecutive-verify", out])
+    elif (out / "network-full/history-verified.json").exists():
         history_verify()
     else:
         run("full-verify", [fixture, "full-verify", out])
+    sys.exit(0)
+if mode == "consecutive":
+    assert (out / "full-result.json").exists(), "complete run output required"
+    if not (out / "consecutive-donor-snapshot.json").exists():
+        save(out / "consecutive-donor-snapshot.json", snapshot("consecutive-donor-snapshot"))
+    network = out / "network-consecutive"
+    if not (network / "paused.json").exists():
+        run("consecutive-pause", [fixture, "consecutive-pause", out])
+        save(out / "consecutive-paused-snapshot.json", json.loads(run("consecutive-paused-snapshot", [fixture, "consecutive-snapshot", out])))
+    assert (out / "consecutive-paused-snapshot.json").exists(), "unrecorded consecutive pause retained"
+    if not (network / "complete.json").exists():
+        run("consecutive-resume", [fixture, "consecutive-resume", out])
+    after = json.loads(run("consecutive-complete-snapshot", [fixture, "consecutive-snapshot", out]))
+    paused = json.loads((out / "consecutive-paused-snapshot.json").read_text())
+    assert paused["native_digest"] == after["native_digest"], "consecutive proving changed native provider"
+    indexed = {row["key"]: row for row in after["rows"]}
+    donor = json.loads((out / "consecutive-donor-snapshot.json").read_text())
+    for row in donor["rows"]:
+        if bytes.fromhex(row["key"]) not in (b"local/canonical-production/v1/bytes", b"local/canonical-production/v1/jobs"):
+            assert indexed[row["key"]] == row, "original donor certificate/source changed"
+    logs = "\n".join(path.read_text() for label in ("consecutive-pause", "consecutive-resume") for path in (out / "commands").glob(label + "*.log"))
+    generated = re.findall(r"^Proving (.+)$", logs, re.M)
+    borrowed = re.findall(r"^Borrowed and reverified (.+)$", logs, re.M)
+    common = re.compile(r"^(sender-0|proposer)-(key|key-hash|tagged-key|tr|matrix-[0-5]-[0-4]|t1-[0-5])$")
+    assert len(generated) == len(set(generated)) == 41 and not any(common.fullmatch(name) for name in generated), "common math was regenerated"
+    assert len(borrowed) == len(set(borrowed)) == 77 and all(common.fullmatch(name) for name in borrowed), "common certificates not reverified"
+    run("consecutive-verify", [fixture, "consecutive-verify", out])
+    run("consecutive-verify-cold", [fixture, "consecutive-verify", out])
+    if not (out / "network-consecutive-bad/refused.json").exists():
+        run("consecutive-bad-reference", [fixture, "consecutive-bad-reference", out])
+    save(out / "consecutive-result.json", {"both_full_targets_proof_admitted": True, "common_components_reverified_not_regenerated": 77,
+         "new_input_components_proved": 41, "physical_checkpoint_bytes": after["physical_checkpoint_bytes"],
+         "original_donor_immutable": True, "cold_two_target_replays_no_writes": True,
+         "corrupt_reference_production_refused": True, "finished_at": now()})
     sys.exit(0)
 out.mkdir(exist_ok=True)
 if not (out / "control.json").exists():
