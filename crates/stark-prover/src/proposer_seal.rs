@@ -7,7 +7,7 @@ use crate::{
     mldsa_verification::{verify_mldsa65, Mldsa65VerificationProof},
 };
 use serde::{Deserialize, Serialize};
-use shell_core::BlockHeader;
+use shell_core::{Block, BlockHeader};
 use shell_crypto::{CryptoError, PQSignature, SignatureType, Verifier};
 use shell_primitives::{Address, ShellHash};
 use shell_storage::{CanonicalParentView, KvStore};
@@ -31,6 +31,11 @@ pub struct VerifiedProposerSeal {
     seal: PQSignature,
 }
 impl VerifiedProposerSeal {
+    pub fn matches_block(&self, block: &Block) -> bool {
+        self.hash == block.hash()
+            && self.proposer == block.header.proposer
+            && block.proposer_seal.as_ref() == Some(&self.seal)
+    }
     pub fn hash(&self) -> ShellHash {
         self.hash
     }
@@ -48,6 +53,11 @@ impl Verifier for VerifiedProposerSeal {
         message: &[u8],
         signature: &PQSignature,
     ) -> Result<bool, CryptoError> {
+        if !shell_crypto::is_algorithm_allowed(SignatureType::MlDsa65) {
+            return Err(CryptoError::UnsupportedSignatureType(
+                SignatureType::MlDsa65,
+            ));
+        }
         // No native signature fallback for any changed tuple.
         Ok(key == self.key && message == self.hash.as_bytes() && signature == &self.seal)
     }
@@ -69,16 +79,40 @@ pub fn verify_canonical_proposer_seal<S: KvStore + 'static>(
     seal: &PQSignature,
     proof: &ProposerSealProof,
 ) -> Result<VerifiedProposerSeal, String> {
+    if canonical_child_hash(view, header)? != *expected_hash {
+        return Err("proposer seal expected canonical hash mismatch".into());
+    }
+    verify_seal_at_parent(
+        view,
+        header,
+        expected_hash,
+        expected_proposer,
+        expected_chain_id,
+        seal,
+        proof,
+    )
+}
+
+/// Shared crypto predicate after the batch caller has checked canonical history
+/// or an activated fresh extension. Native authority selection remains external.
+pub(crate) fn verify_seal_at_parent<S: KvStore + 'static>(
+    view: &CanonicalParentView<S>,
+    header: &BlockHeader,
+    expected_hash: &ShellHash,
+    expected_proposer: &Address,
+    expected_chain_id: u64,
+    seal: &PQSignature,
+    proof: &ProposerSealProof,
+) -> Result<VerifiedProposerSeal, String> {
     if proof.version != 1
         || seal.sig_type != SignatureType::MlDsa65
         || seal.data.len() != 3309
         || header.proposer != *expected_proposer
         || view.config().chain_id != expected_chain_id
+        || view.parent().number.checked_add(1) != Some(header.number)
+        || header.parent_hash != view.parent().hash()
     {
         return Err("unsupported proposer seal framing or selected authority mismatch".into());
-    }
-    if canonical_child_hash(view, header)? != *expected_hash {
-        return Err("proposer seal expected canonical hash mismatch".into());
     }
     let key = view
         .registered_key(expected_proposer)

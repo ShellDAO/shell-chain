@@ -4,6 +4,7 @@
 use crate::{
     account_state::AccountStateProof,
     canonical_signature::{canonical_child_hash, verify_canonical_registered_signature},
+    proposer_seal::{verify_seal_at_parent, ProposerSealProof, VerifiedProposerSeal},
     registered_signature::{RegisteredSignatureProof, VerifiedRegisteredSignature},
 };
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,16 @@ pub struct CanonicalTransactionProof {
 pub struct CanonicalSignatureBatchProof {
     pub version: u8,
     pub transactions: Vec<CanonicalTransactionProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposer: Option<ProposerSealProof>,
+}
+impl CanonicalSignatureBatchProof {
+    fn valid_profile(&self) -> bool {
+        matches!(
+            (self.version, self.proposer.is_some()),
+            (1, false) | (2, true)
+        )
+    }
 }
 
 /// No public constructor or deserializer: every sender predicate must pass
@@ -37,6 +48,7 @@ pub struct VerifiedCanonicalSignatureBatch {
     block: ShellHash,
     chain_id: u64,
     signatures: Vec<VerifiedRegisteredSignature>,
+    proposer: Option<VerifiedProposerSeal>,
 }
 impl VerifiedCanonicalSignatureBatch {
     pub fn tip(&self) -> ShellHash {
@@ -57,8 +69,15 @@ impl VerifiedCanonicalSignatureBatch {
     pub fn is_empty(&self) -> bool {
         self.signatures.is_empty()
     }
+    pub fn proposer_seal(&self) -> Option<&VerifiedProposerSeal> {
+        self.proposer.as_ref()
+    }
     pub fn matches_block(&self, block: &Block) -> bool {
         block.hash() == self.block
+            && self
+                .proposer
+                .as_ref()
+                .is_none_or(|proof| proof.matches_block(block))
             && block.header.parent_hash == self.parent
             && block.transactions.len() == self.signatures.len()
             && self
@@ -96,7 +115,7 @@ pub fn verify_canonical_signature_batch<S: KvStore + 'static>(
     block: &Block,
     proof: &CanonicalSignatureBatchProof,
 ) -> Result<VerifiedCanonicalSignatureBatch, String> {
-    if proof.version != 1
+    if !proof.valid_profile()
         || block.transactions.is_empty()
         || block.transactions.len() > MAX_CANONICAL_SIGNATURE_BATCH
         || proof.transactions.len() != block.transactions.len()
@@ -150,13 +169,33 @@ fn verify_batch_at_parent<S: KvStore + 'static>(
     proof: &CanonicalSignatureBatchProof,
     hash: ShellHash,
 ) -> Result<VerifiedCanonicalSignatureBatch, String> {
-    if proof.version != 1
+    if !proof.valid_profile()
         || block.transactions.is_empty()
         || block.transactions.len() > MAX_CANONICAL_SIGNATURE_BATCH
         || proof.transactions.len() != block.transactions.len()
     {
         return Err("canonical signature batch version/count/profile mismatch".into());
     }
+    // The independent native caller still selects and authorizes the proposer.
+    // Refuse an invalid mandatory seal before spending work on sender graphs.
+    let proposer = proof
+        .proposer
+        .as_ref()
+        .map(|seal| {
+            verify_seal_at_parent(
+                view,
+                &block.header,
+                &hash,
+                &block.header.proposer,
+                view.config().chain_id,
+                block
+                    .proposer_seal
+                    .as_ref()
+                    .ok_or("full proof block has no proposer seal")?,
+                seal,
+            )
+        })
+        .transpose()?;
     let mut seen = std::collections::HashSet::new();
     let mut signatures = Vec::with_capacity(block.transactions.len());
     for (tx, item) in block.transactions.iter().zip(&proof.transactions) {
@@ -174,6 +213,7 @@ fn verify_batch_at_parent<S: KvStore + 'static>(
         block: hash,
         chain_id: view.config().chain_id,
         signatures,
+        proposer,
     })
 }
 
@@ -183,6 +223,22 @@ mod tests {
     use shell_core::BlockHeader;
     use shell_storage::{MemoryDb, WorldState};
     use std::sync::Arc;
+    #[test]
+    fn legacy_wire_bytes_stay_unchanged_and_full_profile_cannot_omit_seal() {
+        let bytes = br#"{"version":1,"transactions":[]}"#;
+        let legacy: CanonicalSignatureBatchProof = serde_json::from_slice(bytes).unwrap();
+        assert!(legacy.valid_profile());
+        assert_eq!(serde_json::to_vec(&legacy).unwrap(), bytes);
+        for version in [0, 2, 3] {
+            let value = serde_json::json!({"version":version,"transactions":[]});
+            let proof: CanonicalSignatureBatchProof = serde_json::from_value(value).unwrap();
+            assert!(!proof.valid_profile());
+        }
+        assert!(serde_json::from_value::<CanonicalSignatureBatchProof>(
+            serde_json::json!({"version":1,"transactions":[],"verified":true})
+        )
+        .is_err());
+    }
     #[test]
     fn candidate_batch_requires_active_current_parent_and_exact_body() {
         for activation in [None, Some(1), Some(2)] {
@@ -216,6 +272,7 @@ mod tests {
             let proof = CanonicalSignatureBatchProof {
                 version: 1,
                 transactions: vec![],
+                proposer: None,
             };
             let before = db.scan_all().unwrap();
             let error = verify_candidate_signature_batch(&view, &child, &proof).unwrap_err();

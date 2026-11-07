@@ -242,6 +242,7 @@ fn canonical_digest(store: &impl KvStore) -> Result<ShellHash, Error> {
         .filter(|(k, _)| {
             !k.starts_with(CANONICAL_PROOF_CACHE_PREFIX)
                 && !k.starts_with(b"local/canonical-admission/v1/")
+                && !k.starts_with(b"local/canonical-production/v1/")
         })
         .collect();
     Ok(blake3_hash(&serde_json::to_vec(&rows)?))
@@ -250,6 +251,9 @@ pub(super) fn prepare(out: &Path) -> Result<(), Error> {
     prepare_at(out, "network")
 }
 fn prepare_at(out: &Path, directory: &str) -> Result<(), Error> {
+    prepare_from(out, directory, &out.join("native/db"))
+}
+fn prepare_from(out: &Path, directory: &str, source_path: &Path) -> Result<(), Error> {
     let network = out.join(directory);
     ensure(
         !network.exists(),
@@ -258,7 +262,7 @@ fn prepare_at(out: &Path, directory: &str) -> Result<(), Error> {
     std::fs::create_dir(&network)?;
     let c: fixture::Context = read(&out.join("context.json"))?;
     let block: Block = read(&out.join("candidate.json"))?;
-    let source = RocksDbStore::open_all(out.join("native/db"), None)?;
+    let source = RocksDbStore::open_all(source_path, None)?;
     std::fs::create_dir(network.join("provider"))?;
     source.create_checkpoint(network.join("provider/db"))?;
     let chain = ChainStore::new(Arc::new(source.state));
@@ -449,7 +453,8 @@ pub(super) fn verify(out: &Path) -> Result<(), Error> {
 fn verify_at(out: &Path, directory: &str) -> Result<(), Error> {
     let c: fixture::Context = read(&out.join("context.json"))?;
     let block: Block = read(&out.join("candidate.json"))?;
-    let proof = read(&out.join("job/proof.json"))?;
+    let proof: shell_stark_prover::canonical_batch::CanonicalSignatureBatchProof =
+        read(&out.join("job/proof.json"))?;
     let control: Value = read(&out.join("control.json"))?;
     let network = out.join(directory);
     let stores = RocksDbStore::open_all(network.join("receiver/db"), None)?;
@@ -462,7 +467,8 @@ fn verify_at(out: &Path, directory: &str) -> Result<(), Error> {
     )?;
     let result = node.replay_canonical_transactions_with_proof(c.block, c.block, &proof)?;
     ensure(
-        result.state_root == block.header.state_root
+        result.proved_proposer_signature == (proof.version == 2)
+            && result.state_root == block.header.state_root
             && serde_json::to_value(&result.receipts)? == control["receipts"]
             && accounts(store.clone(), &block)? == control["accounts"],
         "cold automatic proof-backed replay differs from native control",
@@ -482,6 +488,298 @@ fn verify_at(out: &Path, directory: &str) -> Result<(), Error> {
 
 pub(super) fn verify_gossip(out: &Path) -> Result<(), Error> {
     verify_at(out, "network-gossip")
+}
+
+pub(super) fn verify_full(out: &Path) -> Result<(), Error> {
+    let proof: shell_stark_prover::canonical_batch::CanonicalSignatureBatchProof =
+        read(&out.join("job/proof.json"))?;
+    ensure(
+        proof.version == 2 && proof.proposer.is_some(),
+        "full proof envelope missing proposer",
+    )?;
+    verify_at(out, "network-full")
+}
+
+pub(super) fn snapshot_full(out: &Path) -> Result<(), Error> {
+    let stores = RocksDbStore::open_all(out.join("network-full/provider/db"), None)?;
+    let rows: Vec<_> = stores.state.scan_prefix(b"local/canonical-production/v1/")?.into_iter()
+        .map(|(key,value)|json!({"key":hex::encode(key),"hash":blake3_hash(&value),"bytes":value.len()})).collect();
+    println!(
+        "{}",
+        json!({"native_digest":canonical_digest(&stores.state)?,"rows":rows})
+    );
+    Ok(())
+}
+
+/// Advance through an explicitly separate ordinary native successor, then
+/// replay the full proof at its historical parent without changing current state.
+pub(super) fn history_full(out: &Path, advance: bool) -> Result<(), Error> {
+    let c: fixture::Context = read(&out.join("context.json"))?;
+    let block: Block = read(&out.join("candidate.json"))?;
+    let later: Block = read(&out.join("later-block.json"))?;
+    let control: Value = read(&out.join("later-control.json"))?;
+    let proof: shell_stark_prover::canonical_batch::CanonicalSignatureBatchProof =
+        read(&out.join("job/proof.json"))?;
+    let stores = RocksDbStore::open_all(out.join("network-full/receiver/db"), None)?;
+    let store = Arc::new(stores.state);
+    let node = fixture::node(store.clone(), c.authority, &c.authority_key)?;
+    if advance {
+        ensure(
+            node.chain_store.get_head_hash()? == Some(c.block),
+            "history advance requires full admitted child",
+        )?;
+        node.import_block(later.clone(), &MultiVerifier)?;
+    }
+    ensure(
+        node.chain_store.get_head_hash()? == Some(later.hash())
+            && later.header.state_root != block.header.state_root
+            && node
+                .chain_store
+                .get_receipts(&later.hash())?
+                .map(serde_json::to_value)
+                .transpose()?
+                == Some(control["receipts"].clone())
+            && accounts(store.clone(), &later)? == control["accounts"],
+        "ordinary native history control mismatch",
+    )?;
+    let before = digest(store.as_ref())?;
+    let replay = node.replay_canonical_transactions_with_proof(later.hash(), c.block, &proof)?;
+    let original: Value = read(&out.join("control.json"))?;
+    ensure(
+        replay.proved_proposer_signature
+            && replay.state_root == block.header.state_root
+            && serde_json::to_value(&replay.receipts)? == original["receipts"]
+            && digest(store.as_ref())? == before,
+        "full historical replay changed current state or output",
+    )?;
+    let network = out.join("network-full");
+    let mut path = network.join("history-verified.json");
+    let mut n = 2;
+    while path.exists() {
+        path = network.join(format!("history-verified-{n}.json"));
+        n += 1;
+    }
+    write(
+        &path,
+        &json!({"replay":replay,"current_head":later.hash(),"current_state_root":later.header.state_root,"current_state_unchanged":true,"ordinary_successor_is_not_claimed_proof_admitted":true}),
+    )
+}
+
+/// Real production, shutdown/checkpoint recovery, peer intake and native consensus.
+pub(super) async fn full(out: &Path, phase: &str) -> Result<(), Error> {
+    let pause = phase == "full-pause";
+    let negative = phase == "full-bad-proposer";
+    let directory = if negative {
+        "network-full-bad"
+    } else {
+        "network-full"
+    };
+    let network = out.join(directory);
+    if pause {
+        prepare_at(out, directory)?;
+    } else if negative {
+        ensure(
+            out.join("network-full/complete.json").exists(),
+            "complete full flow required",
+        )?;
+        prepare_from(out, directory, &out.join("network-full/provider/db"))?;
+    } else {
+        ensure(
+            network.join("paused.json").exists(),
+            "full checkpoint pause evidence absent",
+        )?;
+        ensure(
+            !network.join("complete.json").exists(),
+            "full flow already complete; use verify",
+        )?;
+    }
+    let c: fixture::Context = read(&out.join("context.json"))?;
+    let block: Block = read(&out.join("candidate.json"))?;
+    ensure(
+        block
+            .proposer_seal
+            .as_ref()
+            .is_some_and(|s| s.sig_type == shell_crypto::SignatureType::MlDsa65),
+        "full fixture proposer must use MLDSA65",
+    )?;
+    let initial: Value = read(&network.join("initial.json"))?;
+    let faults = Arc::new(Faults::default());
+    if negative {
+        let mut proof: shell_stark_prover::canonical_batch::CanonicalSignatureBatchProof =
+            read(&out.join("job/proof.json"))?;
+        proof
+            .proposer
+            .as_mut()
+            .ok_or("missing full proposer proof")?
+            .signature
+            .equation
+            .key
+            .proof_bytes[0] ^= 1;
+        let bytes = serde_json::to_vec(&proof)?;
+        let mut manifest: CanonicalProofManifest = read(&out.join("job/manifest.json"))?;
+        manifest.total_bytes = bytes.len() as u64;
+        manifest.payload_hash = blake3_hash(&bytes);
+        let stores = RocksDbStore::open_all(network.join("provider/db"), None)?;
+        let cache = shell_storage::CanonicalProofUploadStore::new(Arc::new(stores.state));
+        let id = cache.begin(manifest.clone())?.proof_id;
+        for (index, chunk) in bytes
+            .chunks(shell_storage::CANONICAL_PROOF_CHUNK_BYTES)
+            .enumerate()
+        {
+            cache.append(&id, index as u32, chunk)?;
+        }
+        ensure(
+            cache.payload(&id)? == bytes,
+            "bad proposer payload outer hash incorrect",
+        )?;
+        *faults.manifest_override.write().unwrap() = Some(manifest);
+    }
+    let provider = Live::start(
+        &network.join("provider/db"),
+        &c,
+        vec![],
+        false,
+        !negative,
+        Some(faults.clone()),
+    )
+    .await?;
+    let receiver = Live::start(
+        &network.join("receiver/db"),
+        &c,
+        vec![provider.dial()],
+        true,
+        false,
+        None,
+    )
+    .await?;
+    let provider_node = provider.node.clone();
+    let receiver_node = receiver.node.clone();
+    let result = async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6*60*60);
+        let mut last_progress = tokio::time::Instant::now();
+        let mut prior = None;
+        loop {
+            ensure(!provider.task.is_finished() && !receiver.task.is_finished(), "full proof node exited")?;
+            let components = checkpoint_components(provider.node.store.as_ref(), c.block)?;
+            let production = provider.call("admin_canonicalProofProduction", json!([c.block])).await?;
+            ensure(production["status"]["state"] != "failed", &format!("full producer failed: {production}"))?;
+            let admission = receiver.call("admin_canonicalProofAdmission", json!([c.block])).await?;
+            let state = (components, production["status"]["state"].clone(), admission["status"]["state"].clone());
+            if prior.as_ref() != Some(&state) {
+                prior = Some(state); last_progress = tokio::time::Instant::now();
+                let progress = json!({"components":components,"production":production["status"],"admission":admission,"receiver_head":receiver.node.chain_store.get_head_hash()?});
+                let temporary = network.join("progress.tmp");std::fs::write(&temporary,serde_json::to_vec(&progress)?)?;std::fs::rename(temporary,network.join("progress.json"))?;
+                println!("full proof components={components}; admission={}", admission["status"]["state"]);
+            }
+            if pause && components > 0 {
+                ensure(admission["nativeCanonical"] == false && json!(canonical_digest(receiver.node.store.as_ref())?) == initial["native_digest"], "partial full graph changed native state")?;
+                break;
+            }
+            if admission["status"]["state"] == "failed" {
+                ensure(negative && admission["nativeCanonical"] == false && json!(canonical_digest(receiver.node.store.as_ref())?) == initial["native_digest"], &format!("full proof admission failed: {admission}"))?;
+                let error = admission["status"]["error"].as_str().ok_or("missing full refusal reason")?;
+                ensure(error.contains("public-key") || error.contains("proof"), "unexpected proposer proof refusal")?;
+                write(&network.join("refused.json"),&json!({"admission":admission,"correct_outer_hash":true,"genuine_raw_seal_and_sender":true,"native_unchanged":true}))?;
+                break;
+            }
+            if admission["status"]["state"] == "complete" {
+                ensure(!pause && !negative && production["status"]["state"] == "complete" && components == 118, "full production component profile incomplete")?;
+                let control: Value = read(&out.join("control.json"))?;
+                ensure(receiver.node.chain_store.get_head_hash()? == Some(c.block)
+                    && receiver.node.chain_store.get_receipts(&c.block)?.map(serde_json::to_value).transpose()? == Some(control["receipts"].clone())
+                    && accounts(receiver.node.store.clone(), &block)? == control["accounts"], "full native output differs from independent execution")?;
+                if receiver.node.finality.read().last_finalized_number() < block.number() {
+                    ensure(tokio::time::Instant::now() < deadline && last_progress.elapsed() < Duration::from_secs(1800), "full import certificate did not finalize within documented bound")?;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                ensure(*receiver.node.finality.read().last_finalized_hash() == c.block
+                    && provider.node.finality.read().last_finalized_number() == block.number(), "full import finality differs from genuine native quorum")?;
+                let manifest: CanonicalProofManifest = serde_json::from_value(admission["status"]["manifest"].clone())?;
+                let cache = shell_storage::CanonicalProofUploadStore::new(receiver.node.store.clone());
+                let bytes = cache.payload(&manifest.id())?;
+                let proof: shell_stark_prover::canonical_batch::CanonicalSignatureBatchProof = serde_json::from_slice(&bytes)?;
+                ensure(proof.version == 2 && proof.proposer.is_some(), "full graph downgraded to sender-only")?;
+                ensure(cache.status(&manifest.id())?.result.as_ref().is_some_and(|r|r["proved_proposer_signature"] == true), "native import did not consume full proposer AIR")?;
+                std::fs::create_dir(out.join("job"))?;
+                {
+                    use std::io::Write;
+                    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(out.join("job/proof.json"))?;
+                    file.write_all(&bytes)?;file.sync_all()?;
+                }
+                write(&out.join("job/manifest.json"), &manifest)?;
+                let paused: Value = read(&network.join("paused.json"))?;
+                ensure(production["status"]["reused"].as_u64().unwrap_or(0) >= paused["status"]["components"].as_u64().ok_or("paused count absent")?, "full checkpoint was not reverified")?;
+                write(&network.join("complete.json"), &json!({"production":production["status"],"admission":admission,"served_chunks":faults.chunks.load(Ordering::SeqCst),"root_receipts_accounts_match":true,"full_native_proposer_AIR_consumed":true,"finalized_height":block.number()}))?;
+                break;
+            }
+            ensure(tokio::time::Instant::now() < deadline && last_progress.elapsed() < Duration::from_secs(1800), "full proof made no progress within documented bound")?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Ok::<_, Error>(())
+    }.await;
+    let receiver_stop = receiver.stop().await;
+    let provider_stop = provider.stop().await;
+    result?;
+    receiver_stop?;
+    provider_stop?;
+    if pause {
+        let production = provider_node
+            .canonical_production_status(c.block)?
+            .ok_or("full paused job absent")?;
+        ensure(
+            production["status"]["state"] == "paused"
+                && production["status"]["components"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0 && n < 118),
+            "full producer did not persist interrupted checkpoint",
+        )?;
+        ensure(
+            json!(canonical_digest(receiver_node.store.as_ref())?) == initial["native_digest"],
+            "paused full receiver changed canonical state",
+        )?;
+        write(&network.join("paused.json"), &production)?;
+    }
+    if negative {
+        let mut offline =
+            fixture::node(receiver_node.store.clone(), c.authority, &c.authority_key)?;
+        let mut proof: shell_stark_prover::canonical_batch::CanonicalSignatureBatchProof =
+            read(&out.join("job/proof.json"))?;
+        let before = canonical_digest(offline.store.as_ref())?;
+        proof.version = 1;
+        ensure(
+            offline
+                .import_block_with_canonical_proof(block.header.parent_hash, block.clone(), &proof)
+                .is_err(),
+            "v1 accepted an unversioned proposer proof",
+        )?;
+        proof.version = 2;
+        let seal = proof.proposer.take();
+        ensure(
+            offline
+                .import_block_with_canonical_proof(block.header.parent_hash, block.clone(), &proof)
+                .is_err(),
+            "v2 missing proposer proof fell back to native crypto",
+        )?;
+        proof.proposer = seal;
+        let mut unauthorized = block.clone();
+        unauthorized.header.proposer = Address::from([0x77; 32]);
+        ensure(
+            offline
+                .import_block_with_canonical_proof(block.header.parent_hash, unauthorized, &proof)
+                .is_err(),
+            "proof replaced native proposer authorization",
+        )?;
+        ensure(
+            canonical_digest(offline.store.as_ref())? == before,
+            "full envelope/authority refusal changed native state",
+        )?;
+        write(
+            &network.join("envelope-refused.json"),
+            &json!({"v1_with_seal":true,"v2_without_seal":true,"native_authority_retained":true,"native_unchanged":true}),
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) async fn gossip(out: &Path) -> Result<(), Error> {
@@ -588,8 +886,10 @@ fn checkpoint_components(store: &impl KvStore, block: ShellHash) -> Result<usize
         b"/production/index",
     ]
     .concat();
-    let index: Value =
-        serde_json::from_slice(&store.get(&key)?.ok_or("source2 checkpoint index absent")?)?;
+    let Some(bytes) = store.get(&key)? else {
+        return Ok(0);
+    };
+    let index: Value = serde_json::from_slice(&bytes)?;
     Ok(index["components"]
         .as_object()
         .ok_or("source2 components absent")?

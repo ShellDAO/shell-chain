@@ -15,6 +15,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add opt-in version 2 canonical signature proofs with full ML-DSA-65 proposer
+  seal/header AIR, durable captured signer evidence, resumed production and
+  exact-tuple consumption through native consensus import. Preserve version 1
+  sender-only encoding, default-off operation and native authority policy.
+
 - Add a real gossip-only canonical sender-proof regression with an independent
   genesis receiver, direct block-body suppression, authenticated proof transfer,
   native receipt/account checks and cold full-proof replay without writes.

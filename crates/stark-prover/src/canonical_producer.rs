@@ -6,6 +6,7 @@ use crate::{
     canonical_batch::{
         CanonicalSignatureBatchProof, CanonicalTransactionProof, MAX_CANONICAL_SIGNATURE_BATCH,
     },
+    header_hash::{prove_header_hash, verify_header_hash},
     mldsa_challenge::{prove_challenge, verify_challenge, ChallengeProof},
     mldsa_decode::{prove_signature_decode, verify_signature_decode, SignatureDecodeProof},
     mldsa_equation::{prove_equation, verify_equation, EquationInputs, EquationProof},
@@ -22,6 +23,7 @@ use crate::{
         Mldsa65VerificationProof,
     },
     production_store::{bounded_json, ProductionError, ProductionStore},
+    proposer_seal::ProposerSealProof,
     registered_signature::{verify_registered_signature_entry, RegisteredSignatureProof},
     shake_sponge::{prove_shake, verify_shake, ShakeKind, ShakeProof},
     SigBatchEntry,
@@ -50,6 +52,8 @@ struct CapturedInputs {
     parent: BlockHeader,
     block: Block,
     senders: Vec<SenderSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proposer_key: Option<Vec<u8>>,
 }
 /// Immutable public proving inputs, never a canonical authorization token.
 /// Capture freezes the native source once; proving makes no live state reads.
@@ -155,13 +159,27 @@ impl CanonicalProductionSource {
                 nodes,
             });
         }
+        let proposer_key = if block
+            .proposer_seal
+            .as_ref()
+            .is_some_and(|s| s.sig_type == SignatureType::MlDsa65)
+        {
+            Some(
+                view.registered_key(&block.header.proposer)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("full production requires a parent-registered proposer key")?,
+            )
+        } else {
+            None
+        };
         let input = CapturedInputs {
-            version: 1,
+            version: if proposer_key.is_some() { 2 } else { 1 },
             tip,
             config: view.config().clone(),
             parent: view.parent().clone(),
             block,
             senders,
+            proposer_key,
         };
         let identity = bounded_json(
             &serde_json::to_value(&input).map_err(|e| e.to_string())?,
@@ -205,8 +223,10 @@ impl CanonicalProductionSource {
             .get_chain_config()
             .map_err(|e| e.to_string())?
             .ok_or("production chain configuration absent")?;
-        if i.version != 1
-            || cfg.chain_id != i.config.chain_id
+        if !matches!(
+            (i.version, i.proposer_key.is_some()),
+            (1, false) | (2, true)
+        ) || cfg.chain_id != i.config.chain_id
             || cfg.genesis_hash != i.config.genesis_hash
             || chain
                 .get_block_hash_by_number(0)
@@ -255,6 +275,29 @@ impl CanonicalProductionSource {
                 .any(|tx| tx.kind != shell_core::SystemTxKind::BlockGasReward)
         {
             return Err("production source count/system profile mismatch".into());
+        }
+        if let Some(key) = &i.proposer_key {
+            let seal = i
+                .block
+                .proposer_seal
+                .as_ref()
+                .ok_or("full production seal absent")?;
+            let signer = chain
+                .get_block_signers(&i.block.hash())
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|s| s.address == i.block.header.proposer)
+                .ok_or("full production retained native proposer evidence absent")?;
+            if key.len() != 1952
+                || seal.sig_type != SignatureType::MlDsa65
+                || seal.data.len() != 3309
+                || signer.public_key != *key
+                || !MlDsaVerifier
+                    .verify(key, i.block.hash().as_bytes(), seal)
+                    .map_err(|e| e.to_string())?
+            {
+                return Err("full production frozen proposer key/seal evidence mismatch".into());
+            }
         }
         let mut seen = std::collections::HashSet::new();
         for (tx, sender) in i.block.transactions.iter().zip(&i.senders) {
@@ -327,8 +370,28 @@ impl CanonicalProductionSource {
     /// Verify complete mathematics against captured public inputs only. Callers
     /// must independently recheck canonicality and native execution/admission.
     pub fn verify(&self, proof: &CanonicalSignatureBatchProof) -> Result<(), String> {
-        if proof.version != 1 || proof.transactions.len() != self.input.senders.len() {
+        if proof.version != self.input.version
+            || proof.transactions.len() != self.input.senders.len()
+            || proof.proposer.is_some() != self.input.proposer_key.is_some()
+        {
             return Err("production proof source/count mismatch".into());
+        }
+        if let (Some(seal), Some(key)) = (&proof.proposer, &self.input.proposer_key) {
+            let block = &self.input.block;
+            if seal.version != 1 {
+                return Err("unsupported production proposer proof".into());
+            }
+            verify_header_hash(&seal.header, &block.header, &block.hash())?;
+            crate::mldsa_verification::verify_mldsa65(
+                &seal.signature,
+                key,
+                block.hash().as_bytes(),
+                &block
+                    .proposer_seal
+                    .as_ref()
+                    .ok_or("missing source seal")?
+                    .data,
+            )?;
         }
         for ((tx, sender), p) in self
             .input
@@ -435,8 +498,34 @@ impl CanonicalProductionSource {
             });
         }
         let proof = CanonicalSignatureBatchProof {
-            version: 1,
+            version: self.input.version,
             transactions,
+            proposer: if let Some(key) = &self.input.proposer_key {
+                let block = &self.input.block;
+                let signature = prove_mldsa(
+                    job,
+                    "proposer",
+                    key,
+                    block.hash().as_bytes(),
+                    &block
+                        .proposer_seal
+                        .as_ref()
+                        .ok_or_else(|| "full source seal missing".to_string())?
+                        .data,
+                )?;
+                let header = job.checkpoint(
+                    "proposer-header",
+                    || prove_header_hash(&block.header),
+                    |p| verify_header_hash(p, &block.header, &block.hash()).map(|_| ()),
+                )?;
+                Some(ProposerSealProof {
+                    version: 1,
+                    header,
+                    signature,
+                })
+            } else {
+                None
+            },
         };
         self.verify(&proof)?;
         Ok(proof)
@@ -744,6 +833,9 @@ mod recovery_tests {
     use shell_primitives::{Address, U256};
     use shell_storage::{OverlayStore, StorageError};
     fn fixture() -> (Arc<MemoryDb>, CanonicalProductionSource) {
+        fixture_profile(false)
+    }
+    fn fixture_profile(full: bool) -> (Arc<MemoryDb>, CanonicalProductionSource) {
         // Storage-context fixture only; real native execution is exercised by the runtime regression.
         let db = Arc::new(MemoryDb::new());
         let chain = ChainStore::new(db.clone());
@@ -812,6 +904,10 @@ mod recovery_tests {
         };
         block.header.transactions_root =
             shell_core::block_body_root(&block.transactions, &[]).unwrap();
+        if full {
+            block.header.proposer = address;
+            block.proposer_seal = Some(signer.sign(block.hash().as_bytes()).unwrap());
+        }
         let overlay = Arc::new(OverlayStore::new(db.clone()));
         let staged = ChainStore::new(overlay.clone());
         staged
@@ -823,9 +919,39 @@ mod recovery_tests {
         staged
             .commit_canonical_block(&block, Some(&receipts))
             .unwrap();
+        if full {
+            staged
+                .put_block_signers(
+                    &block.hash(),
+                    &[shell_core::BlockSignerEvidence {
+                        address,
+                        public_key: signer.public_key().to_vec(),
+                        signature: block.proposer_seal.clone().unwrap(),
+                    }],
+                )
+                .unwrap();
+        }
         overlay.commit().unwrap();
         let source =
             CanonicalProductionSource::capture(&chain, block.hash(), block.hash()).unwrap();
+        if full {
+            // A later authenticated vote can carry another randomized signature
+            // for the same authority/key/hash without changing the captured seal.
+            let vote = signer.sign(block.hash().as_bytes()).unwrap();
+            assert!(MlDsaVerifier
+                .verify(signer.public_key(), block.hash().as_bytes(), &vote)
+                .unwrap());
+            chain
+                .put_block_signers(
+                    &block.hash(),
+                    &[shell_core::BlockSignerEvidence {
+                        address,
+                        public_key: signer.public_key().to_vec(),
+                        signature: vote,
+                    }],
+                )
+                .unwrap();
+        }
         (db, source)
     }
     struct NoTrieReads(Arc<MemoryDb>);
@@ -850,9 +976,37 @@ mod recovery_tests {
         fn write_batch(&self, _: shell_storage::WriteBatch) -> Result<(), StorageError> {
             Err(StorageError::State("read-only".into()))
         }
-        fn scan_prefix(&self, _: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
-            Err(StorageError::State("read-only".into()))
+        fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+            if prefix.starts_with(b"BSIG") {
+                return self.0.scan_prefix(prefix);
+            }
+            Err(StorageError::State("live scan forbidden".into()))
         }
+    }
+    #[test]
+    fn full_seal_source_freezes_native_signer_across_registry_change_and_rejects_tampering() {
+        let (db, source) = fixture_profile(true);
+        assert_eq!(source.input.version, 2);
+        let chain = ChainStore::new(db.clone());
+        chain
+            .put_pubkey(&source.block().header.proposer, &[9; 1952])
+            .unwrap();
+        let before = db.scan_all().unwrap();
+        let frozen = ChainStore::new(Arc::new(NoTrieReads(db.clone())));
+        assert_eq!(
+            CanonicalProductionSource::restore(&frozen, source.identity())
+                .unwrap()
+                .identity(),
+            source.identity()
+        );
+        let mut value: serde_json::Value = serde_json::from_slice(source.identity()).unwrap();
+        let old = value["proposer_key"][0].as_u64().unwrap();
+        value["proposer_key"][0] = serde_json::json!(old ^ 1);
+        assert!(
+            CanonicalProductionSource::restore(&frozen, &serde_json::to_vec(&value).unwrap())
+                .is_err()
+        );
+        assert_eq!(db.scan_all().unwrap(), before);
     }
     #[test]
     fn restore_uses_authenticated_snapshot_not_current_keys_or_live_trie() {

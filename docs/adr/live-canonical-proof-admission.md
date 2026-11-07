@@ -79,3 +79,39 @@ across cancellation of `next_event` by the node event loop. Accepted source
 hash, receipts, accounts and two cold read-only proof replays must agree with
 native execution. This distinguishes actual broadcast intake from an
 unfinalized block returned directly in response to a sync request.
+
+## Full proposer signature profile
+
+Payload version 1 retains its exact sender-only encoding and native proposer
+cryptography. Version 2 requires the existing full `ProposerSealProof` alongside
+all ordered sender proofs; a missing seal, a seal attached to version 1, or an
+unknown version is rejected. The transport manifest remains version 1 and still
+describes opaque bounded bytes. Both peers need a consumer that understands the
+version 2 payload. Existing default-off production/admission flags and native
+activation parameters are unchanged.
+
+For a native ML-DSA-65 proposer, automatic capture freezes its public key and raw
+seal as version 2 inputs. Restoration checks retained native block-signer
+evidence rather than resampling a later authority key. The same checkpoint store
+generates and rechecks the raw header-hash signature graph plus header hashing;
+one untagged sender and proposer use 118 components. Existing 256 MiB checkpoint
+and payload limits remain, so this is a bounded profile, not indefinite capacity.
+
+Workers return an opaque exact-tuple proposer verifier only after full AIR
+verification. The serialized native import loop still selects the authority,
+loads its key, verifies header/timing/quorum rules and executes economics and
+transactions atomically. Only the final seal cryptography uses the matching
+proof token, with algorithm policy checked under the native parent registry.
+Changed key, header, seal or chain context has no native-crypto fallback. A
+reported `proved_proposer_signature` result is informational and cannot create
+an authorization token.
+
+The full regression uses fresh ML-DSA-65 sender/proposer keys kept in memory,
+automatic capture, a real shutdown/restart checkpoint, peer transfer and native
+import. It also replays the historical full proof after a separately labelled
+ordinary native successor changes current balances and nonce. That successor
+is a history control, not a second proof-admitted block. Bad proposer AIR with
+a correct outer hash and genuine raw signatures, invalid envelopes and an
+unauthorized header must refuse without native writes. Full validator-selection
+AIR, other proposer algorithms, multi-sender load and full fork/amendment
+acceptance remain separate work.

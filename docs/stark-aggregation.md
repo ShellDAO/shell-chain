@@ -220,6 +220,30 @@ full proposer AIR, multi-sender load behavior or a published/activated network.
 
 Design: [Live canonical admission](adr/live-canonical-proof-admission.md).
 
+The opt-in full signature profile adds ML-DSA-65 proposer-seal and header-hash
+AIR to the registered sender graph. Its payload version 2 requires a full seal;
+version 1 remains sender-only with native proposer verification. Current
+consumers on both peers are required for version 2. Native authority selection,
+algorithm policy, consensus, fees and atomic execution remain mandatory.
+
+Run `tests/e2e/mldsa-full-proof.sh run output` for a fresh isolated full-profile
+regression, or `verify output` to cold-recheck retained results. It requires the
+same Python 3, stable Rust and RocksDB prerequisites. The script creates fresh
+test accounts and test funds, keeps private keys only in memory, pauses a real
+producer through shutdown, resumes verified checkpoints and imports the full
+graph through ordinary peer intake. It checks native receipts/accounts, full
+read-only replay after current state changes, correctly hashed bad proposer AIR,
+missing/version-mismatched seals and native authority rejection. The later
+ordinary native block is an explicit historical-state control, not another
+proof-admitted block. Any failed assertion exits nonzero.
+
+Generating 118 components can take hours. The bound is six hours overall or
+30 minutes without component/admission progress, recorded in
+`network-full/progress.json`. Retain the output to resume or inspect its command
+receipts. The existing 256 MiB global checkpoint and per-payload bounds apply;
+multi-sender load, full validator-selection AIR, other algorithms and network
+activation are not established by this local profile.
+
 ## Registered prover activation
 
 The unreleased `prover_registry_height` schedule enables the canonical registry

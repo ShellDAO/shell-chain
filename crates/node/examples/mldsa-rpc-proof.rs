@@ -60,6 +60,7 @@ fn block_proof(
     }
     Ok(CanonicalSignatureBatchProof {
         version: 1,
+        proposer: None,
         transactions,
     })
 }

@@ -43,7 +43,12 @@ fn accounts(store: Arc<RocksDbStore>, block: &Block) -> Result<Value, Error> {
     }
     Ok(json!(rows))
 }
-fn prepare(out: &Path, automatic: bool, capture_on_production: bool) -> Result<(), Error> {
+fn prepare(
+    out: &Path,
+    automatic: bool,
+    capture_on_production: bool,
+    full: bool,
+) -> Result<(), Error> {
     if out.exists() {
         ensure(
             out.is_dir() && !out.symlink_metadata()?.file_type().is_symlink(),
@@ -60,7 +65,11 @@ fn prepare(out: &Path, automatic: bool, capture_on_production: bool) -> Result<(
         std::fs::create_dir(out)?;
     }
     let sender = MlDsaSigner::generate();
-    let proposer = DilithiumSigner::generate();
+    let proposer: Box<dyn Signer> = if full {
+        Box::new(MlDsaSigner::generate())
+    } else {
+        Box::new(DilithiumSigner::generate())
+    };
     let address = Address::from_public_key(sender.public_key(), sender.sig_type().as_u8());
     let authority = Address::from_public_key(proposer.public_key(), proposer.sig_type().as_u8());
     let recipient = Address::from([0x11; 32]);
@@ -128,7 +137,7 @@ fn prepare(out: &Path, automatic: bool, capture_on_production: bool) -> Result<(
     let mut wpoa = shell_consensus::WPoaConfig::from_poa(poa);
     wpoa.chain_id = 10;
     cfg.consensus = ConsensusEngineConfig::WPoa(wpoa);
-    let (node, _) = NodeBuilder::new(cfg, store.clone()).build()?;
+    let (mut node, _) = NodeBuilder::new(cfg, store.clone()).build()?;
     let tx = Transaction {
         chain_id: 10,
         nonce: 0,
@@ -146,7 +155,7 @@ fn prepare(out: &Path, automatic: bool, capture_on_production: bool) -> Result<(
     let signature = sender.sign(tx.signing_hash(sender.sig_type().as_u8()).as_bytes())?;
     let signed = SignedTransaction::new(address, tx, signature);
     node.handle_incoming_tx(signed, &MultiVerifier)?;
-    let block = node.produce_block(&proposer, 100)?;
+    let block = node.produce_block(proposer.as_ref(), 100)?;
     ensure(
         block.transactions.len() == 1 && block.system_transactions.len() == 1,
         "native production did not execute funded sender",
@@ -234,7 +243,7 @@ fn prepare(out: &Path, automatic: bool, capture_on_production: bool) -> Result<(
         )?;
         let mut advance = Vec::new();
         for _ in 0..129 {
-            advance.push(control.produce_block(&proposer, 100)?);
+            advance.push(control.produce_block(proposer.as_ref(), 100)?);
         }
         let last = advance.last().ok_or("advance absent")?;
         let mut account_view = block.clone();
@@ -246,6 +255,51 @@ fn prepare(out: &Path, automatic: bool, capture_on_production: bool) -> Result<(
         )?;
         stores.state.flush()?;
     }
+    if full {
+        // Model the real validator loop: an authenticated quorum vote may use a
+        // different randomized signature from the original block seal.
+        let mut round = shell_consensus::wpoa_state::WPoaRound::new(
+            block.number(),
+            0,
+            node.consensus.read().validator_weights(),
+        );
+        let _ = round.on_block_proposed(block.hash(), authority);
+        *node.wpoa_round.lock() = Some(round);
+        let vote = proposer.sign(block.hash().as_bytes())?;
+        let certificate = node
+            .handle_wpoa_vote(authority, block.hash(), block.number(), vote)
+            .ok_or("full fixture genuine quorum vote did not finalize")?;
+        ensure(
+            !certificate.is_empty() && node.canonical_production_status(block.hash())?.is_some(),
+            "full capture did not survive genuine native vote",
+        )?;
+        write(
+            &out.join("full-vote.json"),
+            &json!({"genuine_native_quorum_vote":true,"captured_seal_preserved":node.chain_store.get_block_by_hash(&block.hash())?.as_ref()==Some(&block),"capture_restored_after_vote":true}),
+        )?;
+        // A separately labelled ordinary native successor changes current state.
+        // It is not claimed as a second proof-admitted block.
+        node.config.canonical_proof_production = false;
+        let mut next = block.transactions[0].tx.clone();
+        next.nonce = 1;
+        let signature = sender.sign(next.signing_hash(sender.sig_type().as_u8()).as_bytes())?;
+        node.handle_incoming_tx(
+            SignedTransaction::new(address, next, signature),
+            &MultiVerifier,
+        )?;
+        let later = node.produce_block(proposer.as_ref(), 100)?;
+        ensure(
+            later.header.state_root != block.header.state_root,
+            "full history control did not change state",
+        )?;
+        write(&out.join("later-block.json"), &later)?;
+        write(
+            &out.join("later-control.json"),
+            &json!({"head":later.hash(),"state_root":later.header.state_root,"receipts":node.chain_store.get_receipts(&later.hash())?,"accounts":accounts(store.clone(), &later)?,"ordinary_native_successor_not_proof_admitted":true}),
+        )?;
+        store.flush()?;
+    }
+
     Ok(())
 }
 fn snapshot(out: &Path, role: &str) -> Result<Value, Error> {
@@ -371,9 +425,18 @@ fn main() -> Result<(), Error> {
     )?;
     let out = Path::new(&args[1]);
     match args[0].as_str() {
-        "prepare" => prepare(out, false, false),
-        "prepare-runtime" => prepare(out, true, false),
-        "prepare-production-hook" => prepare(out, false, true),
+        "prepare" => prepare(out, false, false, false),
+        "prepare-full" => prepare(out, false, true, true),
+        "full-pause" | "full-resume" | "full-bad-proposer" => {
+            tokio::runtime::Runtime::new()?.block_on(admission_runtime::full(out, &args[0]))
+        }
+        "full-verify" => admission_runtime::verify_full(out),
+        "full-snapshot" => admission_runtime::snapshot_full(out),
+        "full-history" | "full-history-verify" => {
+            admission_runtime::history_full(out, args[0] == "full-history")
+        }
+        "prepare-runtime" => prepare(out, true, false, false),
+        "prepare-production-hook" => prepare(out, false, true, false),
         "runtime-pause" | "runtime-resume" => {
             tokio::runtime::Runtime::new()?.block_on(runtime::run(out, args[0] == "runtime-pause"))
         }

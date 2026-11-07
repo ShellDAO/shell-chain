@@ -15,6 +15,11 @@ pub struct CanonicalProofReplay {
     pub state_root: ShellHash,
     pub receipts: Vec<TransactionReceipt>,
     pub proved_sender_signatures: usize,
+    #[serde(default, skip_serializing_if = "unproved_seal")]
+    pub proved_proposer_signature: bool,
+}
+fn unproved_seal(value: &bool) -> bool {
+    !*value
 }
 
 struct ReplaySignatureVerifier<'a>(Option<&'a VerifiedCanonicalSignatureBatch>);
@@ -220,6 +225,15 @@ impl<S: KvStore + 'static> Node<S> {
         parent: &Block,
         finalized_import: bool,
     ) -> Result<shell_core::BlockSignerEvidence, NodeError> {
+        self.verify_import_consensus_with_seal(block, parent, finalized_import, None)
+    }
+    fn verify_import_consensus_with_seal(
+        &self,
+        block: &Block,
+        parent: &Block,
+        finalized_import: bool,
+        proof: Option<&shell_stark_prover::proposer_seal::VerifiedProposerSeal>,
+    ) -> Result<shell_core::BlockSignerEvidence, NodeError> {
         let max_transactions = self.config.network_type.default_params().max_tx_per_block;
         if block.transactions.len() > max_transactions {
             return Err(NodeError::Startup(format!(
@@ -285,10 +299,18 @@ impl<S: KvStore + 'static> Node<S> {
             ))
         })?;
 
-        let verifier = MultiVerifier;
+        let native = MultiVerifier;
+        let verifier: &dyn Verifier = if let Some(proof) = proof {
+            if !proof.matches_block(block) || proof.chain_id() != self.config.chain_id {
+                return Err(NodeError::Startup("proposer proof context changed".into()));
+            }
+            proof
+        } else {
+            &native
+        };
         self.consensus
             .read()
-            .verify_seal(&block.header, seal, &pubkey, &verifier)?;
+            .verify_seal(&block.header, seal, &pubkey, verifier)?;
         self.known_authorities
             .write()
             .entry(*proposer)
@@ -970,11 +992,13 @@ impl<S: KvStore + 'static> Node<S> {
         )?;
         self.verify_incoming_witness_root(&block)?;
         self.verify_import_sig_aggregate_proof(&block)?;
-        let verified = verify_canonical_signature_batch(&view, &block, proof)
-            .map_err(|e| NodeError::Startup(format!("canonical sender proof: {e}")))?;
         let state = view.world_state()?;
         let registry = load_algorithm_registry(&state)
             .map_err(|e| NodeError::Startup(format!("proof replay algorithm registry: {e}")))?;
+        let verified = with_algorithm_registry_override(&registry, || {
+            verify_canonical_signature_batch(&view, &block, proof)
+        })
+        .map_err(|e| NodeError::Startup(format!("canonical signature proof: {e}")))?;
         let overlay = Arc::new(OverlayStore::new(view.store()).with_write_limit(64 * 1024 * 1024)?);
         let (receipts, settlements) = with_algorithm_registry_override(&registry, || {
             self.replay_fork_block_inner(&block, view.parent().state_root, overlay, Some(&verified))
@@ -991,6 +1015,7 @@ impl<S: KvStore + 'static> Node<S> {
             state_root: block.header.state_root,
             receipts,
             proved_sender_signatures: verified.len(),
+            proved_proposer_signature: verified.proposer_seal().is_some(),
         })
     }
 
@@ -1991,6 +2016,7 @@ impl<S: KvStore + 'static> Node<S> {
                     NodeError::Startup("proof import receipts unavailable".into())
                 })?,
                 proved_sender_signatures: verified.len(),
+                proved_proposer_signature: verified.proposer_seal().is_some(),
             })
         })
     }
@@ -2040,7 +2066,12 @@ impl<S: KvStore + 'static> Node<S> {
         // including below the live head, so a competing descendant can be replayed.
         if transition == BlockImportTransition::UnfinalizedFork {
             let parent = self.parent_for_import(&block)?;
-            let signer = self.verify_import_consensus(&block, &parent, finalized_import)?;
+            let signer = self.verify_import_consensus_with_seal(
+                &block,
+                &parent,
+                finalized_import,
+                signature_proof.and_then(|p| p.proposer_seal()),
+            )?;
             self.verify_import_economics(&block, &parent)?;
             self.verify_incoming_witness_root(&block)?;
             self.verify_import_sig_aggregate_proof(&block)?;
@@ -2079,7 +2110,12 @@ impl<S: KvStore + 'static> Node<S> {
         // number->hash mapping with a disconnected block.
         if transition == BlockImportTransition::NextHeightFork {
             let parent = self.parent_for_import(&block)?;
-            let signer = self.verify_import_consensus(&block, &parent, finalized_import)?;
+            let signer = self.verify_import_consensus_with_seal(
+                &block,
+                &parent,
+                finalized_import,
+                signature_proof.and_then(|p| p.proposer_seal()),
+            )?;
             self.verify_import_economics(&block, &parent)?;
             self.verify_incoming_witness_root(&block)?;
             self.verify_import_sig_aggregate_proof(&block)?;
@@ -2124,7 +2160,12 @@ impl<S: KvStore + 'static> Node<S> {
         // Verify consensus rules, including parent linkage, timestamp bounds,
         // and proposer seal.
         let parent = self.parent_for_import(&block)?;
-        let proposer_evidence = self.verify_import_consensus(&block, &parent, finalized_import)?;
+        let proposer_evidence = self.verify_import_consensus_with_seal(
+            &block,
+            &parent,
+            finalized_import,
+            signature_proof.and_then(|p| p.proposer_seal()),
+        )?;
         self.verify_import_economics(&block, &parent)?;
         self.verify_incoming_witness_root(&block)?;
         self.verify_import_sig_aggregate_proof(&block)?;
@@ -2730,6 +2771,7 @@ mod tests {
             .unwrap();
         let proof = CanonicalSignatureBatchProof {
             version: 1,
+            proposer: None,
             transactions: vec![],
         };
         let mut child = Block {
