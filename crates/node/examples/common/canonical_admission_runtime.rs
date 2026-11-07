@@ -23,6 +23,9 @@ struct Faults {
     release: Notify,
     chunks: AtomicUsize,
     manifest_override: RwLock<Option<CanonicalProofManifest>>,
+    hold_suffix: AtomicBool,
+    suffix_seen: AtomicBool,
+    release_suffix: Notify,
 }
 struct Provider {
     inner: Libp2pNetwork,
@@ -45,6 +48,13 @@ impl NetworkService for Provider {
                     *manifest = Some(replacement.clone());
                 }
             }
+        }
+        if (matches!(&m,NetworkMessage::BlockResponse{blocks,..} if blocks.first().is_some_and(|b|b.number()>=3))
+            || matches!(&m,NetworkMessage::NewBlock(block) if block.number()>=3))
+            && self.faults.hold_suffix.swap(false, Ordering::SeqCst)
+        {
+            self.faults.suffix_seen.store(true, Ordering::SeqCst);
+            self.faults.release_suffix.notified().await;
         }
         if let NetworkMessage::CanonicalProofChunkResponse {
             index,
@@ -92,6 +102,7 @@ impl Live {
         c: &fixture::Context,
         boot: Vec<String>,
         admission: bool,
+        production: bool,
         faults: Option<Arc<Faults>>,
     ) -> Result<Self, Error> {
         let stores = RocksDbStore::open_all(db, None)?;
@@ -103,6 +114,8 @@ impl Live {
         node.config.rpc_enabled = true;
         node.config.metrics.enabled = false;
         node.config.canonical_proof_admission = admission;
+        node.config.canonical_proof_production = production;
+        node.config.canonical_proof_component_budget = None;
         node.config.rpc = shell_rpc::RpcConfig {
             listen_addr: address,
             ws_addr: None,
@@ -334,6 +347,7 @@ pub(super) async fn run(
         &c,
         vec![],
         false,
+        false,
         Some(faults.clone()),
     )
     .await?;
@@ -342,6 +356,7 @@ pub(super) async fn run(
         &c,
         vec![provider.dial()],
         true,
+        false,
         None,
     )
     .await?;
@@ -445,4 +460,209 @@ pub(super) fn snapshot(out: &Path) -> Result<(), Error> {
         json!({"head":ChainStore::new(Arc::new(stores.state.clone())).get_head_hash()?,"canonical_digest":canonical_digest(&stores.state)?,"immutable_chunks":rows})
     );
     Ok(())
+}
+
+fn checkpoint_components(store: &impl KvStore, block: ShellHash) -> Result<usize, Error> {
+    let key = [
+        b"local/canonical-production/v1/certificates/".as_slice(),
+        block.as_bytes(),
+        b"/production/index",
+    ]
+    .concat();
+    let index: Value =
+        serde_json::from_slice(&store.get(&key)?.ok_or("source2 checkpoint index absent")?)?;
+    Ok(index["components"]
+        .as_object()
+        .ok_or("source2 components absent")?
+        .len())
+}
+fn sync_controls(
+    out: &Path,
+    receiver: Arc<RocksDbStore>,
+    provider: Arc<RocksDbStore>,
+) -> Result<Value, Error> {
+    let control: Value = read(&out.join("advance-control.json"))?;
+    let c: fixture::Context = read(&out.join("context.json"))?;
+    let candidate: Block = read(&out.join("candidate.json"))?;
+    let mut blocks = vec![candidate];
+    blocks.extend(read::<Vec<Block>>(&out.join("advance-blocks.json"))?);
+    let target = ChainStore::new(receiver.clone());
+    let source = ChainStore::new(provider);
+    let last = blocks.last().ok_or("empty native controls")?;
+    ensure(
+        source.get_head_hash()? == Some(last.hash()),
+        "provider native head changed during proving",
+    )?;
+    ensure(
+        target.get_head_hash()? == Some(last.hash())
+            && json!(last.hash()) == control["head"]
+            && json!(last.number()) == control["height"],
+        "native sync head differs from independent control",
+    )?;
+    ensure(
+        target.get_block_hash_by_number(0)? == source.get_block_hash_by_number(0)?,
+        "native genesis differs",
+    )?;
+    for block in &blocks {
+        ensure(
+            target.get_block_hash_by_number(block.number())? == Some(block.hash())
+                && target.get_block_by_hash(&block.hash())?.as_ref() == Some(block),
+            "canonical synchronized body/hash mismatch",
+        )?;
+        ensure(
+            target.get_receipts(&block.hash())? == source.get_receipts(&block.hash())?,
+            "synchronized persisted receipts differ from native control",
+        )?;
+    }
+    let mut current_view = blocks[0].clone();
+    current_view.header.state_root = last.header.state_root;
+    ensure(
+        json!(last.header.state_root) == control["root"]
+            && accounts(receiver.clone(), &current_view)? == control["accounts"],
+        "native sync root/accounts differ from independent control",
+    )?;
+    let result = json!({"head":last.hash(),"height":last.number(),"root":last.header.state_root,"canonical_bodies_and_receipts":blocks.len(),"accounts":accounts(receiver,&current_view)?,"source1":c.block});
+    Ok(result)
+}
+pub(super) async fn sustained_sync(out: &Path) -> Result<(), Error> {
+    let c: fixture::Context = read(&out.join("context.json"))?;
+    let blocks: Vec<Block> = read(&out.join("advance-blocks.json"))?;
+    let second = blocks.first().ok_or("second native block absent")?.clone();
+    let network = out.join("network");
+    ensure(
+        !network.join("sync-complete.json").exists(),
+        "sync already complete; use verify",
+    )?;
+    let initial_components = {
+        let stores = RocksDbStore::open_all(network.join("provider/db"), None)?;
+        checkpoint_components(&stores.state, second.hash())?
+    };
+    ensure(
+        (1..=61).contains(&initial_components),
+        "source2 captured checkpoint missing or invalid",
+    )?;
+    let faults = Arc::new(Faults::default());
+    faults.hold_suffix.store(true, Ordering::SeqCst);
+    let provider = Live::start(
+        &network.join("provider/db"),
+        &c,
+        vec![],
+        false,
+        true,
+        Some(faults.clone()),
+    )
+    .await?;
+    let receiver = Live::start(
+        &network.join("receiver/db"),
+        &c,
+        vec![provider.dial()],
+        true,
+        false,
+        None,
+    )
+    .await?;
+    let result=async {
+        let deadline=tokio::time::Instant::now()+Duration::from_secs(4*60*60);
+        let mut last_progress=tokio::time::Instant::now();
+        let mut previous=None;
+        loop {
+            ensure(!receiver.task.is_finished() && !provider.task.is_finished(),"sustained sync node exited")?;
+            let production=provider.call("admin_canonicalProofProduction",json!([second.hash()])).await?;
+            ensure(production["status"]["state"]!="failed",&format!("source2 producer failed: {production}"))?;
+            let components=checkpoint_components(provider.node.store.as_ref(),second.hash())?;
+            let head=receiver.node.chain_store.get_head_block()?.ok_or("receiver head absent")?;
+            let admission=receiver.call("admin_canonicalProofAdmission",json!([second.hash()])).await?;
+            ensure(admission["status"]["state"]!="failed",&format!("source2 admission failed: {admission}"))?;
+            let current=(components,head.number(),production["status"]["state"].clone(),admission["status"]["state"].clone());
+            if previous.as_ref()!=Some(&current) {
+                previous=Some(current);last_progress=tokio::time::Instant::now();
+                let progress=json!({"admission":admission,"source2":second.hash(),"checkpoint_components":components,"follower_height":head.number(),"producer":production,"suffix_held":faults.suffix_seen.load(Ordering::SeqCst)});
+                let temp=network.join("sync-progress.tmp");std::fs::write(&temp,serde_json::to_vec(&progress)?)?;std::fs::rename(temp,network.join("sync-progress.json"))?;
+                println!("source2 components={components}; follower height={}",head.number());
+            }
+            if faults.suffix_seen.load(Ordering::SeqCst) {
+                ensure(head.hash()==second.hash(),"suffix gate did not freeze independent parent2")?;
+                ensure(production["status"]["state"]=="complete" && components==61,"source2 graph incomplete")?;
+                let manifest:CanonicalProofManifest=serde_json::from_value(production["status"]["manifest"].clone())?;
+                let first_manifest:CanonicalProofManifest=read(&out.join("job/manifest.json"))?;
+                ensure(manifest.block_hash==second.hash() && manifest.payload_hash!=first_manifest.payload_hash,"source2 reused the first source graph")?;
+                ensure(initial_components==61 || production["status"]["reused"].as_u64().is_some_and(|n|n>=initial_components as u64),"retained source2 certificates were not rechecked")?;
+                let cache=shell_storage::CanonicalProofUploadStore::new(receiver.node.store.clone());
+                let bytes=cache.payload(&manifest.id())?;
+                let proof:shell_stark_prover::canonical_batch::CanonicalSignatureBatchProof=serde_json::from_slice(&bytes)?;
+                let before=canonical_digest(receiver.node.store.as_ref())?;
+                let node=receiver.node.clone();let hash=second.hash();
+                let replay=tokio::task::spawn_blocking(move||node.replay_canonical_transactions_with_proof(hash,hash,&proof)).await??;
+                ensure(canonical_digest(receiver.node.store.as_ref())?==before,"live source2 proof replay wrote native state")?;
+                ensure(replay.state_root==second.header.state_root && receiver.node.chain_store.get_receipts(&hash)?.as_ref()==Some(&replay.receipts),"source2 full replay differs from persisted execution")?;
+                {
+                    use std::io::Write;
+                    let path=network.join("source2-proof.json");
+                    if path.exists() { ensure(std::fs::read(path)?==bytes,"retained source2 proof conflicts")?; }
+                    else { let mut artifact=std::fs::OpenOptions::new().write(true).create_new(true).open(path)?; artifact.write_all(&bytes)?;artifact.sync_all()?; }
+                }
+                write(&network.join("source2-manifest.json"),&manifest)?;
+                write(&network.join("sync-height2-proof-replay.json"),&json!({"replay":replay,"native_unchanged":true,"suffix_delay_is_explicit_test_condition":true,"production":production}))?;
+                faults.release_suffix.notify_one();break;
+            }
+            ensure(tokio::time::Instant::now()<deadline && last_progress.elapsed()<Duration::from_secs(1800),"source2 proving/sync made no progress within its documented long-operation bound")?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let deadline=tokio::time::Instant::now()+Duration::from_secs(180);
+        while receiver.node.chain_store.get_head_block()?.ok_or("receiver head absent")?.number()<130 {
+            ensure(!receiver.task.is_finished() && !provider.task.is_finished(),"suffix sync node exited")?;
+            ensure(tokio::time::Instant::now()<deadline,"ordinary suffix sync failed to reach130")?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let result=sync_controls(out,receiver.node.store.clone(),provider.node.store.clone())?;
+        write(&network.join("sync-complete.json"),&result)?;
+        Ok::<_,Error>(())
+    }.await;
+    // Release a blocked response even on refusal before joining either node.
+    faults.release_suffix.notify_one();
+    let receiver_stop = receiver.stop().await;
+    let provider_stop = provider.stop().await;
+    result?;
+    receiver_stop?;
+    provider_stop?;
+    Ok(())
+}
+pub(super) fn verify_sync(out: &Path) -> Result<(), Error> {
+    let network = out.join("network");
+    let receiver = RocksDbStore::open_all(network.join("receiver/db"), None)?;
+    let provider = RocksDbStore::open_all(network.join("provider/db"), None)?;
+    let before = digest(&receiver.state)?;
+    let store = Arc::new(receiver.state);
+    let result = sync_controls(out, store.clone(), Arc::new(provider.state))?;
+    let c: fixture::Context = read(&out.join("context.json"))?;
+    let blocks: Vec<Block> = read(&out.join("advance-blocks.json"))?;
+    let second = blocks.first().ok_or("source2 absent")?;
+    let proof = read(&network.join("source2-proof.json"))?;
+    let node = fixture::node(store.clone(), c.authority, &c.authority_key)?;
+    let head = node
+        .chain_store
+        .get_head_hash()?
+        .ok_or("cold head absent")?;
+    let error = node
+        .replay_canonical_transactions_with_proof(head, second.hash(), &proof)
+        .unwrap_err()
+        .to_string();
+    ensure(
+        error.contains("retention bound"),
+        &format!("unexpected bounded historical result: {error}"),
+    )?;
+    ensure(
+        digest(store.as_ref())? == before,
+        "cold native sync verification wrote state",
+    )?;
+    let mut path = network.join("sync-verified.json");
+    let mut i = 2;
+    while path.exists() {
+        path = network.join(format!("sync-verified-{i}.json"));
+        i += 1;
+    }
+    write(
+        &path,
+        &json!({"native":result,"expected_historical_refusal":error,"native_unchanged":true}),
+    )
 }

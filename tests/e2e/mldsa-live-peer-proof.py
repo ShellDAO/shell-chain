@@ -65,7 +65,17 @@ def verify():
 
 if mode == "verify":
     assert (out / "network/complete.json").exists(), "automatic native admission incomplete"
-    verify()
+    if (out / "network/sync-complete.json").exists():
+        run("cold-sync-verify", [fixture, "peer-admission-sync-verify", out])
+    else:
+        verify()
+    sys.exit(0)
+if (out / "network/result.json").exists():
+    if not (out / "network/sync-complete.json").exists():
+        run("peer-admission-sync", [fixture, "peer-admission-sync", out])
+    run("cold-sync-verify", [fixture, "peer-admission-sync-verify", out])
+    run("cold-sync-verify", [fixture, "peer-admission-sync-verify", out])
+    print((out / "network/sync-complete.json").read_text())
     sys.exit(0)
 if not (out / "network/initial.json").exists():
     assert not (out / "network").exists(), "partial network preparation retained; inspect receipts"
@@ -92,4 +102,7 @@ result = {"stale_verifier_and_forged_verified_cache_refused": True, "correct_has
 path = out / "network/result.json"
 assert not path.exists(), "network result already exists; use verify"
 save(path, result)
-print(json.dumps(result))
+run("peer-admission-sync", [fixture, "peer-admission-sync", out])
+run("cold-sync-verify", [fixture, "peer-admission-sync-verify", out])
+run("cold-sync-verify", [fixture, "peer-admission-sync-verify", out])
+print((out / "network/sync-complete.json").read_text())

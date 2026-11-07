@@ -39,7 +39,16 @@ importer. The worker never writes canonical state. Shutdown joins a running
 worker and releases its claim without committing its result. Restart rechecks
 all cryptography, including when local metadata says verified. If native commit
 preceded status persistence, recover through canonical replay and receipts;
-do not replay execution or emit a second import event.
+do not replay execution or emit a second import event. After either a fresh
+commit or recovered canonical completion, explicitly request the next native
+height. A generic periodic probe begins at finality plus one to discover missing
+certificates; on an unfinalized chain it can repeatedly retrieve an older
+ancestor instead of continuing past the proof-backed child.
+An unfinalized requested suffix arrives through normal `NewBlock` validation,
+followed by an empty response for its original nonce. After that exact requested
+height advances the native head, request the next height with a new nonce so
+the older empty response cannot end synchronization. Unsolicited announcements
+do not trigger this continuation.
 
 ## Limits
 
@@ -49,3 +58,15 @@ native. It introduces no settlement reward, fee, consensus schedule or activatio
 change. The retained-body cap and large raw graphs limit throughput; there is no
 automatic eviction. Public release and network activation require separate
 acceptance. The live peer regression is linked from the STARK guide.
+## Sustained peer regression
+
+The same two real nodes continue after the first admitted child. Enable automatic
+production on the provider with no component budget, recheck the retained second
+job's certificates and generate its remaining mathematical graph. Ordinary peer
+intake imports that distinct signed child and then the signed empty suffix to
+local height 130. The test holds the suffix explicitly while it replays the
+complete second graph against native head 2 without writes. Cold final checks
+compare every native body, canonical hash, receipt and latest account; history
+outside the existing 128-block bound is an expected refusal, not a successful
+historical proof. This exercises two eligible sender blocks within the retained
+job/cache limits; it does not establish indefinite capacity or throughput.

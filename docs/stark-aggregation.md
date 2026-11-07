@@ -187,10 +187,24 @@ proof replays against independent native receipts and balances. A second isolate
 receiver rejects a correctly hashed graph with damaged key AIR despite genuine
 raw signatures, without canonical writes. It also cold-rechecks a stale verifier
 record and a forged local verified-cache receipt; neither authorizes admission.
-Private keys are
-not persisted; command receipts and output remain available. Any assertion
-failure exits nonzero. `verify` rechecks an existing import without regenerating
-certificates. This limited profile does not establish fork/amendment handling,
+The provider then automatically resumes the captured second sender job and
+publishes its distinct complete graph. The follower receives and verifies it
+through normal peer intake. A deliberately held suffix response freezes the
+follower at height 2 for a full read-only proof replay; releasing that response
+allows ordinary synchronization through the remaining signed empty blocks to
+local height 130. Cold checks compare every canonical body/hash/receipt and
+latest accounts with independent native execution. A historical proof query
+outside the existing 128-block parent-view bound must refuse without writes;
+the earlier height-2 replay records the complete mathematical verification.
+
+Private keys are not persisted; command receipts and output remain available.
+Proving can take hours. Checkpoint component counts and follower height are
+written to `network/sync-progress.json`; allow four hours overall and up to
+30 minutes without component/head progress before the test refuses. These are
+explicit local test bounds and accelerated heights. `run` resumes the retained
+second job without regenerating the completed first graph. `verify` cold-checks
+the latest completed native state without generating certificates. Any assertion
+failure exits nonzero. This limited profile does not establish fork/amendment handling,
 full proposer AIR, multi-sender load behavior or a published/activated network.
 
 Design: [Live canonical admission](adr/live-canonical-proof-admission.md).

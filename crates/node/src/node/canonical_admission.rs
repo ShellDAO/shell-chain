@@ -491,7 +491,7 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(())
     }
     /// The only live canonical mutation point: invoke from Node.run, never a worker.
-    pub(super) fn finish_live_candidate(&self) -> Option<CanonicalProofReplay> {
+    pub(super) fn finish_live_candidate(&self) -> Option<(CanonicalProofReplay, bool)> {
         let pair = {
             let mut runtime = self.live_admission.lock();
             let worker = runtime.worker.as_ref()?;
@@ -560,7 +560,7 @@ impl<S: KvStore + 'static> Node<S> {
         if let Err(e) = self.save_admission(&r) {
             warn!(%e,"candidate status not persisted; native state remains authoritative");
         }
-        success.filter(|_| new_commit)
+        success.map(|replay| (replay, new_commit))
     }
     pub(super) async fn shutdown_live_candidate(&self) {
         let worker = self.live_admission.lock().worker.take();

@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Continue ordinary synchronization from the next native height after a
+  proof-backed child is committed or recovered. Preserve finality certificate
+  discovery, continue requested unfinalized announcements with a new nonce,
+  and avoid duplicate import events on recovery. The live peer
+  regression verifies a distinct second sender graph, read-only replay, native
+  synchronization through height 130 and cold database checks.
+
 ### Added
 
 - Add opt-in ordinary peer admission for complete registered ML-DSA sender proofs, with bounded manifest discovery, interrupted transfer recovery and event-loop native commit.

@@ -871,7 +871,8 @@ impl<S: KvStore + 'static> Node<S> {
                     let completed = if self.config.canonical_proof_admission {
                         proof_admission_work(||self.finish_live_candidate())
                     } else { None };
-                    if let Some(result)=completed{
+                    if let Some((result,new_commit))=completed{
+                        if new_commit {
                         let num=self.chain_store.get_header_by_hash(&result.block)?.ok_or(NodeError::NoGenesis)?.number;
                         production_readiness.note_import_progress(num);
                         self.metrics.blocks_imported.inc();self.metrics.block_height.set(num as i64);
@@ -882,8 +883,15 @@ impl<S: KvStore + 'static> Node<S> {
                         if let Some(header)=self.chain_store.get_header_by_hash(&result.block)?{
                             let _=block_event_tx.send(BlockEvent::NewBlock{header,receipts:result.receipts,removed:false});
                         }
+                        }
+                        // Resume beyond the committed child. A generic suffix probe starts
+                        // at finality+1 and can repeatedly retrieve an unfinalized ancestor.
                         sync_requested=false;sync_request=None;
-                        sync_retry_attempts_without_progress=0;sync_retry_timer.reset_after(Duration::from_millis(1));
+                        if self.request_missing_blocks(&network,None,&mut sync_requested,&mut sync_request,"canonical-proof-next-block").await {
+                            production_readiness.note_sync_requested(self.head_number(),std::time::Instant::now(),catch_up_timeout,"canonical-proof-next-block");
+                        }
+                        sync_retry_attempts_without_progress=0;
+                        sync_retry_timer.reset_after(Duration::from_secs(SYNC_RETRY_BASE_INTERVAL_SECS));
                     }
                     let action=self.drive_canonical_proof_pull();
                     self.send_canonical_proof_action(&network,action).await;
@@ -1354,6 +1362,11 @@ impl<S: KvStore + 'static> Node<S> {
                                                 );
                                                 continue;
                                             }
+                                            // Unfinalized requested blocks arrive as NewBlock,
+                                            // followed by an empty response for the old nonce.
+                                            let continue_sync = sync_requested && sync_request.as_ref().is_some_and(|request|
+                                                request.start_number == imported_number
+                                                    && request.peer.as_ref().is_none_or(|expected| expected == &peer));
                                             if production_readiness.state()
                                                 != ProductionReadinessState::CatchingUp
                                             {
@@ -1369,6 +1382,15 @@ impl<S: KvStore + 'static> Node<S> {
                                                 SYNC_RETRY_BASE_INTERVAL_SECS,
                                             ));
                                             production_readiness.note_import_progress(imported_number);
+                                            if continue_sync && self.request_missing_blocks(
+                                                &network, Some(&peer), &mut sync_requested,
+                                                &mut sync_request, "new-block-next-batch",
+                                            ).await {
+                                                production_readiness.note_sync_requested(
+                                                    self.head_number(), std::time::Instant::now(),
+                                                    catch_up_timeout, "new-block-next-batch",
+                                                );
+                                            }
                                             self.metrics.blocks_imported.inc();
                                             self.metrics.block_height.set(imported_number as i64);
                                             self.metrics.update_finality(
