@@ -6402,6 +6402,7 @@ name = "shell-node"
 version = "0.27.14"
 dependencies = [
  "alloy-rlp",
+ "async-trait",
  "hex",
  "http-body-util",
  "hyper",

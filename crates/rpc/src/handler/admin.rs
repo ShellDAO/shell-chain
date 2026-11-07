@@ -6,6 +6,43 @@ use super::*;
 
 #[jsonrpsee::core::async_trait]
 impl<S: KvStore + 'static> AdminApiServer for RpcHandler<S> {
+    async fn fetch_canonical_proof(
+        &self,
+        peer: String,
+        manifest: shell_storage::CanonicalProofManifest,
+    ) -> Result<shell_storage::CanonicalProofFetchStatus, ErrorObjectOwned> {
+        self.canonical_proof_backend()?
+            .fetch(peer, manifest)
+            .map_err(proof_error)
+    }
+    async fn canonical_proof_fetch_status(
+        &self,
+        id: ShellHash,
+        generation: Option<u64>,
+    ) -> Result<Option<shell_storage::CanonicalProofFetchStatus>, ErrorObjectOwned> {
+        self.canonical_proof_backend()?
+            .fetch_status(id, generation)
+            .map_err(proof_error)
+    }
+    async fn canonical_proof_attempt_status(
+        &self,
+        id: ShellHash,
+        generation: u64,
+    ) -> Result<shell_storage::CanonicalProofUploadStatus, ErrorObjectOwned> {
+        self.canonical_proof_backend()?
+            .attempt_status(id, generation)
+            .map_err(proof_error)
+    }
+    async fn get_canonical_proof_attempt_chunk(
+        &self,
+        id: ShellHash,
+        generation: u64,
+        index: u32,
+    ) -> Result<Bytes, ErrorObjectOwned> {
+        self.canonical_proof_backend()?
+            .attempt_chunk(id, generation, index)
+            .map_err(proof_error)
+    }
     async fn begin_canonical_proof(
         &self,
         manifest: shell_storage::CanonicalProofManifest,

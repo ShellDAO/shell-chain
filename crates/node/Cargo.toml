@@ -32,6 +32,7 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 hyper = { workspace = true, features = ["client"] }
 libp2p.workspace = true
 shell-network = { path = "../network", features = ["libp2p"] }
@@ -51,4 +52,8 @@ required-features = ["rocksdb"]
 
 [[example]]
 name = "mldsa-rpc-proof"
+required-features = ["rocksdb"]
+
+[[example]]
+name = "mldsa-p2p-proof"
 required-features = ["rocksdb"]

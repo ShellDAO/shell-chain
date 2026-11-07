@@ -3,6 +3,7 @@
 mod block_importer;
 pub use block_importer::CanonicalProofReplay;
 mod block_producer;
+mod canonical_proof_peer;
 mod canonical_proof_rpc;
 mod chain_state_machine;
 mod challenge_lifecycle;
@@ -242,6 +243,7 @@ pub struct Node<S: KvStore + 'static> {
     pub store: Arc<S>,
     pub chain_store: Arc<ChainStore<S>>,
     canonical_proof_uploads: Arc<shell_storage::CanonicalProofUploadStore<S>>,
+    canonical_proof_peer: parking_lot::Mutex<canonical_proof_peer::CanonicalProofPeerState>,
     legacy_replay: parking_lot::Mutex<Option<block_importer::LegacyReplay<S>>>,
     legacy_backfill_dependency: parking_lot::Mutex<Option<u64>>,
     pub world_state: Arc<RwLock<WorldState<S>>>,
@@ -836,6 +838,10 @@ impl<'a, N: NetworkService + ?Sized> NetworkInterface<'a, N> {
         self.inner.peer_count().await
     }
 
+    fn supports_canonical_proof_transfer(&self) -> bool {
+        self.inner.supports_canonical_proof_transfer()
+    }
+
     fn peer_count_handle(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.inner.peer_count_handle()
     }
@@ -1006,6 +1012,7 @@ impl<S: KvStore + 'static> Node<S> {
             store,
             chain_store,
             canonical_proof_uploads,
+            canonical_proof_peer: parking_lot::Mutex::new(Default::default()),
             legacy_replay: parking_lot::Mutex::new(None),
             legacy_backfill_dependency: parking_lot::Mutex::new(None),
             world_state,
@@ -2197,7 +2204,10 @@ mod tests {
         setup_node_with_store(authority, Arc::new(MemoryDb::new()))
     }
 
-    fn setup_node_with_store<S: KvStore + 'static>(authority: Address, db: Arc<S>) -> Node<S> {
+    pub(super) fn setup_node_with_store<S: KvStore + 'static>(
+        authority: Address,
+        db: Arc<S>,
+    ) -> Node<S> {
         let chain_store = Arc::new(ChainStore::new(db.clone()));
         let world_state = Arc::new(RwLock::new(WorldState::new(db.clone())));
         let consensus: Arc<RwLock<dyn ConsensusEngine>> = Arc::new(RwLock::new(PoaEngine::new(

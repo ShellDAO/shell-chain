@@ -43,6 +43,12 @@ pub trait NetworkService: Send + Sync {
         self.broadcast(msg).await
     }
 
+    /// True only when proof frames use a dedicated authenticated unicast protocol
+    /// with no compatibility broadcast fallback.
+    fn supports_canonical_proof_transfer(&self) -> bool {
+        false
+    }
+
     /// Wait for the next network event.
     /// Returns `None` if the network has shut down.
     async fn next_event(&mut self) -> Option<NetworkEvent>;

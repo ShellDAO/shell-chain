@@ -8,44 +8,13 @@ use shell_primitives::{blake3_hash, ShellHash};
 use std::sync::Arc;
 
 pub const CANONICAL_PROOF_CACHE_PREFIX: &[u8] = b"local/canonical-proof-upload/v1/";
-pub const CANONICAL_PROOF_CHUNK_BYTES: usize = 256 * 1024;
-pub const MAX_CANONICAL_PROOF_BYTES: u64 = 256 * 1024 * 1024;
+pub use shell_core::{
+    CanonicalProofManifest, CANONICAL_PROOF_CHUNK_BYTES, MAX_CANONICAL_PROOF_BYTES,
+};
 pub const MAX_CANONICAL_PROOF_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_CANONICAL_PROOF_OBJECTS: usize = 8;
 const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CanonicalProofManifest {
-    pub version: u8,
-    pub chain_id: u64,
-    pub genesis_hash: ShellHash,
-    pub block_hash: ShellHash,
-    pub total_bytes: u64,
-    pub payload_hash: ShellHash,
-}
-
-impl CanonicalProofManifest {
-    pub fn validate(&self) -> Result<(), StorageError> {
-        if self.version != 1
-            || self.total_bytes == 0
-            || self.total_bytes > MAX_CANONICAL_PROOF_BYTES
-        {
-            return Err(invalid("canonical proof manifest version/size limit"));
-        }
-        Ok(())
-    }
-    pub fn id(&self) -> ShellHash {
-        let mut bytes = b"SHELL_CANONICAL_PROOF_UPLOAD_V1\0".to_vec();
-        bytes.push(self.version);
-        bytes.extend(self.chain_id.to_be_bytes());
-        bytes.extend(self.genesis_hash.as_bytes());
-        bytes.extend(self.block_hash.as_bytes());
-        bytes.extend(self.total_bytes.to_be_bytes());
-        bytes.extend(self.payload_hash.as_bytes());
-        blake3_hash(&bytes)
-    }
-}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CanonicalProofUploadState {
@@ -60,6 +29,8 @@ pub enum CanonicalProofUploadState {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CanonicalProofUploadStatus {
     pub version: u8,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub generation: u64,
     pub proof_id: ShellHash,
     pub manifest: CanonicalProofManifest,
     pub state: CanonicalProofUploadState,
@@ -69,12 +40,39 @@ pub struct CanonicalProofUploadStatus {
     pub result: Option<serde_json::Value>,
     pub error: Option<String>,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CanonicalProofFetchState {
+    Receiving,
+    Verifying,
+    Complete,
+    Failed,
+    Paused,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CanonicalProofFetchStatus {
+    pub version: u8,
+    pub proof_id: ShellHash,
+    pub generation: u64,
+    pub peer: String,
+    pub nonce: u64,
+    pub next_chunk: u32,
+    pub received_bytes: u64,
+    pub state: CanonicalProofFetchState,
+    pub error: Option<String>,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Index {
     version: u8,
     reserved_bytes: u64,
     objects: Vec<ShellHash>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    archived_attempts: u64,
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 fn invalid(text: &str) -> StorageError {
     StorageError::InvalidInput(text.into())
@@ -93,6 +91,38 @@ fn object_key(id: &ShellHash) -> Vec<u8> {
 }
 fn chunk_key(id: &ShellHash, index: u32) -> Vec<u8> {
     key(&[b"data/".as_slice(), id.as_bytes(), &index.to_be_bytes()].concat())
+}
+
+fn generation_chunk_key(id: &ShellHash, generation: u64, index: u32) -> Vec<u8> {
+    if generation == 0 {
+        return chunk_key(id, index);
+    }
+    key(&[
+        b"generation-data/".as_slice(),
+        id.as_bytes(),
+        &generation.to_be_bytes(),
+        &index.to_be_bytes(),
+    ]
+    .concat())
+}
+fn attempt_key(id: &ShellHash, generation: u64) -> Vec<u8> {
+    key(&[
+        b"attempt/".as_slice(),
+        id.as_bytes(),
+        &generation.to_be_bytes(),
+    ]
+    .concat())
+}
+fn fetch_key(id: &ShellHash) -> Vec<u8> {
+    key(&[b"fetch/".as_slice(), id.as_bytes()].concat())
+}
+fn fetch_attempt_key(id: &ShellHash, generation: u64) -> Vec<u8> {
+    key(&[
+        b"fetch-attempt/".as_slice(),
+        id.as_bytes(),
+        &generation.to_be_bytes(),
+    ]
+    .concat())
 }
 
 /// All writers for one node share this store/lock. Chunk and progress writes are
@@ -115,10 +145,11 @@ impl<S: KvStore> CanonicalProofUploadStore<S> {
                 .get(&object_key(id))?
                 .ok_or_else(|| invalid("canonical proof upload not found"))?,
         )?;
-        status.manifest.validate()?;
+        status.manifest.validate().map_err(|e| invalid(&e))?;
         if status.version != 1
             || status.proof_id != *id
             || status.manifest.id() != *id
+            || status.generation >= MAX_CANONICAL_PROOF_OBJECTS as u64
             || status.received_bytes > status.manifest.total_bytes
             || status.next_chunk as u64
                 != status
@@ -133,7 +164,7 @@ impl<S: KvStore> CanonicalProofUploadStore<S> {
         &self,
         manifest: CanonicalProofManifest,
     ) -> Result<CanonicalProofUploadStatus, StorageError> {
-        manifest.validate()?;
+        manifest.validate().map_err(|e| invalid(&e))?;
         let _guard = self.verifying.lock();
         let id = manifest.id();
         if self.store.get(&object_key(&id))?.is_some() {
@@ -145,12 +176,15 @@ impl<S: KvStore> CanonicalProofUploadStore<S> {
                 version: 1,
                 reserved_bytes: 0,
                 objects: vec![],
+                archived_attempts: 0,
             },
         };
         let unique: std::collections::HashSet<_> = index.objects.iter().collect();
         if index.version != 1
             || unique.len() != index.objects.len()
-            || index.objects.len() >= MAX_CANONICAL_PROOF_OBJECTS
+            || (index.objects.len() as u64)
+                .checked_add(index.archived_attempts)
+                .is_none_or(|n| n >= MAX_CANONICAL_PROOF_OBJECTS as u64)
             || index
                 .reserved_bytes
                 .checked_add(manifest.total_bytes)
@@ -162,6 +196,7 @@ impl<S: KvStore> CanonicalProofUploadStore<S> {
         index.objects.push(id);
         let status = CanonicalProofUploadStatus {
             version: 1,
+            generation: 0,
             proof_id: id,
             manifest,
             state: CanonicalProofUploadState::Uploading,
@@ -189,7 +224,12 @@ impl<S: KvStore> CanonicalProofUploadStore<S> {
         let _guard = self.verifying.lock();
         let mut status = self.status(id)?;
         if index < status.next_chunk {
-            if self.store.get(&chunk_key(id, index))?.as_deref() != Some(data) {
+            if self
+                .store
+                .get(&generation_chunk_key(id, status.generation, index))?
+                .as_deref()
+                != Some(data)
+            {
                 return Err(invalid("canonical proof conflicting retransmission"));
             }
             return Ok(status);
@@ -208,18 +248,202 @@ impl<S: KvStore> CanonicalProofUploadStore<S> {
             status.state = CanonicalProofUploadState::Ready;
         }
         let mut batch = WriteBatch::new();
-        batch.put(chunk_key(id, index), data.to_vec());
+        batch.put(
+            generation_chunk_key(id, status.generation, index),
+            data.to_vec(),
+        );
         batch.put(object_key(id), encode(&status)?);
         self.store.write_batch(batch)?;
         Ok(status)
     }
     pub fn chunk(&self, id: &ShellHash, index: u32) -> Result<Vec<u8>, StorageError> {
-        if index >= self.status(id)?.next_chunk {
+        self.attempt_chunk(id, self.status(id)?.generation, index)
+    }
+    pub fn attempt_status(
+        &self,
+        id: &ShellHash,
+        generation: u64,
+    ) -> Result<CanonicalProofUploadStatus, StorageError> {
+        let current = self.status(id)?;
+        if current.generation == generation {
+            return Ok(current);
+        }
+        let bytes = self
+            .store
+            .get(&attempt_key(id, generation))?
+            .ok_or_else(|| invalid("canonical proof attempt unavailable"))?;
+        let status: CanonicalProofUploadStatus = decode(&bytes)?;
+        if status.version != 1
+            || status.proof_id != *id
+            || status.manifest != current.manifest
+            || status.generation != generation
+            || generation >= current.generation
+            || status.received_bytes > status.manifest.total_bytes
+            || status.next_chunk as u64
+                != status
+                    .received_bytes
+                    .div_ceil(CANONICAL_PROOF_CHUNK_BYTES as u64)
+        {
+            return Err(invalid("canonical proof attempt metadata inconsistent"));
+        }
+        Ok(status)
+    }
+    pub fn attempt_chunk(
+        &self,
+        id: &ShellHash,
+        generation: u64,
+        index: u32,
+    ) -> Result<Vec<u8>, StorageError> {
+        let status = self.attempt_status(id, generation)?;
+        if index >= status.next_chunk {
             return Err(invalid("canonical proof chunk unavailable"));
         }
         self.store
-            .get(&chunk_key(id, index))?
+            .get(&generation_chunk_key(id, generation, index))?
             .ok_or_else(|| invalid("canonical proof chunk missing"))
+    }
+    pub fn restart_corrupt(
+        &self,
+        id: &ShellHash,
+    ) -> Result<CanonicalProofUploadStatus, StorageError> {
+        let worker = self.verifying.lock();
+        if worker.is_some() {
+            return Err(invalid("canonical proof verifier busy"));
+        }
+        let mut status = self.status(id)?;
+        if status.state != CanonicalProofUploadState::Rejected {
+            return Err(invalid("canonical proof attempt is not rejected"));
+        }
+        match self.payload(id) {
+            Err(StorageError::InvalidInput(message))
+                if message == "canonical proof payload hash mismatch" => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(invalid(
+                    "canonical proof content is intact; use explicit verification recheck",
+                ))
+            }
+        }
+        let mut index: Index = decode(
+            &self
+                .store
+                .get(&key(b"index"))?
+                .ok_or_else(|| invalid("canonical proof cache index missing"))?,
+        )?;
+        let reserved = index
+            .reserved_bytes
+            .checked_add(status.manifest.total_bytes)
+            .ok_or_else(|| invalid("canonical proof reservation overflow"))?;
+        let archived = index
+            .archived_attempts
+            .checked_add(1)
+            .ok_or_else(|| invalid("canonical proof archive overflow"))?;
+        if index.version != 1
+            || !index.objects.contains(id)
+            || (index.objects.len() as u64)
+                .checked_add(archived)
+                .is_none_or(|n| n > MAX_CANONICAL_PROOF_OBJECTS as u64)
+            || reserved > MAX_CANONICAL_PROOF_CACHE_BYTES
+        {
+            return Err(invalid("canonical proof cache reservation limit"));
+        }
+        let generation = status
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("canonical proof generation overflow"))?;
+        if self
+            .store
+            .get(&attempt_key(id, status.generation))?
+            .is_some()
+        {
+            return Err(invalid("canonical proof archive already exists"));
+        }
+        let mut batch = WriteBatch::new();
+        batch.put(attempt_key(id, status.generation), encode(&status)?);
+        if let Some(fetch) = self.store.get(&fetch_key(id))? {
+            batch.put(fetch_attempt_key(id, status.generation), fetch);
+        }
+        status.generation = generation;
+        status.state = CanonicalProofUploadState::Uploading;
+        status.received_bytes = 0;
+        status.next_chunk = 0;
+        status.result = None;
+        status.error = None;
+        index.reserved_bytes = reserved;
+        index.archived_attempts = archived;
+        batch.put(key(b"index"), encode(&index)?);
+        batch.put(object_key(id), encode(&status)?);
+        self.store.write_batch(batch)?;
+        Ok(status)
+    }
+    pub fn fetch_status(
+        &self,
+        id: &ShellHash,
+        generation: Option<u64>,
+    ) -> Result<Option<CanonicalProofFetchStatus>, StorageError> {
+        let current = self.status(id)?;
+        let record = match generation {
+            Some(generation) if generation != current.generation => {
+                fetch_attempt_key(id, generation)
+            }
+            _ => fetch_key(id),
+        };
+        let status = self
+            .store
+            .get(&record)?
+            .map(|bytes| decode::<CanonicalProofFetchStatus>(&bytes))
+            .transpose()?;
+        if let Some(ref status) = status {
+            // A crash after archiving but before the next request leaves the last
+            // persisted nonce in the preceding generation. Never lose that nonce.
+            if generation == Some(current.generation) && status.generation < current.generation {
+                return Ok(None);
+            }
+            if status.version != 1
+                || status.proof_id != *id
+                || status.generation > current.generation
+                || generation.is_some_and(|g| g != status.generation)
+                || status.peer.is_empty()
+                || status.peer.len() > 128
+                || status.nonce == 0
+                || status.received_bytes > current.manifest.total_bytes
+                || status
+                    .error
+                    .as_ref()
+                    .is_some_and(|e| e.chars().count() > 2048)
+            {
+                return Err(invalid("canonical proof fetch metadata inconsistent"));
+            }
+        }
+        Ok(status)
+    }
+    pub fn save_fetch_status(
+        &self,
+        status: &CanonicalProofFetchStatus,
+    ) -> Result<(), StorageError> {
+        let _guard = self.verifying.lock();
+        let current = self.status(&status.proof_id)?;
+        if status.version != 1
+            || status.generation != current.generation
+            || status.peer.is_empty()
+            || status.peer.len() > 128
+            || status.nonce == 0
+            || status.next_chunk != current.next_chunk
+            || status.received_bytes != current.received_bytes
+            || status
+                .error
+                .as_ref()
+                .is_some_and(|e| e.chars().count() > 2048)
+            || (status.state == CanonicalProofFetchState::Complete
+                && current.state != CanonicalProofUploadState::Verified)
+        {
+            return Err(invalid("canonical proof fetch metadata inconsistent"));
+        }
+        self.store
+            .put(&fetch_key(&status.proof_id), &encode(status)?)
+    }
+    pub fn verification_in_flight(&self, id: &ShellHash) -> bool {
+        *self.verifying.lock() == Some(*id)
     }
     /// True only for a newly claimed worker. A persisted Verifying state can
     /// be reclaimed after process restart, but not while its worker is alive.
@@ -523,5 +747,180 @@ mod tests {
             assert_eq!(cache.status(&id).unwrap().verification_attempts, 1);
         }
         println!("canonical proof upload store retained at {}", dir.display());
+    }
+    fn reject_corrupt<S: KvStore>(cache: &CanonicalProofUploadStore<S>, tag: u8) -> ShellHash {
+        let id = cache.begin(manifest(b"a", tag)).unwrap().proof_id;
+        cache.append(&id, 0, b"b").unwrap();
+        cache.claim(&id, false).unwrap();
+        let error = cache.payload(&id).unwrap_err().to_string();
+        cache.complete(&id, Err(error)).unwrap();
+        id
+    }
+    #[test]
+    fn canonical_proof_upload_corrupt_generation_archive_and_recovery_keep_all_bytes() {
+        let db = Arc::new(MemoryDb::new());
+        let cache = CanonicalProofUploadStore::new(db.clone());
+        let id = reject_corrupt(&cache, 7);
+        let rejected = cache.status(&id).unwrap();
+        assert!(!serde_json::to_value(&rejected)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("generation"));
+        let failed = CanonicalProofFetchStatus {
+            version: 1,
+            proof_id: id,
+            generation: 0,
+            peer: "peer-a".into(),
+            nonce: 1,
+            next_chunk: 1,
+            received_bytes: 1,
+            state: CanonicalProofFetchState::Failed,
+            error: Some("hash mismatch".into()),
+        };
+        cache.save_fetch_status(&failed).unwrap();
+        let raw = db.get(&chunk_key(&id, 0)).unwrap();
+        let fresh = cache.restart_corrupt(&id).unwrap();
+        assert_eq!(fresh.generation, 1);
+        assert_eq!(fresh.received_bytes, 0);
+        assert_eq!(fresh.verification_attempts, 1);
+        assert_eq!(cache.attempt_status(&id, 0).unwrap(), rejected);
+        assert_eq!(cache.attempt_chunk(&id, 0, 0).unwrap(), b"b");
+        assert_eq!(cache.fetch_status(&id, Some(0)).unwrap(), Some(failed));
+        assert_eq!(db.get(&chunk_key(&id, 0)).unwrap(), raw);
+        let before = db.scan_all().unwrap();
+        assert!(cache.restart_corrupt(&id).is_err());
+        assert_eq!(db.scan_all().unwrap(), before);
+        cache.append(&id, 0, b"a").unwrap();
+        cache.claim(&id, false).unwrap();
+        assert_eq!(cache.payload(&id).unwrap(), b"a");
+        cache
+            .complete(&id, Ok(serde_json::json!({"receipt":"informational"})))
+            .unwrap();
+        drop(cache);
+        let cache = CanonicalProofUploadStore::new(db.clone());
+        assert_eq!(cache.status(&id).unwrap().generation, 1);
+        assert_eq!(cache.attempt_chunk(&id, 0, 0).unwrap(), b"b");
+        assert_eq!(cache.chunk(&id, 0).unwrap(), b"a");
+        let before = db.scan_all().unwrap();
+        assert!(cache.restart_corrupt(&id).is_err());
+        assert_eq!(db.scan_all().unwrap(), before);
+        assert!(cache.attempt_status(&id, 2).is_err());
+    }
+    #[test]
+    fn canonical_proof_upload_retry_reserves_failed_data_and_refuses_intact_invalid_proofs() {
+        for full_bytes in [false, true] {
+            let db = Arc::new(MemoryDb::new());
+            let cache = CanonicalProofUploadStore::new(db.clone());
+            let id = reject_corrupt(&cache, 1);
+            if full_bytes {
+                let mut m = manifest(b"a", 2);
+                m.total_bytes = MAX_CANONICAL_PROOF_BYTES;
+                cache.begin(m).unwrap();
+                let mut m = manifest(b"a", 3);
+                m.total_bytes = MAX_CANONICAL_PROOF_BYTES - 1;
+                cache.begin(m).unwrap();
+            } else {
+                for tag in 2..=8 {
+                    cache.begin(manifest(b"a", tag)).unwrap();
+                }
+            }
+            let before = db.scan_all().unwrap();
+            assert!(cache.restart_corrupt(&id).is_err());
+            assert_eq!(db.scan_all().unwrap(), before);
+        }
+        let db = Arc::new(MemoryDb::new());
+        let cache = CanonicalProofUploadStore::new(db.clone());
+        let id = cache.begin(manifest(b"a", 1)).unwrap().proof_id;
+        cache.append(&id, 0, b"a").unwrap();
+        cache.claim(&id, false).unwrap();
+        cache
+            .complete(&id, Err("canonical proof payload hash mismatch".into()))
+            .unwrap();
+        let before = db.scan_all().unwrap();
+        assert!(cache.restart_corrupt(&id).is_err());
+        assert_eq!(db.scan_all().unwrap(), before);
+    }
+    #[test]
+    #[cfg(feature = "rocksdb")]
+    fn canonical_proof_upload_archive_survives_native_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "shell-canonical-proof-archive-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let id;
+        {
+            let stores = crate::RocksDbStore::open_all(&dir, None).unwrap();
+            let cache = CanonicalProofUploadStore::new(Arc::new(stores.state));
+            id = reject_corrupt(&cache, 9);
+            cache.restart_corrupt(&id).unwrap();
+            cache.append(&id, 0, b"a").unwrap();
+        }
+        {
+            let stores = crate::RocksDbStore::open_all(&dir, None).unwrap();
+            let cache = CanonicalProofUploadStore::new(Arc::new(stores.state));
+            assert_eq!(cache.status(&id).unwrap().generation, 1);
+            assert_eq!(cache.payload(&id).unwrap(), b"a");
+            assert_eq!(cache.attempt_chunk(&id, 0, 0).unwrap(), b"b");
+            cache.claim(&id, false).unwrap();
+            cache
+                .complete(&id, Ok(serde_json::json!({"saved":true})))
+                .unwrap();
+        }
+        {
+            let stores = crate::RocksDbStore::open_all(&dir, None).unwrap();
+            let cache = CanonicalProofUploadStore::new(Arc::new(stores.state));
+            assert_eq!(
+                cache.status(&id).unwrap().state,
+                CanonicalProofUploadState::Verified
+            );
+            assert_eq!(
+                cache.attempt_status(&id, 0).unwrap().state,
+                CanonicalProofUploadState::Rejected
+            );
+        }
+        println!("canonical proof upload store retained at {}", dir.display());
+    }
+    #[test]
+    fn canonical_proof_upload_archive_crash_window_preserves_last_issued_nonce() {
+        let db = Arc::new(MemoryDb::new());
+        let cache = CanonicalProofUploadStore::new(db.clone());
+        let id = reject_corrupt(&cache, 3);
+        let prior = CanonicalProofFetchStatus {
+            version: 1,
+            proof_id: id,
+            generation: 0,
+            peer: "peer".into(),
+            nonce: 91,
+            next_chunk: 1,
+            received_bytes: 1,
+            state: CanonicalProofFetchState::Failed,
+            error: Some("bad hash".into()),
+        };
+        cache.save_fetch_status(&prior).unwrap();
+        cache.restart_corrupt(&id).unwrap();
+        drop(cache);
+        let cache = CanonicalProofUploadStore::new(db);
+        assert_eq!(cache.fetch_status(&id, None).unwrap(), Some(prior.clone()));
+        assert!(cache.fetch_status(&id, Some(1)).unwrap().is_none());
+        assert_eq!(
+            cache.fetch_status(&id, Some(0)).unwrap(),
+            Some(prior.clone())
+        );
+        let next = CanonicalProofFetchStatus {
+            generation: 1,
+            nonce: prior.nonce + 1,
+            next_chunk: 0,
+            received_bytes: 0,
+            state: CanonicalProofFetchState::Receiving,
+            error: None,
+            ..prior
+        };
+        cache.save_fetch_status(&next).unwrap();
+        assert_eq!(cache.fetch_status(&id, None).unwrap(), Some(next));
     }
 }

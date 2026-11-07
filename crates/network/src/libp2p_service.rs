@@ -35,6 +35,7 @@ use crate::service::NetworkService;
 
 const BOOTNODE_REDIAL_INTERVAL_SECS: u64 = 30;
 const DIRECT_MESSAGE_PROTOCOL: StreamProtocol = StreamProtocol::new("/shell/direct/1");
+const CANONICAL_PROOF_PROTOCOL: StreamProtocol = StreamProtocol::new("/shell/canonical-proof/1");
 const MAX_PENDING_DIRECT_MESSAGES: usize = 256;
 const MAX_PENDING_DIRECT_BYTES: usize = 2 * crate::message::MAX_MESSAGE_SIZE;
 const MAX_INBOUND_DIRECT_BYTES_PER_CONNECTION: usize = 2 * crate::message::MAX_MESSAGE_SIZE;
@@ -81,6 +82,7 @@ enum SwarmCommand {
 struct ShellBehaviour {
     gossipsub: gossipsub::Behaviour,
     direct_message: request_response::Behaviour<DirectMessageCodec>,
+    proof_chunks: request_response::Behaviour<DirectMessageCodec>,
     kademlia: Toggle<kad::Behaviour<kad::store::MemoryStore>>,
     mdns: Toggle<mdns::tokio::Behaviour>,
     identify: identify::Behaviour,
@@ -285,7 +287,9 @@ fn take_direct_message_fallback(
     if matches!(
         error,
         request_response::OutboundFailure::UnsupportedProtocols
-    ) {
+    ) && message.as_ref().is_some_and(|message| {
+        !crate::message::serialized_message_requires_canonical_proof_transport(&message.data)
+    }) {
         message
     } else {
         None
@@ -752,6 +756,16 @@ fn build_swarm_with_identity(
                     .with_max_concurrent_streams(max_concurrent_direct_streams(max_msg_size)),
             );
 
+            let proof_chunks = request_response::Behaviour::with_codec(
+                DirectMessageCodec {
+                    max_message_size: max_msg_size.min(crate::message::MAX_CONSENSUS_MESSAGE_SIZE),
+                },
+                [(CANONICAL_PROOF_PROTOCOL, ProtocolSupport::Full)],
+                request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(30))
+                    .with_max_concurrent_streams(4),
+            );
+
             let dcutr_behaviour: Option<dcutr::Behaviour> =
                 if enable_dcutr && relay_behaviour.is_some() {
                     Some(dcutr::Behaviour::new(peer_id))
@@ -782,6 +796,7 @@ fn build_swarm_with_identity(
             Ok(ShellBehaviour {
                 gossipsub,
                 direct_message,
+                proof_chunks,
                 kademlia: kademlia.into(),
                 mdns: mdns.into(),
                 identify,
@@ -884,6 +899,7 @@ struct SwarmLoopState {
     peer_tracker: crate::security::PeerTracker,
     peer_ban_list: crate::security::PeerBanList,
     pending_direct_messages: PendingDirectMessages,
+    pending_proof_chunks: PendingDirectMessages,
     explicit_mdns_peers: ExplicitMdnsPeers,
 }
 
@@ -898,6 +914,10 @@ impl SwarmLoopState {
             pending_direct_messages: PendingDirectMessages::new(
                 MAX_PENDING_DIRECT_MESSAGES,
                 MAX_PENDING_DIRECT_BYTES,
+            ),
+            pending_proof_chunks: PendingDirectMessages::new(
+                4,
+                2 * crate::message::MAX_CONSENSUS_MESSAGE_SIZE,
             ),
             explicit_mdns_peers: ExplicitMdnsPeers::new(config.max_peers),
         }
@@ -1026,17 +1046,20 @@ async fn swarm_loop(
                     }
                     Some(SwarmCommand::SendToPeer { peer, topic, data, byte_permit }) => {
                         let data: Arc<[u8]> = data.into();
+                        let proof=crate::message::serialized_message_requires_canonical_proof_transport(&data);
+                        let pending=if proof {&mut state.pending_proof_chunks} else {&mut state.pending_direct_messages};
                         match direct_message_admission(
-                            &state.pending_direct_messages,
+                            pending,
                             &loop_config.bandwidth,
                             data.len(),
                         ) {
                             DirectMessageAdmission::Send => {
-                                let request_id = swarm
-                                    .behaviour_mut()
-                                    .direct_message
-                                    .send_request(&peer, Arc::clone(&data));
-                                state.pending_direct_messages.insert(
+                                let request_id = if proof {
+                                    swarm.behaviour_mut().proof_chunks.send_request(&peer,Arc::clone(&data))
+                                } else {
+                                    swarm.behaviour_mut().direct_message.send_request(&peer,Arc::clone(&data))
+                                };
+                                pending.insert(
                                     request_id,
                                     PendingDirectMessage { topic, data },
                                 );
@@ -1159,6 +1182,7 @@ fn handle_swarm_event(
         peer_tracker,
         peer_ban_list,
         pending_direct_messages,
+        pending_proof_chunks,
         explicit_mdns_peers,
     } = state;
     match event {
@@ -1190,7 +1214,7 @@ fn handle_swarm_event(
 
             let peer = PeerId(source.to_string());
             match crate::message::deserialize_checked(&data, loop_config.max_msg_size) {
-                Ok(message) => {
+                Ok(message) if !message.requires_canonical_proof_transport() => {
                     if let Err(error) = try_forward_message_event(
                         event_tx,
                         &loop_config.event_byte_budget,
@@ -1203,6 +1227,11 @@ fn handle_swarm_event(
                             peer = %source,
                             "node event queue unavailable - dropping direct message"
                         );
+                    }
+                }
+                Ok(_) => {
+                    if peer_ban_list.record_violation(&peer) {
+                        let _ = swarm.disconnect_peer_id(source);
                     }
                 }
                 Err(error) => {
@@ -1271,6 +1300,68 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(ShellBehaviourEvent::DirectMessage(
             request_response::Event::ResponseSent { .. },
         )) => {}
+        SwarmEvent::Behaviour(ShellBehaviourEvent::ProofChunks(event)) => match event {
+            request_response::Event::Message {
+                peer: source,
+                message:
+                    request_response::Message::Request {
+                        request: data,
+                        channel,
+                        ..
+                    },
+                ..
+            } => {
+                let _ = swarm
+                    .behaviour_mut()
+                    .proof_chunks
+                    .send_response(channel, ());
+                if !loop_config.bandwidth.record_inbound(data.len() as u64) {
+                    return;
+                }
+                let peer = PeerId(source.to_string());
+                match crate::message::deserialize_checked(&data, loop_config.max_msg_size) {
+                    Ok(message) if message.requires_canonical_proof_transport() => {
+                        if let Err(error) = try_forward_message_event(
+                            event_tx,
+                            &loop_config.event_byte_budget,
+                            peer,
+                            message,
+                            data.len(),
+                        ) {
+                            debug!(?error, "canonical proof event queue unavailable");
+                        }
+                    }
+                    _ => {
+                        if peer_ban_list.record_violation(&peer) {
+                            let _ = swarm.disconnect_peer_id(source);
+                        }
+                    }
+                }
+            }
+            request_response::Event::Message {
+                message: request_response::Message::Response { request_id, .. },
+                ..
+            } => {
+                pending_proof_chunks.remove(&request_id);
+            }
+            request_response::Event::OutboundFailure {
+                request_id,
+                peer,
+                error,
+                ..
+            } => {
+                pending_proof_chunks.remove(&request_id);
+                debug!(%peer,%error,"canonical proof direct delivery failed; no gossip fallback");
+            }
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                if inbound_direct_message_is_peer_violation(&error)
+                    && peer_ban_list.record_violation(&PeerId(peer.to_string()))
+                {
+                    let _ = swarm.disconnect_peer_id(peer);
+                }
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        },
         // Gossipsub message received.
         SwarmEvent::Behaviour(ShellBehaviourEvent::Gossipsub(gossipsub::Event::Message {
             propagation_source,
@@ -1323,6 +1414,17 @@ fn handle_swarm_event(
             let peer = PeerId(propagation_source.to_string());
             match crate::message::deserialize_checked(&message.data, loop_config.max_msg_size) {
                 Ok(msg) => {
+                    if msg.requires_canonical_proof_transport() {
+                        swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .report_message_validation_result(
+                                &message_id,
+                                &propagation_source,
+                                gossipsub::MessageAcceptance::Reject,
+                            );
+                        return;
+                    }
                     if !message_matches_topic(
                         &msg,
                         &message.topic,
@@ -1752,6 +1854,12 @@ impl NetworkService for Libp2pNetwork {
     }
 
     async fn broadcast(&self, msg: NetworkMessage) -> Result<(), NetworkError> {
+        if msg.requires_canonical_proof_transport() {
+            return Err(NetworkError::Transport(
+                "canonical proof frames require dedicated unicast".into(),
+            ));
+        }
+
         let topic = topic_kind_for_message(&msg);
 
         let data = crate::message::serialize_checked(&msg, self.max_msg_size)?;
@@ -1793,6 +1901,10 @@ impl NetworkService for Libp2pNetwork {
             })
             .await
             .map_err(|_| NetworkError::ChannelClosed)
+    }
+
+    fn supports_canonical_proof_transfer(&self) -> bool {
+        true
     }
 
     async fn next_event(&mut self) -> Option<NetworkEvent> {
@@ -1969,6 +2081,33 @@ mod tests {
             max_msg_size: crate::message::MAX_MESSAGE_SIZE,
         };
         let target = Libp2pPeerId::random();
+        let proof = NetworkMessage::CanonicalProofChunkRequest {
+            version: 1,
+            proof_id: shell_primitives::ShellHash::ZERO,
+            index: 0,
+            nonce: 1,
+        };
+        assert!(network.broadcast(proof.clone()).await.is_err());
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        network
+            .send_to_peer(&PeerId(target.to_string()), proof)
+            .await
+            .unwrap();
+        let command = cmd_rx.recv().await.unwrap();
+        match command {
+            SwarmCommand::SendToPeer {
+                data, byte_permit, ..
+            } => {
+                assert!(
+                    crate::message::serialized_message_requires_canonical_proof_transport(&data)
+                );
+                drop(byte_permit);
+            }
+            _ => panic!("proof frame must be peer targeted"),
+        }
 
         network
             .send_to_peer(&PeerId(target.to_string()), NetworkMessage::Ping)
@@ -3099,5 +3238,96 @@ mod tests {
             swarm.is_ok(),
             "build_swarm should succeed with connection limits and relay"
         );
+    }
+    #[test]
+    fn canonical_proof_frames_never_take_legacy_gossip_fallback() {
+        let mut behaviour = request_response::Behaviour::with_codec(
+            DirectMessageCodec {
+                max_message_size: crate::message::MAX_CONSENSUS_MESSAGE_SIZE,
+            },
+            [(CANONICAL_PROOF_PROTOCOL, ProtocolSupport::Full)],
+            request_response::Config::default(),
+        );
+        let data: Arc<[u8]> = crate::message::serialize_checked(
+            &NetworkMessage::CanonicalProofChunkRequest {
+                version: 1,
+                proof_id: shell_primitives::ShellHash::ZERO,
+                index: 0,
+                nonce: 1,
+            },
+            crate::message::MAX_MESSAGE_SIZE,
+        )
+        .unwrap()
+        .into();
+        let request = behaviour.send_request(&Libp2pPeerId::random(), data.clone());
+        let mut pending = PendingDirectMessages::new(1, 1024);
+        pending.insert(
+            request,
+            PendingDirectMessage {
+                topic: TopicKind::Proofs,
+                data,
+            },
+        );
+        assert!(take_direct_message_fallback(
+            &mut pending,
+            request,
+            &request_response::OutboundFailure::UnsupportedProtocols
+        )
+        .is_none());
+        assert_eq!(pending.bytes, 0);
+        assert!(pending.messages.is_empty());
+    }
+    #[tokio::test]
+    async fn canonical_proof_gossip_is_rejected_before_node_event_forwarding() {
+        let config = NetworkConfig {
+            enable_mdns: false,
+            enable_kademlia: false,
+            ..Default::default()
+        };
+        let mut swarm = build_swarm(&config).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let security = PeerSecurityConfig::from(&config);
+        let loops = SwarmLoopConfig {
+            local_node_info: Arc::new(std::sync::RwLock::new(crate::LocalNodeInfo::default())),
+            peer_count: Arc::new(AtomicUsize::new(0)),
+            blocks_topic: IdentTopic::new(config.blocks_topic.clone()),
+            txs_topic: IdentTopic::new(config.txs_topic.clone()),
+            attestation_topic: IdentTopic::new(config.attestation_topic.clone()),
+            proofs_topic: IdentTopic::new(config.proofs_topic.clone()),
+            bandwidth: Arc::new(BandwidthTracker::new(0, 0)),
+            boot_nodes: vec![],
+            max_msg_size: config.effective_max_message_size(),
+            event_byte_budget: Arc::new(Semaphore::new(1024 * 1024)),
+            peer_security: security,
+        };
+        let mut state = SwarmLoopState::new(security);
+        let source = Libp2pPeerId::random();
+        let data = crate::message::serialize_checked(
+            &NetworkMessage::CanonicalProofChunkRequest {
+                version: 1,
+                proof_id: shell_primitives::ShellHash::ZERO,
+                index: 0,
+                nonce: 1,
+            },
+            config.effective_max_message_size(),
+        )
+        .unwrap();
+        let event =
+            SwarmEvent::Behaviour(ShellBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                propagation_source: source,
+                message_id: gossipsub::MessageId::from("proof-gossip"),
+                message: gossipsub::Message {
+                    source: Some(source),
+                    data,
+                    sequence_number: Some(1),
+                    topic: loops.proofs_topic.hash(),
+                },
+            }));
+        handle_swarm_event(event, &mut swarm, &tx, &loops, &mut state);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(loops.event_byte_budget.available_permits(), 1024 * 1024);
     }
 }

@@ -93,6 +93,21 @@ pub enum NetworkMessage {
     Ping,
     /// Pong response to ping.
     Pong,
+    /// Off-chain artifacts use the dedicated peer-authenticated protocol only.
+    CanonicalProofChunkRequest {
+        version: u8,
+        proof_id: ShellHash,
+        index: u32,
+        nonce: u64,
+    },
+    CanonicalProofChunkResponse {
+        version: u8,
+        proof_id: ShellHash,
+        index: u32,
+        nonce: u64,
+        data: Option<shell_primitives::Bytes>,
+        error: Option<String>,
+    },
     /// G5: Broadcast a STARK proof amendment for a previously sealed block.
     ///
     /// Sent by the `ProverService` after completing async proof generation.
@@ -189,6 +204,12 @@ pub enum NetworkTopic {
 }
 
 impl NetworkMessage {
+    pub fn requires_canonical_proof_transport(&self) -> bool {
+        matches!(
+            self,
+            Self::CanonicalProofChunkRequest { .. } | Self::CanonicalProofChunkResponse { .. }
+        )
+    }
     /// Maximum serialized size allowed for this specific message kind.
     pub fn max_serialized_size(&self) -> usize {
         match self {
@@ -202,10 +223,12 @@ impl NetworkMessage {
             | Self::EquivocationEvidence(_)
             | Self::ProofChallenge(_)
             | Self::ProofChallengeResponse(_)
+            | Self::CanonicalProofChunkResponse { .. }
             | Self::WPoaVote { .. }
             | Self::WPoaViewChange(_)
             | Self::CommitCertificate { .. } => MAX_CONSENSUS_MESSAGE_SIZE,
             Self::BlockRequest { .. }
+            | Self::CanonicalProofChunkRequest { .. }
             | Self::BodyRequest { .. }
             | Self::Ping
             | Self::Pong
@@ -230,6 +253,8 @@ impl NetworkMessage {
             | Self::WPoaViewChange(_)
             | Self::CommitCertificate { .. } => NetworkTopic::Attestation,
             Self::ProofAmendment { .. }
+            | Self::CanonicalProofChunkRequest { .. }
+            | Self::CanonicalProofChunkResponse { .. }
             | Self::ProofAck { .. }
             | Self::EquivocationEvidence(_)
             | Self::ProofChallenge(_)
@@ -302,6 +327,41 @@ pub fn serialize_checked(msg: &NetworkMessage, limit: usize) -> Result<Vec<u8>, 
 impl NetworkMessage {
     fn validate_semantics(&self) -> Result<(), NetworkError> {
         match self {
+            Self::CanonicalProofChunkRequest {
+                version,
+                index,
+                nonce,
+                ..
+            } if *version != 1
+                || *nonce == 0
+                || u64::from(*index)
+                    >= shell_core::MAX_CANONICAL_PROOF_BYTES
+                        .div_ceil(shell_core::CANONICAL_PROOF_CHUNK_BYTES as u64) =>
+            {
+                Err(NetworkError::Serialization(
+                    "canonical proof request version/index/nonce limit".into(),
+                ))
+            }
+            Self::CanonicalProofChunkResponse {
+                version,
+                index,
+                nonce,
+                data,
+                error,
+                ..
+            } if *version != 1
+                || *nonce == 0
+                || u64::from(*index)
+                    >= shell_core::MAX_CANONICAL_PROOF_BYTES
+                        .div_ceil(shell_core::CANONICAL_PROOF_CHUNK_BYTES as u64)
+                || !matches!((data,error),(Some(bytes),None)if !bytes.is_empty() && bytes.len()<=shell_core::CANONICAL_PROOF_CHUNK_BYTES)
+                    && !matches!((data,error),(None,Some(error))if !error.is_empty() && error.len()<=256) =>
+            {
+                Err(NetworkError::Serialization(
+                    "canonical proof response payload limit".into(),
+                ))
+            }
+
             Self::BlockRequest { count, .. } | Self::BodyRequest { count, .. }
                 if !(1..=MAX_RESPONSE_BLOCKS as u64).contains(count) =>
             {
@@ -502,18 +562,29 @@ fn serialized_message_size_limit(data: &[u8]) -> Option<usize> {
         | "EquivocationEvidence"
         | "ProofChallenge"
         | "ProofChallengeResponse"
+        | "CanonicalProofChunkResponse"
         | "WPoaVote"
         | "WPoaViewChange"
         | "CommitCertificate" => MAX_CONSENSUS_MESSAGE_SIZE,
-        "BlockRequest" | "BodyRequest" | "Ping" | "Pong" | "StorageCapability" => {
-            MAX_CONTROL_MESSAGE_SIZE
-        }
+        "BlockRequest"
+        | "BodyRequest"
+        | "Ping"
+        | "Pong"
+        | "StorageCapability"
+        | "CanonicalProofChunkRequest" => MAX_CONTROL_MESSAGE_SIZE,
         // Unknown variants will be rejected during deserialization, so cap them
         // at the control-message budget instead of spending the full raw limit.
         _ => MAX_CONTROL_MESSAGE_SIZE,
     })
 }
 
+#[cfg(any(test, feature = "libp2p"))]
+pub(crate) fn serialized_message_requires_canonical_proof_transport(data: &[u8]) -> bool {
+    matches!(
+        serialized_message_variant(data),
+        Some("CanonicalProofChunkRequest" | "CanonicalProofChunkResponse")
+    )
+}
 #[cfg(any(test, feature = "libp2p"))]
 pub(crate) fn serialized_message_uses_sequence_scoped_id(data: &[u8]) -> bool {
     matches!(
@@ -1196,6 +1267,77 @@ mod tests {
                 assert_eq!(view_change.signature, vec![1, 2, 3]);
             }
             other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+    #[test]
+    fn canonical_proof_frames_are_bounded_and_direct_only() {
+        let request = NetworkMessage::CanonicalProofChunkRequest {
+            version: 1,
+            proof_id: ShellHash::ZERO,
+            index: 0,
+            nonce: 1,
+        };
+        let encoded = serialize_checked(&request, MAX_MESSAGE_SIZE).unwrap();
+        assert!(serialized_message_requires_canonical_proof_transport(
+            &encoded
+        ));
+        assert!(deserialize_checked(&encoded, MAX_MESSAGE_SIZE)
+            .unwrap()
+            .requires_canonical_proof_transport());
+        assert_eq!(request.max_serialized_size(), MAX_CONTROL_MESSAGE_SIZE);
+        let data = shell_primitives::Bytes::from(vec![7; shell_core::CANONICAL_PROOF_CHUNK_BYTES]);
+        let response = NetworkMessage::CanonicalProofChunkResponse {
+            version: 1,
+            proof_id: ShellHash::ZERO,
+            index: 0,
+            nonce: 1,
+            data: Some(data),
+            error: None,
+        };
+        let encoded = serialize_checked(&response, MAX_MESSAGE_SIZE).unwrap();
+        assert!(encoded.len() < MAX_CONSENSUS_MESSAGE_SIZE);
+        assert!(deserialize_checked(&encoded, MAX_MESSAGE_SIZE).is_ok());
+        for (data, error) in [
+            (Some(shell_primitives::Bytes::new()), None),
+            (
+                Some(shell_primitives::Bytes::from(vec![
+                    0;
+                    shell_core::CANONICAL_PROOF_CHUNK_BYTES
+                        + 1
+                ])),
+                None,
+            ),
+            (None, None),
+            (None, Some("x".repeat(257))),
+            (
+                Some(shell_primitives::Bytes::from(vec![1])),
+                Some("x".into()),
+            ),
+        ] {
+            let bad = NetworkMessage::CanonicalProofChunkResponse {
+                version: 1,
+                proof_id: ShellHash::ZERO,
+                index: 0,
+                nonce: 1,
+                data,
+                error,
+            };
+            assert!(serialize_checked(&bad, MAX_MESSAGE_SIZE).is_err());
+            assert!(
+                deserialize_checked(&serde_json::to_vec(&bad).unwrap(), MAX_MESSAGE_SIZE).is_err()
+            );
+        }
+        for (version, index, nonce) in [(0, 0, 1), (1, 1024, 1), (1, 0, 0)] {
+            assert!(serialize_checked(
+                &NetworkMessage::CanonicalProofChunkRequest {
+                    version,
+                    proof_id: ShellHash::ZERO,
+                    index,
+                    nonce
+                },
+                MAX_MESSAGE_SIZE
+            )
+            .is_err());
         }
     }
 }

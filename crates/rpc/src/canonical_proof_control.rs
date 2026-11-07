@@ -5,6 +5,22 @@ use std::sync::Arc;
 /// Operator-only artifact intake. The node owns persistence and actual sender
 /// proof/replay verification; the RPC layer never manufactures verified results.
 pub trait CanonicalProofControl: Send + Sync {
+    fn fetch(
+        &self,
+        peer: String,
+        manifest: CanonicalProofManifest,
+    ) -> Result<shell_storage::CanonicalProofFetchStatus, String>;
+    fn fetch_status(
+        &self,
+        id: ShellHash,
+        generation: Option<u64>,
+    ) -> Result<Option<shell_storage::CanonicalProofFetchStatus>, String>;
+    fn attempt_status(
+        &self,
+        id: ShellHash,
+        generation: u64,
+    ) -> Result<CanonicalProofUploadStatus, String>;
+    fn attempt_chunk(&self, id: ShellHash, generation: u64, index: u32) -> Result<Bytes, String>;
     fn begin(&self, manifest: CanonicalProofManifest)
         -> Result<CanonicalProofUploadStatus, String>;
     fn append(

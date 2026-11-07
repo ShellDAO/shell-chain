@@ -55,6 +55,31 @@ pub struct PeerInfo {
 /// Admin namespace RPC API trait.
 #[rpc(server, namespace = "admin")]
 pub trait AdminApi {
+    #[method(name = "fetchCanonicalProof")]
+    async fn fetch_canonical_proof(
+        &self,
+        peer: String,
+        manifest: shell_storage::CanonicalProofManifest,
+    ) -> Result<shell_storage::CanonicalProofFetchStatus, jsonrpsee::types::ErrorObjectOwned>;
+    #[method(name = "canonicalProofFetchStatus")]
+    async fn canonical_proof_fetch_status(
+        &self,
+        id: shell_primitives::ShellHash,
+        generation: Option<u64>,
+    ) -> Result<Option<shell_storage::CanonicalProofFetchStatus>, jsonrpsee::types::ErrorObjectOwned>;
+    #[method(name = "canonicalProofAttemptStatus")]
+    async fn canonical_proof_attempt_status(
+        &self,
+        id: shell_primitives::ShellHash,
+        generation: u64,
+    ) -> Result<shell_storage::CanonicalProofUploadStatus, jsonrpsee::types::ErrorObjectOwned>;
+    #[method(name = "getCanonicalProofAttemptChunk")]
+    async fn get_canonical_proof_attempt_chunk(
+        &self,
+        id: shell_primitives::ShellHash,
+        generation: u64,
+        index: u32,
+    ) -> Result<shell_primitives::Bytes, jsonrpsee::types::ErrorObjectOwned>;
     #[method(name = "beginCanonicalProof")]
     async fn begin_canonical_proof(
         &self,

@@ -943,7 +943,7 @@ Resume from the returned `nextChunk` after a restart. These limits keep chunk
 requests below 2 MiB; they do not raise consensus-message limits.
 
 The receiver reserves at most 256 MiB per payload, 512 MiB across all payloads,
-and eight objects. Partial, successful and rejected uploads keep their
+and eight upload attempts across all objects. Partial, successful and rejected uploads keep their
 reservations and bytes; there is no automatic eviction or deletion. Status
 metadata is separate from canonical transaction state, and receipts are limited
 to 8 MiB. A full cache refuses new uploads. Budget disk and memory for the raw
@@ -989,3 +989,99 @@ Keep all inputs and artifacts.
 This operator interface does not alter `ProofAmendment`, P2P, fresh block
 admission, proposer seals, consensus proof rewards or activation schedules.
 Those consumers and public release/network acceptance remain separate work.
+
+## Strict peer transfer of retained proofs
+
+An administrator can fetch a complete manifest from an already connected peer
+using `admin_fetchCanonicalProof(peerId, manifest)`. Use the exact manifest
+returned by the proof provider's admin status and its live
+`admin_nodeInfo.id`. The receiver checks its own chain, genesis, canonical body
+and supported profile before allocating storage. The admin namespace and its
+existing API-key policy still apply. Ordinary defaults cannot initiate a pull,
+and unsolicited network data cannot create an upload.
+
+Both peers need `/shell/canonical-proof/1`, a dedicated request-response stream
+over the existing TCP/Noise transport. It negotiates separately from legacy
+peer messages and has no compatibility gossip fallback. Broadcasts and inbound
+gossip of these frames are rejected. The protocol transports data only; its
+transport acknowledgement does not certify the proof or authorize a reward.
+
+One pull runs per node. Each response must match the exact connected provider,
+proof ID, chunk index and outstanding persisted nonce. The next nonce commits
+before sending; an explicit resume uses a later nonce after restart. Only one
+chunk is outstanding, with at most two timeout retries. Disconnects and exhausted
+retries leave the data intact and report an interrupted or failed transfer.
+Providers serve only retained, verified artifacts whose source remains canonical.
+The existing bandwidth and event queue bounds still apply; the new stream also
+limits pending sends to four messages and 4 MiB. At most 256 connected identities
+are tracked for this transfer service. The 256 KiB raw chunk and 256 MiB payload
+ceiling remain unchanged. Responses remain limited to 2 MiB and requests to the
+existing 64 KiB control-message budget.
+
+Poll `admin_canonicalProofFetchStatus(proofId)` for network progress and
+`admin_canonicalProofStatus(proofId)` for the actual proof worker/result.
+Transfers move through `receiving`, `verifying`, `complete`, `failed` or `paused`.
+A status query after interruption reports a paused transfer without writing
+history. Restarting a node does not automatically download or repeat failed
+proof work: call `fetchCanonicalProof` again to resume explicitly. Complete
+local verified data may be reused; `verifyCanonicalProof(id, true)` requests
+fresh full mathematical verification and native replay.
+
+Received chunks become immutable before their whole-payload hash is known.
+If a provider supplies bytes with the wrong complete hash, an explicit new fetch
+archives the rejected generation and receives into a new generation under the
+same manifest. The bad bytes are not overwritten or erased. Both generations
+consume the full reservation and one attempt slot, within the same 512 MiB and
+eight-attempt limits. A correctly hashed but mathematically invalid artifact
+is not downloaded again automatically; use explicit verification recheck when
+its relevant inputs or verifier have changed.
+
+Generation zero reads the original stored format and omits the new generation
+field in ordinary upload status. Later generations appear explicitly. Inspect
+retained history with:
+
+| Method | Positional parameters | Result |
+| --- | --- | --- |
+| `admin_canonicalProofAttemptStatus` | proof ID, generation | Current or archived upload metadata |
+| `admin_getCanonicalProofAttemptChunk` | proof ID, generation, chunk index | Current or archived raw bytes |
+| `admin_canonicalProofFetchStatus` | proof ID, optional generation | Last transfer or archived transfer metadata |
+
+Archive inspection remains read-only and informational, including after a source
+ceases to be canonical. Fetching, appending, verification and network serving
+still enforce their canonical source checks. Old generation-zero files and
+manifest identities remain readable; older software may reject the extended
+nonzero-generation cache metadata. These are local artifact records outside
+canonical transaction state, not a chain migration.
+
+After generating the native Node and HTTP proof fixtures in the preceding
+sections, run from the repository root with a new output directory and an
+existing parent:
+
+```bash
+tests/e2e/mldsa-p2p-proof.sh transfer proof-dir/node proof-dir/rpc proof-dir/p2p
+tests/e2e/mldsa-p2p-proof.sh verify proof-dir/node proof-dir/rpc proof-dir/p2p
+```
+
+The entry needs the same Rust/C++/libclang toolchain and loopback TCP access.
+It clones the closed fixtures, then runs two real `Node.run` loops with fresh
+non-authority signers, independent Noise peer identities and no block-production
+authority. It tests a well-formed response with a wrong nonce and a third real
+peer's response with the correct nonce, interrupts and reopens the receiver at
+partial progress, and detects a provider's deliberately corrupted first chunk.
+An explicit retry retains the failed bytes, obtains the genuine graph in a new
+generation, and runs the complete sender verifier and native historical replay.
+A subsequent cold RPC recheck consumes the persisted received graph again.
+
+The native fixture, original graph and original HTTP proof files remain intact.
+`provider/native-db`, `receiver/native-db`, `context.json`, `manifest.json`,
+`security-result.json`, `partial-status.json`, `rejected-status.json`,
+`result.json` and recheck receipts remain in the output. Repeated successful
+`verify` calls retain the first receipt and add `recheck-N.json`. Failure exits
+nonzero and keeps the data for explicit RPC recovery; it does not overwrite an
+existing transfer directory.
+
+This path provides explicit retained-history artifact availability and receiving
+verification. Producers, `ProofAmendment`, fresh block admission, proposer
+crypto proofs, proof reward settlement and pruning authorization continue to
+use their existing separate paths. Public release and network activation
+remain separate requirements.

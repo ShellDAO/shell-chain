@@ -3,7 +3,7 @@ use shell_rpc::CanonicalProofControl;
 use shell_storage::{CanonicalProofManifest, CanonicalProofUploadStatus};
 
 impl<S: KvStore + 'static> Node<S> {
-    fn validate_proof_upload_source(
+    pub(super) fn validate_proof_upload_source(
         &self,
         manifest: &CanonicalProofManifest,
     ) -> Result<(), String> {
@@ -93,6 +93,35 @@ impl<S: KvStore + 'static> Node<S> {
     }
 }
 impl<S: KvStore + 'static> CanonicalProofControl for Node<S> {
+    fn fetch(
+        &self,
+        peer: String,
+        manifest: CanonicalProofManifest,
+    ) -> Result<shell_storage::CanonicalProofFetchStatus, String> {
+        self.start_canonical_proof_fetch(peer, manifest)
+    }
+    fn fetch_status(
+        &self,
+        id: ShellHash,
+        generation: Option<u64>,
+    ) -> Result<Option<shell_storage::CanonicalProofFetchStatus>, String> {
+        self.canonical_proof_fetch_status(id, generation)
+    }
+    fn attempt_status(
+        &self,
+        id: ShellHash,
+        generation: u64,
+    ) -> Result<CanonicalProofUploadStatus, String> {
+        self.canonical_proof_uploads
+            .attempt_status(&id, generation)
+            .map_err(|e| e.to_string())
+    }
+    fn attempt_chunk(&self, id: ShellHash, generation: u64, index: u32) -> Result<Bytes, String> {
+        self.canonical_proof_uploads
+            .attempt_chunk(&id, generation, index)
+            .map(Bytes::from)
+            .map_err(|e| e.to_string())
+    }
     fn begin(
         &self,
         manifest: CanonicalProofManifest,

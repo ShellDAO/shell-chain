@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add administrator-requested complete canonical proof fetches over a dedicated
+  peer-authenticated protocol with bounded chunks and no gossip fallback.
+  Bind responses to peer, proof, index and persisted nonce; resume partial
+  receives after restart and verify the complete graph through native replay.
+  Retain hash-corrupt generations under the same manifest while reserving quota
+  for a fresh attempt. Proof reward and block admission rules remain unchanged.
+
 - Add bounded, resumable complete sender-proof uploads through opt-in admin RPC.
   Persist chunks, progress and verification results; run full sender proof and
   native historical replay in a single background worker. The HTTP regression

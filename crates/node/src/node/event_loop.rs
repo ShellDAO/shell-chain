@@ -795,6 +795,9 @@ impl<S: KvStore + 'static> Node<S> {
             }
         }
 
+        let _canonical_proof_network =
+            self.activate_canonical_proof_network(network.supports_canonical_proof_transfer());
+        let mut canonical_proof_timer = interval(Duration::from_millis(100));
         while !*shutdown_rx.borrow() {
             let prover_ready = production_readiness.can_produce();
             self.prover_ready
@@ -820,6 +823,10 @@ impl<S: KvStore + 'static> Node<S> {
                 .set(self.pending_stark_settlements.lock().len() as i64);
 
             tokio::select! {
+                _=canonical_proof_timer.tick()=>{
+                    let action=self.drive_canonical_proof_pull();
+                    self.send_canonical_proof_action(&network,action).await;
+                }
                 Some(amendment) = prover_amendment_rx.recv(),
                     if production_readiness.can_produce()
                         && self.pending_stark_settlements.lock().len()
@@ -1776,6 +1783,10 @@ impl<S: KvStore + 'static> Node<S> {
                                 }
                                 // G5: Receive async STARK proof amendment from a prover node.
                                 // Deserialize, store via ProofAmendmentStore, log result.
+                                message @ (NetworkMessage::CanonicalProofChunkRequest {..}|NetworkMessage::CanonicalProofChunkResponse {..})=>{
+                                    let action=self.canonical_proof_message(&peer,message);
+                                    self.send_canonical_proof_action(&network,action).await;
+                                }
                                 NetworkMessage::ProofAmendment { block_hash, block_number, payload } => {
                                     debug!(%peer, block = block_number, "received ProofAmendment");
                                     let mut amendment = match shell_stark_prover::ProofAmendment::from_json(&payload) {
@@ -2356,6 +2367,7 @@ impl<S: KvStore + 'static> Node<S> {
                             }
                         }
                         Some(NetworkEvent::PeerConnected(peer)) => {
+                            self.canonical_proof_peer_connected(peer.clone());
                             info!(%peer, "peer connected");
                             // L4: re-advertise storage capability so newly connected peer knows.
                             {
@@ -2432,6 +2444,7 @@ impl<S: KvStore + 'static> Node<S> {
                             .await;
                         }
                         Some(NetworkEvent::PeerDisconnected(peer)) => {
+                            self.canonical_proof_peer_disconnected(&peer);
                             info!(%peer, "peer disconnected");
                             self.peer_caps.remove(&peer);
                             let peers = network.peer_count().await;
@@ -3238,7 +3251,7 @@ impl<S: KvStore + 'static> Node<S> {
             .map_err(NodeError::from)
     }
 
-    fn wall_clock_millis() -> u64 {
+    pub(super) fn wall_clock_millis() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
