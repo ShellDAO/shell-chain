@@ -240,6 +240,10 @@ pub struct NodeConfig {
     /// entries and stores the result in `BlockHeader::sig_aggregate_proof`.
     /// Off by default — generating a STARK proof per block is expensive (~150ms).
     pub enable_stark_aggregation: bool,
+    /// Opt-in full ML-DSA canonical sender certificates; separate from settlement.
+    pub canonical_proof_production: bool,
+    /// Maximum newly generated components per node process; None runs to completion.
+    pub canonical_proof_component_budget: Option<std::num::NonZeroUsize>,
     /// Maximum concurrent CPU proof jobs; results are handed off in source order.
     pub prover_max_concurrent_proofs: usize,
     /// Order of CPU proof computation; publication remains canonical.
@@ -306,6 +310,8 @@ impl NodeConfig {
             state_cache_size_mb: 64,
             parallel_pqvm: ParallelPqvmConfig::default(),
             enable_stark_aggregation: params.stark_aggregation,
+            canonical_proof_production: false,
+            canonical_proof_component_budget: None,
             prover_max_concurrent_proofs: 1,
             prover_priority: crate::ProvingPriority::Sequential,
             l2_stark_mode: L2StarkMode::Disabled,

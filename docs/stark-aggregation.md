@@ -52,6 +52,86 @@ check, using the same source mapper as the producer and L1 amendment validation.
 This fixes acceptance of foreign claims without assigning full-signature
 semantics to the accumulator proof or selecting a new proof carrier or schedule.
 
+## Automatic complete sender proofs (unreleased)
+
+A dedicated prover can opt into full ML-DSA-65 sender-certificate generation:
+
+```bash
+shell-node --datadir node-data run --config node.toml --db rocksdb \
+  --node-role prover --canonical-proof-production
+```
+
+Use a RocksDB-enabled build, a previously initialized node with an activated
+body-commitment schedule and its matching `node.toml` runtime configuration.
+An eligible canonical block contains 1–16 supported ML-DSA-65 user transactions
+and only gas-reward system transactions. The supported profile requires
+parent-registered keys, default account validation, transaction types 0–3 and
+signing payloads within the existing 4096-byte hash limit. AA, first-use key
+registration and other signature algorithms require separate producer work.
+After normal production or import,
+the node captures the signed body and parent account/key witnesses. Startup
+also captures an eligible current head. One background worker generates the
+complete mathematical graph when normal prover readiness permits work.
+
+The feature defaults off. Its `[consensus]` configuration keys are
+`canonical_proof_production` and optional nonzero
+`canonical_proof_component_budget`; explicit CLI values take precedence.
+`--canonical-proof-production=false` disables a configured producer. Validator
+roles without proving capability and a budget without production mode are
+rejected before startup. The budget counts new certificates per process;
+restarting resumes and cryptographically rechecks retained certificates.
+Shutdown and readiness changes pause between certificates, so shutdown may
+wait for the current expensive certificate to finish.
+
+The native database retains at most two jobs with a global 256 MiB logical
+key/value checkpoint limit (64 KiB reserved for status updates). Captured
+sources are bounded to 4 MiB. Completed, failed and stale jobs remain retained;
+there is no automatic deletion or rotation. Capacity refusal leaves normal
+canonical execution intact. A raw graph can exceed these quotas even for an
+eligible block. Use a separate prover database and account for the
+existing 512 MiB raw proof-cache limit plus database/backend overhead.
+
+With the `admin` namespace enabled, query
+`admin_canonicalProofProduction` with the block hash. It returns `status`, the
+captured `block` and `nativeExecutionVerified: false`. A complete job exposes a
+manifest; use its ID with `admin_canonicalProofStatus` and
+`admin_getCanonicalProofChunk` to retrieve bounded chunks. Configure the normal
+RPC API-key protection before exposing admin methods. The cache is `ready`:
+a follower must independently verify the full mathematics, canonical context,
+native consensus and execution before accepting the block. A producer status
+or stored completion flag never authorizes acceptance.
+
+Recovery authenticates captured MPT witnesses against independently retained
+canonical headers and rechecks the committed body and raw signatures. It does
+not substitute the current registry or account for the historical parent.
+These retained inputs support long proving jobs after live state changes and
+historical undo metadata expires. Canonical remapping refuses stale sources.
+Headers and canonical mappings must remain available. This producer does not
+alter the legacy 512-entry accumulator schedule, settlement rewards, pruning,
+activation heights, amendment carrier or peer admission rules.
+
+Run the expensive standalone regression with Python 3, stable Rust and the
+repository's RocksDB C/C++/libclang prerequisites:
+
+```bash
+tests/e2e/mldsa-automatic-proof.sh run proof-output
+tests/e2e/mldsa-automatic-proof.sh verify proof-output
+```
+
+It creates fresh funded test accounts in memory, pauses actual `Node.run`
+production after three certificates, imports 129 further native blocks, and
+cold resumes the remaining 58. A further process dispatches the second job
+captured by ordinary import and pauses after one newly generated certificate.
+It downloads the complete first graph through authenticated
+RPC and checks independent CLI import and two cold proof-backed replays against
+native execution. Accelerated heights and a widened local future-time window
+are explicit test conditions. Private keys are not saved. Keep the output;
+repeated runs retain checkpoints and command receipts, and failed assertions
+exit nonzero. `verify` rechecks existing output without generating certificates.
+This source feature is not a published binary or network activation.
+
+Design: [Automatic canonical production](adr/automatic-canonical-proof-production.md).
+
 ## Registered prover activation
 
 The unreleased `prover_registry_height` schedule enables the canonical registry

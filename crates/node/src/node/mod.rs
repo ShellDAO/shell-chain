@@ -3,6 +3,7 @@
 mod block_importer;
 pub use block_importer::CanonicalProofReplay;
 mod block_producer;
+mod canonical_production;
 mod canonical_proof_peer;
 mod canonical_proof_rpc;
 mod chain_state_machine;
@@ -243,6 +244,7 @@ pub struct Node<S: KvStore + 'static> {
     pub store: Arc<S>,
     pub chain_store: Arc<ChainStore<S>>,
     canonical_proof_uploads: Arc<shell_storage::CanonicalProofUploadStore<S>>,
+    canonical_production: Arc<canonical_production::CanonicalProductionStore<S>>,
     canonical_proof_peer: parking_lot::Mutex<canonical_proof_peer::CanonicalProofPeerState>,
     legacy_replay: parking_lot::Mutex<Option<block_importer::LegacyReplay<S>>>,
     legacy_backfill_dependency: parking_lot::Mutex<Option<u64>>,
@@ -1007,11 +1009,15 @@ impl<S: KvStore + 'static> Node<S> {
 
         let canonical_proof_uploads =
             Arc::new(shell_storage::CanonicalProofUploadStore::new(store.clone()));
+        let canonical_production = Arc::new(canonical_production::CanonicalProductionStore::new(
+            store.clone(),
+        ));
         let node = Self {
             config,
             store,
             chain_store,
             canonical_proof_uploads,
+            canonical_production,
             canonical_proof_peer: parking_lot::Mutex::new(Default::default()),
             legacy_replay: parking_lot::Mutex::new(None),
             legacy_backfill_dependency: parking_lot::Mutex::new(None),

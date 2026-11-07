@@ -68,6 +68,8 @@ pub struct P2pSection {
 pub struct ConsensusSection {
     pub engine: Option<String>,
     pub enable_stark_aggregation: Option<bool>,
+    pub canonical_proof_production: Option<bool>,
+    pub canonical_proof_component_budget: Option<std::num::NonZeroUsize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -358,5 +360,25 @@ listen_addr = "0.0.0.0:9100"
             .or(config.metrics.listen_addr)
             .unwrap_or_else(|| "127.0.0.1:9090".to_string());
         assert_eq!(effective, "127.0.0.1:9090");
+    }
+    #[test]
+    fn canonical_production_config_budget_is_nonzero_and_optional() {
+        let config: ShellConfig = toml::from_str(
+            "[consensus]\ncanonical_proof_production=true\ncanonical_proof_component_budget=3\n",
+        )
+        .unwrap();
+        assert_eq!(config.consensus.canonical_proof_production, Some(true));
+        assert_eq!(
+            config
+                .consensus
+                .canonical_proof_component_budget
+                .unwrap()
+                .get(),
+            3
+        );
+        assert!(
+            toml::from_str::<ShellConfig>("[consensus]\ncanonical_proof_component_budget=0\n")
+                .is_err()
+        );
     }
 }

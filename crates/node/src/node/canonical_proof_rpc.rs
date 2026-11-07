@@ -24,6 +24,9 @@ impl<S: KvStore + 'static> Node<S> {
         {
             return Err("canonical proof chain/genesis identity mismatch".into());
         }
+        if self.production_manifest_source(manifest)? {
+            return Ok(());
+        }
         let block = self
             .chain_store
             .get_block_by_hash(&manifest.block_hash)
@@ -93,6 +96,9 @@ impl<S: KvStore + 'static> Node<S> {
     }
 }
 impl<S: KvStore + 'static> CanonicalProofControl for Node<S> {
+    fn production(&self, block: ShellHash) -> Result<Option<serde_json::Value>, String> {
+        self.canonical_production_status(block)
+    }
     fn fetch(
         &self,
         peer: String,

@@ -242,6 +242,12 @@ enum Commands {
         /// dedicated prover or validator-prover node when proof work is needed.
         #[arg(long, default_value = "false", default_missing_value = "true", num_args = 0..=1, action = clap::ArgAction::Set)]
         enable_stark_aggregation: bool,
+        /// Automatically generate full canonical ML-DSA sender proofs, separate from settlement.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+        canonical_proof_production: bool,
+        /// Pause automatic proving after this many new components in this process.
+        #[arg(long)]
+        canonical_proof_component_budget: Option<std::num::NonZeroUsize>,
 
         /// L2 STARK aggregation mode: disabled, scaffold, or active.
         ///
@@ -704,6 +710,8 @@ async fn main() {
             witness_retention,
             body_retention,
             enable_stark_aggregation,
+            canonical_proof_production,
+            canonical_proof_component_budget,
             l2_stark_mode,
             consensus_engine,
             node_role,
@@ -757,6 +765,14 @@ async fn main() {
                 file_config.consensus.enable_stark_aggregation,
             );
 
+            let effective_canonical_proof_production = config_or_cli(
+                run_matches,
+                "canonical_proof_production",
+                canonical_proof_production,
+                file_config.consensus.canonical_proof_production,
+            );
+            let effective_canonical_proof_budget = canonical_proof_component_budget
+                .or(file_config.consensus.canonical_proof_component_budget);
             let effective_chain_id =
                 config_or_cli(run_matches, "chain_id", chain_id, file_config.node.chain_id);
 
@@ -885,6 +901,8 @@ async fn main() {
                 witness_retention,
                 body_retention,
                 enable_stark_aggregation: effective_stark_aggregation,
+                canonical_proof_production: effective_canonical_proof_production,
+                canonical_proof_component_budget: effective_canonical_proof_budget,
                 l2_stark_mode,
                 consensus_engine: effective_consensus_engine,
                 node_role: effective_node_role,
@@ -1174,5 +1192,46 @@ mod tests {
             } => assert!(enable_stark_aggregation),
             _ => panic!("expected run command"),
         }
+    }
+    #[test]
+    fn canonical_production_cli_preserves_explicit_false_and_config_precedence() {
+        for (args, expected) in [
+            (vec!["shell-node", "run"], true),
+            (
+                vec!["shell-node", "run", "--canonical-proof-production=false"],
+                false,
+            ),
+            (
+                vec!["shell-node", "run", "--canonical-proof-production"],
+                true,
+            ),
+        ] {
+            let matches = Cli::command().try_get_matches_from(args).unwrap();
+            let cli = Cli::from_arg_matches(&matches).unwrap();
+            if let Commands::Run {
+                canonical_proof_production,
+                ..
+            } = cli.command
+            {
+                assert_eq!(
+                    config_or_cli(
+                        matches.subcommand_matches("run").unwrap(),
+                        "canonical_proof_production",
+                        canonical_proof_production,
+                        Some(true)
+                    ),
+                    expected
+                );
+            } else {
+                panic!("run expected");
+            }
+        }
+        assert!(Cli::try_parse_from([
+            "shell-node",
+            "run",
+            "--canonical-proof-component-budget",
+            "0"
+        ])
+        .is_err());
     }
 }

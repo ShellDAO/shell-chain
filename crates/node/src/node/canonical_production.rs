@@ -1,0 +1,694 @@
+//! Bounded opt-in automatic full sender-proof generation, separate from settlement.
+use super::*;
+use serde::{Deserialize, Serialize};
+use shell_crypto::SignatureType;
+use shell_primitives::blake3_hash;
+use shell_stark_prover::{
+    canonical_producer::CanonicalProductionSource,
+    production_store::{bounded_json, ProductionError, ProductionStore},
+};
+use shell_storage::{
+    CanonicalProofManifest, EntryVisitor, StorageError, WriteBatch, WriteBatchOp,
+    CANONICAL_PROOF_CHUNK_BYTES, MAX_CANONICAL_PROOF_BYTES,
+};
+use std::time::Duration;
+use std::{
+    collections::{BTreeMap, HashSet},
+    num::NonZeroUsize,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+const PREFIX: &[u8] = b"local/canonical-production/v1/";
+const MAX_JOBS: usize = 2;
+const MAX_BYTES: u64 = 256 * 1024 * 1024;
+const DATA_CEILING: u64 = MAX_BYTES - 64 * 1024;
+fn key(suffix: &[u8]) -> Vec<u8> {
+    [PREFIX, suffix].concat()
+}
+fn record_key(hash: ShellHash) -> Vec<u8> {
+    key(&[b"record/".as_slice(), hash.as_bytes()].concat())
+}
+fn source_key(hash: ShellHash) -> Vec<u8> {
+    key(&[b"source/".as_slice(), hash.as_bytes()].concat())
+}
+fn error(e: impl std::fmt::Display) -> StorageError {
+    StorageError::State(e.to_string())
+}
+fn encode(v: &impl Serialize) -> Result<Vec<u8>, StorageError> {
+    serde_json::to_vec(v).map_err(error)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CanonicalProductionState {
+    Queued,
+    Proving,
+    Paused,
+    Complete,
+    Failed,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CanonicalProductionStatus {
+    pub version: u8,
+    pub block_hash: ShellHash,
+    pub block_number: u64,
+    pub source_hash: ShellHash,
+    pub state: CanonicalProductionState,
+    pub components: usize,
+    pub checkpoint_bytes: usize,
+    pub newly_proved: usize,
+    pub reused: usize,
+    pub manifest: Option<CanonicalProofManifest>,
+    pub error: Option<String>,
+}
+/// One shared writer lock and global quota for descriptors, records and certificates.
+pub(super) struct CanonicalProductionStore<S: KvStore> {
+    store: Arc<S>,
+    lock: Arc<parking_lot::Mutex<Option<u64>>>,
+}
+impl<S: KvStore> CanonicalProductionStore<S> {
+    pub(super) fn new(store: Arc<S>) -> Self {
+        Self {
+            store,
+            lock: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+    fn ids(&self) -> Result<Vec<ShellHash>, StorageError> {
+        let ids: Vec<ShellHash> = self
+            .store
+            .get(&key(b"jobs"))?
+            .map(|b| serde_json::from_slice(&b).map_err(error))
+            .transpose()?
+            .unwrap_or_default();
+        if ids.len() > MAX_JOBS || ids.iter().collect::<HashSet<_>>().len() != ids.len() {
+            return Err(error("canonical production job index corrupt"));
+        }
+        Ok(ids)
+    }
+    fn checked_total(&self, observed: &mut Option<u64>) -> Result<u64, StorageError> {
+        let old = self
+            .store
+            .get(&key(b"bytes"))?
+            .map(|b| {
+                <[u8; 8]>::try_from(b)
+                    .map(u64::from_be_bytes)
+                    .map_err(|_| error("canonical production quota width mismatch"))
+            })
+            .transpose()?
+            .unwrap_or(0);
+        if let Some(expected) = *observed {
+            if old != expected {
+                return Err(error("canonical production quota counter changed"));
+            }
+        } else {
+            let mut actual = 0u64;
+            self.store
+                .visit_prefix_range(PREFIX, PREFIX, None, false, &mut |k, v| {
+                    if k != key(b"bytes") {
+                        actual = actual
+                            .checked_add((k.len() + v.len()) as u64)
+                            .ok_or_else(|| error("canonical production accounting overflow"))?;
+                    }
+                    if actual > MAX_BYTES {
+                        return Err(error("canonical production retained data exceeds quota"));
+                    }
+                    Ok(true)
+                })?;
+            if actual != old {
+                return Err(error("canonical production quota counter mismatch"));
+            }
+        }
+        *observed = Some(old);
+        Ok(old)
+    }
+    fn write_locked(
+        &self,
+        changes: Vec<(Vec<u8>, Vec<u8>)>,
+        observed: &mut Option<u64>,
+        ceiling: u64,
+    ) -> Result<(), StorageError> {
+        let old = self.checked_total(observed)?;
+        let mut total = old;
+        let changes: BTreeMap<_, _> = changes.into_iter().collect();
+        let mut batch = WriteBatch::new();
+        for (k, v) in changes {
+            if !k.starts_with(PREFIX) || k == key(b"bytes") {
+                return Err(error("canonical production namespace violation"));
+            }
+            let prior = self.store.get(&k)?;
+            if let Some(bytes) = prior {
+                total = total
+                    .checked_sub((k.len() + bytes.len()) as u64)
+                    .ok_or_else(|| error("canonical production accounting corrupt"))?;
+            }
+            total = total
+                .checked_add((k.len() + v.len()) as u64)
+                .ok_or_else(|| error("canonical production size overflow"))?;
+            if total > ceiling {
+                return Err(error(
+                    "canonical production global checkpoint quota exceeded",
+                ));
+            }
+            batch.put(k, v);
+        }
+        batch.put(key(b"bytes"), total.to_be_bytes().to_vec());
+        self.store.write_batch(batch)?;
+        *observed = Some(total);
+        self.store.flush()
+    }
+    fn status(&self, hash: ShellHash) -> Result<Option<CanonicalProductionStatus>, StorageError> {
+        self.store
+            .get(&record_key(hash))?
+            .map(|b| {
+                if b.len() > 16 * 1024 {
+                    return Err(error("canonical production record size limit"));
+                }
+                let s: CanonicalProductionStatus = serde_json::from_slice(&b).map_err(error)?;
+                if s.version != 1
+                    || s.block_hash != hash
+                    || s.components > 2048
+                    || s.checkpoint_bytes > MAX_BYTES as usize
+                {
+                    return Err(error("canonical production record corrupt"));
+                }
+                Ok(s)
+            })
+            .transpose()
+    }
+    fn save(&self, status: &CanonicalProductionStatus) -> Result<(), StorageError> {
+        let mut guard = self.lock.lock();
+        self.write_locked(
+            vec![(record_key(status.block_hash), encode(status)?)],
+            &mut guard,
+            MAX_BYTES,
+        )
+    }
+    fn source(&self, status: &CanonicalProductionStatus) -> Result<Vec<u8>, StorageError> {
+        let bytes = self
+            .store
+            .get(&source_key(status.block_hash))?
+            .ok_or_else(|| error("canonical production source absent"))?;
+        if bytes.len() > 4 * 1024 * 1024 || blake3_hash(&bytes) != status.source_hash {
+            return Err(error("canonical production source hash/size mismatch"));
+        }
+        Ok(bytes)
+    }
+    fn insert(&self, source: &CanonicalProductionSource) -> Result<(), StorageError> {
+        let mut guard = self.lock.lock();
+        let hash = source.block().hash();
+        if self.status(hash)?.is_some() {
+            return Ok(());
+        }
+        let mut ids = self.ids()?;
+        if ids.contains(&hash) || self.store.get(&source_key(hash))?.is_some() {
+            return Err(error("orphaned canonical production source/index retained"));
+        }
+        if ids.len() >= MAX_JOBS {
+            return Err(error("canonical production retained job limit reached"));
+        }
+        let status = CanonicalProductionStatus {
+            version: 1,
+            block_hash: hash,
+            block_number: source.block().number(),
+            source_hash: blake3_hash(source.identity()),
+            state: CanonicalProductionState::Queued,
+            components: 0,
+            checkpoint_bytes: 0,
+            newly_proved: 0,
+            reused: 0,
+            manifest: None,
+            error: None,
+        };
+        ids.push(hash);
+        self.write_locked(
+            vec![
+                (key(b"jobs"), encode(&ids)?),
+                (record_key(hash), encode(&status)?),
+                (source_key(hash), source.identity().to_vec()),
+            ],
+            &mut guard,
+            DATA_CEILING,
+        )
+    }
+    fn job(&self, hash: ShellHash) -> ProductionJob<S> {
+        ProductionJob {
+            store: self.store.clone(),
+            lock: self.lock.clone(),
+            prefix: key(&[b"certificates/".as_slice(), hash.as_bytes(), b"/"].concat()),
+        }
+    }
+}
+/// Scoped job KV reuses the mathematical producer's atomic checkpoint format.
+struct ProductionJob<S: KvStore> {
+    store: Arc<S>,
+    lock: Arc<parking_lot::Mutex<Option<u64>>>,
+    prefix: Vec<u8>,
+}
+impl<S: KvStore> KvStore for ProductionJob<S> {
+    fn get(&self, k: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        self.store.get(&[self.prefix.as_slice(), k].concat())
+    }
+    fn put(&self, k: &[u8], v: &[u8]) -> Result<(), StorageError> {
+        let mut b = WriteBatch::new();
+        b.put(k.to_vec(), v.to_vec());
+        self.write_batch(b)
+    }
+    fn delete(&self, _: &[u8]) -> Result<(), StorageError> {
+        Err(error("canonical production certificates cannot be deleted"))
+    }
+    fn flush(&self) -> Result<(), StorageError> {
+        self.store.flush()
+    }
+    fn scan_prefix(&self, p: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        self.store
+            .scan_prefix(&[self.prefix.as_slice(), p].concat())
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(k, v)| (k[self.prefix.len()..].to_vec(), v))
+                    .collect()
+            })
+    }
+    fn visit_all(&self, visitor: &mut EntryVisitor<'_>) -> Result<(), StorageError> {
+        self.store
+            .visit_prefix_range(&self.prefix, &self.prefix, None, false, &mut |k, v| {
+                visitor(&k[self.prefix.len()..], v)?;
+                Ok(true)
+            })
+    }
+    fn write_batch(&self, b: WriteBatch) -> Result<(), StorageError> {
+        let mut guard = self.lock.lock();
+        let mut changes = Vec::new();
+        for op in b.ops() {
+            match op {
+                WriteBatchOp::Put { key: k, value: v } => {
+                    if (k == b"production/source" || k.starts_with(b"production/component/"))
+                        && self.get(k)?.is_some_and(|old| old != *v)
+                    {
+                        return Err(error("immutable production certificate conflict"));
+                    }
+                    changes.push(([self.prefix.as_slice(), k].concat(), v.clone()));
+                }
+                WriteBatchOp::Delete { .. } => {
+                    return Err(error("canonical production checkpoint deletion refused"))
+                }
+            }
+        }
+        CanonicalProductionStore {
+            store: self.store.clone(),
+            lock: self.lock.clone(),
+        }
+        .write_locked(changes, &mut guard, DATA_CEILING)
+    }
+}
+
+impl<S: KvStore + 'static> Node<S> {
+    /// Called after native canonical publication; errors cannot undo or authorize a block.
+    pub(super) fn capture_canonical_production(&self, block: &Block) {
+        if !self.config.canonical_proof_production
+            || !self.config.node_role.runs_prover()
+            || block.transactions.is_empty()
+        {
+            return;
+        }
+        if block.transactions.len()
+            > shell_stark_prover::canonical_batch::MAX_CANONICAL_SIGNATURE_BATCH
+            || block
+                .transactions
+                .iter()
+                .any(|t| t.signature.sig_type != SignatureType::MlDsa65)
+        {
+            return;
+        }
+        let captured = (|| -> Result<(), String> {
+            if self
+                .canonical_production
+                .status(block.hash())
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                return Ok(());
+            }
+            let tip = self
+                .chain_store
+                .get_head_hash()
+                .map_err(|e| e.to_string())?
+                .ok_or("canonical production tip absent")?;
+            let source = CanonicalProductionSource::capture(&self.chain_store, tip, block.hash())?;
+            self.canonical_production
+                .insert(&source)
+                .map_err(|e| e.to_string())
+        })();
+        if let Err(error) = captured {
+            warn!(block=%block.hash(),%error,"canonical sender proof capture unavailable; native block remains committed");
+        }
+    }
+    fn restore_canonical_job(
+        &self,
+        status: &CanonicalProductionStatus,
+    ) -> Result<CanonicalProductionSource, String> {
+        let bytes = self
+            .canonical_production
+            .source(status)
+            .map_err(|e| e.to_string())?;
+        let source = CanonicalProductionSource::restore(&self.chain_store, &bytes)?;
+        if source.block().hash() != status.block_hash
+            || source.block().number() != status.block_number
+        {
+            return Err("canonical production record/source identity mismatch".into());
+        }
+        if let Some(m) = &status.manifest {
+            m.validate()?;
+            if m.block_hash != status.block_hash
+                || m.chain_id != source.chain_id()
+                || m.genesis_hash != source.genesis_hash()
+            {
+                return Err("canonical production manifest/source identity mismatch".into());
+            }
+        }
+        Ok(source)
+    }
+    pub fn canonical_production_status(
+        &self,
+        hash: ShellHash,
+    ) -> Result<Option<serde_json::Value>, String> {
+        {
+            let mut guard = self.canonical_production.lock.lock();
+            self.canonical_production
+                .checked_total(&mut guard)
+                .map_err(|e| e.to_string())?;
+        }
+        let status = self
+            .canonical_production
+            .status(hash)
+            .map_err(|e| e.to_string())?;
+        status.map(|s|{
+            let source=self.restore_canonical_job(&s)?;
+            Ok(serde_json::json!({"status":s,"block":source.block(),"nativeExecutionVerified":false}))
+        }).transpose()
+    }
+    pub(super) fn production_manifest_source(
+        &self,
+        manifest: &CanonicalProofManifest,
+    ) -> Result<bool, String> {
+        let Some(status) = self
+            .canonical_production
+            .status(manifest.block_hash)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
+        if status.manifest.as_ref() != Some(manifest) {
+            return Ok(false);
+        }
+        let source = self.restore_canonical_job(&status)?;
+        Ok(source.chain_id() == manifest.chain_id
+            && source.genesis_hash() == manifest.genesis_hash
+            && source.block().hash() == manifest.block_hash)
+    }
+    fn produce_canonical_job(
+        &self,
+        mut status: CanonicalProductionStatus,
+        limit: Option<NonZeroUsize>,
+        cancel: &AtomicBool,
+    ) -> usize {
+        let mut spent = 0;
+        status.newly_proved = 0;
+        status.reused = 0;
+        status.state = CanonicalProductionState::Proving;
+        status.error = None;
+        let result = (|| -> Result<CanonicalProofManifest, String> {
+            let source = self.restore_canonical_job(&status)?;
+            status.state = CanonicalProductionState::Proving;
+            status.error = None;
+            self.canonical_production
+                .save(&status)
+                .map_err(|e| e.to_string())?;
+            let mut kv = self.canonical_production.job(status.block_hash);
+            let interrupt =
+                || cancel.load(Ordering::Acquire) || !self.prover_ready.load(Ordering::Acquire);
+            let mut job = ProductionStore::open(&mut kv, source.identity(), limit)
+                .map_err(|e| e.to_string())?
+                .with_interrupt(&interrupt);
+            let result = source.produce(&mut job);
+            let progress = job.progress();
+            spent = progress.newly_proved;
+            status.components = progress.components;
+            status.checkpoint_bytes = progress.checkpoint_bytes;
+            status.newly_proved = spent;
+            status.reused = progress.reused;
+            let proof = match result {
+                Ok(p) => p,
+                Err(ProductionError::Paused) => {
+                    status.state = CanonicalProductionState::Paused;
+                    return Err("component budget, readiness or shutdown pause".into());
+                }
+                Err(e) => return Err(e.to_string()),
+            };
+            source.recheck_canonical(&self.chain_store)?;
+            if interrupt() {
+                status.state = CanonicalProductionState::Paused;
+                return Err("readiness or shutdown pause".into());
+            }
+            let payload = bounded_json(&proof, MAX_CANONICAL_PROOF_BYTES as usize)
+                .map_err(|e| e.to_string())?;
+            let manifest = CanonicalProofManifest {
+                version: 1,
+                chain_id: source.chain_id(),
+                genesis_hash: source.genesis_hash(),
+                block_hash: source.block().hash(),
+                total_bytes: payload.len() as u64,
+                payload_hash: blake3_hash(&payload),
+            };
+            let mut cache = self
+                .canonical_proof_uploads
+                .begin(manifest.clone())
+                .map_err(|e| e.to_string())?;
+            for (index, chunk) in payload.chunks(CANONICAL_PROOF_CHUNK_BYTES).enumerate() {
+                source.recheck_canonical(&self.chain_store)?;
+                if index < (cache.next_chunk as usize) {
+                    if self
+                        .canonical_proof_uploads
+                        .chunk(&manifest.id(), index as u32)
+                        .map_err(|e| e.to_string())?
+                        != chunk
+                    {
+                        return Err("canonical production cached chunk conflict".into());
+                    }
+                } else {
+                    cache = self
+                        .canonical_proof_uploads
+                        .append(&manifest.id(), index as u32, chunk)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            source.recheck_canonical(&self.chain_store)?;
+            // Ready is byte availability, not an execution receipt or admission token.
+            Ok(manifest)
+        })();
+        match result {
+            Ok(manifest) => {
+                status.state = CanonicalProductionState::Complete;
+                status.manifest = Some(manifest);
+                status.error = None;
+            }
+            Err(e) => {
+                if status.state != CanonicalProductionState::Paused {
+                    status.state = CanonicalProductionState::Failed;
+                }
+                status.error = Some(e.chars().take(2048).collect());
+            }
+        }
+        if let Err(error) = self.canonical_production.save(&status) {
+            warn!(%error,"canonical production status persistence failed; retained source/components require restart recheck");
+        }
+        spent
+    }
+    pub(super) fn start_canonical_production(
+        self: &Arc<Self>,
+    ) -> Result<Option<CanonicalProductionHandle>, NodeError> {
+        if !self.config.canonical_proof_production {
+            return Ok(None);
+        }
+        if !self.config.node_role.runs_prover() {
+            return Err(NodeError::Startup(
+                "canonical proof production requires a prover role".into(),
+            ));
+        }
+        if let Some(block) = self.chain_store.get_head_block()? {
+            self.capture_canonical_production(&block);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let node = self.clone();
+        let handle = tokio::spawn(async move {
+            let mut attempted = HashSet::new();
+            let mut used = 0usize;
+            while !worker_cancel.load(Ordering::Acquire) {
+                let budget = node.config.canonical_proof_component_budget;
+                let available = budget.map(|n| n.get().saturating_sub(used));
+                if node.prover_ready.load(Ordering::Acquire) && available != Some(0) {
+                    let next = node.canonical_production.ids().and_then(|ids| {
+                        for hash in ids {
+                            if attempted.contains(&hash) {
+                                continue;
+                            }
+                            if let Some(s) = node.canonical_production.status(hash)? {
+                                if !matches!(
+                                    s.state,
+                                    CanonicalProductionState::Complete
+                                        | CanonicalProductionState::Failed
+                                ) {
+                                    return Ok(Some(s));
+                                }
+                            }
+                        }
+                        Ok(None)
+                    });
+                    match next {
+                        Ok(Some(status)) => {
+                            let hash = status.block_hash;
+                            attempted.insert(hash);
+                            let n = node.clone();
+                            let c = worker_cancel.clone();
+                            let limit = available.and_then(NonZeroUsize::new);
+                            match tokio::task::spawn_blocking(move || {
+                                n.produce_canonical_job(status, limit, &c)
+                            })
+                            .await
+                            {
+                                Ok(spent) => {
+                                    used = used.saturating_add(spent);
+                                    if !cancellation_budget_exhausted(budget, used)
+                                        && !worker_cancel.load(Ordering::Acquire)
+                                        && node
+                                            .canonical_production
+                                            .status(hash)
+                                            .ok()
+                                            .flatten()
+                                            .is_some_and(|s| {
+                                                s.state == CanonicalProductionState::Paused
+                                            })
+                                    {
+                                        attempted.remove(&hash);
+                                    }
+                                }
+                                Err(error) => {
+                                    warn!(%error,"canonical production worker panicked; source/components retained")
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!(%error,"canonical production queue is unavailable; no repeated dispatch");
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+        Ok(Some(CanonicalProductionHandle {
+            cancel,
+            handle: Some(handle),
+        }))
+    }
+}
+pub(super) struct CanonicalProductionHandle {
+    cancel: Arc<AtomicBool>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+impl CanonicalProductionHandle {
+    pub(super) async fn shutdown(mut self) {
+        self.cancel.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+impl Drop for CanonicalProductionHandle {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
+fn cancellation_budget_exhausted(budget: Option<NonZeroUsize>, used: usize) -> bool {
+    budget.is_some_and(|n| used >= n.get())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shell_storage::MemoryDb;
+    #[test]
+    fn namespaces_are_immutable_and_global_accounting_rejects_tampering() {
+        let db = Arc::new(MemoryDb::new());
+        db.put(b"HEAD", b"native anchor").unwrap();
+        let owner = CanonicalProductionStore::new(db.clone());
+        let kv = owner.job(ShellHash::from([1; 32]));
+        kv.put(b"production/source", b"raw public source").unwrap();
+        kv.put(b"production/component/key", b"certificate").unwrap();
+        let before = db.scan_all().unwrap();
+        assert!(kv.put(b"production/component/key", b"different").is_err());
+        assert!(kv.delete(b"production/source").is_err());
+        assert_eq!(before, db.scan_all().unwrap());
+        assert!(owner
+            .job(ShellHash::from([2; 32]))
+            .get(b"production/source")
+            .unwrap()
+            .is_none());
+        db.put(&key(b"bytes"), &0u64.to_be_bytes()).unwrap();
+        let before = db.scan_all().unwrap();
+        assert!(kv.put(b"production/component/new", b"x").is_err());
+        assert_eq!(before, db.scan_all().unwrap());
+        let restored = CanonicalProductionStore::new(db.clone());
+        assert!(restored
+            .job(ShellHash::from([1; 32]))
+            .put(b"x", b"y")
+            .is_err());
+        assert_eq!(db.get(b"HEAD").unwrap(), Some(b"native anchor".to_vec()));
+    }
+    #[test]
+    fn simulated_global_quota_refuses_whole_batch_without_changing_native_data() {
+        let db = Arc::new(MemoryDb::new());
+        let owner = CanonicalProductionStore::new(db.clone());
+        // Counter boundary simulation only; no claim of a 256MiB load/stress test.
+        *owner.lock.lock() = Some(MAX_BYTES - 1);
+        db.put(&key(b"bytes"), &(MAX_BYTES - 1).to_be_bytes())
+            .unwrap();
+        let before = db.scan_all().unwrap();
+        let kv = owner.job(ShellHash::from([1; 32]));
+        let mut batch = WriteBatch::new();
+        batch.put(b"a".to_vec(), b"b".to_vec());
+        batch.put(b"c".to_vec(), b"d".to_vec());
+        assert!(kv.write_batch(batch).is_err());
+        assert_eq!(before, db.scan_all().unwrap());
+    }
+    #[test]
+    fn default_and_non_prover_role_do_not_allocate_work() {
+        let mut cfg = NodeConfig::dev(Address::ZERO);
+        assert!(!cfg.canonical_proof_production);
+        assert!(cfg.canonical_proof_component_budget.is_none());
+        cfg.node_role = crate::NodeRole::Prover;
+        let disabled_db = Arc::new(MemoryDb::new());
+        let (disabled, _) = crate::NodeBuilder::new(cfg.clone(), disabled_db.clone())
+            .build()
+            .unwrap();
+        let before_disabled = disabled_db.scan_all().unwrap();
+        assert!(Arc::new(disabled)
+            .start_canonical_production()
+            .unwrap()
+            .is_none());
+        assert_eq!(before_disabled, disabled_db.scan_all().unwrap());
+        assert!(disabled_db.scan_prefix(PREFIX).unwrap().is_empty());
+        cfg.node_role = crate::NodeRole::Validator;
+        cfg.canonical_proof_production = true;
+        let db = Arc::new(MemoryDb::new());
+        let (node, _) = crate::NodeBuilder::new(cfg, db.clone()).build().unwrap();
+        let node = Arc::new(node);
+        let before = db.scan_all().unwrap();
+        assert!(node.start_canonical_production().is_err());
+        assert_eq!(before, db.scan_all().unwrap());
+        assert!(db.scan_prefix(PREFIX).unwrap().is_empty());
+    }
+}

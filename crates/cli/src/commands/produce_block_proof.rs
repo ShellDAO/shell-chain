@@ -36,8 +36,8 @@ pub fn produce_block_proof(
         let database = database.canonicalize()?;
         // Establish exclusive native ownership before touching output artifacts.
         let native = Arc::new(RocksDbStore::open_all(&database, None)?.state);
-        let source =
-            CanonicalProductionSource::capture(&ChainStore::new(native), expected_tip, block_hash)?;
+        let chain = ChainStore::new(native);
+        let source = CanonicalProductionSource::capture(&chain, expected_tip, block_hash)?;
         let block_bytes = bounded_json(source.block(), 2 * 1024 * 1024)?;
         let output = prepare_output(&database, &output)?;
         let mut db = RocksDbStore::open_all(output.join("db"), None)?.state;

@@ -4,8 +4,7 @@ use crate::{
     account_state::{prove_account_state, verify_account_state},
     blake3_hash::{prove_hash, verify_hash},
     canonical_batch::{
-        verify_canonical_signature_batch, CanonicalSignatureBatchProof, CanonicalTransactionProof,
-        MAX_CANONICAL_SIGNATURE_BATCH,
+        CanonicalSignatureBatchProof, CanonicalTransactionProof, MAX_CANONICAL_SIGNATURE_BATCH,
     },
     mldsa_challenge::{prove_challenge, verify_challenge, ChallengeProof},
     mldsa_decode::{prove_signature_decode, verify_signature_decode, SignatureDecodeProof},
@@ -23,32 +22,48 @@ use crate::{
         Mldsa65VerificationProof,
     },
     production_store::{bounded_json, ProductionError, ProductionStore},
-    registered_signature::RegisteredSignatureProof,
+    registered_signature::{verify_registered_signature_entry, RegisteredSignatureProof},
     shake_sponge::{prove_shake, verify_shake, ShakeKind, ShakeProof},
     SigBatchEntry,
 };
-use serde::Serialize;
-use shell_core::{Account, Block, PQTX_ID_DOMAIN};
+use alloy_rlp::Encodable;
+use serde::{Deserialize, Serialize};
+use shell_core::{Account, Block, BlockHeader, PQTX_ID_DOMAIN};
 use shell_crypto::{MlDsaVerifier, SignatureType, Verifier};
 use shell_primitives::{blake3_hash, keccak256, ShellHash};
-use shell_storage::{CanonicalParentView, ChainStore, KvStore, MerkleTrie};
+use shell_storage::{ChainConfig, ChainStore, KvStore, MemoryDb, MerkleTrie};
+use std::sync::Arc;
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SenderSource {
     key: Vec<u8>,
     account: Account,
     nodes: Vec<Vec<u8>>,
 }
-/// Captured native canonical context, with no public unchecked constructor.
-/// Keep the backing database offline/exclusive until production finishes.
-pub struct CanonicalProductionSource<S: KvStore> {
-    view: CanonicalParentView<S>,
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapturedInputs {
+    version: u8,
+    tip: ShellHash,
+    config: ChainConfig,
+    parent: BlockHeader,
     block: Block,
     senders: Vec<SenderSource>,
+}
+/// Immutable public proving inputs, never a canonical authorization token.
+/// Capture freezes the native source once; proving makes no live state reads.
+/// Recovery authenticates headers/body/MPT/key bindings again before reuse.
+pub struct CanonicalProductionSource {
+    input: CapturedInputs,
     identity: Vec<u8>,
 }
-impl<S: KvStore + 'static> CanonicalProductionSource<S> {
-    pub fn capture(chain: &ChainStore<S>, tip: ShellHash, hash: ShellHash) -> Result<Self, String> {
+impl CanonicalProductionSource {
+    pub fn capture<S: KvStore + 'static>(
+        chain: &ChainStore<S>,
+        tip: ShellHash,
+        hash: ShellHash,
+    ) -> Result<Self, String> {
         let block = chain
             .get_block_by_hash(&hash)
             .map_err(|e| e.to_string())?
@@ -140,25 +155,207 @@ impl<S: KvStore + 'static> CanonicalProductionSource<S> {
                 nodes,
             });
         }
-        let identity = bounded_json(&serde_json::json!({"version":1,"tip":tip,"config":view.config(),"parent":view.parent(),"block":block,"senders":senders}), 4 * 1024 * 1024).map_err(|e| e.to_string())?;
-        Ok(Self {
-            view,
+        let input = CapturedInputs {
+            version: 1,
+            tip,
+            config: view.config().clone(),
+            parent: view.parent().clone(),
             block,
             senders,
-            identity,
-        })
+        };
+        let identity = bounded_json(
+            &serde_json::to_value(&input).map_err(|e| e.to_string())?,
+            4 * 1024 * 1024,
+        )
+        .map_err(|e| e.to_string())?;
+        let source = Self { input, identity };
+        source.recheck_canonical(chain)?;
+        Ok(source)
+    }
+    /// Restore public inputs only. No verified token or cached success flag is decoded.
+    /// Historical registry reads are replaced by a complete native MPT/key-hash
+    /// preflight against the independently retained canonical parent header.
+    pub fn restore<S: KvStore + 'static>(
+        chain: &ChainStore<S>,
+        bytes: &[u8],
+    ) -> Result<Self, String> {
+        if bytes.is_empty() || bytes.len() > 4 * 1024 * 1024 {
+            return Err("production source size limit".into());
+        }
+        let input: CapturedInputs =
+            serde_json::from_slice(bytes).map_err(|e| format!("production source decode: {e}"))?;
+        let identity = bounded_json(
+            &serde_json::to_value(&input).map_err(|e| e.to_string())?,
+            4 * 1024 * 1024,
+        )
+        .map_err(|e| e.to_string())?;
+        if identity != bytes {
+            return Err("noncanonical production source encoding".into());
+        }
+        let source = Self { input, identity };
+        source.recheck_canonical(chain)?;
+        Ok(source)
+    }
+    pub fn recheck_canonical<S: KvStore + 'static>(
+        &self,
+        chain: &ChainStore<S>,
+    ) -> Result<(), String> {
+        let i = &self.input;
+        let cfg = chain
+            .get_chain_config()
+            .map_err(|e| e.to_string())?
+            .ok_or("production chain configuration absent")?;
+        if i.version != 1
+            || cfg.chain_id != i.config.chain_id
+            || cfg.genesis_hash != i.config.genesis_hash
+            || chain
+                .get_block_hash_by_number(0)
+                .map_err(|e| e.to_string())?
+                != Some(cfg.genesis_hash)
+            || cfg
+                .block_commitment_height
+                .is_none_or(|h| i.block.number() < h)
+            || i.config
+                .block_commitment_height
+                .is_none_or(|h| i.block.number() < h)
+            || i.parent.number.checked_add(1) != Some(i.block.number())
+            || i.block.header.parent_hash != i.parent.hash()
+            || chain
+                .get_header_by_hash(&i.block.hash())
+                .map_err(|e| e.to_string())?
+                .as_ref()
+                != Some(&i.block.header)
+            || chain
+                .get_header_by_hash(&i.parent.hash())
+                .map_err(|e| e.to_string())?
+                .as_ref()
+                != Some(&i.parent)
+            || chain
+                .get_block_hash_by_number(i.block.number())
+                .map_err(|e| e.to_string())?
+                != Some(i.block.hash())
+            || chain
+                .get_block_hash_by_number(i.parent.number)
+                .map_err(|e| e.to_string())?
+                != Some(i.parent.hash())
+            || shell_core::block_body_root(&i.block.transactions, &i.block.system_transactions)
+                .map_err(|e| e.to_string())?
+                != i.block.header.transactions_root
+        {
+            return Err(
+                "production source is not the activated trusted canonical body/parent".into(),
+            );
+        }
+        if i.block.transactions.is_empty()
+            || i.block.transactions.len() > MAX_CANONICAL_SIGNATURE_BATCH
+            || i.senders.len() != i.block.transactions.len()
+            || i.block
+                .system_transactions
+                .iter()
+                .any(|tx| tx.kind != shell_core::SystemTxKind::BlockGasReward)
+        {
+            return Err("production source count/system profile mismatch".into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (tx, sender) in i.block.transactions.iter().zip(&i.senders) {
+            if tx.tx.chain_id != cfg.chain_id
+                || tx.tx.tx_type > 3
+                || tx.aa_bundle.is_some()
+                || tx.signature.sig_type != SignatureType::MlDsa65
+                || tx.signature.data.len() != 3309
+                || sender.key.len() != 1952
+                || !seen.insert(tx.uncached_hash())
+                || tx.tx.signing_payload(SignatureType::MlDsa65.as_u8()).len()
+                    > crate::blake3_hash::MAX_HASH_BYTES
+                || tx
+                    .pubkey_mode
+                    .pubkey_bytes()
+                    .is_some_and(|key| key != sender.key)
+                || sender.account.validation_code_hash.is_some()
+                || sender.nodes.len() > crate::account_state::MAX_ACCOUNT_PROOF_NODES
+                || sender
+                    .nodes
+                    .iter()
+                    .any(|n| n.len() > crate::shake_sponge::MAX_SHAKE_MESSAGE_BYTES)
+            {
+                return Err("production source sender profile/resource mismatch".into());
+            }
+            let mut tagged = vec![SignatureType::MlDsa65.as_u8()];
+            tagged.extend_from_slice(&sender.key);
+            if sender.account.pq_pubkey_hash != blake3_hash(&sender.key)
+                && sender.account.pq_pubkey_hash != blake3_hash(&tagged)
+            {
+                return Err("production source parent key commitment mismatch".into());
+            }
+            let actual = MerkleTrie::verify_proof(
+                Arc::new(MemoryDb::new()),
+                i.parent.state_root.as_bytes(),
+                keccak256(tx.from.as_bytes()).as_bytes(),
+                sender.nodes.clone(),
+            )
+            .map_err(|e| e.to_string())?;
+            let mut encoded = Vec::new();
+            sender.account.encode(&mut encoded);
+            if actual.as_deref() != Some(encoded.as_slice()) {
+                return Err("production source native MPT/account mismatch".into());
+            }
+            if !MlDsaVerifier
+                .verify(
+                    &sender.key,
+                    tx.sender_signing_hash().as_bytes(),
+                    &tx.signature,
+                )
+                .map_err(|e| e.to_string())?
+            {
+                return Err("invalid raw production signature".into());
+            }
+        }
+        Ok(())
     }
     pub fn identity(&self) -> &[u8] {
         &self.identity
     }
     pub fn block(&self) -> &Block {
-        &self.block
+        &self.input.block
     }
     pub fn chain_id(&self) -> u64 {
-        self.view.config().chain_id
+        self.input.config.chain_id
     }
     pub fn genesis_hash(&self) -> ShellHash {
-        self.view.config().genesis_hash
+        self.input.config.genesis_hash
+    }
+    /// Verify complete mathematics against captured public inputs only. Callers
+    /// must independently recheck canonicality and native execution/admission.
+    pub fn verify(&self, proof: &CanonicalSignatureBatchProof) -> Result<(), String> {
+        if proof.version != 1 || proof.transactions.len() != self.input.senders.len() {
+            return Err("production proof source/count mismatch".into());
+        }
+        for ((tx, sender), p) in self
+            .input
+            .block
+            .transactions
+            .iter()
+            .zip(&self.input.senders)
+            .zip(&proof.transactions)
+        {
+            let account = verify_account_state(
+                &p.account,
+                self.input.parent.state_root.as_bytes(),
+                tx.from.as_bytes(),
+                Some(&sender.account),
+            )?;
+            let entry = SigBatchEntry::from_signed_transaction(tx);
+            verify_registered_signature_entry(
+                &p.signature,
+                tx,
+                &sender.key,
+                &account,
+                tx.uncached_hash().as_bytes(),
+                &entry,
+                &entry.to_leaf_bytes(),
+            )?;
+        }
+        Ok(())
     }
 
     /// All new and reused components are cryptographically checked. Pauses publish
@@ -174,10 +371,11 @@ impl<S: KvStore + 'static> CanonicalProductionSource<S> {
         }
         let mut transactions = Vec::new();
         for (i, (signed, source)) in self
+            .input
             .block
             .transactions
             .iter()
-            .zip(&self.senders)
+            .zip(&self.input.senders)
             .enumerate()
         {
             let prefix = format!("sender-{i}");
@@ -194,7 +392,7 @@ impl<S: KvStore + 'static> CanonicalProductionSource<S> {
                 |p| {
                     verify_account_state(
                         p,
-                        self.view.parent().state_root.as_bytes(),
+                        self.input.parent.state_root.as_bytes(),
                         signed.from.as_bytes(),
                         Some(&source.account),
                     )
@@ -240,7 +438,7 @@ impl<S: KvStore + 'static> CanonicalProductionSource<S> {
             version: 1,
             transactions,
         };
-        verify_canonical_signature_batch(&self.view, &self.block, &proof)?;
+        self.verify(&proof)?;
         Ok(proof)
     }
 }
@@ -535,5 +733,170 @@ mod tests {
             );
             assert_eq!(before, db.scan_all().unwrap(), "{mode}");
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use shell_core::{SignedTransaction, Transaction, TransactionReceipt};
+    use shell_crypto::{MlDsaSigner, Signer};
+    use shell_primitives::{Address, U256};
+    use shell_storage::{OverlayStore, StorageError};
+    fn fixture() -> (Arc<MemoryDb>, CanonicalProductionSource) {
+        // Storage-context fixture only; real native execution is exercised by the runtime regression.
+        let db = Arc::new(MemoryDb::new());
+        let chain = ChainStore::new(db.clone());
+        let signer = MlDsaSigner::generate();
+        let address = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let mut world = shell_storage::WorldState::new(db.clone());
+        world
+            .set_account(
+                &address,
+                &Account::new_user_account(blake3_hash(signer.public_key()), U256::from(1_000_000)),
+            )
+            .unwrap();
+        let root = world.state_root().unwrap();
+        let genesis = Block {
+            header: BlockHeader {
+                state_root: root,
+                ..Default::default()
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let cfg=serde_json::from_value(serde_json::json!({"chain_id":10,"genesis_hash":genesis.hash(),"block_commitment_height":1})).unwrap();
+        chain.put_pubkey(&address, signer.public_key()).unwrap();
+        chain.commit_genesis_block(&genesis, &cfg).unwrap();
+        let tx = Transaction {
+            chain_id: 10,
+            nonce: 0,
+            to: Some(Address::from([17; 32])),
+            value: U256::from(1),
+            data: Default::default(),
+            gas_limit: 21000,
+            max_fee_per_gas: 2,
+            max_priority_fee_per_gas: 1,
+            tx_type: 0,
+            access_list: None,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        };
+        let signature = signer
+            .sign(tx.signing_hash(signer.sig_type().as_u8()).as_bytes())
+            .unwrap();
+        let signed = SignedTransaction::new(address, tx, signature);
+        let receipts = vec![TransactionReceipt {
+            tx_hash: signed.uncached_hash(),
+            block_number: 1,
+            tx_index: 0,
+            status: 1,
+            gas_used: 0,
+            cumulative_gas_used: 0,
+            contract_address: None,
+            logs_bloom: Default::default(),
+            logs: vec![],
+        }];
+        let mut block = Block {
+            header: BlockHeader {
+                parent_hash: genesis.hash(),
+                state_root: root,
+                number: 1,
+                receipts_root: shell_core::block_receipts_root(&receipts),
+                ..Default::default()
+            },
+            transactions: vec![signed],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        block.header.transactions_root =
+            shell_core::block_body_root(&block.transactions, &[]).unwrap();
+        let overlay = Arc::new(OverlayStore::new(db.clone()));
+        let staged = ChainStore::new(overlay.clone());
+        staged
+            .stage_address_metadata_undo(
+                &block.hash(),
+                &staged.address_metadata_checkpoint().unwrap(),
+            )
+            .unwrap();
+        staged
+            .commit_canonical_block(&block, Some(&receipts))
+            .unwrap();
+        overlay.commit().unwrap();
+        let source =
+            CanonicalProductionSource::capture(&chain, block.hash(), block.hash()).unwrap();
+        (db, source)
+    }
+    struct NoTrieReads(Arc<MemoryDb>);
+    impl KvStore for NoTrieReads {
+        fn get(&self, k: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+            if k.len() == 32 {
+                return Err(StorageError::State(
+                    "live trie access forbidden after capture".into(),
+                ));
+            }
+            self.0.get(k)
+        }
+        fn put(&self, _: &[u8], _: &[u8]) -> Result<(), StorageError> {
+            Err(StorageError::State("read-only".into()))
+        }
+        fn delete(&self, _: &[u8]) -> Result<(), StorageError> {
+            Err(StorageError::State("read-only".into()))
+        }
+        fn flush(&self) -> Result<(), StorageError> {
+            Err(StorageError::State("read-only".into()))
+        }
+        fn write_batch(&self, _: shell_storage::WriteBatch) -> Result<(), StorageError> {
+            Err(StorageError::State("read-only".into()))
+        }
+        fn scan_prefix(&self, _: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+            Err(StorageError::State("read-only".into()))
+        }
+    }
+    #[test]
+    fn restore_uses_authenticated_snapshot_not_current_keys_or_live_trie() {
+        let (db, source) = fixture();
+        let chain = ChainStore::new(db.clone());
+        chain
+            .put_pubkey(&source.block().transactions[0].from, &[9; 1952])
+            .unwrap();
+        let before = db.scan_all().unwrap();
+        let frozen = ChainStore::new(Arc::new(NoTrieReads(db.clone())));
+        let recovered = CanonicalProductionSource::restore(&frozen, source.identity()).unwrap();
+        assert_eq!(recovered.identity(), source.identity());
+        assert_eq!(recovered.block(), source.block());
+        assert_eq!(before, db.scan_all().unwrap());
+    }
+    #[test]
+    fn source_tampering_and_stale_canonical_target_refuse_without_writes() {
+        let (db, source) = fixture();
+        let chain = ChainStore::new(db.clone());
+        let original: serde_json::Value = serde_json::from_slice(source.identity()).unwrap();
+        for mode in ["account", "key", "body", "parent", "version", "unknown"] {
+            let mut v = original.clone();
+            match mode {
+                "account" => v["senders"][0]["account"]["nonce"] = serde_json::json!(1),
+                "key" => {
+                    let n = v["senders"][0]["key"][0].as_u64().unwrap();
+                    v["senders"][0]["key"][0] = serde_json::json!(n ^ 1);
+                }
+                "body" => v["block"]["transactions"][0]["tx"]["nonce"] = serde_json::json!(1),
+                "parent" => v["parent"]["state_root"] = serde_json::json!(ShellHash::ZERO),
+                "version" => v["version"] = serde_json::json!(2),
+                _ => v["untrusted_success"] = serde_json::json!(true),
+            }
+            let before = db.scan_all().unwrap();
+            assert!(
+                CanonicalProductionSource::restore(&chain, &serde_json::to_vec(&v).unwrap())
+                    .is_err(),
+                "{mode}"
+            );
+            assert_eq!(before, db.scan_all().unwrap());
+        }
+        chain.set_canonical(1, &ShellHash::from([8; 32])).unwrap();
+        let before = db.scan_all().unwrap();
+        assert!(CanonicalProductionSource::restore(&chain, source.identity()).is_err());
+        assert_eq!(before, db.scan_all().unwrap());
     }
 }

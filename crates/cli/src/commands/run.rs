@@ -82,6 +82,8 @@ pub struct RunArgs {
     pub storage_profile: String,
     /// Enable STARK aggregate proof generation during block production (on by default).
     pub enable_stark_aggregation: bool,
+    pub canonical_proof_production: bool,
+    pub canonical_proof_component_budget: Option<std::num::NonZeroUsize>,
     pub prover_max_concurrent_proofs: usize,
     pub prover_priority: shell_node::ProvingPriority,
     /// L2 STARK aggregation mode: disabled, scaffold, or active.
@@ -303,6 +305,18 @@ fn validate_transaction_protocol<S: KvStore + 'static>(
 
 /// Start the node: load genesis, initialize state, and run the event loop.
 pub async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let proof_role = args
+        .node_role
+        .parse::<shell_node::NodeRole>()
+        .map_err(|e| format!("invalid --node-role: {e}"))?;
+    if args.canonical_proof_production && !proof_role.runs_prover() {
+        return Err("canonical proof production requires a prover role".into());
+    }
+    if args.canonical_proof_component_budget.is_some() && !args.canonical_proof_production {
+        return Err(
+            "canonical proof component budget requires --canonical-proof-production".into(),
+        );
+    }
     let _: NetworkType = args.network.parse()?;
 
     // F-096: Canonicalize and validate data directory.
@@ -988,6 +1002,8 @@ async fn run_with_store<S: KvStore + 'static>(
             ..shell_node::config::ParallelPqvmConfig::default()
         },
         enable_stark_aggregation: args.enable_stark_aggregation,
+        canonical_proof_production: args.canonical_proof_production,
+        canonical_proof_component_budget: args.canonical_proof_component_budget,
         prover_max_concurrent_proofs: args.prover_max_concurrent_proofs,
         prover_priority: args.prover_priority,
         l2_stark_mode: args
@@ -1213,6 +1229,8 @@ mod tests {
             body_retention: Some(DEFAULT_BODY_RETENTION),
             storage_profile: "full".into(),
             enable_stark_aggregation: false,
+            canonical_proof_production: false,
+            canonical_proof_component_budget: None,
             prover_max_concurrent_proofs: 1,
             prover_priority: shell_node::ProvingPriority::Sequential,
             l2_stark_mode: "disabled".into(),

@@ -2,6 +2,8 @@
 #[allow(dead_code)]
 #[path = "common/canonical_proof_fixture.rs"]
 mod fixture;
+#[path = "common/canonical_production_runtime.rs"]
+mod runtime;
 #[allow(dead_code)]
 #[path = "../../stark-prover/examples/common/mldsa_source.rs"]
 mod source;
@@ -39,7 +41,7 @@ fn accounts(store: Arc<RocksDbStore>, block: &Block) -> Result<Value, Error> {
     }
     Ok(json!(rows))
 }
-fn prepare(out: &Path) -> Result<(), Error> {
+fn prepare(out: &Path, automatic: bool, capture_on_production: bool) -> Result<(), Error> {
     if out.exists() {
         ensure(
             out.is_dir() && !out.symlink_metadata()?.file_type().is_symlink(),
@@ -111,8 +113,17 @@ fn prepare(out: &Path) -> Result<(), Error> {
     cfg.mempool.chain_id = 10;
     cfg.enable_stark_aggregation = false;
     cfg.rpc_enabled = false;
-    let mut wpoa =
-        shell_consensus::WPoaConfig::from_poa(shell_consensus::PoaConfig::new(vec![authority], 1));
+    if capture_on_production {
+        cfg.node_role = shell_node::NodeRole::ValidatorProver;
+        cfg.canonical_proof_production = true;
+    }
+    let poa = shell_consensus::PoaConfig::new(vec![authority], 1);
+    let poa = if automatic {
+        poa.with_max_future_secs(86_400)
+    } else {
+        poa
+    };
+    let mut wpoa = shell_consensus::WPoaConfig::from_poa(poa);
     wpoa.chain_id = 10;
     cfg.consensus = ConsensusEngineConfig::WPoa(wpoa);
     let (node, _) = NodeBuilder::new(cfg, store.clone()).build()?;
@@ -170,8 +181,69 @@ fn prepare(out: &Path) -> Result<(), Error> {
     store.flush()?;
     write(
         &out.join("control.json"),
-        &json!({"native_digest":digest(store.as_ref())?,"parent":block.header.parent_hash,"block":block.hash(),"state_root":block.header.state_root,"receipts":node.chain_store.get_receipts(&block.hash())?,"accounts":accounts(store, &block)?,"raw_fresh_sender_count":1,"private_keys_persisted":false}),
+        &json!({"native_digest":digest(store.as_ref())?,"parent":block.header.parent_hash,"block":block.hash(),"state_root":block.header.state_root,"receipts":node.chain_store.get_receipts(&block.hash())?,"accounts":accounts(store.clone(), &block)?,"raw_fresh_sender_count":1,"private_keys_persisted":false}),
     )?;
+    if capture_on_production {
+        let captured = node
+            .canonical_production_status(block.hash())?
+            .ok_or("production hook did not capture source")?;
+        ensure(
+            captured["status"]["state"] == "queued"
+                && captured["block"] == serde_json::to_value(&block)?,
+            "production capture was not a queued matching source",
+        )?;
+        write(&out.join("produced-job.json"), &captured)?;
+        store.flush()?;
+    }
+    if automatic {
+        // Independent native execution control for advancement beyond historical undo retention.
+        let stores = RocksDbStore::open_all(out.join("native-control/db"), None)?;
+        let chain = ChainStore::new(Arc::new(stores.state.clone()));
+        // Import the same genesis and block into a separate native database.
+        let source_chain = ChainStore::new(store.clone());
+        let genesis = source_chain
+            .get_block_by_hash(&block.header.parent_hash)?
+            .ok_or("genesis absent")?;
+        let mut world = WorldState::new(Arc::new(stores.state.clone()));
+        world.set_account(
+            &address,
+            &Account::new_user_account(blake3_hash(sender.public_key()), U256::from(1_000_000)),
+        )?;
+        ensure(
+            world.state_root()? == genesis.header.state_root,
+            "control genesis mismatch",
+        )?;
+        chain.put_pubkey(&address, sender.public_key())?;
+        chain.put_pubkey(&authority, proposer.public_key())?;
+        chain.commit_genesis_block(
+            &genesis,
+            &source_chain.get_chain_config()?.ok_or("config absent")?,
+        )?;
+        let mut control_cfg = node.config.clone();
+        control_cfg.canonical_proof_production = false;
+        let (control, _) = NodeBuilder::new(control_cfg, Arc::new(stores.state.clone())).build()?;
+        control.import_block(block.clone(), &MultiVerifier)?;
+        let mut tx = block.transactions[0].tx.clone();
+        tx.nonce = 1;
+        let signature = sender.sign(tx.signing_hash(sender.sig_type().as_u8()).as_bytes())?;
+        control.handle_incoming_tx(
+            SignedTransaction::new(address, tx, signature),
+            &MultiVerifier,
+        )?;
+        let mut advance = Vec::new();
+        for _ in 0..129 {
+            advance.push(control.produce_block(&proposer, 100)?);
+        }
+        let last = advance.last().ok_or("advance absent")?;
+        let mut account_view = block.clone();
+        account_view.header.state_root = last.header.state_root;
+        write(&out.join("advance-blocks.json"), &advance)?;
+        write(
+            &out.join("advance-control.json"),
+            &json!({"head":last.hash(),"height":last.number(),"root":last.header.state_root,"accounts":accounts(Arc::new(stores.state.clone()),&account_view)?,"accelerated_local_heights":true,"max_future_secs":86400}),
+        )?;
+        stores.state.flush()?;
+    }
     Ok(())
 }
 fn snapshot(out: &Path, role: &str) -> Result<Value, Error> {
@@ -185,10 +257,14 @@ fn verify(out: &Path) -> Result<(), Error> {
     let control: Value = read(&out.join("control.json"))?;
     let proof = read(&out.join("job/proof.json"))?;
     let native = snapshot(out, "native")?;
-    ensure(
-        native["digest"] == control["native_digest"],
-        "native source changed during production",
-    )?;
+    if out.join("advance-control.json").exists() {
+        runtime::verify_native(out)?;
+    } else {
+        ensure(
+            native["digest"] == control["native_digest"],
+            "native source changed during production",
+        )?;
+    }
     let stores = RocksDbStore::open_all(out.join("follower/db"), None)?;
     let store = Arc::new(stores.state);
     let before = digest(store.as_ref())?;
@@ -293,7 +369,18 @@ fn main() -> Result<(), Error> {
     )?;
     let out = Path::new(&args[1]);
     match args[0].as_str() {
-        "prepare" => prepare(out),
+        "prepare" => prepare(out, false, false),
+        "prepare-runtime" => prepare(out, true, false),
+        "prepare-production-hook" => prepare(out, false, true),
+        "runtime-pause" | "runtime-resume" => {
+            tokio::runtime::Runtime::new()?.block_on(runtime::run(out, args[0] == "runtime-pause"))
+        }
+        "runtime-snapshot" => runtime::snapshot(out),
+        "runtime-native-check" => runtime::verify_native(out),
+        "runtime-next-job" => tokio::runtime::Runtime::new()?.block_on(runtime::next_job(out)),
+        "runtime-bad-certificate" | "runtime-bad-source" => {
+            tokio::runtime::Runtime::new()?.block_on(runtime::negative(out, &args[0]))
+        }
         "snapshot" => {
             println!("{}", snapshot(out, "native")?);
             Ok(())

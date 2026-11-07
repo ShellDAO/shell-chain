@@ -2638,6 +2638,7 @@ impl<S: KvStore + 'static> Node<S> {
             }
         }
 
+        self.capture_canonical_production(&block);
         Ok(())
     }
 }

@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add opt-in durable full canonical ML-DSA sender proving with restart-safe captured inputs, bounded checkpoints and read-only RPC availability; native admission and settlement remain independently verified.
+
 - Add an offline `import-block-proof` command that verifies a complete sender
   graph against the current canonical parent, executes one signed extension
   through the native importer, and atomically persists its body and receipts.

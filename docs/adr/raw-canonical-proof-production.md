@@ -17,7 +17,8 @@ Capture the body, configuration, parent account witnesses and registry keys from
 the sealed native view. Native preflight refuses invalid signatures before
 expensive generation; only the complete AIR verifier authenticates the output.
 Keep the source database exclusively open and prohibit source/output overlap.
-Do not introduce live history reservations or automatic scheduling in this step.
+Automatic scheduling is specified separately in
+[Automatic canonical production](automatic-canonical-proof-production.md).
 
 Compose the existing mathematical proving functions and persist each completed,
 verified certificate in a separate native job database. Atomically publish its
@@ -41,6 +42,6 @@ a real signed canonical block and an independent parent-only follower. It cold
 proves, pauses, reopens, resumes, imports the output through the actual CLI and
 rechecks persisted execution with full proof-backed historical replay. Focused
 store and file tests cover source/certificate mismatch, refusal before publishing,
-quota, immutable cached bytes and conflicting output prefixes. Automatic live
-production, peer admission, fork/amendment use and compact graphs remain separate
+quota, immutable cached bytes and conflicting output prefixes. The automatic producer has a separate runtime regression; ordinary automatic
+peer admission, fork/amendment use and compact graphs remain separate
 acceptance work; this source feature is not a network activation or release.

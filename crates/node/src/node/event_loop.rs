@@ -290,6 +290,7 @@ fn decode_challenge_response_amendment(
 struct NodeTaskLifecycle {
     tasks: tokio::task::JoinSet<()>,
     prover_service: Option<ProverServiceHandle>,
+    canonical_production: Option<super::canonical_production::CanonicalProductionHandle>,
 }
 
 impl NodeTaskLifecycle {
@@ -297,6 +298,7 @@ impl NodeTaskLifecycle {
         Self {
             tasks: tokio::task::JoinSet::new(),
             prover_service: None,
+            canonical_production: None,
         }
     }
 
@@ -312,6 +314,9 @@ impl NodeTaskLifecycle {
     }
 
     async fn shutdown(mut self) {
+        if let Some(handle) = self.canonical_production.take() {
+            handle.shutdown().await;
+        }
         if let Some(prover_service) = self.prover_service.take() {
             prover_service.shutdown().await;
         }
@@ -474,6 +479,18 @@ impl<S: KvStore + 'static> Node<S> {
         use shell_rpc::{start_rpc_server_with_proof_control, BlockEvent};
         use tokio::time::{interval, Duration};
 
+        if self.config.canonical_proof_production && !self.config.node_role.runs_prover() {
+            return Err(NodeError::Startup(
+                "canonical proof production requires a prover role".into(),
+            ));
+        }
+        if self.config.canonical_proof_component_budget.is_some()
+            && !self.config.canonical_proof_production
+        {
+            return Err(NodeError::Startup(
+                "canonical proof component budget requires production mode".into(),
+            ));
+        }
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         if *shutdown_rx.borrow() {
             return Ok(());
@@ -683,6 +700,8 @@ impl<S: KvStore + 'static> Node<S> {
         let (prover_amendment_tx, mut prover_amendment_rx) =
             tokio::sync::mpsc::channel(PROVER_AMENDMENT_CHANNEL_CAPACITY);
         let (prover_readiness_tx, prover_readiness_rx) = tokio::sync::watch::channel(false);
+
+        task_lifecycle.canonical_production = self.start_canonical_production()?;
 
         // H3: Start background prover service if this node is configured to run proving.
         if self.config.node_role.runs_prover() {

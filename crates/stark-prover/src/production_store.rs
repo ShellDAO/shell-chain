@@ -64,6 +64,7 @@ pub struct ProductionStore<'a, S: KvStore> {
     limit: Option<NonZeroUsize>,
     added: usize,
     reused: usize,
+    interrupt: Option<&'a dyn Fn() -> bool>,
 }
 impl<'a, S: KvStore> ProductionStore<'a, S> {
     pub fn open(
@@ -157,7 +158,13 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
             limit,
             added: 0,
             reused: 0,
+            interrupt: None,
         })
+    }
+    /// Stop between mathematical certificates; already committed bytes remain immutable.
+    pub fn with_interrupt(mut self, check: &'a dyn Fn() -> bool) -> Self {
+        self.interrupt = Some(check);
+        self
     }
     pub(crate) fn matches_source(&self, source: &[u8]) -> bool {
         self.index.source_hash == blake3_hash(source) && self.index.source_bytes == source.len()
@@ -182,6 +189,9 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
         prove: impl FnOnce() -> Result<T, String>,
         verify: impl FnOnce(&T) -> Result<(), String>,
     ) -> Result<T, ProductionError> {
+        if self.interrupt.is_some_and(|check| check()) {
+            return Err(ProductionError::Paused);
+        }
         let key = component_key(name)?;
         if self.index.components.contains_key(name) {
             let bytes = self
@@ -354,6 +364,19 @@ mod tests {
         drop(job);
         assert_eq!(before, db.scan_all().unwrap());
         assert!(ProductionStore::open(&mut db, b"source", None).is_ok());
+    }
+    #[test]
+    fn interrupt_preserves_checkpoint_and_never_returns_cached_success() {
+        let mut db = MemoryDb::new();
+        let stop = || true;
+        let mut job = ProductionStore::open(&mut db, b"source", None)
+            .unwrap()
+            .with_interrupt(&stop);
+        assert!(matches!(
+            job.checkpoint("first", || Ok(7u32), |_| Ok(())),
+            Err(ProductionError::Paused)
+        ));
+        assert_eq!(job.progress().components, 0);
     }
     #[test]
     fn quota_unknown_keys_and_failed_verification_never_publish() {
