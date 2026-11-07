@@ -394,6 +394,10 @@ fn main() -> Result<(), Error> {
             tokio::runtime::Runtime::new()?.block_on(admission_runtime::sustained_sync(out))
         }
         "peer-admission-sync-verify" => admission_runtime::verify_sync(out),
+        "peer-admission-gossip" => {
+            tokio::runtime::Runtime::new()?.block_on(admission_runtime::gossip(out))
+        }
+        "peer-admission-gossip-verify" => admission_runtime::verify_gossip(out),
         "peer-admission-verify" => admission_runtime::verify(out),
         "peer-admission-snapshot" => admission_runtime::snapshot(out),
         "runtime-snapshot" => runtime::snapshot(out),

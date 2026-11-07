@@ -15,7 +15,7 @@ import subprocess
 import sys
 
 mode, raw_fixture, raw_output = sys.argv[1:]
-assert mode in ("run", "verify")
+assert mode in ("run", "verify", "gossip", "gossip-verify")
 fixture, out = map(lambda p: Path(p).resolve(), (raw_fixture, raw_output))
 
 def now():
@@ -63,18 +63,37 @@ def snapshot(role, label):
 def verify():
     run("cold-verify", [fixture, "peer-admission-verify", out])
 
+def gossip_verify():
+    run("cold-gossip-verify", [fixture, "peer-admission-gossip-verify", out])
+
+def gossip():
+    if not (out / "network-gossip/complete.json").exists():
+        run("peer-admission-gossip", [fixture, "peer-admission-gossip", out])
+    gossip_verify()
+    gossip_verify()
+
+if mode == "gossip":
+    gossip()
+    print((out / "network-gossip/complete.json").read_text())
+    sys.exit(0)
+if mode == "gossip-verify":
+    gossip_verify()
+    sys.exit(0)
 if mode == "verify":
     assert (out / "network/complete.json").exists(), "automatic native admission incomplete"
     if (out / "network/sync-complete.json").exists():
         run("cold-sync-verify", [fixture, "peer-admission-sync-verify", out])
     else:
         verify()
+    if (out / "network-gossip/complete.json").exists():
+        gossip_verify()
     sys.exit(0)
 if (out / "network/result.json").exists():
     if not (out / "network/sync-complete.json").exists():
         run("peer-admission-sync", [fixture, "peer-admission-sync", out])
     run("cold-sync-verify", [fixture, "peer-admission-sync-verify", out])
     run("cold-sync-verify", [fixture, "peer-admission-sync-verify", out])
+    gossip()
     print((out / "network/sync-complete.json").read_text())
     sys.exit(0)
 if not (out / "network/initial.json").exists():
@@ -105,4 +124,5 @@ save(path, result)
 run("peer-admission-sync", [fixture, "peer-admission-sync", out])
 run("cold-sync-verify", [fixture, "peer-admission-sync-verify", out])
 run("cold-sync-verify", [fixture, "peer-admission-sync-verify", out])
+gossip()
 print((out / "network/sync-complete.json").read_text())

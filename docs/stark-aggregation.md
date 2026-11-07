@@ -197,6 +197,17 @@ latest accounts with independent native execution. A historical proof query
 outside the existing 128-block parent-view bound must refuse without writes;
 the earlier height-2 replay records the complete mathematical verification.
 
+A separate fresh receiver then exercises gossip-only intake. The provider
+broadcasts the genuine signed first block over libp2p gossip while the test
+suppresses every direct `NewBlock` and `BlockResponse`. Dedicated authenticated
+proof discovery and chunk transfer remain real. Native commit must match the
+independent execution, followed by two cold full-proof replays without writes.
+To exercise only this route with an existing output containing the captured
+native source and complete first graph, use
+`tests/e2e/mldsa-live-peer-proof.sh gossip output`; use `gossip-verify` for a cold
+recheck. The focused mode never regenerates certificates. Retain an incomplete
+gossip fixture and inspect its command receipt before starting another attempt.
+
 Private keys are not persisted; command receipts and output remain available.
 Proving can take hours. Checkpoint component counts and follower height are
 written to `network/sync-progress.json`; allow four hours overall and up to

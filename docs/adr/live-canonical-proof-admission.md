@@ -70,3 +70,12 @@ compare every native body, canonical hash, receipt and latest account; history
 outside the existing 128-block bound is an expected refusal, not a successful
 historical proof. This exercises two eligible sender blocks within the retained
 job/cache limits; it does not establish indefinite capacity or throughput.
+
+The separate gossip assertion starts from independent genesis and an empty
+proof cache. A test transport suppresses direct block bodies and periodically
+broadcasts the genuine signed block through libp2p gossip; it does not change
+production node validation or proof transport. The broadcast timer persists
+across cancellation of `next_event` by the node event loop. Accepted source
+hash, receipts, accounts and two cold read-only proof replays must agree with
+native execution. This distinguishes actual broadcast intake from an
+unfinalized block returned directly in response to a sync request.

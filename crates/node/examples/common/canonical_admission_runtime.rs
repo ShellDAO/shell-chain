@@ -26,10 +26,14 @@ struct Faults {
     hold_suffix: AtomicBool,
     suffix_seen: AtomicBool,
     release_suffix: Notify,
+    gossip_block: RwLock<Option<Block>>,
+    gossip_attempts: AtomicUsize,
+    suppressed_direct_bodies: AtomicUsize,
 }
 struct Provider {
     inner: Libp2pNetwork,
     faults: Arc<Faults>,
+    gossip_timer: tokio::time::Interval,
 }
 #[async_trait]
 impl NetworkService for Provider {
@@ -37,6 +41,17 @@ impl NetworkService for Provider {
         self.inner.broadcast(m).await
     }
     async fn send_to_peer(&self, p: &PeerId, mut m: NetworkMessage) -> Result<(), NetworkError> {
+        if self.faults.gossip_block.read().unwrap().is_some()
+            && matches!(
+                &m,
+                NetworkMessage::NewBlock(_) | NetworkMessage::BlockResponse { .. }
+            )
+        {
+            self.faults
+                .suppressed_direct_bodies
+                .fetch_add(1, Ordering::SeqCst);
+            return Ok(());
+        }
         if let NetworkMessage::CanonicalProofManifestResponse {
             block_hash,
             manifest,
@@ -71,7 +86,21 @@ impl NetworkService for Provider {
         self.inner.send_to_peer(p, m).await
     }
     async fn next_event(&mut self) -> Option<NetworkEvent> {
-        self.inner.next_event().await
+        if self.faults.gossip_block.read().unwrap().is_none() {
+            return self.inner.next_event().await;
+        }
+        loop {
+            tokio::select! {
+                event = self.inner.next_event() => return event,
+                _ = self.gossip_timer.tick() => {
+                    if self.inner.peer_count().await == 0 { continue; }
+                    let block = self.faults.gossip_block.read().unwrap().clone()?;
+                    if self.inner.broadcast(NetworkMessage::NewBlock(Box::new(block))).await.is_ok() {
+                        self.faults.gossip_attempts.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
     }
     async fn peer_count(&self) -> usize {
         self.inner.peer_count().await
@@ -153,6 +182,7 @@ impl Live {
                     &mut Provider {
                         inner: network,
                         faults,
+                        gossip_timer: tokio::time::interval(Duration::from_secs(3)),
                     },
                 )
                 .await
@@ -414,11 +444,15 @@ pub(super) async fn run(
     Ok(())
 }
 pub(super) fn verify(out: &Path) -> Result<(), Error> {
+    verify_at(out, "network")
+}
+fn verify_at(out: &Path, directory: &str) -> Result<(), Error> {
     let c: fixture::Context = read(&out.join("context.json"))?;
     let block: Block = read(&out.join("candidate.json"))?;
     let proof = read(&out.join("job/proof.json"))?;
     let control: Value = read(&out.join("control.json"))?;
-    let stores = RocksDbStore::open_all(out.join("network/receiver/db"), None)?;
+    let network = out.join(directory);
+    let stores = RocksDbStore::open_all(network.join("receiver/db"), None)?;
     let store = Arc::new(stores.state);
     let before = digest(store.as_ref())?;
     let node = fixture::node(store.clone(), c.authority, &c.authority_key)?;
@@ -437,13 +471,98 @@ pub(super) fn verify(out: &Path) -> Result<(), Error> {
         digest(store.as_ref())? == before,
         "cold automatic verification wrote native state",
     )?;
-    let mut receipt = out.join("network/verified.json");
+    let mut receipt = network.join("verified.json");
     let mut i = 2;
     while receipt.exists() {
-        receipt = out.join(format!("network/verified-{i}.json"));
+        receipt = network.join(format!("verified-{i}.json"));
         i += 1;
     }
     write(&receipt, &result)
+}
+
+pub(super) fn verify_gossip(out: &Path) -> Result<(), Error> {
+    verify_at(out, "network-gossip")
+}
+
+pub(super) async fn gossip(out: &Path) -> Result<(), Error> {
+    let network = out.join("network-gossip");
+    ensure(
+        !network.exists(),
+        "gossip fixture exists; retain it and inspect receipts",
+    )?;
+    prepare_at(out, "network-gossip")?;
+    let c: fixture::Context = read(&out.join("context.json"))?;
+    let block: Block = read(&out.join("candidate.json"))?;
+    let initial: Value = read(&network.join("initial.json"))?;
+    {
+        let stores = RocksDbStore::open_all(network.join("receiver/db"), None)?;
+        let chain = ChainStore::new(Arc::new(stores.state.clone()));
+        ensure(
+            chain.get_block_by_hash(&c.block)?.is_none()
+                && stores
+                    .state
+                    .scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?
+                    .is_empty(),
+            "gossip receiver already has source body or proof cache",
+        )?;
+        ensure(
+            json!(canonical_digest(&stores.state)?) == initial["native_digest"],
+            "gossip initial state changed",
+        )?;
+    }
+    let faults = Arc::new(Faults::default());
+    *faults.gossip_block.write().unwrap() = Some(block.clone());
+    let provider = Live::start(
+        &network.join("provider/db"),
+        &c,
+        vec![],
+        false,
+        false,
+        Some(faults.clone()),
+    )
+    .await?;
+    let provider_peer = provider.info.read().unwrap().peer_id.clone();
+    let receiver = Live::start(
+        &network.join("receiver/db"),
+        &c,
+        vec![provider.dial()],
+        true,
+        false,
+        None,
+    )
+    .await?;
+    let result = async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        loop {
+            ensure(!provider.task.is_finished() && !receiver.task.is_finished(), "gossip node exited")?;
+            let status = receiver.call("admin_canonicalProofAdmission", json!([c.block])).await?;
+            ensure(status["status"]["state"] != "failed", &format!("gossip proof refused: {status}"))?;
+            if status["status"]["state"] == "complete" {
+                let control: Value = read(&out.join("control.json"))?;
+                ensure(status["nativeCanonical"] == true
+                    && status["status"]["peer"] == provider_peer
+                    && receiver.node.chain_store.get_head_hash()? == Some(c.block)
+                    && receiver.node.chain_store.get_receipts(&c.block)?.map(serde_json::to_value).transpose()? == Some(control["receipts"].clone())
+                    && accounts(receiver.node.store.clone(), &block)? == control["accounts"],
+                    "gossip native commit differs from independent control")?;
+                let attempts = faults.gossip_attempts.load(Ordering::SeqCst);
+                let suppressed = faults.suppressed_direct_bodies.load(Ordering::SeqCst);
+                let chunks = faults.chunks.load(Ordering::SeqCst);
+                ensure(attempts > 0 && suppressed > 0 && chunks > 0, "gossip-only transport condition not exercised")?;
+                write(&network.join("complete.json"), &json!({"admission":status,"broadcast_attempts":attempts,"suppressed_direct_bodies":suppressed,"served_chunks":chunks,"actual_libp2p_gossip":true,"no_direct_source_body":true,"root_receipts_accounts_match":true}))?;
+                break;
+            }
+            ensure(tokio::time::Instant::now() < deadline, &format!("gossip admission timeout: {status}"))?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok::<_, Error>(())
+    }.await;
+    let receiver_stop = receiver.stop().await;
+    let provider_stop = provider.stop().await;
+    result?;
+    receiver_stop?;
+    provider_stop?;
+    Ok(())
 }
 
 pub(super) fn snapshot(out: &Path) -> Result<(), Error> {

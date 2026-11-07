@@ -15,6 +15,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add a real gossip-only canonical sender-proof regression with an independent
+  genesis receiver, direct block-body suppression, authenticated proof transfer,
+  native receipt/account checks and cold full-proof replay without writes.
+
 - Add opt-in ordinary peer admission for complete registered ML-DSA sender proofs, with bounded manifest discovery, interrupted transfer recovery and event-loop native commit.
 
 - Add opt-in durable full canonical ML-DSA sender proving with restart-safe captured inputs, bounded checkpoints and read-only RPC availability; native admission and settlement remain independently verified.
