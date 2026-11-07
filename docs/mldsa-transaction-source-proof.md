@@ -1253,3 +1253,39 @@ against native receipts, account balances/nonces and state root. Test keys are
 created in memory and discarded. The verify mode rechecks the existing result
 without generating new proofs. These source commands do not establish a public
 binary release, network activation, full proposer proof or recursive compression.
+
+## Full ordered-batch peer regression
+
+To exercise full ML-DSA-65 sender and proposer AIR with two transactions from the
+same registered sender, use a new output directory from this source checkout:
+
+```sh
+tests/e2e/mldsa-full-proof.sh batch full-batch-test
+tests/e2e/mldsa-full-proof.sh verify full-batch-test
+```
+
+This requires Python 3, the stable Rust toolchain and the repository's RocksDB
+build prerequisites. It is an expensive public-certificate computation. Fresh
+test accounts are funded in an isolated genesis; signing keys exist only during
+preparation and are never saved. Keep the output, databases and command receipts.
+Repeating `batch` resumes durable preparation/proving checkpoints; `verify`
+rechecks the retained result without generating new certificates. A failed
+assertion or child command exits nonzero and retains its inputs and log.
+
+The valid block executes nonces 0 and 1, finalizes through genuine single-authority
+consensus and must match independent native roots, receipts, balances and nonce.
+Identical mathematical inputs at the second position and later job are fully
+reverified and shared. Each full graph has 179 components; logical and physical
+checkpoint bounds remain 256 MiB and transport retains its separate 512 MiB bound.
+
+A separately labelled Byzantine storage source then supplies genuine signatures
+for nonces 2 and 3 with an incorrect resulting root. The receiver must verify the
+full AIR graph, execute both transactions and refuse the state-root mismatch
+without native state, index, receipt or finality writes. This bad source is not
+native execution evidence. An independently produced correct second block is
+imported separately through ordinary native verification, after which cold
+historical proof replay must match the first block without changing any KV data.
+The correct successor is a history control, not a proof-admitted target. The
+output includes both raw graphs, manifests, native controls and command receipts.
+These source tests do not establish public binary release, network activation,
+full 16-transaction load, arbitrary key layouts or recursive compression.

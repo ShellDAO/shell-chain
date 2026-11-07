@@ -30,6 +30,8 @@ struct CertificateReference {
     block: ShellHash,
     bytes: usize,
     hash: ShellHash,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    component: Option<String>,
 }
 fn certificate_prefix(hash: ShellHash) -> Vec<u8> {
     key(&[b"certificates/".as_slice(), hash.as_bytes(), b"/"].concat())
@@ -260,40 +262,139 @@ struct ProductionJob<S: KvStore> {
     prefix: Vec<u8>,
 }
 impl<S: KvStore> ProductionJob<S> {
-    fn resolve(&self, k: &[u8], bytes: Vec<u8>) -> Result<Vec<u8>, StorageError> {
-        if !k.starts_with(b"production/component/") {
-            return Ok(bytes);
+    fn component_name(k: &[u8]) -> Result<&str, StorageError> {
+        let name = std::str::from_utf8(
+            k.strip_prefix(b"production/component/")
+                .ok_or_else(|| error("not a production component"))?,
+        )
+        .map_err(error)?;
+        if name.is_empty()
+            || name.len() > 96
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(error("invalid referenced component name"));
         }
+        Ok(name)
+    }
+    fn anchor(
+        &self,
+        k: &[u8],
+        bytes: Vec<u8>,
+    ) -> Result<(Vec<u8>, ShellHash, String), StorageError> {
+        let name = Self::component_name(k)?;
         let Some(encoded) = bytes.strip_prefix(REFERENCE) else {
-            return Ok(bytes);
+            return Ok((bytes, self.block, name.into()));
         };
         if encoded.len() > 1024 {
             return Err(error("production certificate reference size limit"));
         }
         let reference: CertificateReference = serde_json::from_slice(encoded).map_err(error)?;
+        let target_name = match (reference.version, reference.component.as_deref()) {
+            (1, None) if reference.block != self.block => name,
+            (2, Some(target)) if reference.block != self.block || target != name => target,
+            _ => return Err(error("invalid production certificate reference target")),
+        };
+        let target_key = [b"production/component/", target_name.as_bytes()].concat();
+        Self::component_name(&target_key)?;
         let owner = CanonicalProductionStore {
             store: self.store.clone(),
             lock: self.lock.clone(),
         };
-        if reference.version != 1
-            || reference.block == self.block
-            || reference.bytes > MAX_BYTES as usize
-            || !owner.ids()?.contains(&reference.block)
+        let ids = owner.ids()?;
+        if reference.bytes > MAX_BYTES as usize
+            || !ids.contains(&self.block)
+            || !ids.contains(&reference.block)
         {
-            return Err(error("invalid production certificate reference target"));
+            return Err(error("invalid production certificate reference owner"));
         }
         let target = self
             .store
-            .get(&[certificate_prefix(reference.block).as_slice(), k].concat())?
+            .get(
+                &[
+                    certificate_prefix(reference.block).as_slice(),
+                    target_key.as_slice(),
+                ]
+                .concat(),
+            )?
             .ok_or_else(|| error("missing production certificate reference target"))?;
-        // References always terminate at immutable inline bytes; no chains or cycles.
         if target.starts_with(REFERENCE)
             || target.len() != reference.bytes
             || blake3_hash(&target) != reference.hash
         {
             return Err(error("production certificate reference integrity mismatch"));
         }
-        Ok(target)
+        Ok((target, reference.block, target_name.into()))
+    }
+    fn resolve(&self, k: &[u8], bytes: Vec<u8>) -> Result<Vec<u8>, StorageError> {
+        if !k.starts_with(b"production/component/") {
+            return Ok(bytes);
+        }
+        self.anchor(k, bytes).map(|v| v.0)
+    }
+    fn reference_to(
+        &self,
+        k: &[u8],
+        v: &[u8],
+    ) -> Result<Option<CertificateReference>, StorageError> {
+        let current = Self::component_name(k)?;
+        let hash = blake3_hash(v);
+        let owner = CanonicalProductionStore {
+            store: self.store.clone(),
+            lock: self.lock.clone(),
+        };
+        for block in owner.ids()? {
+            let job = owner.job(block);
+            let mut candidates = Vec::new();
+            if block != self.block {
+                candidates.push(k.to_vec());
+            }
+            if let Some(index) = job.get(b"production/index")? {
+                if index.len() > 256 * 1024 {
+                    return Err(error("production donor index size limit"));
+                }
+                let index: serde_json::Value = serde_json::from_slice(&index).map_err(error)?;
+                let entries = index["components"]
+                    .as_object()
+                    .ok_or_else(|| error("production donor index shape"))?;
+                if index["version"] != 1 || entries.len() > 2048 {
+                    return Err(error("production donor index version/count"));
+                }
+                for (name, entry) in entries {
+                    if entry["bytes"].as_u64() == Some(v.len() as u64)
+                        && entry["hash"] == serde_json::to_value(hash).map_err(error)?
+                    {
+                        let key = [b"production/component/", name.as_bytes()].concat();
+                        Self::component_name(&key)?;
+                        if block != self.block || name != current {
+                            candidates.push(key);
+                        }
+                    }
+                }
+            }
+            for target in candidates {
+                if let Some(raw) = self
+                    .store
+                    .get(&[job.prefix.as_slice(), target.as_slice()].concat())?
+                {
+                    let (bytes, anchor, name) = job.anchor(&target, raw)?;
+                    if bytes != v {
+                        continue;
+                    }
+                    if anchor == self.block && name == current {
+                        return Err(error("cyclic production reference"));
+                    }
+                    let named = anchor == self.block || name != current;
+                    return Ok(Some(CertificateReference {
+                        version: if named { 2 } else { 1 },
+                        block: anchor,
+                        bytes: v.len(),
+                        hash,
+                        component: named.then_some(name),
+                    }));
+                }
+            }
+        }
+        Ok(None)
     }
 }
 impl<S: KvStore> KvStore for ProductionJob<S> {
@@ -352,32 +453,8 @@ impl<S: KvStore> KvStore for ProductionJob<S> {
                         if let Some(existing) = self.store.get(&physical)? {
                             // Preserve an existing inline certificate or reference exactly.
                             value = existing;
-                        } else {
-                            let owner = CanonicalProductionStore {
-                                store: self.store.clone(),
-                                lock: self.lock.clone(),
-                            };
-                            for donor in owner.ids()? {
-                                if donor == self.block {
-                                    continue;
-                                }
-                                if self
-                                    .store
-                                    .get(&[certificate_prefix(donor).as_slice(), k].concat())?
-                                    .is_some_and(|bytes| {
-                                        !bytes.starts_with(REFERENCE) && bytes == *v
-                                    })
-                                {
-                                    let reference = CertificateReference {
-                                        version: 1,
-                                        block: donor,
-                                        bytes: v.len(),
-                                        hash: blake3_hash(v),
-                                    };
-                                    value = [REFERENCE, encode(&reference)?.as_slice()].concat();
-                                    break;
-                                }
-                            }
+                        } else if let Some(reference) = self.reference_to(k, v)? {
+                            value = [REFERENCE, encode(&reference)?.as_slice()].concat();
                         }
                     }
                     changes.push((physical, value));
@@ -535,11 +612,11 @@ impl<S: KvStore + 'static> Node<S> {
             }
             let reuse = |name: &str| -> Result<Option<Vec<u8>>, String> {
                 for (hash, donor) in &donors {
-                    if source.can_reuse_component_from(donor, name) {
+                    if let Some(component) = source.reusable_component_from(donor, name) {
                         let bytes = self
                             .canonical_production
                             .job(*hash)
-                            .get(&[b"production/component/", name.as_bytes()].concat())
+                            .get(&[b"production/component/", component.as_bytes()].concat())
                             .map_err(|e| e.to_string())?
                             .ok_or_else(|| "matching donor certificate missing".to_string())?;
                         return Ok(Some(bytes));
@@ -744,6 +821,66 @@ mod tests {
     use super::*;
     use shell_storage::MemoryDb;
     #[test]
+    fn named_local_references_and_cross_job_flattening_preserve_inline_anchor() {
+        let db = Arc::new(MemoryDb::new());
+        let owner = CanonicalProductionStore::new(db.clone());
+        let first = ShellHash::from([1; 32]);
+        let second = ShellHash::from([2; 32]);
+        {
+            let mut guard = owner.lock.lock();
+            owner
+                .write_locked(
+                    vec![(key(b"jobs"), encode(&vec![first, second]).unwrap())],
+                    &mut guard,
+                    DATA_CEILING,
+                )
+                .unwrap();
+        }
+        let a = owner.job(first);
+        let b = owner.job(second);
+        let value = vec![7u8; 4096];
+        let hash = blake3_hash(&value);
+        a.put(b"production/component/z-key", &value).unwrap();
+        let index = |both| {
+            serde_json::to_vec(&if both {serde_json::json!({"version":1,"components":{"a-key":{"bytes":4096,"hash":hash},"z-key":{"bytes":4096,"hash":hash}}})}else{serde_json::json!({"version":1,"components":{"z-key":{"bytes":4096,"hash":hash}}})}).unwrap()
+        };
+        a.put(b"production/index", &index(false)).unwrap();
+        a.put(b"production/component/a-key", &value).unwrap();
+        assert_eq!(
+            a.get(b"production/component/a-key").unwrap().unwrap(),
+            value
+        );
+        a.put(b"production/index", &index(true)).unwrap();
+        b.put(b"production/component/b-key", &value).unwrap();
+        let physical = [b.prefix.as_slice(), b"production/component/b-key"].concat();
+        let raw = db.get(&physical).unwrap().unwrap();
+        let reference: CertificateReference =
+            serde_json::from_slice(raw.strip_prefix(REFERENCE).unwrap()).unwrap();
+        assert_eq!(reference.version, 2);
+        assert_eq!(reference.block, first);
+        assert_eq!(reference.component.as_deref(), Some("z-key"));
+        assert_eq!(
+            b.get(b"production/component/b-key").unwrap().unwrap(),
+            value
+        );
+        assert_eq!(
+            db.get(&[a.prefix.as_slice(), b"production/component/z-key"].concat())
+                .unwrap()
+                .unwrap(),
+            value
+        );
+        assert!(owner.checked_total(&mut None).unwrap() < 6000);
+        let mut cycle = reference;
+        cycle.block = second;
+        cycle.component = Some("b-key".into());
+        db.put(
+            &physical,
+            &[REFERENCE, encode(&cycle).unwrap().as_slice()].concat(),
+        )
+        .unwrap();
+        assert!(b.get(b"production/component/b-key").is_err());
+    }
+    #[test]
     fn one_hop_references_deduplicate_and_refuse_changed_missing_or_cyclic_targets() {
         let db = Arc::new(MemoryDb::new());
         db.put(b"HEAD", b"native anchor").unwrap();
@@ -792,6 +929,7 @@ mod tests {
             block: second,
             bytes: 4096,
             hash: blake3_hash(&certificate),
+            component: None,
         };
         db.put(
             &physical,

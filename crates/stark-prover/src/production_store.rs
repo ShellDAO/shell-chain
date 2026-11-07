@@ -67,6 +67,7 @@ pub struct ProductionStore<'a, S: KvStore> {
     reused: usize,
     interrupt: Option<&'a dyn Fn() -> bool>,
     reuse: Option<&'a ComponentReuse<'a>>,
+    local_reuse: BTreeMap<String, String>,
 }
 impl<'a, S: KvStore> ProductionStore<'a, S> {
     pub fn open(
@@ -162,6 +163,7 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
             reused: 0,
             interrupt: None,
             reuse: None,
+            local_reuse: BTreeMap::new(),
         })
     }
     /// Stop between mathematical certificates; already committed bytes remain immutable.
@@ -174,6 +176,9 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
     pub fn with_reuse(mut self, reuse: &'a ComponentReuse<'a>) -> Self {
         self.reuse = Some(reuse);
         self
+    }
+    pub(crate) fn set_local_reuse(&mut self, names: BTreeMap<String, String>) {
+        self.local_reuse = names;
     }
     pub(crate) fn matches_source(&self, source: &[u8]) -> bool {
         self.index.source_hash == blake3_hash(source) && self.index.source_bytes == source.len()
@@ -220,7 +225,20 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
         if self.index.components.len() >= MAX_COMPONENTS {
             return Err(failure("production component count limit"));
         }
-        let donor = self.reuse.map(|reuse| reuse(name)).transpose()?.flatten();
+        let local = self
+            .local_reuse
+            .get(name)
+            .filter(|other| self.index.components.contains_key(*other));
+        let donor = if let Some(other) = local {
+            Some(
+                self.store
+                    .get(&component_key(other)?)
+                    .map_err(failure)?
+                    .ok_or_else(|| failure("local donor certificate missing"))?,
+            )
+        } else {
+            self.reuse.map(|reuse| reuse(name)).transpose()?.flatten()
+        };
         let borrowed = donor.is_some();
         let remaining = MAX_CHECKPOINT_BYTES - self.progress().checkpoint_bytes;
         let p = if let Some(bytes) = donor {
@@ -297,6 +315,44 @@ pub fn bounded_json(value: &impl Serialize, limit: usize) -> Result<Vec<u8>, Pro
 mod tests {
     use super::*;
     use shell_storage::MemoryDb;
+    #[test]
+    fn local_position_reuse_rechecks_and_persists_without_reproving() {
+        let mut db = MemoryDb::new();
+        let mut job = ProductionStore::open(&mut db, b"source", None).unwrap();
+        job.checkpoint("sender-0-key", || Ok(7u32), |_| Ok(()))
+            .unwrap();
+        job.set_local_reuse(BTreeMap::from([(
+            "sender-1-key".into(),
+            "sender-0-key".into(),
+        )]));
+        assert!(job
+            .checkpoint::<u32>(
+                "sender-1-key",
+                || panic!("must not reprove"),
+                |_| Err("different input".into())
+            )
+            .is_err());
+        assert_eq!(job.progress().components, 1);
+        assert_eq!(
+            job.checkpoint::<u32>(
+                "sender-1-key",
+                || panic!("must not reprove"),
+                |p| if *p == 7 { Ok(()) } else { Err("bad".into()) }
+            )
+            .unwrap(),
+            7
+        );
+        assert_eq!(job.progress().newly_proved, 1);
+        assert_eq!(job.progress().reused, 1);
+        drop(job);
+        assert_eq!(
+            ProductionStore::open(&mut db, b"source", None)
+                .unwrap()
+                .progress()
+                .components,
+            2
+        );
+    }
     #[test]
     fn donor_is_verified_before_atomic_publication_and_never_reproved() {
         let mut db = FailingBatch {

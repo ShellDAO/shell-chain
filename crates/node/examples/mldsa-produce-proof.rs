@@ -48,6 +48,7 @@ fn prepare(
     automatic: bool,
     capture_on_production: bool,
     full: bool,
+    batch: bool,
 ) -> Result<(), Error> {
     if out.exists() {
         ensure(
@@ -78,10 +79,16 @@ fn prepare(
         "fixture actor collision",
     )?;
     let mut native = None;
+    let mut native_checkpoint = None;
     let mut genesis_hash = None;
-    for role in ["native", "follower"] {
+    let roles: &[&str] = if batch {
+        &["native"]
+    } else {
+        &["native", "follower"]
+    };
+    for &role in roles {
         let stores = RocksDbStore::open_all(out.join(role).join("db"), None)?;
-        let store = Arc::new(stores.state);
+        let store = Arc::new(stores.state.clone());
         let mut world = WorldState::new(store.clone());
         world.set_account(
             &address,
@@ -114,6 +121,9 @@ fn prepare(
         chain.commit_genesis_block(&genesis, &cfg)?;
         if role == "native" {
             native = Some(store);
+            if batch {
+                native_checkpoint = Some(stores);
+            }
         } else {
             store.flush()?;
         }
@@ -152,22 +162,29 @@ fn prepare(
         max_fee_per_blob_gas: None,
         blob_versioned_hashes: None,
     };
-    let signature = sender.sign(tx.signing_hash(sender.sig_type().as_u8()).as_bytes())?;
-    let signed = SignedTransaction::new(address, tx, signature);
-    node.handle_incoming_tx(signed, &MultiVerifier)?;
+    let count = if batch { 2u64 } else { 1 };
+    for nonce in 0..count {
+        let mut tx = tx.clone();
+        tx.nonce = nonce;
+        let signature = sender.sign(tx.signing_hash(sender.sig_type().as_u8()).as_bytes())?;
+        node.handle_incoming_tx(
+            SignedTransaction::new(address, tx, signature),
+            &MultiVerifier,
+        )?;
+    }
     let block = node.produce_block(proposer.as_ref(), 100)?;
     ensure(
-        block.transactions.len() == 1 && block.system_transactions.len() == 1,
+        block.transactions.len() == count as usize && block.system_transactions.len() == 1,
         "native production did not execute funded sender",
     )?;
     {
         let world = node.world_state.read();
         ensure(
-            world.get_nonce(&address)? == 1
-                && world.get_balance(&address)? == U256::from(957_999)
-                && world.get_balance(&recipient)? == U256::from(1)
-                && world.get_balance(&authority)? == U256::from(42_000)
-                && block.header.gas_used == 21_000,
+            world.get_nonce(&address)? == count
+                && world.get_balance(&address)? == U256::from(1_000_000 - count * 42_001)
+                && world.get_balance(&recipient)? == U256::from(count)
+                && world.get_balance(&authority)? == U256::from(count * 42_000)
+                && block.header.gas_used == count * 21_000,
             "native fresh transfer nonce/value/fee/reward control mismatch",
         )?;
     }
@@ -279,14 +296,24 @@ fn prepare(
         )?;
         // A separately labelled ordinary native successor changes current state.
         // It is not claimed as a second proof-admitted block.
+        if batch {
+            std::fs::create_dir(out.join("batch-native"))?;
+            store.flush()?;
+            native_checkpoint
+                .as_ref()
+                .ok_or("batch checkpoint handle missing")?
+                .create_checkpoint(out.join("batch-native/db"))?;
+        }
         node.config.canonical_proof_production = false;
-        let mut next = block.transactions[0].tx.clone();
-        next.nonce = 1;
-        let signature = sender.sign(next.signing_hash(sender.sig_type().as_u8()).as_bytes())?;
-        node.handle_incoming_tx(
-            SignedTransaction::new(address, next, signature),
-            &MultiVerifier,
-        )?;
+        for nonce in count..2 * count {
+            let mut next = block.transactions[0].tx.clone();
+            next.nonce = nonce;
+            let signature = sender.sign(next.signing_hash(sender.sig_type().as_u8()).as_bytes())?;
+            node.handle_incoming_tx(
+                SignedTransaction::new(address, next, signature),
+                &MultiVerifier,
+            )?;
+        }
         let later = node.produce_block(proposer.as_ref(), 100)?;
         ensure(
             later.header.state_root != block.header.state_root,
@@ -297,6 +324,59 @@ fn prepare(
             &out.join("later-control.json"),
             &json!({"head":later.hash(),"state_root":later.header.state_root,"receipts":node.chain_store.get_receipts(&later.hash())?,"accounts":accounts(store.clone(), &later)?,"ordinary_native_successor_not_proof_admitted":true}),
         )?;
+        if batch {
+            let mut bad = later.clone();
+            bad.header.state_root = block.header.state_root;
+            bad.proposer_seal = Some(proposer.sign(bad.hash().as_bytes())?);
+            write(&out.join("batch-bad-block.json"), &bad)?;
+            let stores = RocksDbStore::open_all(out.join("batch-native/db"), None)?;
+            let bad_store = Arc::new(stores.state);
+            // Byzantine source fixture only: storage does not establish execution.
+            // The actual native control above has a different, correct second root.
+            let overlay = Arc::new(shell_storage::OverlayStore::new(bad_store.clone()));
+            let staged = ChainStore::new(overlay.clone());
+            staged
+                .stage_address_metadata_undo(&bad.hash(), &staged.address_metadata_checkpoint()?)?;
+            staged.put_block_signers(
+                &bad.hash(),
+                &[shell_core::BlockSignerEvidence {
+                    address: authority,
+                    public_key: proposer.public_key().to_vec(),
+                    signature: bad.proposer_seal.clone().ok_or("missing bad seal")?,
+                }],
+            )?;
+            staged.commit_canonical_block(
+                &bad,
+                Some(
+                    node.chain_store
+                        .get_receipts(&later.hash())?
+                        .as_ref()
+                        .ok_or("control receipts missing")?,
+                ),
+            )?;
+            overlay.commit()?;
+            let source_node = fixture::node(bad_store.clone(), authority, proposer.public_key())?;
+            let mut round = shell_consensus::wpoa_state::WPoaRound::new(
+                bad.number(),
+                0,
+                source_node.consensus.read().validator_weights(),
+            );
+            let _ = round.on_block_proposed(bad.hash(), authority);
+            *source_node.wpoa_round.lock() = Some(round);
+            source_node
+                .handle_wpoa_vote(
+                    authority,
+                    bad.hash(),
+                    bad.number(),
+                    bad.proposer_seal.clone().ok_or("missing bad vote")?,
+                )
+                .ok_or("Byzantine same-hash quorum fixture failed")?;
+            bad_store.flush()?;
+            write(
+                &out.join("batch-fixture.json"),
+                &json!({"good1_natively_executed":true,"control2_natively_executed":true,"bad2_storage_only_byzantine_source":true,"bad2_not_execution_evidence":true,"private_keys_persisted":false,"transactions_per_block":2}),
+            )?;
+        }
         store.flush()?;
     }
 
@@ -425,11 +505,18 @@ fn main() -> Result<(), Error> {
     )?;
     let out = Path::new(&args[1]);
     match args[0].as_str() {
-        "prepare" => prepare(out, false, false, false),
-        "prepare-full" => prepare(out, false, true, true),
+        "prepare" => prepare(out, false, false, false, false),
+        "prepare-full" => prepare(out, false, true, true, false),
+        "prepare-batch" => prepare(out, false, true, true, true),
         "full-pause" | "full-resume" | "full-bad-proposer" => {
             tokio::runtime::Runtime::new()?.block_on(admission_runtime::full(out, &args[0]))
         }
+        "batch-pause" | "batch-resume" => tokio::runtime::Runtime::new()?
+            .block_on(admission_runtime::batch(out, args[0] == "batch-pause")),
+        "batch-snapshot" => admission_runtime::snapshot_batch(out),
+        "batch-verify" => admission_runtime::verify_batch(out, false, false),
+        "batch-history" => admission_runtime::verify_batch(out, true, true),
+        "batch-history-verify" => admission_runtime::verify_batch(out, true, false),
         "full-verify" => admission_runtime::verify_full(out),
         "full-snapshot" => admission_runtime::snapshot_full(out),
         "consecutive-pause" | "consecutive-resume" => tokio::runtime::Runtime::new()?.block_on(
@@ -442,8 +529,8 @@ fn main() -> Result<(), Error> {
         "full-history" | "full-history-verify" => {
             admission_runtime::history_full(out, args[0] == "full-history")
         }
-        "prepare-runtime" => prepare(out, true, false, false),
-        "prepare-production-hook" => prepare(out, false, true, false),
+        "prepare-runtime" => prepare(out, true, false, false, false),
+        "prepare-production-hook" => prepare(out, false, true, false, false),
         "runtime-pause" | "runtime-resume" => {
             tokio::runtime::Runtime::new()?.block_on(runtime::run(out, args[0] == "runtime-pause"))
         }

@@ -18,6 +18,7 @@ use std::{
 use tokio::{sync::Notify, task::JoinHandle};
 #[derive(Default)]
 struct Faults {
+    withheld_block: RwLock<Option<ShellHash>>,
     hold: AtomicBool,
     seen: AtomicBool,
     release: Notify,
@@ -30,6 +31,32 @@ struct Faults {
     gossip_attempts: AtomicUsize,
     suppressed_direct_bodies: AtomicUsize,
 }
+impl Faults {
+    fn withhold(&self, message: &mut NetworkMessage) -> bool {
+        // Deliver the Byzantine child only after the valid parent has finalized.
+        // Empty responses still reach the ordinary sync/certificate handlers.
+        let Some(hash) = *self.withheld_block.read().unwrap() else {
+            return false;
+        };
+        match message {
+            NetworkMessage::NewBlock(block) if block.hash() == hash => return true,
+            NetworkMessage::CommitCertificate { block_hash, .. } if *block_hash == hash => {
+                return true
+            }
+            NetworkMessage::BlockResponse {
+                blocks,
+                commit_certificates,
+                ..
+            } => {
+                blocks.retain(|b| b.hash() != hash);
+                commit_certificates.retain(|(h, _)| *h != hash);
+            }
+            NetworkMessage::BodyResponse { blocks, .. } => blocks.retain(|b| b.hash() != hash),
+            _ => {}
+        }
+        false
+    }
+}
 struct Provider {
     inner: Libp2pNetwork,
     faults: Arc<Faults>,
@@ -37,10 +64,16 @@ struct Provider {
 }
 #[async_trait]
 impl NetworkService for Provider {
-    async fn broadcast(&self, m: NetworkMessage) -> Result<(), NetworkError> {
+    async fn broadcast(&self, mut m: NetworkMessage) -> Result<(), NetworkError> {
+        if self.faults.withhold(&mut m) {
+            return Ok(());
+        }
         self.inner.broadcast(m).await
     }
     async fn send_to_peer(&self, p: &PeerId, mut m: NetworkMessage) -> Result<(), NetworkError> {
+        if self.faults.withhold(&mut m) {
+            return Ok(());
+        }
         if self.faults.gossip_block.read().unwrap().is_some()
             && matches!(
                 &m,
@@ -512,7 +545,13 @@ pub(super) fn snapshot_full(out: &Path) -> Result<(), Error> {
 }
 
 pub(super) fn snapshot_consecutive(out: &Path) -> Result<(), Error> {
-    let stores = RocksDbStore::open_all(out.join("network-consecutive/provider/db"), None)?;
+    snapshot_production(out, "network-consecutive")
+}
+pub(super) fn snapshot_batch(out: &Path) -> Result<(), Error> {
+    snapshot_production(out, "network-batch")
+}
+fn snapshot_production(out: &Path, directory: &str) -> Result<(), Error> {
+    let stores = RocksDbStore::open_all(out.join(directory).join("provider/db"), None)?;
     let rows = stores
         .state
         .scan_prefix(b"local/canonical-production/v1/")?;
@@ -1432,5 +1471,245 @@ pub(super) fn verify_sync(out: &Path) -> Result<(), Error> {
     write(
         &path,
         &json!({"native":result,"expected_historical_refusal":error,"native_unchanged":true}),
+    )
+}
+
+/// Full ordered same-signer batch, followed by a genuinely signed wrong-root child.
+/// The bad child's source is explicitly Byzantine storage, never native execution.
+pub(super) async fn batch(out: &Path, pause: bool) -> Result<(), Error> {
+    let network = out.join("network-batch");
+    let c: fixture::Context = read(&out.join("context.json"))?;
+    let good: Block = read(&out.join("candidate.json"))?;
+    let bad: Block = read(&out.join("batch-bad-block.json"))?;
+    let control2: Block = read(&out.join("later-block.json"))?;
+    ensure(
+        good.transactions.len() == 2
+            && bad.transactions.len() == 2
+            && good.transactions[0].from == good.transactions[1].from
+            && good.transactions[0].tx.nonce == 0
+            && good.transactions[1].tx.nonce == 1
+            && bad.transactions[0].tx.nonce == 2
+            && bad.transactions[1].tx.nonce == 3
+            && bad.transactions == control2.transactions
+            && bad.header.state_root != control2.header.state_root,
+        "ordered batch fixture mismatch",
+    )?;
+    if !network.exists() {
+        ensure(
+            pause && out.join("batch-fixture.json").exists(),
+            "batch preparation required",
+        )?;
+        prepare_from(out, "network-batch", &out.join("batch-native/db"))?;
+    }
+    ensure(
+        !network.join("complete.json").exists(),
+        "batch already complete; use verify",
+    )?;
+    ensure(
+        pause || network.join("paused.json").exists(),
+        "batch pause evidence missing",
+    )?;
+    let initial: Value = read(&network.join("initial.json"))?;
+    let faults = Arc::new(Faults::default());
+    *faults.withheld_block.write().unwrap() = Some(bad.hash());
+    let provider = Live::start(
+        &network.join("provider/db"),
+        &c,
+        vec![],
+        false,
+        true,
+        Some(faults.clone()),
+    )
+    .await?;
+    let receiver = match Live::start(
+        &network.join("receiver/db"),
+        &c,
+        vec![provider.dial()],
+        true,
+        false,
+        None,
+    )
+    .await
+    {
+        Ok(live) => live,
+        Err(error) => {
+            provider.stop().await?;
+            return Err(error);
+        }
+    };
+    let provider_node = provider.node.clone();
+    let result = async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6 * 60 * 60);
+        let mut last_progress = tokio::time::Instant::now();
+        let mut prior = None;
+        let mut baseline = None;
+        loop {
+            ensure(!provider.task.is_finished() && !receiver.task.is_finished(), "batch node exited")?;
+            let counts = [checkpoint_components(provider.node.store.as_ref(), c.block)?, checkpoint_components(provider.node.store.as_ref(), bad.hash())?];
+            let production1 = provider.call("admin_canonicalProofProduction", json!([c.block])).await?;
+            let production2 = provider.call("admin_canonicalProofProduction", json!([bad.hash()])).await?;
+            for status in [&production1, &production2] {
+                ensure(status["status"]["state"] != "failed", &format!("batch producer failed: {status}"))?;
+            }
+            let admission1 = receiver.call("admin_canonicalProofAdmission", json!([c.block])).await?;
+            let admission2 = receiver.call("admin_canonicalProofAdmission", json!([bad.hash()])).await?;
+            let head = receiver.node.chain_store.get_head_block()?.ok_or("batch receiver head missing")?;
+            let finalized = receiver.node.finality.read().last_finalized_number();
+            let state = json!({"components":counts,"production1":production1["status"],"production2":production2["status"],"admission1":admission1,"admission2":admission2,"head":head.hash(),"height":head.number(),"finalized":finalized});
+            if prior.as_ref() != Some(&state) {
+                prior = Some(state.clone()); last_progress = tokio::time::Instant::now();
+                let tmp = network.join("progress.tmp"); std::fs::write(&tmp, serde_json::to_vec(&state)?)?; std::fs::rename(tmp, network.join("progress.json"))?;
+                println!("batch components={counts:?}; height={}; finalized={finalized}; admission2={}", head.number(), admission2["status"]["state"]);
+            }
+            ensure(admission1["status"]["state"] != "failed", &format!("valid ordered batch refused: {admission1}"))?;
+            if pause && counts[0] > 0 {
+                ensure(head.number() == 0 && finalized == 0 && json!(canonical_digest(receiver.node.store.as_ref())?) == initial["native_digest"], "partial batch changed native state")?;
+                break;
+            }
+            if baseline.is_none() && admission1["status"]["state"] == "complete" && finalized == 1 {
+                let control: Value = read(&out.join("control.json"))?;
+                ensure(head.hash() == c.block && *receiver.node.finality.read().last_finalized_hash() == c.block
+                    && counts[0] == 179 && production1["status"]["state"] == "complete"
+                    && receiver.node.chain_store.get_receipts(&c.block)?.map(serde_json::to_value).transpose()? == Some(control["receipts"].clone())
+                    && accounts(receiver.node.store.clone(), &good)? == control["accounts"], "valid batch native outputs/finality mismatch")?;
+                let before = canonical_digest(receiver.node.store.as_ref())?;
+                let path = network.join("rollback-baseline.json");
+                let record = json!({"native_digest":before,"head":head.hash(),"finalized":finalized,"accounts":control["accounts"],"receipts":control["receipts"]});
+                if path.exists() { ensure(read::<Value>(&path)? == record, "persisted rollback baseline changed")?; }
+                else { write(&path, &record)?; }
+                baseline = Some(before);
+                *faults.withheld_block.write().unwrap() = None;
+            }
+            if admission2["status"]["state"] == "failed" {
+                let error = admission2["status"]["error"].as_str().ok_or("missing batch refusal")?;
+                ensure(error.contains("state root mismatch") && error.contains(&format!("{:?}", control2.header.state_root)), &format!("batch failed before both native transactions executed: {error}"))?;
+                let before = baseline.ok_or("bad child delivered before finalized parent")?;
+                ensure(head.hash() == c.block && finalized == 1 && admission2["nativeCanonical"] == false
+                    && receiver.node.chain_store.get_block_by_hash(&bad.hash())?.is_none()
+                    && receiver.node.chain_store.get_receipts(&bad.hash())?.is_none()
+                    && canonical_digest(receiver.node.store.as_ref())? == before, "failed batch leaked native writes")?;
+                ensure(counts == [179,179] && production2["status"]["state"] == "complete", "batch full graph incomplete")?;
+                for (hash, status, store, name) in [(c.block, &admission1, receiver.node.store.clone(), "good"), (bad.hash(), &production2, provider.node.store.clone(), "bad")] {
+                    let manifest: CanonicalProofManifest = serde_json::from_value(status["status"]["manifest"].clone())?;
+                    ensure(manifest.block_hash == hash, "batch manifest mismatch")?;
+                    let cache = shell_storage::CanonicalProofUploadStore::new(store);
+                    if hash == c.block {
+                        ensure(cache.status(&manifest.id())?.result.as_ref().is_some_and(|r| r["proved_sender_signatures"] == 2 && r["proved_proposer_signature"] == true), "native batch did not consume both sender AIRs and proposer AIR")?;
+                    }
+                    let bytes = cache.payload(&manifest.id())?;
+                    let proof: shell_stark_prover::canonical_batch::CanonicalSignatureBatchProof = serde_json::from_slice(&bytes)?;
+                    ensure(proof.version == 2 && proof.proposer.is_some() && proof.transactions.len() == 2, "full batch profile downgraded")?;
+                    use std::io::Write;
+                    let path = network.join(format!("{name}-proof.json"));
+                    if path.exists() { ensure(std::fs::read(&path)? == bytes, "retained batch proof changed")?; }
+                    else { let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?; file.write_all(&bytes)?; file.sync_all()?; }
+                    let path = network.join(format!("{name}-manifest.json"));
+                    if path.exists() { ensure(read::<CanonicalProofManifest>(&path)? == manifest, "retained batch manifest changed")?; }
+                    else { write(&path, &manifest)?; }
+                }
+                write(&network.join("complete.json"), &json!({"production1":production1["status"],"production2":production2["status"],"admission1":admission1,"admission2":admission2,"native_digest":before,"served_chunks":faults.chunks.load(Ordering::SeqCst),"both_native_transactions_executed_before_wrong_root_refusal":true,"failed_batch_native_unchanged":true,"bad_source_is_storage_only_byzantine_fixture":true,"finalized":finalized}))?;
+                break;
+            }
+            ensure(tokio::time::Instant::now() < deadline && last_progress.elapsed() < Duration::from_secs(1800), "batch progress bound exceeded")?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Ok::<_,Error>(())
+    }.await;
+    let receiver_stop = receiver.stop().await;
+    let provider_stop = provider.stop().await;
+    result?;
+    receiver_stop?;
+    provider_stop?;
+    if pause {
+        let production = provider_node
+            .canonical_production_status(c.block)?
+            .ok_or("batch pause status missing")?;
+        ensure(
+            production["status"]["state"] == "paused"
+                && production["status"]["components"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0 && n < 179),
+            "batch producer did not durably pause",
+        )?;
+        write(&network.join("paused.json"), &production)?;
+    }
+    Ok(())
+}
+
+/// Cold replay before/after a separately labelled, ordinarily imported correct child.
+pub(super) fn verify_batch(out: &Path, history: bool, advance: bool) -> Result<(), Error> {
+    let network = out.join("network-batch");
+    let completed: Value = read(&network.join("complete.json"))?;
+    let c: fixture::Context = read(&out.join("context.json"))?;
+    let block: Block = read(&out.join("candidate.json"))?;
+    let bad: Block = read(&out.join("batch-bad-block.json"))?;
+    let later: Block = read(&out.join("later-block.json"))?;
+    let proof: shell_stark_prover::canonical_batch::CanonicalSignatureBatchProof =
+        read(&network.join("good-proof.json"))?;
+    let stores = RocksDbStore::open_all(network.join("receiver/db"), None)?;
+    let store = Arc::new(stores.state);
+    let node = fixture::node(store.clone(), c.authority, &c.authority_key)?;
+    if advance {
+        ensure(history, "ordinary batch advance requires history mode")?;
+        match node.chain_store.get_head_hash()? {
+            Some(head) if head == c.block => node.import_block(later.clone(), &MultiVerifier)?,
+            Some(head) if head == later.hash() => {}
+            _ => {
+                return Err(
+                    "batch ordinary advance requires valid parent or retained control".into(),
+                )
+            }
+        }
+    }
+    let tip = if history { later.hash() } else { c.block };
+    let control: Value = read(&out.join(if history {
+        "later-control.json"
+    } else {
+        "control.json"
+    }))?;
+    let current = if history { &later } else { &block };
+    ensure(
+        node.chain_store.get_head_hash()? == Some(tip)
+            && node.chain_store.get_block_by_hash(&bad.hash())?.is_none()
+            && accounts(store.clone(), current)? == control["accounts"]
+            && node
+                .chain_store
+                .get_receipts(&tip)?
+                .map(serde_json::to_value)
+                .transpose()?
+                == Some(control["receipts"].clone()),
+        "cold batch native controls mismatch",
+    )?;
+    if !history {
+        ensure(
+            json!(canonical_digest(store.as_ref())?) == completed["native_digest"],
+            "cold failed-batch state changed",
+        )?;
+    }
+    let before = digest(store.as_ref())?;
+    let replay = node.replay_canonical_transactions_with_proof(tip, c.block, &proof)?;
+    let original: Value = read(&out.join("control.json"))?;
+    ensure(
+        replay.proved_sender_signatures == 2
+            && replay.proved_proposer_signature
+            && replay.state_root == block.header.state_root
+            && serde_json::to_value(&replay.receipts)? == original["receipts"]
+            && digest(store.as_ref())? == before,
+        "cold full batch replay wrote state or output mismatch",
+    )?;
+    let label = if history {
+        "history-verified"
+    } else {
+        "verified"
+    };
+    let mut path = network.join(format!("{label}.json"));
+    let mut n = 2;
+    while path.exists() {
+        path = network.join(format!("{label}-{n}.json"));
+        n += 1;
+    }
+    write(
+        &path,
+        &json!({"replay":replay,"current_head":tip,"current_state_root":current.header.state_root,"all_kv_unchanged":true,"ordinary_correct_successor_not_proof_admitted":history}),
     )
 }

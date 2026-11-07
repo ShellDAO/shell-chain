@@ -421,63 +421,120 @@ impl CanonicalProductionSource {
         Ok(())
     }
 
-    /// Only public-key-dependent mathematical inputs can cross source boundaries.
-    /// This selects an untrusted candidate; checkpoint verification still checks AIR.
-    pub fn can_reuse_component_from(&self, donor: &Self, name: &str) -> bool {
+    /// Locate only an equal mathematical input, never an authorization token.
+    /// Earlier positions in this source may supply key or identical account witnesses.
+    pub fn reusable_component_from(&self, donor: &Self, name: &str) -> Option<String> {
         if self.chain_id() != donor.chain_id() || self.genesis_hash() != donor.genesis_hash() {
-            return false;
+            return None;
         }
-        let (key, old_key, suffix, tagged) = if let Some(suffix) = name.strip_prefix("proposer-") {
-            let (Some(key), Some(old_key)) = (&self.input.proposer_key, &donor.input.proposer_key)
-            else {
-                return false;
-            };
-            (key, old_key, suffix, false)
-        } else if let Some(sender) = name.strip_prefix("sender-") {
-            let Some((index, suffix)) = sender.split_once('-') else {
-                return false;
-            };
-            let Ok(index) = index.parse::<usize>() else {
-                return false;
-            };
-            let (Some(source), Some(old)) = (
-                self.input.senders.get(index),
-                donor.input.senders.get(index),
-            ) else {
-                return false;
-            };
+        let (position, key, suffix, sender) = if let Some(suffix) = name.strip_prefix("proposer-") {
             (
-                &source.key,
-                &old.key,
+                self.input.senders.len(),
+                self.input.proposer_key.as_ref()?,
                 suffix,
-                source.account.pq_pubkey_hash != blake3_hash(&source.key)
-                    && old.account.pq_pubkey_hash != blake3_hash(&old.key),
+                None,
             )
         } else {
-            return false;
+            let (index, suffix) = name.strip_prefix("sender-")?.split_once('-')?;
+            let index = index.parse::<usize>().ok()?;
+            (
+                index,
+                &self.input.senders.get(index)?.key,
+                suffix,
+                Some(index),
+            )
         };
-        if key != old_key {
-            return false;
+        let stable = matches!(suffix, "key" | "tr")
+            || suffix
+                .strip_prefix("t1-")
+                .is_some_and(|row| row.parse::<usize>().is_ok_and(|r| r < 6))
+            || suffix
+                .strip_prefix("matrix-")
+                .and_then(|v| v.split_once('-'))
+                .is_some_and(|(r, c)| {
+                    r.parse::<usize>().is_ok_and(|r| r < 6)
+                        && c.parse::<usize>().is_ok_and(|c| c < 5)
+                });
+        if !stable && !matches!(suffix, "key-hash" | "tagged-key" | "account") {
+            return None;
         }
-        if suffix == "tagged-key" {
-            return tagged;
+        for old_position in 0..=donor.input.senders.len() {
+            if self.block().hash() == donor.block().hash() && old_position >= position {
+                continue;
+            }
+            let (old_key, old_sender, prefix) = if old_position < donor.input.senders.len() {
+                (
+                    &donor.input.senders[old_position].key,
+                    Some(old_position),
+                    format!("sender-{old_position}"),
+                )
+            } else {
+                let Some(key) = donor.input.proposer_key.as_ref() else {
+                    continue;
+                };
+                (key, None, "proposer".to_string())
+            };
+            if key != old_key {
+                continue;
+            }
+            if !stable {
+                let (Some(index), Some(old_index)) = (sender, old_sender) else {
+                    continue;
+                };
+                let current = &self.input.senders[index];
+                let old = &donor.input.senders[old_index];
+                if suffix == "tagged-key"
+                    && (current.account.pq_pubkey_hash == blake3_hash(key)
+                        || old.account.pq_pubkey_hash == blake3_hash(old_key))
+                {
+                    continue;
+                }
+                if suffix == "account"
+                    && (self.input.parent.state_root != donor.input.parent.state_root
+                        || self.input.block.transactions[index].from
+                            != donor.input.block.transactions[old_index].from
+                        || current.account != old.account
+                        || current.nodes != old.nodes)
+                {
+                    continue;
+                }
+            }
+            return Some(format!("{prefix}-{suffix}"));
         }
-        if suffix == "key-hash" {
-            return name.starts_with("sender-");
-        }
-        if matches!(suffix, "key" | "tr") {
-            return true;
-        }
-        if let Some(row) = suffix.strip_prefix("t1-") {
-            return row.parse::<usize>().is_ok_and(|row| row < 6);
-        }
-        if let Some(pair) = suffix.strip_prefix("matrix-") {
-            if let Some((row, col)) = pair.split_once('-') {
-                return row.parse::<usize>().is_ok_and(|row| row < 6)
-                    && col.parse::<usize>().is_ok_and(|col| col < 5);
+        None
+    }
+    pub fn can_reuse_component_from(&self, donor: &Self, name: &str) -> bool {
+        self.reusable_component_from(donor, name).is_some()
+    }
+    fn local_reuse_components(&self) -> std::collections::BTreeMap<String, String> {
+        let mut map = std::collections::BTreeMap::new();
+        for position in 0..=self.input.senders.len() {
+            if position == self.input.senders.len() && self.input.proposer_key.is_none() {
+                continue;
+            }
+            let prefix = if position < self.input.senders.len() {
+                format!("sender-{position}")
+            } else {
+                "proposer".into()
+            };
+            let mut suffixes = vec!["key".to_string(), "tr".to_string()];
+            for row in 0..6 {
+                suffixes.push(format!("t1-{row}"));
+                for col in 0..5 {
+                    suffixes.push(format!("matrix-{row}-{col}"));
+                }
+            }
+            if position < self.input.senders.len() {
+                suffixes.extend(["key-hash".into(), "tagged-key".into(), "account".into()]);
+            }
+            for suffix in suffixes {
+                let name = format!("{prefix}-{suffix}");
+                if let Some(donor) = self.reusable_component_from(self, &name) {
+                    map.insert(name, donor);
+                }
             }
         }
-        false
+        map
     }
 
     /// All new and reused components are cryptographically checked. Pauses publish
@@ -491,6 +548,7 @@ impl CanonicalProductionSource {
                 .to_string()
                 .into());
         }
+        job.set_local_reuse(self.local_reuse_components());
         let mut transactions = Vec::new();
         for (i, (signed, source)) in self
             .input
@@ -918,7 +976,6 @@ mod recovery_tests {
                 "finish",
                 "mu",
                 "commitment",
-                "account",
                 "signing-hash",
                 "id",
                 "leaf",
@@ -936,6 +993,27 @@ mod recovery_tests {
         assert!(next.can_reuse_component_from(&donor, "sender-0-key-hash"));
         assert!(!next.can_reuse_component_from(&donor, "sender-0-tagged-key"));
         assert!(!next.can_reuse_component_from(&donor, "proposer-key-hash"));
+        assert!(next.can_reuse_component_from(&donor, "sender-0-account"));
+        assert!(!next.can_reuse_component_from(&donor, "proposer-account"));
+        let account: SenderSource =
+            serde_json::from_value(serde_json::to_value(&next.input.senders[0]).unwrap()).unwrap();
+        next.input.senders.push(account);
+        next.input
+            .block
+            .transactions
+            .push(next.input.block.transactions[0].clone());
+        assert_eq!(
+            next.reusable_component_from(&next, "sender-1-key"),
+            Some("sender-0-key".into())
+        );
+        assert_eq!(
+            next.reusable_component_from(&next, "sender-1-account"),
+            Some("sender-0-account".into())
+        );
+        let root = next.input.parent.state_root;
+        next.input.parent.state_root = ShellHash::ZERO;
+        assert!(!next.can_reuse_component_from(&donor, "sender-0-account"));
+        next.input.parent.state_root = root;
         let mut bytes = vec![SignatureType::MlDsa65.as_u8()];
         bytes.extend_from_slice(&donor.input.senders[0].key);
         donor.input.senders[0].account.pq_pubkey_hash = blake3_hash(&bytes);

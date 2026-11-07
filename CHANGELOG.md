@@ -15,6 +15,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Reverify input-equal ML-DSA certificates across ordered batch positions using
+  immutable named direct checkpoint references. Add a full two-transaction peer
+  regression with real native outputs, signed wrong-root rollback and cold
+  historical replay; preserve old checkpoints, proof formats and quotas.
+
 - Reverify and reuse equal-public-key mathematical certificates across bounded
   canonical production jobs. Store immutable one-hop references without increasing
   checkpoint quotas, and exercise two consecutive full-proof native peer imports.

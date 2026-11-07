@@ -118,12 +118,15 @@ acceptance remain separate work.
 
 ## Consecutive full jobs
 
-For equal registered ML-DSA-65 keys at the same sender position or proposer role,
-the next job may borrow public-key decoding, matrix expansion, scaled public-key
+For equal registered ML-DSA-65 keys across sender positions or the proposer role,
+a later position or job may borrow public-key decoding, matrix expansion, scaled public-key
 NTTs and public-key hashing certificates. Every borrowed certificate runs its
 ordinary full AIR verifier against the new job's inputs before publication.
-Signature/message-dependent graphs, account witnesses, transaction identities
-and headers are always bound to their own source. A donor status is informational;
+Signature/message-dependent graphs, transaction identities and headers remain
+bound to their own source. An account witness is shared only for the identical
+parent state root, sender address, encoded account and native MPT witness nodes;
+subsequent account changes require a new proof. Native execution still checks
+ordered nonces and state changes for every transaction. A donor status is informational;
 it cannot create a verified token or bypass native source restoration.
 
 Old inline certificates remain immutable and readable. Equal certificate bytes
@@ -148,3 +151,43 @@ shared and local checkpoints. A separate damaged-reference copy must fail
 production without changing the provider's native state even when valid ready
 transport payloads remain cached. Independent observers may still accept those
 valid payloads; production checkpoint integrity is not a consensus invalidation.
+
+
+## Ordered full batches and named references
+
+The source matcher returns the exact donor component name and permits only
+mathematically input-equal key components or identical account witnesses. Within
+a job, only an earlier position can donate, after its durable checkpoint exists.
+Every borrowed certificate runs the recipient's full verifier before atomic
+publication. No signature, nonce-dependent identity or header proof is borrowed.
+
+Named version 2 local reference records can point to another component name in
+the same indexed job or another retained job. If a donor already uses a reference,
+the writer resolves and verifies it, then points directly to its immutable inline
+anchor. Reads validate the owners, bounded component name, exact length and hash;
+self-references, missing anchors, chains and cycles refuse. Existing inline and
+version 1 same-name cross-job records remain readable and are preserved exactly.
+This is a local checkpoint format change; the full proof wire format stays at
+version 2 and the logical/physical quotas and job/transport bounds stay unchanged.
+
+`tests/e2e/mldsa-full-proof.sh batch output` creates fresh memory-only test keys
+and two transactions from one registered sender in each block. It pauses and
+reopens real production, generates two 179-component full graphs, and sends them
+through real peer admission. A fresh genesis receiver must execute and finalize
+the valid ordered batch, matching independent native receipts, balances and nonce.
+Key mathematics and identical within-parent account witnesses are reverified and
+shared rather than regenerated at the second position or next job.
+
+The second source is explicitly a Byzantine storage fixture: its genuine sender,
+proposer and single-authority quorum signatures cover a wrong state root. It is
+not claimed to have passed native execution. The independent correct second
+block is produced by actual native execution. Only after the valid first block
+has finalized does the transport fixture release the bad child. Admission must
+reach both native transaction executions and reject the wrong resulting root,
+leaving all native trie, index, receipt and finality rows unchanged. Proof/cache
+metadata may record the failed attempt; a valid signature proof does not establish
+state-transition validity. The correct second block is then imported separately
+through ordinary native verification, and cold historical full-batch replay must
+match original outputs without writing any current KV data. This control is not
+claimed as a second proof-admitted target. Full 16-transaction load, arbitrary
+sender/key layouts and unbounded job retention remain unqualified.
