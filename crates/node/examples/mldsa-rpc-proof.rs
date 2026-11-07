@@ -655,11 +655,29 @@ async fn verify(native: &Path, dir: &Path) -> Result<(), Error> {
         non_cache(&receiver.node.store)? == before,
         "independent recheck changed canonical KV",
     )?;
-    write(&dir.join("recheck-result.json"), &checked)?;
+    let first_receipt = dir.join("recheck-result.json");
+    if first_receipt.try_exists()? {
+        let previous: CanonicalProofUploadStatus = read(&first_receipt)?;
+        ensure(
+            previous.proof_id == checked.proof_id
+                && previous.manifest == checked.manifest
+                && previous.state == CanonicalProofUploadState::Verified
+                && previous.error.is_none()
+                && previous.result == checked.result
+                && previous.verification_attempts < checked.verification_attempts,
+            "saved verification receipt differs from current verified result",
+        )?;
+        write(
+            &dir.join(format!("recheck-{}.json", checked.verification_attempts)),
+            &checked,
+        )?;
+    } else {
+        write(&first_receipt, &checked)?;
+    }
     receiver.stop().await?;
     println!(
         "{}",
-        json!({"mode":"verify","actual_Node_reverified":true,"native_crypto_fallback":false,"canonical_KV_unchanged":true})
+        json!({"mode":"verify","actual_Node_reverified":true,"verification_attempts":checked.verification_attempts,"native_crypto_fallback":false,"canonical_KV_unchanged":true})
     );
     Ok(())
 }

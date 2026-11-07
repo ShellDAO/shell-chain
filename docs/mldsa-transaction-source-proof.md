@@ -975,6 +975,9 @@ role. It reuses genuine signatures and existing graph certificates, interrupts
 and resumes an upload, checks independent native receipts, rejects corrupt AIR
 with otherwise genuine signatures, and reopens the saved result and bytes.
 `verify` requests a full new verification of the retained valid payload.
+It preserves the first `recheck-result.json`; repeated successful runs validate
+that saved identity/result and add a new `recheck-N.json` for the current
+verification attempt.
 `payload.json`, `corrupt-payload.json`, `context.json`, `native-db`,
 `rpc-result.json` and `recheck-result.json` are retained; failures exit nonzero.
 For a preparation or first-server interruption before any chunks were uploaded,
