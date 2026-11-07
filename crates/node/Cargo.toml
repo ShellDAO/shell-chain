@@ -61,3 +61,7 @@ required-features = ["rocksdb"]
 [[example]]
 name = "mldsa-fresh-proof"
 required-features = ["rocksdb"]
+
+[[example]]
+name = "mldsa-produce-proof"
+required-features = ["rocksdb"]

@@ -1179,3 +1179,76 @@ This covers explicit local import of a fresh extension. Automatic producer proof
 generation, peer admission using the complete graph, full proposer crypto proofs,
 fork proof consumption, larger sender profiles and public binary/network
 acceptance remain separate work.
+
+### Produce a complete graph from a native canonical block
+
+The unreleased source CLI also generates the complete graph directly from a
+stopped node's retained native database. It needs public signatures and the
+parent's registered keys/accounts; it needs no private key or prepared proof
+files. The normal background prover continues to use its existing accumulator
+format. This explicit command does not enable automatic network admission,
+settlement rewards, pruning or a new activation height.
+
+Build with stable Rust and the repository's RocksDB prerequisites:
+
+```sh
+cargo build --locked -p shell-cli --features rocksdb
+./target/debug/shell-node --datadir source produce-block-proof \
+  --block-hash "$BLOCK_HASH" --expected-tip "$SOURCE_TIP" \
+  --output proof-job --component-limit 3
+```
+
+A component limit counts newly proved certificates, not cached ones. Reaching
+it reports a pause and exits nonzero, leaving completed components durable in
+`proof-job/db`. Resume in another process without that limit:
+
+```sh
+./target/debug/shell-node --datadir source produce-block-proof \
+  --block-hash "$BLOCK_HASH" --expected-tip "$SOURCE_TIP" \
+  --output proof-job
+```
+
+Keep the source stopped and pin the same tip across resumptions. The source is
+captured through the bounded canonical parent view, including its configuration,
+body, registered keys and account trie witnesses. A different source, damaged
+checkpoint or invalid signature is refused. Retention still limits how far the
+parent can be from the tip; this command does not reserve history for a live
+node. Unsupported first-use, account-abstraction and other signature profiles
+are refused before proving.
+
+Each certificate is mathematically verified before atomic checkpoint storage
+and again when reused. After the complete graph verifies, the command writes
+`proof.json`, `manifest.json` and `block.json` in the job directory. Existing
+matching prefixes resume by append; conflicting bytes are retained and refused.
+An incomplete output file or a progress counter is never proof of completion.
+Only a zero exit and full consumer verification establish a usable artifact.
+The checkpoint payload has a 256 MiB logical quota and the final proof has the
+existing separate 256 MiB limit, plus small metadata and RocksDB overhead. The
+job directory must be separate from the source database and exclusively owned.
+
+Feed the resulting files to the offline importer with the follower's separately
+trusted consensus configuration and current parent:
+
+```sh
+./target/debug/shell-node --datadir follower import-block-proof \
+  --block proof-job/block.json --proof proof-job/proof.json \
+  --manifest proof-job/manifest.json --consensus consensus.json \
+  --parent "$PARENT_HASH"
+```
+
+For a self-contained cold run with newly generated temporary test keys and an
+independent native execution control:
+
+```sh
+tests/e2e/mldsa-produce-proof.sh run proof-production-test
+tests/e2e/mldsa-produce-proof.sh verify proof-production-test
+```
+
+Python 3 is also required. This is an expensive public-certificate computation;
+retain the output and command receipts across interruptions. The test pauses
+after three new certificates, reopens and resumes, checks those bytes remain
+unchanged, imports through the actual CLI and cold-replays the generated graph
+against native receipts, account balances/nonces and state root. Test keys are
+created in memory and discarded. The verify mode rechecks the existing result
+without generating new proofs. These source commands do not establish a public
+binary release, network activation, full proposer proof or recursive compression.

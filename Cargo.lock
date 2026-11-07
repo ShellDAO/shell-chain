@@ -6213,6 +6213,7 @@ dependencies = [
  "shell-pqvm",
  "shell-primitives",
  "shell-rpc",
+ "shell-stark-prover",
  "shell-storage",
  "tempfile",
  "tokio",

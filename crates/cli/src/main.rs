@@ -312,6 +312,20 @@ enum Commands {
         snapshot: PathBuf,
     },
 
+    /// Generate complete sender proofs from a retained canonical block, offline.
+    ProduceBlockProof {
+        #[arg(long)]
+        block_hash: String,
+        #[arg(long)]
+        expected_tip: String,
+        /// Separate durable job directory; existing checkpoints are reverified.
+        #[arg(long)]
+        output: PathBuf,
+        /// Pause after this many newly proved components (nonzero).
+        #[arg(long)]
+        component_limit: Option<std::num::NonZeroUsize>,
+    },
+
     /// Offline import of one fresh canonical child with complete sender proofs.
     ImportBlockProof {
         /// Signed candidate block JSON.
@@ -928,6 +942,18 @@ async fn main() {
             commands::export_state(cli.datadir, output, block)
         }
         Commands::ImportState { snapshot } => commands::import_state(cli.datadir, snapshot),
+        Commands::ProduceBlockProof {
+            block_hash,
+            expected_tip,
+            output,
+            component_limit,
+        } => commands::produce_block_proof(
+            cli.datadir,
+            block_hash,
+            expected_tip,
+            output,
+            component_limit,
+        ),
         Commands::ImportBlockProof {
             block,
             proof,

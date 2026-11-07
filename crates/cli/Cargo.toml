@@ -27,6 +27,7 @@ shell-mempool = { path = "../mempool" }
 shell-rpc = { path = "../rpc" }
 shell-network = { path = "../network" }
 shell-node = { path = "../node" }
+shell-stark-prover = { path = "../stark-prover" }
 shell-keystore = { path = "../keystore" }
 clap.workspace = true
 tokio.workspace = true
