@@ -207,3 +207,100 @@ fn header_batch_source_binding_native_reopen() {
         directory.display()
     );
 }
+
+#[test]
+fn live_candidate_staging_preserves_native_state_and_checks_activation_seal_and_body() {
+    let (leader, proposer) = setup_stark_node();
+    let db = Arc::new(MemoryDb::new());
+    let mut follower = setup_node_with_store(leader.config.proposer_address.unwrap(), db.clone());
+    let signer = shell_crypto::MlDsaSigner::generate();
+    let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+    let configure = |node: &Node<MemoryDb>, activation| {
+        node.register_authority_pubkey(
+            node.config.proposer_address.unwrap(),
+            proposer.public_key().to_vec(),
+        );
+        fund_account(node, &sender, U256::from(1_000_000_000_000_000_000u64));
+        let mut account = node
+            .world_state
+            .read()
+            .get_account(&sender)
+            .unwrap()
+            .unwrap();
+        account.pq_pubkey_hash = shell_primitives::blake3_hash(signer.public_key());
+        node.world_state
+            .write()
+            .set_account(&sender, &account)
+            .unwrap();
+        node.chain_store
+            .put_pubkey(&sender, signer.public_key())
+            .unwrap();
+        store_consistent_genesis(node);
+        let cfg=serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":node.chain_store.get_head_hash().unwrap().unwrap(),"block_commitment_height":activation,"fee_accounting_activation_height":1})).unwrap();
+        node.chain_store.put_chain_config(&cfg).unwrap();
+    };
+    configure(&leader, 1u64);
+    configure(&follower, 1u64);
+    submit_signed_tx(
+        &leader,
+        &signer,
+        sender,
+        Transaction {
+            chain_id: 1337,
+            nonce: 0,
+            to: Some(Address::from([0xab; 32])),
+            value: U256::from(1),
+            data: Bytes::new(),
+            gas_limit: 100_000,
+            max_fee_per_gas: shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas: 1,
+            access_list: None,
+            tx_type: 2,
+            max_fee_per_blob_gas: None,
+            blob_versioned_hashes: None,
+        },
+    );
+    let block = leader.produce_block(&proposer, 100).unwrap();
+    let peer = shell_network::PeerId("provider".into());
+    let before = db.scan_all().unwrap();
+    assert!(!follower.stage_live_candidate(&peer, &block).unwrap());
+    assert_eq!(db.scan_all().unwrap(), before);
+    follower.config.canonical_proof_admission = true;
+    let inactive_db = Arc::new(MemoryDb::new());
+    let mut inactive =
+        setup_node_with_store(leader.config.proposer_address.unwrap(), inactive_db.clone());
+    configure(&inactive, 2u64);
+    inactive.config.canonical_proof_admission = true;
+    let before = inactive_db.scan_all().unwrap();
+    assert!(!inactive.stage_live_candidate(&peer, &block).unwrap());
+    assert_eq!(inactive_db.scan_all().unwrap(), before);
+    let cfg = follower.chain_store.get_chain_config().unwrap().unwrap();
+    let before = db.scan_all().unwrap();
+    let mut bad_seal = block.clone();
+    bad_seal.proposer_seal.as_mut().unwrap().data[0] ^= 1;
+    let mut bad_body = block.clone();
+    bad_body.transactions[0].tx.value = U256::from(2);
+    for bad in [bad_seal, bad_body] {
+        assert!(follower.stage_live_candidate(&peer, &bad).is_err());
+        assert_eq!(db.scan_all().unwrap(), before);
+    }
+    assert!(follower.stage_live_candidate(&peer, &block).unwrap());
+    assert_eq!(
+        follower.chain_store.get_head_hash().unwrap(),
+        Some(cfg.genesis_hash)
+    );
+    assert!(follower
+        .chain_store
+        .get_block_by_hash(&block.hash())
+        .unwrap()
+        .is_none());
+    assert!(follower
+        .chain_store
+        .get_receipts(&block.hash())
+        .unwrap()
+        .is_none());
+    assert!(follower
+        .canonical_admission_status(block.hash())
+        .unwrap()
+        .is_some());
+}

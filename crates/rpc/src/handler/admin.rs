@@ -6,6 +6,14 @@ use super::*;
 
 #[jsonrpsee::core::async_trait]
 impl<S: KvStore + 'static> AdminApiServer for RpcHandler<S> {
+    async fn canonical_proof_admission(
+        &self,
+        block: ShellHash,
+    ) -> Result<Option<serde_json::Value>, ErrorObjectOwned> {
+        self.canonical_proof_backend()?
+            .admission(block)
+            .map_err(proof_error)
+    }
     async fn canonical_proof_production(
         &self,
         block: ShellHash,

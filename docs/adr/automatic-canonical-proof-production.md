@@ -48,5 +48,6 @@ cover stale canonical mappings, modified MPT/account/key/body inputs, unknown
 source fields, quota accounting and immutable batch refusal. Simulated quota
 boundaries do not establish a 256 MiB load test. Legacy cached producer graphs
 must retain their original source identity after the source representation
-change. Automatic fresh peer admission, fork/amendment consumption, full
-proposer cryptography and compact settlement graphs remain separate work.
+change. Opt-in fresh peer admission is specified in
+[live canonical admission](live-canonical-proof-admission.md). Fork/amendment
+consumption, full proposer cryptography and compact settlement graphs remain separate work.

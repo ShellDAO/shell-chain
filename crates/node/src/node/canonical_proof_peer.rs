@@ -18,6 +18,7 @@ const MAX_PROOF_PEERS: usize = 256;
 pub(super) struct CanonicalProofPeerState {
     running: bool,
     peers: HashSet<PeerId>,
+    discovery_peers: HashSet<PeerId>,
     active: Option<Pull>,
 }
 struct Pull {
@@ -37,6 +38,7 @@ impl<S: KvStore + 'static> Drop for ProofPeerGuard<'_, S> {
         let mut state = self.node.canonical_proof_peer.lock();
         state.running = false;
         state.peers.clear();
+        state.discovery_peers.clear();
         if let Some(mut pull) = state.active.take() {
             self.node.finish_proof_pull(
                 &mut pull,
@@ -60,6 +62,8 @@ impl<S: KvStore + 'static> Node<S> {
     pub(super) fn canonical_proof_peer_disconnected(&self, peer: &PeerId) {
         let mut state = self.canonical_proof_peer.lock();
         state.peers.remove(peer);
+        state.discovery_peers.remove(peer);
+        self.admission_peer_disconnected(peer);
         if state
             .active
             .as_ref()
@@ -72,6 +76,20 @@ impl<S: KvStore + 'static> Node<S> {
                     "proof peer disconnected; resume explicitly".into(),
                 );
             }
+        }
+    }
+    pub(super) fn note_proof_discovery_support(&self, peer: PeerId) {
+        let mut s = self.canonical_proof_peer.lock();
+        if s.running && s.peers.contains(&peer) {
+            s.discovery_peers.insert(peer);
+        }
+    }
+    pub(super) fn connected_proof_peers(&self) -> Vec<PeerId> {
+        let state = self.canonical_proof_peer.lock();
+        if state.running {
+            state.discovery_peers.iter().cloned().collect()
+        } else {
+            vec![]
         }
     }
     pub(super) fn start_canonical_proof_fetch(
@@ -117,7 +135,9 @@ impl<S: KvStore + 'static> Node<S> {
             nonce,
             next_chunk: upload.next_chunk,
             received_bytes: upload.received_bytes,
-            state: if upload.state == UploadState::Verified {
+            state: if upload.state == UploadState::Verified
+                && !self.has_live_manifest(upload.proof_id)
+            {
                 FetchState::Complete
             } else {
                 FetchState::Receiving
@@ -187,6 +207,20 @@ impl<S: KvStore + 'static> Node<S> {
         pull: &mut Pull,
     ) -> Result<(Option<ProofPeerAction>, bool), String> {
         let upload = self.pull_progress(pull)?;
+        if self.has_live_manifest(upload.proof_id)
+            && matches!(
+                upload.state,
+                UploadState::Ready | UploadState::Verifying | UploadState::Verified
+            )
+        {
+            self.start_live_candidate_verification(upload.proof_id)?;
+            pull.status.state = FetchState::Verifying;
+            pull.sent_at = None;
+            self.canonical_proof_uploads
+                .save_fetch_status(&pull.status)
+                .map_err(|e| e.to_string())?;
+            return Ok((None, false));
+        }
         match upload.state {
             UploadState::Verified => {
                 pull.status.state = FetchState::Complete;
@@ -286,6 +320,54 @@ impl<S: KvStore + 'static> Node<S> {
         message: NetworkMessage,
     ) -> Option<ProofPeerAction> {
         match message {
+            NetworkMessage::CanonicalProofManifestRequest {
+                version,
+                block_hash,
+                nonce,
+            } => {
+                let allowed = {
+                    let s = self.canonical_proof_peer.lock();
+                    s.running && s.discovery_peers.contains(peer)
+                };
+                if !allowed || version != 1 || nonce == 0 {
+                    return None;
+                }
+                let manifest = self
+                    .canonical_proof_uploads
+                    .available_manifests()
+                    .ok()?
+                    .into_iter()
+                    .find(|m| {
+                        m.block_hash == block_hash && self.validate_proof_upload_source(m).is_ok()
+                    });
+                Some(ProofPeerAction {
+                    peer: peer.clone(),
+                    message: NetworkMessage::CanonicalProofManifestResponse {
+                        version: 1,
+                        block_hash,
+                        nonce,
+                        manifest,
+                    },
+                })
+            }
+            NetworkMessage::CanonicalProofManifestResponse {
+                version,
+                block_hash,
+                nonce,
+                manifest,
+            } => {
+                let allowed = {
+                    let s = self.canonical_proof_peer.lock();
+                    s.running && s.discovery_peers.contains(peer)
+                };
+                if !allowed || version != 1 {
+                    return None;
+                }
+                if let Err(error) = self.accept_live_manifest(peer, block_hash, nonce, manifest) {
+                    warn!(%error,"fresh proof manifest refused; candidate retained");
+                }
+                self.drive_canonical_proof_pull()
+            }
             NetworkMessage::CanonicalProofChunkRequest {
                 version,
                 proof_id,
@@ -307,7 +389,9 @@ impl<S: KvStore + 'static> Node<S> {
                 }
                 let data = <Self as CanonicalProofControl>::status(self, proof_id)
                     .ok()
-                    .filter(|status| status.state == UploadState::Verified)
+                    .filter(|status| {
+                        matches!(status.state, UploadState::Verified | UploadState::Ready)
+                    })
                     .and_then(|_| {
                         <Self as CanonicalProofControl>::chunk(self, proof_id, index).ok()
                     });

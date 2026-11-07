@@ -24,6 +24,9 @@ impl<S: KvStore + 'static> Node<S> {
         {
             return Err("canonical proof chain/genesis identity mismatch".into());
         }
+        if self.pending_manifest_source(manifest)? {
+            return Ok(());
+        }
         if self.production_manifest_source(manifest)? {
             return Ok(());
         }
@@ -96,6 +99,9 @@ impl<S: KvStore + 'static> Node<S> {
     }
 }
 impl<S: KvStore + 'static> CanonicalProofControl for Node<S> {
+    fn admission(&self, block: ShellHash) -> Result<Option<serde_json::Value>, String> {
+        self.canonical_admission_status(block)
+    }
     fn production(&self, block: ShellHash) -> Result<Option<serde_json::Value>, String> {
         self.canonical_production_status(block)
     }
@@ -187,6 +193,9 @@ impl<S: KvStore + 'static> CanonicalProofControl for Node<S> {
                 .map_err(|e| e.to_string())?
                 .manifest,
         )?;
+        if self.has_live_manifest(id) {
+            return Err("live candidate verification belongs to the canonical event loop".into());
+        }
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| "canonical proof verification requires a runtime")?;
         let (status, claimed) = self

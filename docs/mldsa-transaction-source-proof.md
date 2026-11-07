@@ -1175,10 +1175,11 @@ The output includes the command receipts, refusal and rollback evidence, importe
 result and cold-recheck receipts. Repeated `verify` runs retain the first receipt
 and add a separate numbered receipt. Failures exit nonzero and retain evidence.
 
-This covers explicit local import of a fresh extension. Automatic producer proof
-generation, peer admission using the complete graph, full proposer crypto proofs,
-fork proof consumption, larger sender profiles and public binary/network
-acceptance remain separate work.
+This section covers explicit local import of a fresh extension. Separately opted-in,
+bounded automatic production and ordinary peer admission are described in the
+[STARK guide](stark-aggregation.md#ordinary-peer-admission-with-complete-proofs-unreleased).
+Full proposer crypto proofs, fork/amendment consumption, larger sender load
+profiles and public binary/network acceptance remain separate work.
 
 ### Produce a complete graph from a native canonical block
 

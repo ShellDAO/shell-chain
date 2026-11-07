@@ -245,6 +245,9 @@ enum Commands {
         /// Automatically generate full canonical ML-DSA sender proofs, separate from settlement.
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
         canonical_proof_production: bool,
+        /// Automatically consume complete sender proofs for eligible ordinary peer blocks.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+        canonical_proof_admission: bool,
         /// Pause automatic proving after this many new components in this process.
         #[arg(long)]
         canonical_proof_component_budget: Option<std::num::NonZeroUsize>,
@@ -711,6 +714,7 @@ async fn main() {
             body_retention,
             enable_stark_aggregation,
             canonical_proof_production,
+            canonical_proof_admission,
             canonical_proof_component_budget,
             l2_stark_mode,
             consensus_engine,
@@ -770,6 +774,12 @@ async fn main() {
                 "canonical_proof_production",
                 canonical_proof_production,
                 file_config.consensus.canonical_proof_production,
+            );
+            let effective_canonical_proof_admission = config_or_cli(
+                run_matches,
+                "canonical_proof_admission",
+                canonical_proof_admission,
+                file_config.consensus.canonical_proof_admission,
             );
             let effective_canonical_proof_budget = canonical_proof_component_budget
                 .or(file_config.consensus.canonical_proof_component_budget);
@@ -902,6 +912,7 @@ async fn main() {
                 body_retention,
                 enable_stark_aggregation: effective_stark_aggregation,
                 canonical_proof_production: effective_canonical_proof_production,
+                canonical_proof_admission: effective_canonical_proof_admission,
                 canonical_proof_component_budget: effective_canonical_proof_budget,
                 l2_stark_mode,
                 consensus_engine: effective_consensus_engine,

@@ -242,6 +242,8 @@ pub struct NodeConfig {
     pub enable_stark_aggregation: bool,
     /// Opt-in full ML-DSA canonical sender certificates; separate from settlement.
     pub canonical_proof_production: bool,
+    /// Consume full sender graphs for eligible ordinary peer candidates (default off).
+    pub canonical_proof_admission: bool,
     /// Maximum newly generated components per node process; None runs to completion.
     pub canonical_proof_component_budget: Option<std::num::NonZeroUsize>,
     /// Maximum concurrent CPU proof jobs; results are handed off in source order.
@@ -311,6 +313,7 @@ impl NodeConfig {
             parallel_pqvm: ParallelPqvmConfig::default(),
             enable_stark_aggregation: params.stark_aggregation,
             canonical_proof_production: false,
+            canonical_proof_admission: false,
             canonical_proof_component_budget: None,
             prover_max_concurrent_proofs: 1,
             prover_priority: crate::ProvingPriority::Sequential,

@@ -5,6 +5,10 @@ use std::sync::Arc;
 /// Operator-only artifact intake. The node owns persistence and actual sender
 /// proof/replay verification; the RPC layer never manufactures verified results.
 pub trait CanonicalProofControl: Send + Sync {
+    fn admission(
+        &self,
+        block: shell_primitives::ShellHash,
+    ) -> Result<Option<serde_json::Value>, String>;
     fn production(&self, block: ShellHash) -> Result<Option<serde_json::Value>, String>;
     fn fetch(
         &self,

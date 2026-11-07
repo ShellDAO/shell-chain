@@ -1,4 +1,6 @@
 //! Fresh raw-source producer fixture and independent native execution control.
+#[path = "common/canonical_admission_runtime.rs"]
+mod admission_runtime;
 #[allow(dead_code)]
 #[path = "common/canonical_proof_fixture.rs"]
 mod fixture;
@@ -375,6 +377,21 @@ fn main() -> Result<(), Error> {
         "runtime-pause" | "runtime-resume" => {
             tokio::runtime::Runtime::new()?.block_on(runtime::run(out, args[0] == "runtime-pause"))
         }
+        "prepare-peer-admission" => admission_runtime::prepare(out),
+        "peer-admission-pause" | "peer-admission-resume" => tokio::runtime::Runtime::new()?
+            .block_on(admission_runtime::run(
+                out,
+                args[0] == "peer-admission-pause",
+                false,
+                false,
+            )),
+        "peer-admission-bad-air" => tokio::runtime::Runtime::new()?
+            .block_on(admission_runtime::run(out, false, true, false)),
+        "peer-admission-recheck-bad-air" => {
+            tokio::runtime::Runtime::new()?.block_on(admission_runtime::run(out, false, true, true))
+        }
+        "peer-admission-verify" => admission_runtime::verify(out),
+        "peer-admission-snapshot" => admission_runtime::snapshot(out),
         "runtime-snapshot" => runtime::snapshot(out),
         "runtime-native-check" => runtime::verify_native(out),
         "runtime-next-job" => tokio::runtime::Runtime::new()?.block_on(runtime::next_job(out)),

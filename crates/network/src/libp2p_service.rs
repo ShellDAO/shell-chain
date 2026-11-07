@@ -35,6 +35,8 @@ use crate::service::NetworkService;
 
 const BOOTNODE_REDIAL_INTERVAL_SECS: u64 = 30;
 const DIRECT_MESSAGE_PROTOCOL: StreamProtocol = StreamProtocol::new("/shell/direct/1");
+const CANONICAL_PROOF_DISCOVERY_PROTOCOL: StreamProtocol =
+    StreamProtocol::new("/shell/canonical-proof/2");
 const CANONICAL_PROOF_PROTOCOL: StreamProtocol = StreamProtocol::new("/shell/canonical-proof/1");
 const MAX_PENDING_DIRECT_MESSAGES: usize = 256;
 const MAX_PENDING_DIRECT_BYTES: usize = 2 * crate::message::MAX_MESSAGE_SIZE;
@@ -760,7 +762,10 @@ fn build_swarm_with_identity(
                 DirectMessageCodec {
                     max_message_size: max_msg_size.min(crate::message::MAX_CONSENSUS_MESSAGE_SIZE),
                 },
-                [(CANONICAL_PROOF_PROTOCOL, ProtocolSupport::Full)],
+                [
+                    (CANONICAL_PROOF_DISCOVERY_PROTOCOL, ProtocolSupport::Full),
+                    (CANONICAL_PROOF_PROTOCOL, ProtocolSupport::Full),
+                ],
                 request_response::Config::default()
                     .with_request_timeout(Duration::from_secs(30))
                     .with_max_concurrent_streams(4),
@@ -1650,6 +1655,16 @@ fn handle_swarm_event(
             }
         }
         // Connection established.
+        SwarmEvent::Behaviour(ShellBehaviourEvent::Identify(identify::Event::Received {
+            peer_id,
+            info,
+            ..
+        })) if info.protocols.contains(&CANONICAL_PROOF_DISCOVERY_PROTOCOL) => {
+            let _ = try_forward_event(
+                event_tx,
+                NetworkEvent::CanonicalProofDiscoverySupported(PeerId(peer_id.to_string())),
+            );
+        }
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             let peer = PeerId(peer_id.to_string());
             // F-305: Check ban list before accepting connection.

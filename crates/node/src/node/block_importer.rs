@@ -1873,6 +1873,16 @@ impl<S: KvStore + 'static> Node<S> {
         block: Block,
         proof: &CanonicalSignatureBatchProof,
     ) -> Result<CanonicalProofReplay, NodeError> {
+        let verified = self.verify_live_candidate_signatures(expected_parent, &block, proof)?;
+        self.commit_live_verified_candidate(expected_parent, block, &verified)
+    }
+
+    /// Read-only preflight before a bounded fresh candidate is retained or downloaded.
+    pub(super) fn validate_live_candidate_source(
+        &self,
+        expected_parent: ShellHash,
+        block: &Block,
+    ) -> Result<(), NodeError> {
         let head = self
             .chain_store
             .get_head_block()?
@@ -1885,35 +1895,84 @@ impl<S: KvStore + 'static> Node<S> {
                 "proof import requires exact current canonical parent".into(),
             ));
         }
-        if block
-            .system_transactions
-            .iter()
-            .any(|tx| tx.kind != SystemTxKind::BlockGasReward)
+        let config = self
+            .chain_store
+            .get_chain_config()?
+            .ok_or(NodeError::NoGenesis)?;
+        if config.chain_id != self.config.chain_id
+            || self.chain_store.get_block_hash_by_number(0)? != Some(config.genesis_hash)
+            || config
+                .block_commitment_height
+                .is_none_or(|h| block.number() < h)
+            || block.transactions.is_empty()
+            || block.transactions.len()
+                > shell_stark_prover::canonical_batch::MAX_CANONICAL_SIGNATURE_BATCH
+            || block.transactions.iter().any(|tx| {
+                tx.tx.tx_type > 3
+                    || tx.aa_bundle.is_some()
+                    || tx.signature.sig_type != shell_crypto::SignatureType::MlDsa65
+                    || tx.signature.data.len() != 3309
+            })
+            || block
+                .system_transactions
+                .iter()
+                .any(|tx| tx.kind != SystemTxKind::BlockGasReward)
         {
             return Err(NodeError::Startup(
-                "proof import settlement profile unsupported".into(),
+                "fresh proof source profile inactive or unsupported".into(),
             ));
         }
         let view = self
             .chain_store
             .canonical_parent_view(expected_parent, expected_parent)?;
-        if view.config().chain_id != self.config.chain_id {
-            return Err(NodeError::Startup(
-                "proof import chain identity mismatch".into(),
-            ));
-        }
         let registry = load_algorithm_registry(&view.world_state()?)
             .map_err(|e| NodeError::Startup(format!("proof import parent registry: {e}")))?;
         with_algorithm_registry_override(&registry, || {
-            self.chain_store.verify_block_body_commitment(&block)?;
-            self.verify_import_consensus(&block, &head, false)?;
-            self.verify_import_economics(&block, &head)?;
-            self.verify_incoming_witness_root(&block)?;
-            self.verify_import_sig_aggregate_proof(&block)?;
-            let verified = verify_candidate_signature_batch(&view, &block, proof)
-                .map_err(|e| NodeError::Startup(format!("candidate sender proof: {e}")))?;
+            self.chain_store.verify_block_body_commitment(block)?;
+            self.verify_import_consensus(block, &head, false)?;
+            self.verify_import_economics(block, &head)?;
+            self.verify_incoming_witness_root(block)?;
+            self.verify_import_sig_aggregate_proof(block)?;
+            Ok(())
+        })
+    }
+
+    /// CPU workers construct opaque verified tuples, never a persisted authorization flag.
+    pub(super) fn verify_live_candidate_signatures(
+        &self,
+        expected_parent: ShellHash,
+        block: &Block,
+        proof: &CanonicalSignatureBatchProof,
+    ) -> Result<VerifiedCanonicalSignatureBatch, NodeError> {
+        self.validate_live_candidate_source(expected_parent, block)?;
+        let view = self
+            .chain_store
+            .canonical_parent_view(expected_parent, expected_parent)?;
+        let registry = load_algorithm_registry(&view.world_state()?)
+            .map_err(|e| NodeError::Startup(format!("proof import parent registry: {e}")))?;
+        with_algorithm_registry_override(&registry, || {
+            verify_candidate_signature_batch(&view, block, proof)
+                .map_err(|e| NodeError::Startup(format!("candidate sender proof: {e}")))
+        })
+    }
+
+    /// The live caller is the serialized Node.run canonical mutation loop. CPU workers
+    /// must only return tuples to that loop; they must never invoke this method.
+    pub(super) fn commit_live_verified_candidate(
+        &self,
+        expected_parent: ShellHash,
+        block: Block,
+        verified: &VerifiedCanonicalSignatureBatch,
+    ) -> Result<CanonicalProofReplay, NodeError> {
+        self.validate_live_candidate_source(expected_parent, &block)?;
+        let view = self
+            .chain_store
+            .canonical_parent_view(expected_parent, expected_parent)?;
+        let registry = load_algorithm_registry(&view.world_state()?)
+            .map_err(|e| NodeError::Startup(format!("proof import parent registry: {e}")))?;
+        with_algorithm_registry_override(&registry, || {
             let hash = block.hash();
-            self.import_block_inner(block, false, Some(&verified))?;
+            self.import_block_inner(block, false, Some(verified))?;
             let imported = self
                 .chain_store
                 .get_head_block()?

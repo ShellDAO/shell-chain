@@ -132,6 +132,69 @@ This source feature is not a published binary or network activation.
 
 Design: [Automatic canonical production](adr/automatic-canonical-proof-production.md).
 
+## Ordinary peer admission with complete proofs (unreleased)
+
+A follower can select complete sender verification for supported fresh extensions:
+
+```bash
+shell-node --datadir follower-data run --config node.toml --db rocksdb \
+  --node-role prover --canonical-proof-admission
+```
+
+It defaults off; `[consensus].canonical_proof_admission` and explicit
+`--canonical-proof-admission=false` follow the normal config/CLI precedence.
+Use matching initialized genesis/runtime configuration, an activated body
+commitment schedule and a dedicated proof-capable network implementation.
+Supported blocks have 1–16 registered default-account ML-DSA-65 senders,
+transaction types 0–3, signing payloads up to 4096 bytes, gas-reward system
+transactions only, and a serialized body up to 2 MiB. Unsupported profiles use
+the existing native path. Selected candidates wait for a full proof; rejected
+proofs do not silently fall back to native sender verification.
+
+Normal block gossip or synchronization stages the untrusted body, discovers an
+available manifest from a compatible peer, resumes bounded chunks and verifies
+full AIR. Native consensus and execution still decide acceptance. Canonical
+commit runs on the node event loop after a fresh parent/context check. No admin
+fetch or import command is required. Producers can serve `ready` graph bytes;
+ready/verified metadata never replaces the receiver's complete verification.
+Discovery uses authenticated protocol version 2 capability advertisements;
+legacy chunk protocol version 1 remains offered and receives no new frames.
+
+At most two bodies remain retained, including complete and failed candidates.
+The separate raw cache remains bounded to 512 MiB with its existing object and
+immutable-generation limits. Two distinct manifests and one hash-corrupt
+recovery per candidate are allowed; there is no automatic eviction. A peer can
+withhold a graph, and a valid graph can still exceed capacity. Shutdown joins an
+in-flight verifier and pauses before native commit. Cold restart independently
+rechecks retained bytes and native context. With an authenticated `admin`
+namespace, `admin_canonicalProofAdmission` takes a block hash and reports local
+status and native canonical membership; status is not authorization.
+
+Run the expensive self-contained regression with Python 3, stable Rust and the
+repository RocksDB prerequisites:
+
+```bash
+tests/e2e/mldsa-live-peer-proof.sh run proof-output
+tests/e2e/mldsa-live-peer-proof.sh verify proof-output
+```
+
+A new output first creates fresh signed test accounts and the complete source
+graph through the automatic producer regression. Two actual nodes then use
+ordinary synchronization and dedicated proof discovery/transfer. The receiver
+stops after three chunks without canonical mutation, cold resumes the same
+immutable chunks, commits through native execution and performs two cold full
+proof replays against independent native receipts and balances. A second isolated
+receiver rejects a correctly hashed graph with damaged key AIR despite genuine
+raw signatures, without canonical writes. It also cold-rechecks a stale verifier
+record and a forged local verified-cache receipt; neither authorizes admission.
+Private keys are
+not persisted; command receipts and output remain available. Any assertion
+failure exits nonzero. `verify` rechecks an existing import without regenerating
+certificates. This limited profile does not establish fork/amendment handling,
+full proposer AIR, multi-sender load behavior or a published/activated network.
+
+Design: [Live canonical admission](adr/live-canonical-proof-admission.md).
+
 ## Registered prover activation
 
 The unreleased `prover_registry_height` schedule enables the canonical registry

@@ -83,6 +83,7 @@ pub struct RunArgs {
     /// Enable STARK aggregate proof generation during block production (on by default).
     pub enable_stark_aggregation: bool,
     pub canonical_proof_production: bool,
+    pub canonical_proof_admission: bool,
     pub canonical_proof_component_budget: Option<std::num::NonZeroUsize>,
     pub prover_max_concurrent_proofs: usize,
     pub prover_priority: shell_node::ProvingPriority,
@@ -1003,6 +1004,7 @@ async fn run_with_store<S: KvStore + 'static>(
         },
         enable_stark_aggregation: args.enable_stark_aggregation,
         canonical_proof_production: args.canonical_proof_production,
+        canonical_proof_admission: args.canonical_proof_admission,
         canonical_proof_component_budget: args.canonical_proof_component_budget,
         prover_max_concurrent_proofs: args.prover_max_concurrent_proofs,
         prover_priority: args.prover_priority,
@@ -1230,6 +1232,7 @@ mod tests {
             storage_profile: "full".into(),
             enable_stark_aggregation: false,
             canonical_proof_production: false,
+            canonical_proof_admission: false,
             canonical_proof_component_budget: None,
             prover_max_concurrent_proofs: 1,
             prover_priority: shell_node::ProvingPriority::Sequential,

@@ -160,6 +160,44 @@ impl<S: KvStore> CanonicalProofUploadStore<S> {
         }
         Ok(status)
     }
+    /// Byte availability only. Callers independently validate source identity and
+    /// cryptography; neither ready nor persisted verified metadata authorizes import.
+    pub fn available_manifests(&self) -> Result<Vec<CanonicalProofManifest>, StorageError> {
+        let Some(bytes) = self.store.get(&key(b"index"))? else {
+            return Ok(vec![]);
+        };
+        if bytes.len() > 16 * 1024 {
+            return Err(invalid("canonical cache index size limit"));
+        }
+        let index: Index = decode(&bytes)?;
+        if index.version != 1
+            || index.objects.len() > MAX_CANONICAL_PROOF_OBJECTS
+            || (index.objects.len() as u64)
+                .checked_add(index.archived_attempts)
+                .is_none_or(|n| n > MAX_CANONICAL_PROOF_OBJECTS as u64)
+            || index.reserved_bytes > MAX_CANONICAL_PROOF_CACHE_BYTES
+            || index
+                .objects
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != index.objects.len()
+        {
+            return Err(invalid("canonical cache index invalid"));
+        }
+        let mut result = Vec::new();
+        for id in index.objects {
+            let status = self.status(&id)?;
+            if matches!(
+                status.state,
+                CanonicalProofUploadState::Ready | CanonicalProofUploadState::Verified
+            ) && status.received_bytes == status.manifest.total_bytes
+            {
+                result.push(status.manifest);
+            }
+        }
+        Ok(result)
+    }
     pub fn begin(
         &self,
         manifest: CanonicalProofManifest,
@@ -487,6 +525,26 @@ impl<S: KvStore> CanonicalProofUploadStore<S> {
         *worker = Some(*id);
         Ok((status, true))
     }
+    /// Release a joined worker without an execution receipt. Raw chunks and attempt
+    /// counters remain immutable; a later owner must perform full verification again.
+    pub fn pause_claim(&self, id: &ShellHash, attempt: u32) -> Result<(), StorageError> {
+        let mut worker = self.verifying.lock();
+        let mut status = self.status(id)?;
+        if *worker != Some(*id)
+            || status.state != CanonicalProofUploadState::Verifying
+            || status.verification_attempts != attempt
+        {
+            return Err(invalid("canonical claim owner changed"));
+        }
+        status.state = CanonicalProofUploadState::Ready;
+        status.result = None;
+        status.error =
+            Some("verification interrupted before native commit; full recheck required".into());
+        self.store.put(&object_key(id), &encode(&status)?)?;
+        self.store.flush()?;
+        *worker = None;
+        Ok(())
+    }
     pub fn payload(&self, id: &ShellHash) -> Result<Vec<u8>, StorageError> {
         let status = self.status(id)?;
         if status.received_bytes != status.manifest.total_bytes {
@@ -557,6 +615,41 @@ mod tests {
             total_bytes: bytes.len() as u64,
             payload_hash: blake3_hash(bytes),
         }
+    }
+    #[test]
+    fn interrupted_claim_keeps_bytes_and_requires_new_verification_owner() {
+        let db = Arc::new(MemoryDb::new());
+        let cache = CanonicalProofUploadStore::new(db.clone());
+        let m = manifest(b"abc", 2);
+        let id = cache.begin(m.clone()).unwrap().proof_id;
+        assert!(cache.available_manifests().unwrap().is_empty());
+        cache.append(&id, 0, b"abc").unwrap();
+        assert_eq!(cache.available_manifests().unwrap(), vec![m.clone()]);
+        let (first, claimed) = cache.claim(&id, true).unwrap();
+        assert!(claimed);
+        let before = db.scan_all().unwrap();
+        assert!(cache
+            .pause_claim(&id, first.verification_attempts + 1)
+            .is_err());
+        assert_eq!(db.scan_all().unwrap(), before);
+        cache.pause_claim(&id, first.verification_attempts).unwrap();
+        assert_eq!(cache.payload(&id).unwrap(), b"abc");
+        assert_eq!(
+            cache.status(&id).unwrap().state,
+            CanonicalProofUploadState::Ready
+        );
+        assert!(cache
+            .complete(&id, Ok(serde_json::json!({"forged":true})))
+            .is_err());
+        let (second, claimed) = cache.claim(&id, true).unwrap();
+        assert!(claimed);
+        assert_eq!(
+            second.verification_attempts,
+            first.verification_attempts + 1
+        );
+        cache.complete(&id, Err("invalid full AIR".into())).unwrap();
+        assert!(cache.available_manifests().unwrap().is_empty());
+        assert_eq!(cache.payload(&id).unwrap(), b"abc");
     }
     #[test]
     fn canonical_proof_upload_resumes_and_refuses_conflicts_without_writes() {

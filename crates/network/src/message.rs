@@ -94,6 +94,18 @@ pub enum NetworkMessage {
     /// Pong response to ping.
     Pong,
     /// Off-chain artifacts use the dedicated peer-authenticated protocol only.
+    CanonicalProofManifestRequest {
+        version: u8,
+        block_hash: ShellHash,
+        nonce: u64,
+    },
+    /// nonce0 is a bounded availability announcement, never an admission receipt.
+    CanonicalProofManifestResponse {
+        version: u8,
+        block_hash: ShellHash,
+        nonce: u64,
+        manifest: Option<shell_core::CanonicalProofManifest>,
+    },
     CanonicalProofChunkRequest {
         version: u8,
         proof_id: ShellHash,
@@ -207,7 +219,10 @@ impl NetworkMessage {
     pub fn requires_canonical_proof_transport(&self) -> bool {
         matches!(
             self,
-            Self::CanonicalProofChunkRequest { .. } | Self::CanonicalProofChunkResponse { .. }
+            Self::CanonicalProofChunkRequest { .. }
+                | Self::CanonicalProofChunkResponse { .. }
+                | Self::CanonicalProofManifestRequest { .. }
+                | Self::CanonicalProofManifestResponse { .. }
         )
     }
     /// Maximum serialized size allowed for this specific message kind.
@@ -229,6 +244,8 @@ impl NetworkMessage {
             | Self::CommitCertificate { .. } => MAX_CONSENSUS_MESSAGE_SIZE,
             Self::BlockRequest { .. }
             | Self::CanonicalProofChunkRequest { .. }
+            | Self::CanonicalProofManifestRequest { .. }
+            | Self::CanonicalProofManifestResponse { .. }
             | Self::BodyRequest { .. }
             | Self::Ping
             | Self::Pong
@@ -253,6 +270,8 @@ impl NetworkMessage {
             | Self::WPoaViewChange(_)
             | Self::CommitCertificate { .. } => NetworkTopic::Attestation,
             Self::ProofAmendment { .. }
+            | Self::CanonicalProofManifestRequest { .. }
+            | Self::CanonicalProofManifestResponse { .. }
             | Self::CanonicalProofChunkRequest { .. }
             | Self::CanonicalProofChunkResponse { .. }
             | Self::ProofAck { .. }
@@ -273,6 +292,8 @@ pub enum NetworkEvent {
     },
     /// A new peer connected.
     PeerConnected(PeerId),
+    /// Authenticated Identify reports support for canonical proof discovery v2.
+    CanonicalProofDiscoverySupported(PeerId),
     /// A peer disconnected.
     PeerDisconnected(PeerId),
     /// Kademlia routing table was updated.
@@ -327,6 +348,28 @@ pub fn serialize_checked(msg: &NetworkMessage, limit: usize) -> Result<Vec<u8>, 
 impl NetworkMessage {
     fn validate_semantics(&self) -> Result<(), NetworkError> {
         match self {
+            Self::CanonicalProofManifestRequest { version, nonce, .. }
+                if *version != 1 || *nonce == 0 =>
+            {
+                Err(NetworkError::Serialization(
+                    "canonical manifest request version/nonce".into(),
+                ))
+            }
+            Self::CanonicalProofManifestResponse {
+                version,
+                block_hash,
+                nonce,
+                manifest,
+            } if *version != 1
+                || (*nonce == 0 && manifest.is_none())
+                || manifest
+                    .as_ref()
+                    .is_some_and(|m| m.block_hash != *block_hash || m.validate().is_err()) =>
+            {
+                Err(NetworkError::Serialization(
+                    "canonical manifest response identity/version".into(),
+                ))
+            }
             Self::CanonicalProofChunkRequest {
                 version,
                 index,
@@ -571,7 +614,9 @@ fn serialized_message_size_limit(data: &[u8]) -> Option<usize> {
         | "Ping"
         | "Pong"
         | "StorageCapability"
-        | "CanonicalProofChunkRequest" => MAX_CONTROL_MESSAGE_SIZE,
+        | "CanonicalProofChunkRequest"
+        | "CanonicalProofManifestRequest"
+        | "CanonicalProofManifestResponse" => MAX_CONTROL_MESSAGE_SIZE,
         // Unknown variants will be rejected during deserialization, so cap them
         // at the control-message budget instead of spending the full raw limit.
         _ => MAX_CONTROL_MESSAGE_SIZE,
@@ -582,7 +627,12 @@ fn serialized_message_size_limit(data: &[u8]) -> Option<usize> {
 pub(crate) fn serialized_message_requires_canonical_proof_transport(data: &[u8]) -> bool {
     matches!(
         serialized_message_variant(data),
-        Some("CanonicalProofChunkRequest" | "CanonicalProofChunkResponse")
+        Some(
+            "CanonicalProofChunkRequest"
+                | "CanonicalProofChunkResponse"
+                | "CanonicalProofManifestRequest"
+                | "CanonicalProofManifestResponse"
+        )
     )
 }
 #[cfg(any(test, feature = "libp2p"))]
@@ -1267,6 +1317,68 @@ mod tests {
                 assert_eq!(view_change.signature, vec![1, 2, 3]);
             }
             other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+    #[test]
+    fn canonical_manifest_discovery_is_bounded_and_direct_only() {
+        let manifest = shell_core::CanonicalProofManifest {
+            version: 1,
+            chain_id: 10,
+            genesis_hash: ShellHash::ZERO,
+            block_hash: ShellHash::from([1; 32]),
+            total_bytes: 1,
+            payload_hash: ShellHash::from([2; 32]),
+        };
+        for message in [
+            NetworkMessage::CanonicalProofManifestRequest {
+                version: 1,
+                block_hash: manifest.block_hash,
+                nonce: 7,
+            },
+            NetworkMessage::CanonicalProofManifestResponse {
+                version: 1,
+                block_hash: manifest.block_hash,
+                nonce: 0,
+                manifest: Some(manifest.clone()),
+            },
+            NetworkMessage::CanonicalProofManifestResponse {
+                version: 1,
+                block_hash: manifest.block_hash,
+                nonce: 7,
+                manifest: None,
+            },
+        ] {
+            let bytes = serialize_checked(&message, MAX_MESSAGE_SIZE).unwrap();
+            assert!(serialized_message_requires_canonical_proof_transport(
+                &bytes
+            ));
+            assert!(deserialize_checked(&bytes, MAX_MESSAGE_SIZE)
+                .unwrap()
+                .requires_canonical_proof_transport());
+            assert!(bytes.len() < MAX_CONTROL_MESSAGE_SIZE);
+        }
+        for message in [
+            NetworkMessage::CanonicalProofManifestRequest {
+                version: 1,
+                block_hash: manifest.block_hash,
+                nonce: 0,
+            },
+            NetworkMessage::CanonicalProofManifestResponse {
+                version: 1,
+                block_hash: manifest.block_hash,
+                nonce: 0,
+                manifest: None,
+            },
+            NetworkMessage::CanonicalProofManifestResponse {
+                version: 1,
+                block_hash: ShellHash::ZERO,
+                nonce: 7,
+                manifest: Some(manifest),
+            },
+        ] {
+            let bytes = serde_json::to_vec(&message).unwrap();
+            assert!(serialize_checked(&message, MAX_MESSAGE_SIZE).is_err());
+            assert!(deserialize_checked(&bytes, MAX_MESSAGE_SIZE).is_err());
         }
     }
     #[test]

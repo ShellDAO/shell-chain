@@ -55,6 +55,11 @@ pub struct PeerInfo {
 /// Admin namespace RPC API trait.
 #[rpc(server, namespace = "admin")]
 pub trait AdminApi {
+    #[method(name = "canonicalProofAdmission")]
+    async fn canonical_proof_admission(
+        &self,
+        block: shell_primitives::ShellHash,
+    ) -> Result<Option<serde_json::Value>, jsonrpsee::types::ErrorObjectOwned>;
     #[method(name = "canonicalProofProduction")]
     async fn canonical_proof_production(
         &self,

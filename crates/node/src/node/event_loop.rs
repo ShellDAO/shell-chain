@@ -332,6 +332,18 @@ impl NodeTaskLifecycle {
     }
 }
 
+// Admission work may be embedded in a current-thread runtime. Its canonical
+// writes still run only inside the serialized event loop.
+fn proof_admission_work<R>(work: impl FnOnce() -> R) -> R {
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(work)
+    } else {
+        work()
+    }
+}
+
 impl<S: KvStore + 'static> Node<S> {
     fn update_challenge_lifecycle<T>(
         &self,
@@ -517,6 +529,11 @@ impl<S: KvStore + 'static> Node<S> {
         })?;
         *AlgorithmRegistry::global_mut() = registry;
         *self.runtime_signer.write() = Some(Arc::clone(&signer));
+        if self.config.canonical_proof_admission && !network.supports_canonical_proof_transfer() {
+            return Err(NodeError::Startup(
+                "canonical proof admission requires dedicated peer transport".into(),
+            ));
+        }
         let mut network = NetworkInterface::new(network);
         let local_signer_address =
             Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
@@ -817,6 +834,7 @@ impl<S: KvStore + 'static> Node<S> {
         let _canonical_proof_network =
             self.activate_canonical_proof_network(network.supports_canonical_proof_transfer());
         let mut canonical_proof_timer = interval(Duration::from_millis(100));
+        let mut proof_availability_timer = interval(Duration::from_secs(1));
         while !*shutdown_rx.borrow() {
             let prover_ready = production_readiness.can_produce();
             self.prover_ready
@@ -842,7 +860,31 @@ impl<S: KvStore + 'static> Node<S> {
                 .set(self.pending_stark_settlements.lock().len() as i64);
 
             tokio::select! {
+                _=proof_availability_timer.tick()=>{
+                    let peers=self.connected_proof_peers();
+                    for(peer,message)in self.proof_availability_announcements(&peers){let _=network.send_to_peer(&peer,message).await;}
+                    if let Some((peer,message))=self.live_discovery_request(&peers){
+                        if peers.contains(&peer){let _=network.send_to_peer(&peer,message).await;}
+                    }
+                }
                 _=canonical_proof_timer.tick()=>{
+                    let completed = if self.config.canonical_proof_admission {
+                        proof_admission_work(||self.finish_live_candidate())
+                    } else { None };
+                    if let Some(result)=completed{
+                        let num=self.chain_store.get_header_by_hash(&result.block)?.ok_or(NodeError::NoGenesis)?.number;
+                        production_readiness.note_import_progress(num);
+                        self.metrics.blocks_imported.inc();self.metrics.block_height.set(num as i64);
+                        self.metrics.update_finality(num,self.finality.read().last_finalized_number());
+                        self.consensus.write().note_block_progress(Self::wall_clock_millis());
+                        if early_commit_certificate.finalize_imported(&self){*finalized_number.write()=self.finality.read().last_finalized_number();}
+                        self.slash_timed_out_challenges(num);
+                        if let Some(header)=self.chain_store.get_header_by_hash(&result.block)?{
+                            let _=block_event_tx.send(BlockEvent::NewBlock{header,receipts:result.receipts,removed:false});
+                        }
+                        sync_requested=false;sync_request=None;
+                        sync_retry_attempts_without_progress=0;sync_retry_timer.reset_after(Duration::from_millis(1));
+                    }
                     let action=self.drive_canonical_proof_pull();
                     self.send_canonical_proof_action(&network,action).await;
                 }
@@ -1284,6 +1326,9 @@ impl<S: KvStore + 'static> Node<S> {
                         Some(NetworkEvent::MessageReceived { peer, message }) => {
                             match message {
                                 NetworkMessage::NewBlock(block) => {
+                                    match if self.config.canonical_proof_admission { proof_admission_work(||self.stage_live_candidate(&peer,&block)) } else { Ok(false) }{
+                                        Ok(true)=>{continue;},Ok(false)=>{},Err(error)=>{warn!(%error,"fresh proof candidate refused; no native fallback");continue;}
+                                    }
                                     let verifier = MultiVerifier;
                                     let saved_header = block.header.clone();
                                     let saved_hash = block.hash();
@@ -1604,6 +1649,9 @@ impl<S: KvStore + 'static> Node<S> {
                                     let certs: HashMap<ShellHash, Vec<u8>> =
                                         commit_certificates.into_iter().collect();
                                     for block in blocks {
+                                        match if self.config.canonical_proof_admission { proof_admission_work(||self.stage_live_candidate(&peer,&block)) } else { Ok(false) }{
+                                            Ok(true)=>{break;},Ok(false)=>{},Err(error)=>{warn!(%error,"fresh sync proof candidate refused; no native fallback");break;}
+                                        }
                                         let num = block.number();
                                         let hdr = block.header.clone();
                                         let bhash = block.hash();
@@ -1802,7 +1850,7 @@ impl<S: KvStore + 'static> Node<S> {
                                 }
                                 // G5: Receive async STARK proof amendment from a prover node.
                                 // Deserialize, store via ProofAmendmentStore, log result.
-                                message @ (NetworkMessage::CanonicalProofChunkRequest {..}|NetworkMessage::CanonicalProofChunkResponse {..})=>{
+                                message @ (NetworkMessage::CanonicalProofChunkRequest {..}|NetworkMessage::CanonicalProofChunkResponse {..}|NetworkMessage::CanonicalProofManifestRequest {..}|NetworkMessage::CanonicalProofManifestResponse {..})=>{
                                     let action=self.canonical_proof_message(&peer,message);
                                     self.send_canonical_proof_action(&network,action).await;
                                 }
@@ -2385,6 +2433,7 @@ impl<S: KvStore + 'static> Node<S> {
                                 }
                             }
                         }
+                        Some(NetworkEvent::CanonicalProofDiscoverySupported(peer))=>{self.note_proof_discovery_support(peer);}
                         Some(NetworkEvent::PeerConnected(peer)) => {
                             self.canonical_proof_peer_connected(peer.clone());
                             info!(%peer, "peer connected");
@@ -2709,6 +2758,7 @@ impl<S: KvStore + 'static> Node<S> {
             eprintln!("✓ RPC server stopped");
         }
 
+        self.shutdown_live_candidate().await;
         task_lifecycle.shutdown().await;
 
         // Preserve the flush error while still shutting down the network.

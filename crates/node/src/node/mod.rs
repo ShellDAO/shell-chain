@@ -3,6 +3,7 @@
 mod block_importer;
 pub use block_importer::CanonicalProofReplay;
 mod block_producer;
+mod canonical_admission;
 mod canonical_production;
 mod canonical_proof_peer;
 mod canonical_proof_rpc;
@@ -246,6 +247,7 @@ pub struct Node<S: KvStore + 'static> {
     canonical_proof_uploads: Arc<shell_storage::CanonicalProofUploadStore<S>>,
     canonical_production: Arc<canonical_production::CanonicalProductionStore<S>>,
     canonical_proof_peer: parking_lot::Mutex<canonical_proof_peer::CanonicalProofPeerState>,
+    live_admission: parking_lot::Mutex<canonical_admission::LiveAdmissionRuntime>,
     legacy_replay: parking_lot::Mutex<Option<block_importer::LegacyReplay<S>>>,
     legacy_backfill_dependency: parking_lot::Mutex<Option<u64>>,
     pub world_state: Arc<RwLock<WorldState<S>>>,
@@ -1019,6 +1021,7 @@ impl<S: KvStore + 'static> Node<S> {
             canonical_proof_uploads,
             canonical_production,
             canonical_proof_peer: parking_lot::Mutex::new(Default::default()),
+            live_admission: parking_lot::Mutex::new(Default::default()),
             legacy_replay: parking_lot::Mutex::new(None),
             legacy_backfill_dependency: parking_lot::Mutex::new(None),
             world_state,
