@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add an offline `import-block-proof` command that verifies a complete sender
+  graph against the current canonical parent, executes one signed extension
+  through the native importer, and atomically persists its body and receipts.
+  Proposer seals and all native execution policy still apply; the proof path
+  uses exact verified sender tuples in both batch and sequential checks.
+
 - Add administrator-requested complete canonical proof fetches over a dedicated
   peer-authenticated protocol with bounded chunks and no gossip fallback.
   Bind responses to peer, proof, index and persisted nonce; resume partial

@@ -6,6 +6,7 @@ mod backup;
 mod database_lock;
 mod export_state;
 mod genesis;
+mod import_block_proof;
 mod import_state;
 mod init;
 mod key;
@@ -22,6 +23,7 @@ pub use export_state::export_state;
 pub use genesis::{
     genesis_add_alloc, genesis_set_economics, genesis_set_validator_stake, genesis_validate_supply,
 };
+pub use import_block_proof::import_block_proof;
 pub use import_state::import_state;
 pub use init::init;
 pub use key::{key_generate, key_inspect, key_migrate};

@@ -116,6 +116,47 @@ pub fn verify_canonical_signature_batch<S: KvStore + 'static>(
     chain
         .verify_block_body_commitment(block)
         .map_err(|e| e.to_string())?;
+    verify_batch_at_parent(view, block, proof, hash)
+}
+
+/// Verify a proposed canonical extension before its body exists in storage.
+/// The caller must separately authenticate the proposer and execute the block.
+/// Only an activated child of the independently captured current tip qualifies;
+/// this never inserts a candidate into the trusted view.
+pub fn verify_candidate_signature_batch<S: KvStore + 'static>(
+    view: &CanonicalParentView<S>,
+    block: &Block,
+    proof: &CanonicalSignatureBatchProof,
+) -> Result<VerifiedCanonicalSignatureBatch, String> {
+    if view.tip() != view.parent().hash()
+        || view.parent().number.checked_add(1) != Some(block.number())
+        || block.header.parent_hash != view.tip()
+        || view
+            .config()
+            .block_commitment_height
+            .is_none_or(|height| block.number() < height)
+    {
+        return Err("candidate signature batch requires activated current canonical parent".into());
+    }
+    ChainStore::new(view.store())
+        .verify_block_body_commitment(block)
+        .map_err(|e| e.to_string())?;
+    verify_batch_at_parent(view, block, proof, block.hash())
+}
+
+fn verify_batch_at_parent<S: KvStore + 'static>(
+    view: &CanonicalParentView<S>,
+    block: &Block,
+    proof: &CanonicalSignatureBatchProof,
+    hash: ShellHash,
+) -> Result<VerifiedCanonicalSignatureBatch, String> {
+    if proof.version != 1
+        || block.transactions.is_empty()
+        || block.transactions.len() > MAX_CANONICAL_SIGNATURE_BATCH
+        || proof.transactions.len() != block.transactions.len()
+    {
+        return Err("canonical signature batch version/count/profile mismatch".into());
+    }
     let mut seen = std::collections::HashSet::new();
     let mut signatures = Vec::with_capacity(block.transactions.len());
     for (tx, item) in block.transactions.iter().zip(&proof.transactions) {
@@ -134,4 +175,61 @@ pub fn verify_canonical_signature_batch<S: KvStore + 'static>(
         chain_id: view.config().chain_id,
         signatures,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shell_core::BlockHeader;
+    use shell_storage::{MemoryDb, WorldState};
+    use std::sync::Arc;
+    #[test]
+    fn candidate_batch_requires_active_current_parent_and_exact_body() {
+        for activation in [None, Some(1), Some(2)] {
+            let db = Arc::new(MemoryDb::new());
+            let root = WorldState::new(db.clone()).state_root().unwrap();
+            let parent = Block {
+                header: BlockHeader {
+                    state_root: root,
+                    ..Default::default()
+                },
+                transactions: vec![],
+                system_transactions: vec![],
+                proposer_seal: None,
+            };
+            let chain = ChainStore::new(db.clone());
+            let cfg=serde_json::from_value(serde_json::json!({"chain_id":10,"genesis_hash":parent.hash(),"block_commitment_height":activation})).unwrap();
+            chain.commit_genesis_block(&parent, &cfg).unwrap();
+            let view = chain
+                .canonical_parent_view(parent.hash(), parent.hash())
+                .unwrap();
+            let mut child = Block {
+                header: BlockHeader {
+                    parent_hash: parent.hash(),
+                    number: 1,
+                    ..Default::default()
+                },
+                transactions: vec![],
+                system_transactions: vec![],
+                proposer_seal: None,
+            };
+            let proof = CanonicalSignatureBatchProof {
+                version: 1,
+                transactions: vec![],
+            };
+            let before = db.scan_all().unwrap();
+            let error = verify_candidate_signature_batch(&view, &child, &proof).unwrap_err();
+            assert!(error.contains(if activation != Some(1) {
+                "activated current canonical parent"
+            } else {
+                "body commitment mismatch"
+            }));
+            child.header.number = 2;
+            assert!(verify_candidate_signature_batch(&view, &child, &proof)
+                .unwrap_err()
+                .contains("activated current canonical parent"));
+            assert_eq!(db.scan_all().unwrap(), before);
+            assert!(chain.get_header_by_hash(&child.hash()).unwrap().is_none());
+        }
+    }
 }

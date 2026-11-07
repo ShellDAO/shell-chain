@@ -1085,3 +1085,97 @@ verification. Producers, `ProofAmendment`, fresh block admission, proposer
 crypto proofs, proof reward settlement and pruning authorization continue to
 use their existing separate paths. Public release and network activation
 remain separate requirements.
+
+## Offline import of a fresh canonical extension
+
+`shell-node import-block-proof` consumes a complete sender graph before the
+candidate block exists in the receiving database. Stop the node first. The
+command opens only an existing initialized RocksDB and keeps its native
+exclusive ownership lock through verification, execution, commit and flush.
+It needs no signing key, RPC listener or network service.
+
+Provide these independent inputs:
+
+- The receiver's current canonical parent hash, selected locally.
+- The signed candidate block JSON and its complete proof JSON.
+- A version-one manifest pinning the chain, genesis, candidate hash, payload
+  byte length and BLAKE3 hash, using the same format as the upload interface.
+- A trusted local `ConsensusConfig` JSON, using the `consensus` object format
+  from genesis configuration. Select its authorities, block interval, epoch
+  length and effective weights independently of the candidate and proof.
+
+For example, a uniform test authority configuration has this shape; replace
+the authority with the actual trusted full-width address:
+
+```json
+{
+  "engine": "wpoa",
+  "authorities": ["0x1111111111111111111111111111111111111111111111111111111111111111"],
+  "block_time_secs": 1,
+  "weights": [1]
+}
+```
+
+This file supplies bootstrap consensus parameters, while the existing builder
+recovers active membership and weights from retained local Registry state.
+Keys come from the local public-key registry. Optional `authority_pubkeys`
+must agree with that registry. Stake-derived bootstrap parameters are refused;
+this interface requires concrete effective weights rather than an economics
+configuration from which it would have to infer them.
+
+```bash
+shell-node --datadir follower import-block-proof \
+  --block candidate.json --proof complete-proof.json --manifest manifest.json \
+  --consensus consensus.json --parent 0xCURRENT_CANONICAL_PARENT
+```
+
+Replace the parent placeholder with the actual 32-byte hash. For machine-readable
+output, add `--log-level off`; the final JSON contains the imported block,
+parent, state root, receipts and proved sender count. The command validates the
+manifest against the receiver's stored chain/genesis and exact current head.
+It bounds block JSON to 2 MiB, control files to 64 KiB and proof bytes to the
+existing 256 MiB ceiling, checks the complete hash and rejects trailing JSON.
+
+The candidate must be the next canonical child, with block commitments already
+active. The same registered/default-account ML-DSA-65 profile and sixteen-sender
+limit apply. The independently frozen current parent supplies account state and
+registered keys; a candidate never becomes trusted by first inserting its header
+or body. Native proposer authentication, body and receipt commitments, nonce,
+algorithm policy, fees, gas and execution remain mandatory. The complete graph
+supplies sender cryptography in both batch and sequential validation; unmatched
+tuples have no native sender-crypto fallback.
+
+Only ordinary transactions and the existing block-gas reward are supported in
+this proof-import profile. Stale or duplicate input, forks, gaps, inactive
+commitments and other settlement profiles fail explicitly. Imported state,
+canonical metadata, block body and receipts use the existing atomic commit.
+This explicit import does not alter normal peer imports, `ProofAmendment`,
+reward settlement rules or network activation.
+
+After creating the preceding native Node and HTTP proof fixtures, run:
+
+```bash
+tests/e2e/mldsa-fresh-proof.sh run proof-dir/node proof-dir/rpc proof-dir/fresh
+tests/e2e/mldsa-fresh-proof.sh verify proof-dir/node proof-dir/rpc proof-dir/fresh
+```
+
+The entry requires Python 3 and the same Rust/C++/libclang toolchain. Use a new
+output directory with an existing parent. It builds the actual CLI, prepares a
+follower at the independent parent without the candidate in its database, and
+runs the command with the original complete graph. It checks refusals, including
+a corrupted but correctly hashed graph despite genuine raw transaction
+signatures, and verifies unchanged native state after each failure. A separate
+native-store fault injection reaches the canonical commit after full proof
+verification and execution, then checks rollback of staged changes.
+
+Successful import is compared with independent native execution, then cold
+reopened to check head, body, receipts, sender/recipient/reward accounts and a
+fresh complete proof replay. Inputs and both output databases remain intact.
+The output includes the command receipts, refusal and rollback evidence, imported
+result and cold-recheck receipts. Repeated `verify` runs retain the first receipt
+and add a separate numbered receipt. Failures exit nonzero and retain evidence.
+
+This covers explicit local import of a fresh extension. Automatic producer proof
+generation, peer admission using the complete graph, full proposer crypto proofs,
+fork proof consumption, larger sender profiles and public binary/network
+acceptance remain separate work.

@@ -312,6 +312,25 @@ enum Commands {
         snapshot: PathBuf,
     },
 
+    /// Offline import of one fresh canonical child with complete sender proofs.
+    ImportBlockProof {
+        /// Signed candidate block JSON.
+        #[arg(long)]
+        block: PathBuf,
+        /// Complete canonical sender-proof JSON (at most 256 MiB).
+        #[arg(long)]
+        proof: PathBuf,
+        /// Exact version-one artifact manifest JSON.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Independently trusted ConsensusConfig JSON with explicit authorities/weights.
+        #[arg(long)]
+        consensus: PathBuf,
+        /// Independently selected current canonical parent hash.
+        #[arg(long)]
+        parent: String,
+    },
+
     /// Remove the chain database directory.
     Removedb {
         /// Remove without confirmation prompt.
@@ -909,6 +928,13 @@ async fn main() {
             commands::export_state(cli.datadir, output, block)
         }
         Commands::ImportState { snapshot } => commands::import_state(cli.datadir, snapshot),
+        Commands::ImportBlockProof {
+            block,
+            proof,
+            manifest,
+            consensus,
+            parent,
+        } => commands::import_block_proof(cli.datadir, block, proof, manifest, consensus, parent),
         Commands::Removedb { force } => commands::removedb(cli.datadir, force),
         Commands::Version => commands::version(),
         Commands::Tx { command } => commands::tx::execute(command, password_args),

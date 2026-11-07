@@ -1,6 +1,7 @@
 use super::*;
 use shell_stark_prover::canonical_batch::{
-    verify_canonical_signature_batch, CanonicalSignatureBatchProof, VerifiedCanonicalSignatureBatch,
+    verify_candidate_signature_batch, verify_canonical_signature_batch,
+    CanonicalSignatureBatchProof, VerifiedCanonicalSignatureBatch,
 };
 use std::borrow::Cow;
 
@@ -1848,7 +1849,7 @@ impl<S: KvStore + 'static> Node<S> {
     /// potential fork and skipped. If there is a gap (block number is
     /// more than one ahead of head), missing blocks are requested.
     pub fn import_block(&self, block: Block, _verifier: &dyn Verifier) -> Result<(), NodeError> {
-        self.import_block_inner(block, false)
+        self.import_block_inner(block, false, None)
     }
 
     /// Import a block whose commit certificate has already been verified by
@@ -1859,10 +1860,88 @@ impl<S: KvStore + 'static> Node<S> {
         block: Block,
         _verifier: &dyn Verifier,
     ) -> Result<(), NodeError> {
-        self.import_block_inner(block, true)
+        self.import_block_inner(block, true, None)
     }
 
-    fn import_block_inner(&self, block: Block, finalized_import: bool) -> Result<(), NodeError> {
+    /// Exclusively import one fresh canonical child using complete sender proofs.
+    /// The expected parent and native consensus context are independent trust
+    /// inputs. No cached verification receipt or native sender-crypto fallback
+    /// can authorize this path. Call only while this node/store is offline.
+    pub fn import_block_with_canonical_proof(
+        &mut self,
+        expected_parent: ShellHash,
+        block: Block,
+        proof: &CanonicalSignatureBatchProof,
+    ) -> Result<CanonicalProofReplay, NodeError> {
+        let head = self
+            .chain_store
+            .get_head_block()?
+            .ok_or(NodeError::NoGenesis)?;
+        if head.hash() != expected_parent
+            || block.header.parent_hash != expected_parent
+            || head.number().checked_add(1) != Some(block.number())
+        {
+            return Err(NodeError::Startup(
+                "proof import requires exact current canonical parent".into(),
+            ));
+        }
+        if block
+            .system_transactions
+            .iter()
+            .any(|tx| tx.kind != SystemTxKind::BlockGasReward)
+        {
+            return Err(NodeError::Startup(
+                "proof import settlement profile unsupported".into(),
+            ));
+        }
+        let view = self
+            .chain_store
+            .canonical_parent_view(expected_parent, expected_parent)?;
+        if view.config().chain_id != self.config.chain_id {
+            return Err(NodeError::Startup(
+                "proof import chain identity mismatch".into(),
+            ));
+        }
+        let registry = load_algorithm_registry(&view.world_state()?)
+            .map_err(|e| NodeError::Startup(format!("proof import parent registry: {e}")))?;
+        with_algorithm_registry_override(&registry, || {
+            self.chain_store.verify_block_body_commitment(&block)?;
+            self.verify_import_consensus(&block, &head, false)?;
+            self.verify_import_economics(&block, &head)?;
+            self.verify_incoming_witness_root(&block)?;
+            self.verify_import_sig_aggregate_proof(&block)?;
+            let verified = verify_candidate_signature_batch(&view, &block, proof)
+                .map_err(|e| NodeError::Startup(format!("candidate sender proof: {e}")))?;
+            let hash = block.hash();
+            self.import_block_inner(block, false, Some(&verified))?;
+            let imported = self
+                .chain_store
+                .get_head_block()?
+                .ok_or(NodeError::NoGenesis)?;
+            if imported.hash() != hash {
+                return Err(NodeError::Startup(
+                    "proof import did not publish expected block".into(),
+                ));
+            }
+            Ok(CanonicalProofReplay {
+                tip: hash,
+                block: hash,
+                parent: expected_parent,
+                state_root: imported.header.state_root,
+                receipts: self.chain_store.get_receipts(&hash)?.ok_or_else(|| {
+                    NodeError::Startup("proof import receipts unavailable".into())
+                })?,
+                proved_sender_signatures: verified.len(),
+            })
+        })
+    }
+
+    fn import_block_inner(
+        &self,
+        block: Block,
+        finalized_import: bool,
+        signature_proof: Option<&VerifiedCanonicalSignatureBatch>,
+    ) -> Result<(), NodeError> {
         self.chain_store.verify_block_body_commitment(&block)?;
         let block_store = self.block_store();
         let consensus = self.consensus_manager();
@@ -1884,6 +1963,19 @@ impl<S: KvStore + 'static> Node<S> {
             finalized_number,
             canonical_hash_at_incoming,
         )?;
+
+        if let Some(proof) = signature_proof {
+            if transition != BlockImportTransition::CanonicalNext
+                || proof.tip() != head.hash()
+                || proof.parent() != head.hash()
+                || proof.chain_id() != self.config.chain_id
+                || !proof.matches_block(&block)
+            {
+                return Err(NodeError::Startup(
+                    "proof import context changed before execution".into(),
+                ));
+            }
+        }
 
         // Retain authenticated ancestors anywhere in the unfinalized suffix,
         // including below the live head, so a competing descendant can be replayed.
@@ -2039,7 +2131,9 @@ impl<S: KvStore + 'static> Node<S> {
             self.validate_stark_proof_source_binding(amendment)?;
         }
 
-        let mut algorithm_registry_rollback = AlgorithmRegistryRollback::new();
+        let mut algorithm_registry_rollback = signature_proof
+            .is_none()
+            .then(AlgorithmRegistryRollback::new);
         let import_store = Arc::new(shell_storage::OverlayStore::new(self.store.clone()));
         let imported_state_root = if !block.transactions.is_empty() || !stark_settlements.is_empty()
         {
@@ -2139,14 +2233,23 @@ impl<S: KvStore + 'static> Node<S> {
                     })
                 })
                 .collect();
-            batch_verifier
-                .verify_batch_all(&verify_items)
-                .map_err(|e| {
-                    NodeError::Startup(format!(
-                        "block {} batch sig verification failed: {e}",
-                        block.number()
-                    ))
-                })?;
+            let crypto_result = if let Some(proof) = signature_proof {
+                verify_items.iter().try_for_each(|item| {
+                    if proof.verify(item.pubkey, item.message, item.signature)? {
+                        Ok(())
+                    } else {
+                        Err(shell_crypto::CryptoError::VerificationFailed)
+                    }
+                })
+            } else {
+                batch_verifier.verify_batch_all(&verify_items)
+            };
+            crypto_result.map_err(|e| {
+                NodeError::Startup(format!(
+                    "block {} batch sig verification failed: {e}",
+                    block.number()
+                ))
+            })?;
 
             let import_ws = WorldState::at_root(import_store.clone(), &current_root)?;
             let state_db = ShellStateDb::new(import_ws, ChainStore::new(import_store.clone()));
@@ -2232,7 +2335,7 @@ impl<S: KvStore + 'static> Node<S> {
                     &import_cs,
                     self.config.chain_id,
                     &block.header,
-                    &MultiVerifier,
+                    &ReplaySignatureVerifier(signature_proof),
                 )
                 .map_err(|error| {
                     NodeError::Startup(format!(
@@ -2357,15 +2460,14 @@ impl<S: KvStore + 'static> Node<S> {
             }
             // Apply algorithm activations whose timelock has elapsed (WP §6.5).
             // Must run BEFORE state_root so activations are committed to the Merkle root.
-            {
-                let mut registry = AlgorithmRegistry::global_mut();
+            shell_crypto::with_algorithm_registry_mut(|registry| {
                 apply_pending_activations(
                     block.number(),
                     evm.state_db_mut().world_state_mut(),
-                    &mut registry,
+                    registry,
                     "import",
-                )?;
-            }
+                )
+            })?;
             evm.state_db_mut().world_state_mut().state_root()?
         } else {
             if block.header.gas_used != 0 {
@@ -2385,15 +2487,9 @@ impl<S: KvStore + 'static> Node<S> {
             // state_root — a producer at this height will have already applied them.
             let mut ws = WorldState::at_root(import_store.clone(), &current_root)
                 .map_err(|e| NodeError::Startup(format!("world_state at root: {e}")))?;
-            {
-                let mut registry = AlgorithmRegistry::global_mut();
-                apply_pending_activations(
-                    block.number(),
-                    &mut ws,
-                    &mut registry,
-                    "empty-block import",
-                )?;
-            }
+            shell_crypto::with_algorithm_registry_mut(|registry| {
+                apply_pending_activations(block.number(), &mut ws, registry, "empty-block import")
+            })?;
             ws.state_root()
                 .map_err(|e| NodeError::Startup(format!("state_root for empty block: {e}")))?
         };
@@ -2429,13 +2525,22 @@ impl<S: KvStore + 'static> Node<S> {
                 Some(settlement_tx_hash),
             )?)?;
         }
+        if let Some(proof) = signature_proof {
+            if self.chain_store.get_head_hash()? != Some(proof.parent()) {
+                return Err(NodeError::Startup(
+                    "proof import parent changed before commit".into(),
+                ));
+            }
+        }
         import_cs.put_block_signers(&block.hash(), &[proposer_evidence])?;
         import_cs.commit_canonical_overlay(&block, Some(receipts.as_slice()))?;
 
         // Commit to storage.
         let committed_world_state = WorldState::at_root(self.store.clone(), &imported_state_root)?;
         let block_hash = block.hash();
-        algorithm_registry_rollback.commit();
+        if let Some(rollback) = algorithm_registry_rollback.as_mut() {
+            rollback.commit();
+        }
         block_store.replace_world_state(committed_world_state);
         prover.record_settled_sources(&stark_settlements);
         prover.remove_settled_pending(&stark_settlements);
@@ -2543,6 +2648,54 @@ mod tests {
     use shell_core::{Account, PubkeyMode, Transaction};
     use shell_crypto::{DilithiumSigner, SignatureType, Signer};
     use shell_storage::{MemoryDb, StorageError};
+
+    #[test]
+    fn fresh_proof_import_rejects_stale_parent_and_gap_without_writes() {
+        let signer = DilithiumSigner::generate();
+        let authority = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let db = Arc::new(MemoryDb::new());
+        let mut node = super::super::tests::setup_node_with_store(authority, db.clone());
+        let parent = Block {
+            header: BlockHeader {
+                state_root: node.world_state.write().state_root().unwrap(),
+                ..Default::default()
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let config = serde_json::from_value(serde_json::json!({"chain_id":1337,"genesis_hash":parent.hash(),"block_commitment_height":1})).unwrap();
+        node.chain_store
+            .commit_genesis_block(&parent, &config)
+            .unwrap();
+        let proof = CanonicalSignatureBatchProof {
+            version: 1,
+            transactions: vec![],
+        };
+        let mut child = Block {
+            header: BlockHeader {
+                number: 1,
+                parent_hash: parent.hash(),
+                ..Default::default()
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let before = db.scan_all().unwrap();
+        assert!(node
+            .import_block_with_canonical_proof(ShellHash::ZERO, child.clone(), &proof)
+            .unwrap_err()
+            .to_string()
+            .contains("current canonical parent"));
+        child.header.number = 2;
+        assert!(node
+            .import_block_with_canonical_proof(parent.hash(), child, &proof)
+            .unwrap_err()
+            .to_string()
+            .contains("current canonical parent"));
+        assert_eq!(db.scan_all().unwrap(), before);
+    }
 
     fn transaction() -> Transaction {
         Transaction {
