@@ -29,6 +29,7 @@ const OUTPUT: usize = 86;
 const ROUND_CONSTANT: usize = 111;
 const TRACE_WIDTH: usize = 112;
 const CONSTRAINTS: usize = 55;
+pub const MAX_KECCAK_BATCH: usize = 8;
 
 // Lane index is x + 5*y; the least significant bit has z = 0.
 const ROTATION: [u32; 25] = [
@@ -61,7 +62,7 @@ const RC: [u64; ROUNDS] = [
     0x8000000080008008,
 ];
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PermutationRound {
     pub parity: [u64; 5],
@@ -83,6 +84,48 @@ pub struct KeccakPermutationProof {
 struct Inputs {
     input: [u64; 25],
     rounds: Vec<PermutationRound>,
+}
+
+/// One ordered aggregate statement; individual artifacts contain routing states
+/// only. Their empty proof fields cannot masquerade as standalone certificates.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeccakBatchProof {
+    pub version: u8,
+    pub proof_bytes: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct BatchInputs {
+    permutations: Vec<Inputs>,
+    aggregate: bool,
+}
+impl BatchInputs {
+    fn slots(&self) -> usize {
+        if self.aggregate {
+            (self.permutations.len() * ROUNDS * 64).next_power_of_two()
+        } else {
+            SLOTS
+        }
+    }
+    fn trace_length(&self) -> usize {
+        self.slots() * 2
+    }
+}
+impl ToElements<BaseElement> for BatchInputs {
+    fn to_elements(&self) -> Vec<BaseElement> {
+        if !self.aggregate {
+            return self.permutations[0].to_elements();
+        }
+        let mut result = vec![
+            BaseElement::new(u64::from_le_bytes(*b"KECBAT01") as u128),
+            BaseElement::new(self.permutations.len() as u128),
+        ];
+        for permutation in &self.permutations {
+            result.extend(permutation.to_elements());
+        }
+        result
+    }
 }
 
 impl ToElements<BaseElement> for Inputs {
@@ -142,7 +185,7 @@ fn witness(input: [u64; 25]) -> Inputs {
 
 // Only bit extraction and fixed wiring occur here: no XOR, AND, round execution,
 // or native permutation check. Reused public values bind the cross-row edges.
-fn public_rows(inputs: &Inputs) -> Vec<Vec<BaseElement>> {
+fn permutation_rows(inputs: &Inputs) -> Vec<Vec<BaseElement>> {
     let bit = |value: u64, z: usize| BaseElement::new(((value >> z) & 1).into());
     let mut rows = vec![vec![BaseElement::ZERO; TRACE_WIDTH]; SLOTS];
     for (round, step) in inputs.rounds.iter().enumerate() {
@@ -177,9 +220,21 @@ fn public_rows(inputs: &Inputs) -> Vec<Vec<BaseElement>> {
     rows
 }
 
+fn public_rows(inputs: &BatchInputs) -> Vec<Vec<BaseElement>> {
+    if !inputs.aggregate {
+        return permutation_rows(&inputs.permutations[0]);
+    }
+    let mut rows = Vec::with_capacity(inputs.slots());
+    for permutation in &inputs.permutations {
+        rows.extend(permutation_rows(permutation).into_iter().take(ROUNDS * 64));
+    }
+    rows.resize(inputs.slots(), vec![BaseElement::ZERO; TRACE_WIDTH]);
+    rows
+}
+
 struct KeccakAir {
     context: AirContext<BaseElement>,
-    inputs: Inputs,
+    inputs: BatchInputs,
 }
 
 fn xor<E: FieldElement>(a: E, b: E) -> E {
@@ -188,9 +243,9 @@ fn xor<E: FieldElement>(a: E, b: E) -> E {
 
 impl Air for KeccakAir {
     type BaseField = BaseElement;
-    type PublicInputs = Inputs;
-    fn new(info: TraceInfo, inputs: Inputs, options: ProofOptions) -> Self {
-        assert_eq!(info, TraceInfo::new(TRACE_WIDTH, TRACE_LENGTH));
+    type PublicInputs = BatchInputs;
+    fn new(info: TraceInfo, inputs: BatchInputs, options: ProofOptions) -> Self {
+        assert_eq!(info, TraceInfo::new(TRACE_WIDTH, inputs.trace_length()));
         let degrees = (0..CONSTRAINTS)
             .map(|i| {
                 TransitionConstraintDegree::new(if i < 5 {
@@ -247,8 +302,8 @@ impl Air for KeccakAir {
     }
 }
 
-fn trace(inputs: &Inputs) -> TraceTable<BaseElement> {
-    let mut trace = TraceTable::new(TRACE_WIDTH, TRACE_LENGTH);
+fn trace(inputs: &BatchInputs) -> TraceTable<BaseElement> {
+    let mut trace = TraceTable::new(TRACE_WIDTH, inputs.trace_length());
     for (slot, row) in public_rows(inputs).into_iter().enumerate() {
         trace.update_row(slot * 2, &row);
         trace.update_row(slot * 2 + 1, &row);
@@ -266,7 +321,7 @@ fn trace(inputs: &Inputs) -> TraceTable<BaseElement> {
         .chunks_exact(16)
         .map(|v| BaseElement::new(u128::from_le_bytes(v.try_into().expect("16 bytes"))))
         .collect();
-    trace.update_row(TRACE_LENGTH - 1, &row);
+    trace.update_row(inputs.trace_length() - 1, &row);
     trace
 }
 
@@ -275,7 +330,7 @@ type Commitment = MerkleTree<Hasher>;
 type Coin = DefaultRandomCoin<Hasher>;
 
 struct KeccakProver {
-    inputs: Inputs,
+    inputs: BatchInputs,
     options: ProofOptions,
 }
 
@@ -293,7 +348,7 @@ impl Prover for KeccakProver {
     type ConstraintEvaluator<'a, E: FieldElement<BaseField = BaseElement>> =
         DefaultConstraintEvaluator<'a, KeccakAir, E>;
 
-    fn get_pub_inputs(&self, _trace: &Self::Trace) -> Inputs {
+    fn get_pub_inputs(&self, _trace: &Self::Trace) -> BatchInputs {
         self.inputs.clone()
     }
 
@@ -334,12 +389,16 @@ impl Prover for KeccakProver {
 /// Prove the full 24-round permutation. Input and intermediate lanes are public.
 pub fn prove_keccak_permutation(input: &[u64; 25]) -> Result<KeccakPermutationProof, String> {
     let inputs = witness(*input);
+    let statement = BatchInputs {
+        permutations: vec![inputs.clone()],
+        aggregate: false,
+    };
     let prover = KeccakProver {
-        inputs: inputs.clone(),
+        inputs: statement.clone(),
         options: default_proof_options(),
     };
     let inner = prover
-        .prove(trace(&inputs))
+        .prove(trace(&statement))
         .map_err(|e| format!("Keccak proof: {e:?}"))?;
     Ok(KeccakPermutationProof {
         version: 1,
@@ -372,13 +431,98 @@ pub fn verify_keccak_permutation(
     }
     verify::<KeccakAir, Hasher, Coin, Commitment>(
         inner,
-        Inputs {
-            input: proof.input,
-            rounds: proof.rounds.clone(),
+        BatchInputs {
+            permutations: vec![Inputs {
+                input: proof.input,
+                rounds: proof.rounds.clone(),
+            }],
+            aggregate: false,
         },
         &AcceptableOptions::OptionSet(vec![default_proof_options()]),
     )
     .map_err(|e| format!("Keccak verification: {e:?}"))
+}
+
+pub(crate) fn permutation_witness(input: &[u64; 25]) -> KeccakPermutationProof {
+    let inputs = witness(*input);
+    KeccakPermutationProof {
+        version: 1,
+        input: *input,
+        rounds: inputs.rounds,
+        proof_bytes: Vec::new(),
+    }
+}
+
+fn batch_inputs(permutations: &[KeccakPermutationProof]) -> Result<BatchInputs, String> {
+    if permutations.is_empty()
+        || permutations.len() > MAX_KECCAK_BATCH
+        || permutations
+            .iter()
+            .any(|p| p.version != 1 || p.rounds.len() != ROUNDS || !p.proof_bytes.is_empty())
+    {
+        return Err("invalid Keccak aggregate count, routing shape or standalone proof".into());
+    }
+    Ok(BatchInputs {
+        permutations: permutations
+            .iter()
+            .map(|p| Inputs {
+                input: p.input,
+                rounds: p.rounds.clone(),
+            })
+            .collect(),
+        aggregate: true,
+    })
+}
+
+/// Prove every bit and all 24 rounds of at most eight ordered permutations.
+/// The supplied round states are witnesses, not trusted execution results.
+pub fn prove_keccak_batch(
+    permutations: &[KeccakPermutationProof],
+) -> Result<KeccakBatchProof, String> {
+    let inputs = batch_inputs(permutations)?;
+    // Prover-side witness validation prevents malformed requests from reaching
+    // backend assertions. The verifier still uses only the full AIR statement.
+    if inputs
+        .permutations
+        .iter()
+        .any(|p| witness(p.input).rounds != p.rounds)
+    {
+        return Err("invalid Keccak aggregate round witness".into());
+    }
+    let prover = KeccakProver {
+        inputs: inputs.clone(),
+        options: default_proof_options(),
+    };
+    let inner = prover
+        .prove(trace(&inputs))
+        .map_err(|e| format!("Keccak aggregate proof: {e:?}"))?;
+    Ok(KeccakBatchProof {
+        version: 1,
+        proof_bytes: inner.to_bytes(),
+    })
+}
+
+/// Verify caller-bound ordered routing states without native round execution.
+/// Standalone and aggregate transcripts have different public input domains.
+pub fn verify_keccak_batch(
+    proof: &KeccakBatchProof,
+    permutations: &[KeccakPermutationProof],
+) -> Result<(), String> {
+    let inputs = batch_inputs(permutations)?;
+    if proof.version != 1 || proof.proof_bytes.is_empty() || proof.proof_bytes.len() > 1_048_576 {
+        return Err("invalid Keccak aggregate version or proof size".into());
+    }
+    let inner = Proof::from_bytes(&proof.proof_bytes)
+        .map_err(|e| format!("Keccak aggregate decode: {e:?}"))?;
+    if inner.trace_info() != &TraceInfo::new(TRACE_WIDTH, inputs.trace_length()) {
+        return Err("unexpected Keccak aggregate trace layout".into());
+    }
+    verify::<KeccakAir, Hasher, Coin, Commitment>(
+        inner,
+        inputs,
+        &AcceptableOptions::OptionSet(vec![default_proof_options()]),
+    )
+    .map_err(|e| format!("Keccak aggregate verification: {e:?}"))
 }
 
 #[cfg(test)]
@@ -558,7 +702,10 @@ mod tests {
 
     #[test]
     fn all_round_bit_rows_and_each_step_reject_invalid_witness() {
-        let inputs = witness(core::array::from_fn(|i| 1u64 << (i * 17 % 64)));
+        let inputs = BatchInputs {
+            permutations: vec![witness(core::array::from_fn(|i| 1u64 << (i * 17 % 64)))],
+            aggregate: false,
+        };
         let rows = public_rows(&inputs);
         let air = KeccakAir::new(
             TraceInfo::new(TRACE_WIDTH, TRACE_LENGTH),
@@ -591,6 +738,62 @@ mod tests {
         // Every operation row is public-bit-bound; nonbinary values cannot
         // satisfy those fixed boundary assertions, even if algebra cancels.
         assert_eq!(air.get_assertions().len(), TRACE_WIDTH);
+    }
+
+    #[test]
+    fn aggregate_binds_all_rounds_order_count_and_domain() {
+        let permutations: Vec<_> = [
+            [0; 25],
+            ZERO_OUTPUT,
+            [u64::MAX; 25],
+            core::array::from_fn(|i| 1u64 << (i * 17 % 64)),
+        ]
+        .iter()
+        .map(permutation_witness)
+        .collect();
+        for p in &permutations {
+            assert_eq!(p.rounds[23].output, bit_reference(p.input));
+        }
+        let proof = prove_keccak_batch(&permutations).unwrap();
+        verify_keccak_batch(&proof, &permutations).unwrap();
+        let encoded = serde_json::to_vec(&proof).unwrap();
+        let decoded = serde_json::from_slice(&encoded).unwrap();
+        verify_keccak_batch(&decoded, &permutations).unwrap();
+        for index in 0..permutations.len() {
+            for round in [0, 11, 23] {
+                let mut bad = permutations.clone();
+                bad[index].rounds[round].output[24] ^= 1u64 << 63;
+                assert!(verify_keccak_batch(&proof, &bad).is_err());
+                assert!(prove_keccak_batch(&bad).is_err());
+            }
+        }
+        let mut bad = permutations.clone();
+        bad.swap(0, 1);
+        assert!(verify_keccak_batch(&proof, &bad).is_err());
+        assert!(verify_keccak_batch(&proof, &permutations[..3]).is_err());
+        assert!(prove_keccak_batch(&[]).is_err());
+        assert!(
+            verify_keccak_batch(&proof, &vec![permutations[0].clone(); MAX_KECCAK_BATCH + 1])
+                .is_err()
+        );
+        let mut bad = permutations.clone();
+        bad[2].rounds.pop();
+        assert!(verify_keccak_batch(&proof, &bad).is_err());
+        let mut bad = permutations.clone();
+        bad[0].proof_bytes = sample().proof_bytes.clone();
+        assert!(verify_keccak_batch(&proof, &bad).is_err());
+        let one = prove_keccak_batch(&permutations[..1]).unwrap();
+        assert!(verify_keccak_batch(
+            &KeccakBatchProof {
+                version: 1,
+                proof_bytes: sample().proof_bytes.clone(),
+            },
+            &permutations[..1]
+        )
+        .is_err());
+        let mut standalone = sample().clone();
+        standalone.proof_bytes = one.proof_bytes;
+        assert!(verify_keccak_permutation(&standalone, &[0; 25], &ZERO_OUTPUT).is_err());
     }
 
     #[test]

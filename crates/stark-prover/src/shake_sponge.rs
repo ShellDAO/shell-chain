@@ -18,7 +18,8 @@ use winterfell::{
 use crate::prover::default_proof_options;
 
 use crate::keccak_permutation::{
-    prove_keccak_permutation, verify_keccak_permutation, KeccakPermutationProof,
+    permutation_witness, prove_keccak_batch, prove_keccak_permutation, verify_keccak_batch,
+    verify_keccak_permutation, KeccakBatchProof, KeccakPermutationProof, MAX_KECCAK_BATCH,
 };
 
 pub const MAX_SHAKE_MESSAGE_BYTES: usize = 4096;
@@ -60,7 +61,8 @@ impl ShakeKind {
 }
 
 /// Compositional sponge proof. The bridge AIR checks padding/absorption/output;
-/// every complete permutation has its own Keccak-f1600 proof.
+/// Version one proves permutations separately; version two proves bounded groups
+/// with the same complete Keccak-f1600 round constraints.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShakeProof {
@@ -70,6 +72,8 @@ pub struct ShakeProof {
     pub output: Vec<u8>,
     pub permutations: Vec<KeccakPermutationProof>,
     pub sponge_proof_bytes: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permutation_batches: Vec<KeccakBatchProof>,
 }
 
 #[derive(Clone)]
@@ -329,6 +333,25 @@ pub fn prove_shake(
     message: &[u8],
     output_bytes: usize,
 ) -> Result<ShakeProof, String> {
+    prove_shake_inner(kind, message, output_bytes, false)
+}
+
+/// Bound each aggregate to eight permutations while retaining every sponge
+/// absorption, padding, squeeze and permutation constraint.
+pub fn prove_shake_batched(
+    kind: ShakeKind,
+    message: &[u8],
+    output_bytes: usize,
+) -> Result<ShakeProof, String> {
+    prove_shake_inner(kind, message, output_bytes, true)
+}
+
+fn prove_shake_inner(
+    kind: ShakeKind,
+    message: &[u8],
+    output_bytes: usize,
+    aggregate: bool,
+) -> Result<ShakeProof, String> {
     let (absorbs, total) = schedule(kind, message.len(), output_bytes)?;
     let rate = kind.rate();
     let mut state = [0u64; 25];
@@ -349,7 +372,11 @@ pub fn prove_shake(
                 state[offset / 8] ^= u64::from(value) << (8 * (offset % 8));
             }
         }
-        let permutation = prove_keccak_permutation(&state)?;
+        let permutation = if aggregate {
+            permutation_witness(&state)
+        } else {
+            prove_keccak_permutation(&state)?
+        };
         let end = permutation
             .rounds
             .last()
@@ -380,13 +407,22 @@ pub fn prove_shake(
     let inner = prover
         .prove(trace(&inputs))
         .map_err(|e| format!("SHAKE sponge proof: {e:?}"))?;
+    let permutation_batches = if aggregate {
+        permutations
+            .chunks(MAX_KECCAK_BATCH)
+            .map(prove_keccak_batch)
+            .collect::<Result<_, _>>()?
+    } else {
+        Vec::new()
+    };
     Ok(ShakeProof {
-        version: 1,
+        version: if aggregate { 2 } else { 1 },
         kind,
         message: message.to_vec(),
         output,
         permutations,
         sponge_proof_bytes: inner.to_bytes(),
+        permutation_batches,
     })
 }
 
@@ -399,17 +435,30 @@ pub fn verify_shake(
     expected_output: &[u8],
 ) -> Result<(), String> {
     let (_, total) = schedule(kind, expected_message.len(), expected_output.len())?;
-    if proof.version != 1
+    let aggregate = proof.version == 2;
+    if !matches!(proof.version, 1 | 2)
+        || if aggregate {
+            proof.permutation_batches.len() != total.div_ceil(MAX_KECCAK_BATCH)
+        } else {
+            !proof.permutation_batches.is_empty()
+        }
         || proof.kind != kind
         || proof.message != expected_message
         || proof.output != expected_output
         || proof.permutations.len() != total
         || proof.sponge_proof_bytes.is_empty()
         || proof.sponge_proof_bytes.len() > MAX_PROOF_BYTES
+        || proof.permutation_batches.iter().any(|p| {
+            p.version != 1 || p.proof_bytes.is_empty() || p.proof_bytes.len() > MAX_PROOF_BYTES
+        })
         || proof.permutations.iter().any(|p| {
             p.version != 1
                 || p.rounds.len() != 24
-                || p.proof_bytes.is_empty()
+                || if aggregate {
+                    !p.proof_bytes.is_empty()
+                } else {
+                    p.proof_bytes.is_empty()
+                }
                 || p.proof_bytes.len() > MAX_PROOF_BYTES
         })
     {
@@ -440,8 +489,18 @@ pub fn verify_shake(
         &AcceptableOptions::OptionSet(vec![default_proof_options()]),
     )
     .map_err(|e| format!("SHAKE sponge verification: {e:?}"))?;
-    for (p, endpoints) in proof.permutations.iter().zip(inputs.steps) {
-        verify_keccak_permutation(p, &endpoints.input, &endpoints.output)?;
+    if aggregate {
+        for (batch, permutations) in proof
+            .permutation_batches
+            .iter()
+            .zip(proof.permutations.chunks(MAX_KECCAK_BATCH))
+        {
+            verify_keccak_batch(batch, permutations)?;
+        }
+    } else {
+        for (p, endpoints) in proof.permutations.iter().zip(inputs.steps) {
+            verify_keccak_permutation(p, &endpoints.input, &endpoints.output)?;
+        }
     }
     Ok(())
 }
@@ -529,6 +588,41 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+    #[test]
+    fn aggregate_sponge_crosses_chunk_boundary_and_rejects_mixed_transcripts() {
+        let message = [0x97; 34];
+        let p = prove_shake_batched(ShakeKind::Shake128, &message, 9 * 168).unwrap();
+        let expected = native(p.kind, &message, p.output.len());
+        assert_eq!(p.output, expected);
+        assert_eq!(p.permutation_batches.len(), 2);
+        verify_shake(&p, p.kind, &message, &expected).unwrap();
+        let compact = crate::compact_canonical::encode_component(&p).unwrap();
+        let decoded: ShakeProof = crate::compact_canonical::decode_component(&compact).unwrap();
+        verify_shake(&decoded, p.kind, &message, &expected).unwrap();
+        for index in [0, 7, 8] {
+            let mut bad = p.clone();
+            bad.permutations[index].rounds[12].theta[24] ^= 1;
+            assert!(verify_shake(&bad, p.kind, &message, &expected).is_err());
+        }
+        let mut bad = p.clone();
+        bad.permutation_batches.swap(0, 1);
+        assert!(verify_shake(&bad, p.kind, &message, &expected).is_err());
+        let mut bad = p.clone();
+        bad.permutation_batches.pop();
+        assert!(verify_shake(&bad, p.kind, &message, &expected).is_err());
+        let mut bad = p.clone();
+        bad.version = 1;
+        assert!(verify_shake(&bad, p.kind, &message, &expected).is_err());
+        let mut legacy = cases()[0].clone();
+        assert!(!serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("permutation_batches"));
+        legacy.version = 2;
+        assert!(verify_shake(&legacy, legacy.kind, &legacy.message, &legacy.output).is_err());
+        let mut bad = p.clone();
+        bad.permutations[8].proof_bytes = cases()[0].permutations[0].proof_bytes.clone();
+        assert!(verify_shake(&bad, p.kind, &message, &expected).is_err());
     }
     #[test]
     fn empty_last_byte_exact_rate_and_extended_outputs_real_proofs() {

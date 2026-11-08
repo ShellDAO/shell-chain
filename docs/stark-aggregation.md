@@ -554,3 +554,31 @@ key certificate with the other sender's valid certificate, rebuilds correct
 content hashes, and requires native proof verification to refuse it without
 changing any stored data. Repeating `mixed` resumes its
 retained inputs; `verify` never generates proofs.
+
+New matrix certificates in compact jobs use SHAKE version 2: each group of at
+most eight Keccak permutations has one aggregate AIR proof. Every input lane,
+all 24 rounds, permutation order, sponge links and rejection-sampling result
+remain constrained. Aggregation uses a separate public-input domain; empty
+standalone proof fields carry routing states only and never authorize acceptance.
+Legacy SHAKE version 1 certificates remain readable and retained equal-input
+checkpoints are reverified rather than regenerated. Other proof stages retain
+their existing statements. This reduces matrix proof bytes without raising
+checkpoint limits; arbitrary sixteen-key and sustained-job capacity still need
+separate acceptance.
+
+Exercise sixteen transfers from eight independently registered sender keys with
+a distinct proposer in another fresh directory:
+
+```sh
+tests/e2e/mldsa-full-proof.sh eight-keys eight-key-test
+tests/e2e/mldsa-full-proof.sh verify eight-key-test
+```
+
+Each sender executes two transfers, reaching nonce 2 and then nonce 4 after the
+ordinary successor. The entry checks independent native accounts, all receipts,
+fees, reward, finality, durable pause/resume, wrong-root rollback and cold history.
+It also recomputes correct availability hashes after changing an intermediate
+Keccak lane while retaining the genuine aggregate proof, and requires the native
+reader to reject it without state or original-proof writes. These source
+experiments require fresh in-memory test keys and no network funds. Repeating
+`eight-keys` resumes its retained inputs; `verify` generates no proofs.

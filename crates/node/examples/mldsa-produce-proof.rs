@@ -53,9 +53,12 @@ fn prepare(
     capture_on_production: bool,
     full: bool,
     batch_count: usize,
-    mixed: bool,
+    sender_count: usize,
 ) -> Result<(), Error> {
-    ensure(!mixed || batch_count == 16 && full, "invalid mixed profile")?;
+    ensure(
+        matches!(sender_count, 1 | 2 | 8) && (sender_count == 1 || batch_count == 16 && full),
+        "invalid registered sender profile",
+    )?;
     let batch = batch_count > 1;
     let count = if batch { batch_count as u64 } else { 1 };
     let funding = if batch_count > 2 {
@@ -81,9 +84,7 @@ fn prepare(
     if batch_count > 2 {
         write(&out.join("initial-funding.json"), &funding)?;
     }
-    let senders: Vec<_> = (0..if mixed { 2 } else { 1 })
-        .map(|_| MlDsaSigner::generate())
-        .collect();
+    let senders: Vec<_> = (0..sender_count).map(|_| MlDsaSigner::generate()).collect();
     let sender = &senders[0];
     let proposer: Box<dyn Signer> = if full {
         Box::new(MlDsaSigner::generate())
@@ -99,7 +100,10 @@ fn prepare(
     let recipient = Address::from([0x11; 32]);
     ensure(
         addresses.iter().all(|a| *a != authority && *a != recipient)
-            && (!mixed || addresses[0] != addresses[1])
+            && addresses
+                .iter()
+                .enumerate()
+                .all(|(i, a)| !addresses[..i].contains(a))
             && authority != recipient,
         "fixture actor collision",
     )?;
@@ -196,8 +200,12 @@ fn prepare(
         let sender = &senders[index];
         let mut tx = tx.clone();
         tx.nonce = position / senders.len() as u64;
-        // Distinct signing statements, with both effective prices capped at two.
-        tx.max_priority_fee_per_gas = index as u64 + 1;
+        // Both priority caps produce the same effective price of two.
+        tx.max_priority_fee_per_gas = (index % 2) as u64 + 1;
+        if sender_count > 2 {
+            // Distinct signing inputs; each transfer still consumes 21,000 gas.
+            tx.gas_limit += index as u64;
+        }
         let signature = sender.sign(tx.signing_hash(sender.sig_type().as_u8()).as_bytes())?;
         node.handle_incoming_tx(
             SignedTransaction::new(addresses[index], tx, signature),
@@ -348,7 +356,10 @@ fn prepare(
             let sender = &senders[index];
             let mut next = tx.clone();
             next.nonce = position / senders.len() as u64;
-            next.max_priority_fee_per_gas = index as u64 + 1;
+            next.max_priority_fee_per_gas = (index % 2) as u64 + 1;
+            if sender_count > 2 {
+                next.gas_limit += index as u64;
+            }
             let signature = sender.sign(next.signing_hash(sender.sig_type().as_u8()).as_bytes())?;
             node.handle_incoming_tx(
                 SignedTransaction::new(addresses[index], next, signature),
@@ -549,23 +560,28 @@ fn main() -> Result<(), Error> {
     )?;
     let out = Path::new(&args[1]);
     match args[0].as_str() {
-        "prepare" => prepare(out, false, false, false, 0, false),
-        "prepare-full" => prepare(out, false, true, true, 0, false),
-        "prepare-batch" => prepare(out, false, true, true, 2, false),
-        "prepare-wide" => prepare(out, false, true, true, 16, false),
-        "prepare-mixed" => prepare(out, false, true, true, 16, true),
+        "prepare" => prepare(out, false, false, false, 0, 1),
+        "prepare-full" => prepare(out, false, true, true, 0, 1),
+        "prepare-batch" => prepare(out, false, true, true, 2, 1),
+        "prepare-wide" => prepare(out, false, true, true, 16, 1),
+        "prepare-mixed" => prepare(out, false, true, true, 16, 2),
+        "prepare-eight-keys" => prepare(out, false, true, true, 16, 8),
         "mixed-key-swap" => admission_runtime::mixed_key_refusal(out),
-        "wide-pause" | "wide-resume" | "mixed-pause" | "mixed-resume" => {
-            tokio::runtime::Runtime::new()?.block_on(admission_runtime::batch(
-                out,
-                args[0].ends_with("-pause"),
-                true,
-            ))
+        "matrix-aggregate-refusal" => admission_runtime::aggregate_refusal(out),
+        "wide-pause" | "wide-resume" | "mixed-pause" | "mixed-resume" | "eight-keys-pause"
+        | "eight-keys-resume" => tokio::runtime::Runtime::new()?.block_on(
+            admission_runtime::batch(out, args[0].ends_with("-pause"), true),
+        ),
+        "wide-snapshot" | "mixed-snapshot" | "eight-keys-snapshot" => {
+            admission_runtime::snapshot_wide(out)
         }
-        "wide-snapshot" | "mixed-snapshot" => admission_runtime::snapshot_wide(out),
-        "wide-verify" | "mixed-verify" => admission_runtime::verify_batch(out, false, false, true),
-        "wide-history" | "mixed-history" => admission_runtime::verify_batch(out, true, true, true),
-        "wide-history-verify" | "mixed-history-verify" => {
+        "wide-verify" | "mixed-verify" | "eight-keys-verify" => {
+            admission_runtime::verify_batch(out, false, false, true)
+        }
+        "wide-history" | "mixed-history" | "eight-keys-history" => {
+            admission_runtime::verify_batch(out, true, true, true)
+        }
+        "wide-history-verify" | "mixed-history-verify" | "eight-keys-history-verify" => {
             admission_runtime::verify_batch(out, true, false, true)
         }
         "full-pause" | "full-resume" | "full-bad-proposer" => {
@@ -590,8 +606,8 @@ fn main() -> Result<(), Error> {
         "full-history" | "full-history-verify" => {
             admission_runtime::history_full(out, args[0] == "full-history")
         }
-        "prepare-runtime" => prepare(out, true, false, false, 0, false),
-        "prepare-production-hook" => prepare(out, false, true, false, 0, false),
+        "prepare-runtime" => prepare(out, true, false, false, 0, 1),
+        "prepare-production-hook" => prepare(out, false, true, false, 0, 1),
         "runtime-pause" | "runtime-resume" => {
             tokio::runtime::Runtime::new()?.block_on(runtime::run(out, args[0] == "runtime-pause"))
         }

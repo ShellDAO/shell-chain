@@ -19,7 +19,7 @@ use crate::prover::default_proof_options;
 
 use crate::mldsa_ntt::NTT_MODULUS;
 use crate::shake_sponge::{
-    prove_shake, verify_shake, ShakeKind, ShakeProof, MAX_SHAKE_OUTPUT_BYTES,
+    prove_shake, prove_shake_batched, verify_shake, ShakeKind, ShakeProof, MAX_SHAKE_OUTPUT_BYTES,
 };
 
 pub const MATRIX_ROWS: usize = 6;
@@ -325,10 +325,31 @@ pub fn prove_matrix_polynomial(
     row: u8,
     column: u8,
 ) -> Result<MatrixPolynomialProof, String> {
+    prove_matrix_polynomial_inner(rho, row, column, false)
+}
+/// New large production jobs aggregate the SHAKE permutation statements. Legacy
+/// polynomial and sponge transcripts remain verifiable without conversion.
+pub fn prove_matrix_polynomial_batched(
+    rho: &[u8],
+    row: u8,
+    column: u8,
+) -> Result<MatrixPolynomialProof, String> {
+    prove_matrix_polynomial_inner(rho, row, column, true)
+}
+fn prove_matrix_polynomial_inner(
+    rho: &[u8],
+    row: u8,
+    column: u8,
+    aggregate: bool,
+) -> Result<MatrixPolynomialProof, String> {
     let bytes = seed(rho, row, column)?;
     let mut length = 840;
     let (xof, inputs) = loop {
-        let xof = prove_shake(ShakeKind::Shake128, &bytes, length)?;
+        let xof = if aggregate {
+            prove_shake_batched(ShakeKind::Shake128, &bytes, length)?
+        } else {
+            prove_shake(ShakeKind::Shake128, &bytes, length)?
+        };
         if let Some(input) = sample(rho, row, column, &xof.output) {
             break (xof, input);
         }
@@ -455,6 +476,20 @@ mod tests {
         Shake128,
     };
     use std::sync::OnceLock;
+    #[test]
+    fn aggregate_matrix_sampler_binds_rho_coordinate_and_full_shake() {
+        let rho = [0x69; 32];
+        let p = prove_matrix_polynomial_batched(&rho, 5, 4).unwrap();
+        let expected = native(&rho, 5, 4);
+        assert_eq!(p.coefficients, expected);
+        assert_eq!(p.xof.version, 2);
+        verify_matrix_polynomial(&p, &rho, 5, 4, &expected).unwrap();
+        assert!(verify_matrix_polynomial(&p, &[0x68; 32], 5, 4, &expected).is_err());
+        assert!(verify_matrix_polynomial(&p, &rho, 4, 4, &expected).is_err());
+        let mut bad = p.clone();
+        bad.xof.permutations[4].rounds[23].output[24] ^= 1;
+        assert!(verify_matrix_polynomial(&bad, &rho, 5, 4, &expected).is_err());
+    }
     fn native(rho: &[u8], row: u8, column: u8) -> Vec<u32> {
         let mut h = Shake128::default();
         h.update(rho);
@@ -637,6 +672,7 @@ mod tests {
                 output: vec![0; 840],
                 permutations: vec![],
                 sponge_proof_bytes: vec![0],
+                permutation_batches: vec![],
             },
             counts: vec![0, 256],
             coefficients: coefficients.clone(),

@@ -15,6 +15,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Aggregate bounded groups of complete Keccak permutation statements for new
+  compact-job ML-DSA matrix certificates, retaining legacy SHAKE proofs and
+  unchanged checkpoint quotas. Add an eight-sender sixteen-transfer Native
+  regression with persistent production, atomic wrong-root refusal, historical
+  replay and correct-hash intermediate-lane tamper rejection.
 - Add a self-contained sixteen-transfer Native proof regression with two
   independently registered ML-DSA-65 sender keys and a distinct proposer.
   Check both accounts, complete receipts and fee accounting, persistent

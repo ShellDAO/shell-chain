@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 mode, raw_fixture, raw_output = sys.argv[1:]
-assert mode in ("run", "verify", "consecutive", "batch", "wide", "mixed")
+assert mode in ("run", "verify", "consecutive", "batch", "wide", "mixed", "eight-keys")
 fixture, out = map(lambda p: Path(p).resolve(), (raw_fixture, raw_output))
 
 def now():
@@ -72,10 +72,10 @@ if mode == "verify" and (out / "network-batch/complete.json").exists():
     historical = (out / "network-batch/history-verified.json").exists()
     run("batch-cold-verify", [fixture, "batch-history-verify" if historical else "batch-verify", out])
     sys.exit(0)
-if mode in ("batch", "wide", "mixed"):
-    wide = mode in ("wide", "mixed")
+if mode in ("batch", "wide", "mixed", "eight-keys"):
+    wide = mode in ("wide", "mixed", "eight-keys")
     label = mode
-    registered = 2 if mode == "mixed" else 1
+    registered = 8 if mode == "eight-keys" else 2 if mode == "mixed" else 1
     unique_components = 433 + 40 * (registered - 1) if wide else 179
     count = 16 if wide else 2
     shared_inputs = 40 * (count - registered) if wide else 40
@@ -124,8 +124,10 @@ if mode in ("batch", "wide", "mixed"):
         run((label + "-verify"), [fixture, (label + "-verify"), out])
     if not (network / "history-verified.json").exists():
         run((label + "-history"), [fixture, (label + "-history"), out])
-    if registered == 2 and not (network / "cross-key-refused.json").exists():
+    if registered > 1 and not (network / "cross-key-refused.json").exists():
         run("mixed-key-swap", [fixture, "mixed-key-swap", out])
+    if mode == "eight-keys" and not (network / "aggregate-refused.json").exists():
+        run("matrix-aggregate-refusal", [fixture, "matrix-aggregate-refusal", out])
     run((label + "-history-cold"), [fixture, (label + "-history-verify"), out])
     run((label + "-history-cold-again"), [fixture, (label + "-history-verify"), out])
     result = {"two_ordered_transactions_proof_admitted": True,
@@ -136,10 +138,14 @@ if mode in ("batch", "wide", "mixed"):
               "physical_checkpoint_bytes": after["physical_checkpoint_bytes"],
               "reused1": completed["production1"]["reused"], "reused2": completed["production2"]["reused"],
               "native_control_and_cold_historic_replay_match": True, "finished_at": now()}
-    if registered == 2:
+    if registered > 1:
         refusal = json.loads((network / "cross-key-refused.json").read_text())
         assert refusal["all_kv_unchanged"] and refusal["original_proof_unchanged"] and refusal["new_proofs_generated"] == 0
         result["valid_other_registered_key_certificate_refused"] = True
+    if mode == "eight-keys":
+        refusal = json.loads((network / "aggregate-refused.json").read_text())
+        assert refusal["changed_intermediate_lane_with_genuine_aggregate"] and refusal["all_kv_unchanged"] and refusal["original_proof_unchanged"] and refusal["new_proofs_generated"] == 0
+        result["altered_aggregate_with_correct_outer_hash_refused"] = True
     if wide:
         result["sixteen_ordered_transactions_proof_admitted"] = result.pop("two_ordered_transactions_proof_admitted")
     save(out / (label + "-result.json"), result)

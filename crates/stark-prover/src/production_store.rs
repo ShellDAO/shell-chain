@@ -70,6 +70,10 @@ pub struct ProductionStore<'a, S: KvStore> {
     local_reuse: BTreeMap<String, String>,
 }
 impl<'a, S: KvStore> ProductionStore<'a, S> {
+    pub(crate) fn compact_encoding(&self) -> bool {
+        self.index.version == 2
+    }
+
     pub fn open(
         store: &'a mut S,
         source: &[u8],

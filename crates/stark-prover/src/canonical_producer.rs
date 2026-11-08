@@ -14,7 +14,8 @@ use crate::{
     mldsa_inverse::{prove_inverse_ntt, verify_inverse_ntt, InverseNttProof},
     mldsa_key::{prove_public_key_decode, verify_public_key_decode, PublicKeyDecodeProof},
     mldsa_matrix::{
-        prove_matrix_polynomial, verify_matrix_polynomial, MatrixPolynomialProof, MatrixProof,
+        prove_matrix_polynomial, prove_matrix_polynomial_batched, verify_matrix_polynomial,
+        MatrixPolynomialProof, MatrixProof,
     },
     mldsa_ntt::{prove_ntt, verify_ntt, NttProof, NTT_MODULUS},
     mldsa_source::TransactionSignatureProof,
@@ -713,11 +714,18 @@ fn prove_mldsa<S: KvStore>(
         |p| verify_signature_decode(p, sig),
     )?;
     let mut polynomials = Vec::new();
+    let aggregate = job.compact_encoding();
     for row in 0..6 {
         for col in 0..5 {
             let p: MatrixPolynomialProof = job.checkpoint(
                 &format!("{prefix}-matrix-{row}-{col}"),
-                || prove_matrix_polynomial(&key.decoded.rho, row, col),
+                || {
+                    if aggregate {
+                        prove_matrix_polynomial_batched(&key.decoded.rho, row, col)
+                    } else {
+                        prove_matrix_polynomial(&key.decoded.rho, row, col)
+                    }
+                },
                 |p| verify_matrix_polynomial(p, &key.decoded.rho, row, col, &p.coefficients),
             )?;
             polynomials.push(p);

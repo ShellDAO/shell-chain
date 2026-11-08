@@ -1503,7 +1503,7 @@ pub(super) async fn batch(out: &Path, pause: bool, wide: bool) -> Result<(), Err
     let profile: Value = read(&out.join("batch-fixture.json"))?;
     let senders = profile["registered_sender_keys"].as_u64().unwrap_or(1) as usize;
     ensure(
-        (wide && matches!(senders, 1 | 2)) || !wide && senders == 1,
+        (wide && matches!(senders, 1 | 2 | 8)) || !wide && senders == 1,
         "unsupported fixture sender count",
     )?;
     let components = if wide { 433 + 40 * (senders - 1) } else { 179 };
@@ -1775,45 +1775,80 @@ pub(super) fn verify_batch(
 
 /// A valid certificate for another registered key cannot authorize this sender.
 pub(super) fn mixed_key_refusal(out: &Path) -> Result<(), Error> {
+    certificate_refusal(out, false)
+}
+/// Changing an intermediate Keccak lane with a genuine aggregate proof and a
+/// freshly computed availability hash must fail full AIR at the native reader.
+pub(super) fn aggregate_refusal(out: &Path) -> Result<(), Error> {
+    certificate_refusal(out, true)
+}
+fn certificate_refusal(out: &Path, aggregate: bool) -> Result<(), Error> {
     let network = out.join("network-wide");
+    let label = if aggregate {
+        "aggregate-refused"
+    } else {
+        "cross-key-refused"
+    };
     ensure(
-        !network.join("cross-key-refused.json").exists(),
-        "key refusal already recorded",
+        !network.join(format!("{label}.json")).exists(),
+        "certificate refusal already recorded",
     )?;
     let c: fixture::Context = read(&out.join("context.json"))?;
     let block: Block = read(&out.join("candidate.json"))?;
-    let other = block
-        .transactions
-        .iter()
-        .position(|tx| tx.from != block.transactions[0].from)
-        .ok_or("second registered sender missing")?;
+    let other = if aggregate {
+        None
+    } else {
+        Some(
+            block
+                .transactions
+                .iter()
+                .position(|tx| tx.from != block.transactions[0].from)
+                .ok_or("second registered sender missing")?,
+        )
+    };
     let original_path = network.join("good-proof.cbor");
     let original = std::fs::read(&original_path)?;
     let mut proof = shell_stark_prover::compact_canonical::decode_payload(&original)?;
-    let certificate = proof.transactions[other]
-        .signature
-        .transaction
-        .signature
-        .equation
-        .key
-        .clone();
-    ensure(
-        certificate.proof_bytes
-            != proof.transactions[0]
-                .signature
-                .transaction
-                .signature
-                .equation
-                .key
-                .proof_bytes,
-        "distinct key certificates missing",
-    )?;
-    proof.transactions[0]
-        .signature
-        .transaction
-        .signature
-        .equation
-        .key = certificate;
+    if aggregate {
+        let xof = &mut proof.transactions[0]
+            .signature
+            .transaction
+            .signature
+            .equation
+            .matrix
+            .polynomials[0]
+            .xof;
+        ensure(
+            xof.version == 2 && !xof.permutation_batches.is_empty(),
+            "aggregate certificate missing",
+        )?;
+        xof.permutations[0].rounds[11].theta[24] ^= 1;
+    } else {
+        let certificate = proof.transactions[other.ok_or("donor missing")?]
+            .signature
+            .transaction
+            .signature
+            .equation
+            .key
+            .clone();
+        ensure(
+            certificate.proof_bytes
+                != proof.transactions[0]
+                    .signature
+                    .transaction
+                    .signature
+                    .equation
+                    .key
+                    .proof_bytes,
+            "distinct key certificates missing",
+        )?;
+        proof.transactions[0]
+            .signature
+            .transaction
+            .signature
+            .equation
+            .key = certificate;
+    }
     let payload = shell_stark_prover::compact_canonical::encode_payload(
         &proof,
         shell_storage::MAX_CANONICAL_PROOF_BYTES as usize,
@@ -1822,7 +1857,7 @@ pub(super) fn mixed_key_refusal(out: &Path) -> Result<(), Error> {
     let hash = blake3_hash(&payload);
     ensure(
         hash != blake3_hash(&original),
-        "key replacement did not change payload",
+        "certificate replacement did not change payload",
     )?;
     let decoded = shell_stark_prover::compact_canonical::decode_payload(&payload)?;
     let stores = RocksDbStore::open_all(network.join("receiver/db"), None)?;
@@ -1831,30 +1866,34 @@ pub(super) fn mixed_key_refusal(out: &Path) -> Result<(), Error> {
     let tip = node
         .chain_store
         .get_head_hash()?
-        .ok_or("key refusal tip absent")?;
+        .ok_or("certificate refusal tip absent")?;
     let later: Value = read(&out.join("later-control.json"))?;
     ensure(
         json!(tip) == later["head"],
-        "key refusal requires advanced native control",
+        "certificate refusal requires advanced native control",
     )?;
     let before = digest(store.as_ref())?;
     let error = node
         .replay_canonical_transactions_with_proof(tip, c.block, &decoded)
-        .expect_err("another key certificate must not authorize the sender")
+        .expect_err("altered certificate must not authorize the sender")
         .to_string();
     ensure(
-        error.contains("key") || error.contains("proof"),
-        "unexpected cross-key refusal",
+        if aggregate {
+            error.contains("Keccak aggregate verification")
+        } else {
+            error.contains("key") || error.contains("proof")
+        },
+        "unexpected certificate refusal",
     )?;
     ensure(
         digest(store.as_ref())? == before && std::fs::read(original_path)? == original,
-        "key refusal changed native or original proof data",
+        "certificate refusal changed native or original proof data",
     )?;
-    let path = network.join("cross-key-refused.cbor");
+    let path = network.join(format!("{label}.cbor"));
     if path.exists() {
         ensure(
             std::fs::read(path)? == payload,
-            "retained key refusal payload differs",
+            "retained certificate refusal payload differs",
         )?;
     } else {
         use std::io::Write;
@@ -1866,8 +1905,8 @@ pub(super) fn mixed_key_refusal(out: &Path) -> Result<(), Error> {
         file.sync_all()?;
     }
     write(
-        &network.join("cross-key-refused.json"),
-        &json!({"correct_outer_hash":hash,"valid_other_registered_key_certificate":true,"donor_transaction":other,"error":error,"all_kv_unchanged":true,"original_proof_unchanged":true,"new_proofs_generated":0,"current_head":tip}),
+        &network.join(format!("{label}.json")),
+        &json!({"correct_outer_hash":hash,"valid_other_registered_key_certificate":!aggregate,"changed_intermediate_lane_with_genuine_aggregate":aggregate,"donor_transaction":other,"error":error,"all_kv_unchanged":true,"original_proof_unchanged":true,"new_proofs_generated":0,"current_head":tip}),
     )
 }
 
