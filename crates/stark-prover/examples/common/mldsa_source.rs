@@ -49,6 +49,7 @@ fn equation(source: &Path, dir: &Path) -> Result<EquationPipeline, Error> {
     }
     Ok(EquationPipeline {
         matrix: MatrixProof {
+            batches: None,
             version: 1,
             rho: key.decoded.rho.clone(),
             polynomials,

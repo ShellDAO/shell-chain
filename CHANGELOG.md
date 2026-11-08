@@ -15,6 +15,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Share bounded sampler, sponge and permutation AIR proofs across all thirty
+  matrix coordinates for new jobs with more than eight distinct senders.
+  Persist source-bound proof parts without duplicating routing witnesses;
+  retain existing job layouts and standalone proof rejection. Add the
+  sixteen-independent-sender Native acceptance entry under unchanged quotas.
 - Aggregate bounded groups of complete Keccak permutation statements for new
   compact-job ML-DSA matrix certificates, retaining legacy SHAKE proofs and
   unchanged checkpoint quotas. Add an eight-sender sixteen-transfer Native

@@ -71,7 +71,7 @@ pub struct ProductionStore<'a, S: KvStore> {
 }
 impl<'a, S: KvStore> ProductionStore<'a, S> {
     pub(crate) fn compact_encoding(&self) -> bool {
-        self.index.version == 2
+        self.index.version >= 2
     }
 
     pub fn open(
@@ -79,7 +79,7 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
         source: &[u8],
         limit: Option<NonZeroUsize>,
     ) -> Result<Self, ProductionError> {
-        Self::open_format(store, source, limit, false)
+        Self::open_format(store, source, limit, 1)
     }
     /// New large jobs store unique mathematical inputs in bounded compact bytes.
     /// Existing jobs retain their original index/encoding and immutable components.
@@ -88,13 +88,26 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
         source: &[u8],
         limit: Option<NonZeroUsize>,
     ) -> Result<Self, ProductionError> {
-        Self::open_format(store, source, limit, true)
+        Self::open_format(store, source, limit, 2)
     }
+    /// New high-diversity jobs persist shared matrix proof parts. Existing
+    /// index-one/two jobs keep their immutable layout when reopened.
+    pub fn open_shared_matrix(
+        store: &'a mut S,
+        source: &[u8],
+        limit: Option<NonZeroUsize>,
+    ) -> Result<Self, ProductionError> {
+        Self::open_format(store, source, limit, 3)
+    }
+    pub(crate) fn shared_matrix_encoding(&self) -> bool {
+        self.index.version == 3
+    }
+
     fn open_format(
         store: &'a mut S,
         source: &[u8],
         limit: Option<NonZeroUsize>,
-        compact: bool,
+        format: u8,
     ) -> Result<Self, ProductionError> {
         if source.is_empty() || source.len() > MAX_SOURCE_BYTES {
             return Err(failure("production source size limit"));
@@ -104,7 +117,7 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
                 return Err(failure("production index size limit"));
             }
             let index: Index = serde_json::from_slice(&bytes).map_err(failure)?;
-            if !matches!(index.version, 1 | 2)
+            if !matches!(index.version, 1..=3)
                 || index.source_hash != blake3_hash(source)
                 || index.source_bytes != source.len()
                 || store.get(SOURCE).map_err(failure)?.as_deref() != Some(source)
@@ -128,7 +141,7 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
                 return Err(failure("refusing unowned nonempty production store"));
             }
             let index = Index {
-                version: if compact { 2 } else { 1 },
+                version: format,
                 source_hash: blake3_hash(source),
                 source_bytes: source.len(),
                 components: BTreeMap::new(),
@@ -227,7 +240,7 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
         if self.interrupt.is_some_and(|check| check()) {
             return Err(ProductionError::Paused);
         }
-        let shared = if self.index.version == 2 {
+        let shared = if self.index.version >= 2 {
             self.local_reuse.get(name).cloned()
         } else {
             None
@@ -286,7 +299,7 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
             prove()?
         };
         verify(&p)?;
-        let bytes = if self.index.version == 2 {
+        let bytes = if self.index.version >= 2 {
             let bytes = crate::compact_canonical::encode_component(&p).map_err(failure)?;
             if bytes.len() > remaining {
                 return Err(failure("compact checkpoint quota exceeded"));

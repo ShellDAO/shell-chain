@@ -17,9 +17,14 @@ use winterfell::{
 
 use crate::prover::default_proof_options;
 
+use crate::keccak_permutation::{
+    prove_keccak_batch, verify_keccak_batch, KeccakBatchProof, MAX_KECCAK_BATCH,
+};
 use crate::mldsa_ntt::NTT_MODULUS;
 use crate::shake_sponge::{
-    prove_shake, prove_shake_batched, verify_shake, ShakeKind, ShakeProof, MAX_SHAKE_OUTPUT_BYTES,
+    matrix_shake_witness, prove_shake, prove_shake_batched, prove_sponge_batch,
+    validate_matrix_shake, verify_shake, verify_sponge_batch, ShakeKind, ShakeProof,
+    SpongeBatchProof, MAX_SHAKE_OUTPUT_BYTES, MAX_SPONGE_BATCH,
 };
 
 pub const MATRIX_ROWS: usize = 6;
@@ -57,7 +62,26 @@ pub struct MatrixProof {
     pub version: u8,
     pub rho: Vec<u8>,
     pub polynomials: Vec<MatrixPolynomialProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batches: Option<MatrixBatches>,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatrixSamplerBatchProof {
+    pub version: u8,
+    pub proof_bytes: Vec<u8>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatrixBatches {
+    pub samplers: Vec<MatrixSamplerBatchProof>,
+    pub sponges: Vec<SpongeBatchProof>,
+    pub permutations: Vec<KeccakBatchProof>,
+}
+pub(crate) const MAX_MATRIX_BATCH: usize = 8;
+pub(crate) const MAX_MATRIX_PERMUTATION_BATCHES: usize =
+    (MATRIX_ROWS * MATRIX_COLUMNS * MAX_SHAKE_OUTPUT_BYTES.div_ceil(168))
+        .div_ceil(MAX_KECCAK_BATCH);
 #[derive(Clone)]
 struct Inputs {
     rho: Vec<u8>,
@@ -175,14 +199,69 @@ fn witness(row: &mut [BaseElement]) {
         row[SLACK + bit] = BaseElement::new(((slack >> bit) & 1).into());
     }
 }
+// A separate transcript binds every ordered child statement. Legacy inputs
+// retain their exact original public vector, padding and trace layout.
+#[derive(Clone)]
+struct BatchInputs {
+    polynomials: Vec<Inputs>,
+    aggregate: bool,
+}
+impl BatchInputs {
+    fn single(input: Inputs) -> Self {
+        Self {
+            polynomials: vec![input],
+            aggregate: false,
+        }
+    }
+    fn slots(&self) -> usize {
+        if self.aggregate {
+            self.polynomials
+                .iter()
+                .map(|p| p.attempts())
+                .sum::<usize>()
+                .next_power_of_two()
+        } else {
+            self.polynomials[0].slots()
+        }
+    }
+    fn trace_length(&self) -> usize {
+        self.slots() * 2
+    }
+}
+impl ToElements<BaseElement> for BatchInputs {
+    fn to_elements(&self) -> Vec<BaseElement> {
+        if !self.aggregate {
+            return self.polynomials[0].to_elements();
+        }
+        let mut values = vec![
+            BaseElement::new(u64::from_le_bytes(*b"MLMATB01") as u128),
+            BaseElement::new(self.polynomials.len() as u128),
+        ];
+        for input in &self.polynomials {
+            values.extend(input.to_elements());
+        }
+        values
+    }
+}
+fn batch_rows(inputs: &BatchInputs) -> Vec<Vec<BaseElement>> {
+    if !inputs.aggregate {
+        return public_rows(&inputs.polynomials[0]);
+    }
+    let mut rows = Vec::with_capacity(inputs.slots());
+    for p in &inputs.polynomials {
+        rows.extend(public_rows(p).into_iter().take(p.attempts()));
+    }
+    rows.resize(inputs.slots(), vec![BaseElement::ZERO; TRACE_WIDTH]);
+    rows
+}
 struct MatrixPolyAir {
     context: AirContext<BaseElement>,
-    inputs: Inputs,
+    inputs: BatchInputs,
 }
 impl Air for MatrixPolyAir {
     type BaseField = BaseElement;
-    type PublicInputs = Inputs;
-    fn new(info: TraceInfo, inputs: Inputs, options: ProofOptions) -> Self {
+    type PublicInputs = BatchInputs;
+    fn new(info: TraceInfo, inputs: BatchInputs, options: ProofOptions) -> Self {
         assert_eq!(info, TraceInfo::new(TRACE_WIDTH, inputs.trace_length()));
         let degrees = (0..CONSTRAINTS)
             .map(|i| TransitionConstraintDegree::new(if i == 44 { 3 } else { 2 }))
@@ -225,7 +304,7 @@ impl Air for MatrixPolyAir {
         result[44] = r[ACTIVE] * r[ACCEPT] * (value - r[TARGET]);
     }
     fn get_assertions(&self) -> Vec<Assertion<BaseElement>> {
-        let rows = public_rows(&self.inputs);
+        let rows = batch_rows(&self.inputs);
         (0..ACCEPT)
             .map(|col| Assertion::sequence(col, 0, 2, rows.iter().map(|r| r[col]).collect()))
             .collect()
@@ -234,9 +313,9 @@ impl Air for MatrixPolyAir {
         &self.context
     }
 }
-fn trace(inputs: &Inputs) -> TraceTable<BaseElement> {
+fn trace(inputs: &BatchInputs) -> TraceTable<BaseElement> {
     let mut trace = TraceTable::new(TRACE_WIDTH, inputs.trace_length());
-    for (slot, mut row) in public_rows(inputs).into_iter().enumerate() {
+    for (slot, mut row) in batch_rows(inputs).into_iter().enumerate() {
         witness(&mut row);
         trace.update_row(slot * 2, &row);
         trace.update_row(slot * 2 + 1, &row);
@@ -263,7 +342,7 @@ type Commitment = MerkleTree<Hasher>;
 type Coin = DefaultRandomCoin<Hasher>;
 
 struct MatrixPolyProver {
-    inputs: Inputs,
+    inputs: BatchInputs,
     options: ProofOptions,
 }
 
@@ -281,7 +360,7 @@ impl Prover for MatrixPolyProver {
     type ConstraintEvaluator<'a, E: FieldElement<BaseField = BaseElement>> =
         DefaultConstraintEvaluator<'a, MatrixPolyAir, E>;
 
-    fn get_pub_inputs(&self, _trace: &Self::Trace) -> Inputs {
+    fn get_pub_inputs(&self, _trace: &Self::Trace) -> BatchInputs {
         self.inputs.clone()
     }
 
@@ -359,11 +438,11 @@ fn prove_matrix_polynomial_inner(
         length = (length * 2).min(MAX_SHAKE_OUTPUT_BYTES);
     };
     let prover = MatrixPolyProver {
-        inputs: inputs.clone(),
+        inputs: BatchInputs::single(inputs.clone()),
         options: default_proof_options(),
     };
     let inner = prover
-        .prove(trace(&inputs))
+        .prove(trace(&BatchInputs::single(inputs.clone())))
         .map_err(|e| format!("matrix sampling proof: {e:?}"))?;
     Ok(MatrixPolynomialProof {
         version: 1,
@@ -383,8 +462,18 @@ fn validate_shape(
     column: u8,
     expected: &[u32],
 ) -> Result<(), String> {
+    validate_shape_kind(p, rho, row, column, expected, false)
+}
+fn validate_shape_kind(
+    p: &MatrixPolynomialProof,
+    rho: &[u8],
+    row: u8,
+    column: u8,
+    expected: &[u32],
+    aggregate: bool,
+) -> Result<(), String> {
     seed(rho, row, column)?;
-    if p.version != 1
+    if p.version != if aggregate { 2 } else { 1 }
         || p.rho != rho
         || p.row != row
         || p.column != column
@@ -396,7 +485,7 @@ fn validate_shape(
         || p.counts.len() > p.xof.output.len() / 3 + 1
         || p.counts.first() != Some(&0)
         || p.counts.last() != Some(&(N as u16))
-        || p.proof_bytes.is_empty()
+        || p.proof_bytes.is_empty() != aggregate
         || p.proof_bytes.len() > MAX_PROOF_BYTES
     {
         return Err("invalid matrix polynomial version, endpoints, shape or payload".into());
@@ -428,7 +517,7 @@ pub fn verify_matrix_polynomial(
     }
     verify::<MatrixPolyAir, Hasher, Coin, Commitment>(
         inner,
-        inputs,
+        BatchInputs::single(inputs),
         &AcceptableOptions::OptionSet(vec![default_proof_options()]),
     )
     .map_err(|e| format!("matrix sampling verification: {e:?}"))?;
@@ -442,12 +531,17 @@ pub fn verify_matrix_polynomial(
 /// Verify complete row-major 6x5 coverage; partial/duplicate/reordered or foreign
 /// polynomials cannot stand in for a complete ExpandA result.
 pub fn verify_matrix(p: &MatrixProof, rho: &[u8], expected: &[Vec<u32>]) -> Result<(), String> {
-    if p.version != 1
+    if !matches!(p.version, 1 | 2)
+        || (p.version == 2) != p.batches.is_some()
         || rho.len() != 32
         || p.rho != rho
         || p.polynomials.len() != MATRIX_ROWS * MATRIX_COLUMNS
         || expected.len() != MATRIX_ROWS * MATRIX_COLUMNS
         || expected.iter().any(|v| v.len() != N)
+        || p.polynomials
+            .iter()
+            .zip(expected)
+            .any(|(p, expected)| p.coefficients != *expected)
         || p.polynomials.iter().enumerate().any(|(i, v)| {
             usize::from(v.row) != i / MATRIX_COLUMNS
                 || usize::from(v.column) != i % MATRIX_COLUMNS
@@ -455,6 +549,9 @@ pub fn verify_matrix(p: &MatrixProof, rho: &[u8], expected: &[Vec<u32>]) -> Resu
         })
     {
         return Err("invalid complete matrix shape or coordinate coverage".into());
+    }
+    if p.version == 2 {
+        return verify_matrix_batches(p);
     }
     for (i, poly) in p.polynomials.iter().enumerate() {
         verify_matrix_polynomial(
@@ -468,6 +565,176 @@ pub fn verify_matrix(p: &MatrixProof, rho: &[u8], expected: &[Vec<u32>]) -> Resu
     Ok(())
 }
 
+fn routing_inputs(p: &MatrixPolynomialProof) -> Result<Inputs, String> {
+    validate_shape_kind(p, &p.rho, p.row, p.column, &p.coefficients, true)?;
+    validate_matrix_shake(&p.xof)?;
+    if p.xof.message != seed(&p.rho, p.row, p.column)? {
+        return Err("matrix SHAKE coordinate binding".into());
+    }
+    Ok(Inputs {
+        rho: p.rho.clone(),
+        row: p.row,
+        column: p.column,
+        stream: p.xof.output.clone(),
+        counts: p.counts.clone(),
+        coefficients: p.coefficients.clone(),
+    })
+}
+fn sampler_batch_inputs(polynomials: &[MatrixPolynomialProof]) -> Result<BatchInputs, String> {
+    if polynomials.is_empty() || polynomials.len() > MAX_MATRIX_BATCH {
+        return Err("invalid matrix sampler batch count".into());
+    }
+    Ok(BatchInputs {
+        polynomials: polynomials
+            .iter()
+            .map(routing_inputs)
+            .collect::<Result<_, _>>()?,
+        aggregate: true,
+    })
+}
+pub(crate) fn prove_matrix_sampler_batch(
+    polynomials: &[MatrixPolynomialProof],
+) -> Result<MatrixSamplerBatchProof, String> {
+    let inputs = sampler_batch_inputs(polynomials)?;
+    for p in &inputs.polynomials {
+        let expected = sample(&p.rho, p.row, p.column, &p.stream)
+            .ok_or("incomplete matrix sampler witness")?;
+        if expected.counts != p.counts || expected.coefficients != p.coefficients {
+            return Err("invalid matrix sampler witness".into());
+        }
+    }
+    let prover = MatrixPolyProver {
+        inputs: inputs.clone(),
+        options: default_proof_options(),
+    };
+    let proof = prover
+        .prove(trace(&inputs))
+        .map_err(|e| format!("matrix sampler batch proof: {e:?}"))?;
+    Ok(MatrixSamplerBatchProof {
+        version: 1,
+        proof_bytes: proof.to_bytes(),
+    })
+}
+pub(crate) fn verify_matrix_sampler_batch(
+    p: &MatrixSamplerBatchProof,
+    polynomials: &[MatrixPolynomialProof],
+) -> Result<(), String> {
+    let inputs = sampler_batch_inputs(polynomials)?;
+    if p.version != 1 || p.proof_bytes.is_empty() || p.proof_bytes.len() > MAX_PROOF_BYTES {
+        return Err("invalid matrix sampler batch version or size".into());
+    }
+    let proof = Proof::from_bytes(&p.proof_bytes)
+        .map_err(|e| format!("matrix sampler batch decode: {e:?}"))?;
+    if proof.trace_info() != &TraceInfo::new(TRACE_WIDTH, inputs.trace_length()) {
+        return Err("unexpected matrix sampler batch layout".into());
+    }
+    verify::<MatrixPolyAir, Hasher, Coin, Commitment>(
+        proof,
+        inputs,
+        &AcceptableOptions::OptionSet(vec![default_proof_options()]),
+    )
+    .map_err(|e| format!("matrix sampler batch verification: {e:?}"))
+}
+
+/// Routing is constructed only on the prover. The recipient authenticates it
+/// with the sampler, sponge and permutation AIRs, never native SHAKE/sampling.
+pub(crate) fn matrix_witness(rho: &[u8]) -> Result<MatrixProof, String> {
+    let mut polynomials = Vec::with_capacity(30);
+    for row in 0..6 {
+        for column in 0..5 {
+            let message = seed(rho, row, column)?;
+            let mut length = 840;
+            let (xof, input) = loop {
+                let xof = matrix_shake_witness(&message, length)?;
+                if let Some(input) = sample(rho, row, column, &xof.output) {
+                    break (xof, input);
+                }
+                if length == MAX_SHAKE_OUTPUT_BYTES {
+                    return Err("matrix sampler resource bound".into());
+                }
+                length = (length * 2).min(MAX_SHAKE_OUTPUT_BYTES);
+            };
+            polynomials.push(MatrixPolynomialProof {
+                version: 2,
+                rho: rho.to_vec(),
+                row,
+                column,
+                xof,
+                counts: input.counts,
+                coefficients: input.coefficients,
+                proof_bytes: Vec::new(),
+            });
+        }
+    }
+    Ok(MatrixProof {
+        version: 2,
+        rho: rho.to_vec(),
+        polynomials,
+        batches: Some(MatrixBatches {
+            samplers: Vec::new(),
+            sponges: Vec::new(),
+            permutations: Vec::new(),
+        }),
+    })
+}
+/// Complete bounded ExpandA proof; individual routing polynomials cannot verify
+/// standalone or replace an ordered complete matrix.
+pub fn prove_matrix_batched(rho: &[u8]) -> Result<MatrixProof, String> {
+    let mut p = matrix_witness(rho)?;
+    let mut batches = p.batches.take().ok_or("missing matrix batches")?;
+    for group in p.polynomials.chunks(MAX_MATRIX_BATCH) {
+        batches.samplers.push(prove_matrix_sampler_batch(group)?);
+    }
+    let streams: Vec<_> = p.polynomials.iter().map(|v| v.xof.clone()).collect();
+    for group in streams.chunks(MAX_SPONGE_BATCH) {
+        batches.sponges.push(prove_sponge_batch(group)?);
+    }
+    let permutations: Vec<_> = streams
+        .iter()
+        .flat_map(|v| v.permutations.iter().cloned())
+        .collect();
+    for group in permutations.chunks(MAX_KECCAK_BATCH) {
+        batches.permutations.push(prove_keccak_batch(group)?);
+    }
+    p.batches = Some(batches);
+    Ok(p)
+}
+fn verify_matrix_batches(p: &MatrixProof) -> Result<(), String> {
+    let batches = p.batches.as_ref().ok_or("missing matrix batches")?;
+    for v in &p.polynomials {
+        routing_inputs(v)?;
+    }
+    let streams: Vec<_> = p.polynomials.iter().map(|v| v.xof.clone()).collect();
+    let permutations: Vec<_> = streams
+        .iter()
+        .flat_map(|v| v.permutations.iter().cloned())
+        .collect();
+    if batches.samplers.len() != p.polynomials.len().div_ceil(MAX_MATRIX_BATCH)
+        || batches.sponges.len() != streams.len().div_ceil(MAX_SPONGE_BATCH)
+        || batches.permutations.len() != permutations.len().div_ceil(MAX_KECCAK_BATCH)
+    {
+        return Err("invalid complete matrix batch coverage".into());
+    }
+    for (proof, group) in batches
+        .samplers
+        .iter()
+        .zip(p.polynomials.chunks(MAX_MATRIX_BATCH))
+    {
+        verify_matrix_sampler_batch(proof, group)?;
+    }
+    for (proof, group) in batches.sponges.iter().zip(streams.chunks(MAX_SPONGE_BATCH)) {
+        verify_sponge_batch(proof, group)?;
+    }
+    for (proof, group) in batches
+        .permutations
+        .iter()
+        .zip(permutations.chunks(MAX_KECCAK_BATCH))
+    {
+        verify_keccak_batch(proof, group)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +743,146 @@ mod tests {
         Shake128,
     };
     use std::sync::OnceLock;
+    #[test]
+    fn bounded_sampler_and_bridge_batches_bind_all_ordered_inputs() {
+        let matrix = matrix_witness(&[0x73; 32]).unwrap();
+        let polynomials = &matrix.polynomials[..8];
+        let sampler = prove_matrix_sampler_batch(polynomials).unwrap();
+        verify_matrix_sampler_batch(&sampler, polynomials).unwrap();
+        let streams: Vec<_> = polynomials.iter().map(|p| p.xof.clone()).collect();
+        let bridge = prove_sponge_batch(&streams).unwrap();
+        verify_sponge_batch(&bridge, &streams).unwrap();
+        for i in [0, 3, 7] {
+            assert_eq!(
+                polynomials[i].coefficients,
+                native(&[0x73; 32], polynomials[i].row, polynomials[i].column)
+            );
+            let mut bad = polynomials.to_vec();
+            bad[i].counts[1] = 65535;
+            assert!(verify_matrix_sampler_batch(&sampler, &bad).is_err());
+            assert!(prove_matrix_sampler_batch(&bad).is_err());
+            let mut bad = streams.clone();
+            bad[i].output[0] ^= 1;
+            assert!(verify_sponge_batch(&bridge, &bad).is_err());
+            assert!(prove_sponge_batch(&bad).is_err());
+        }
+        let mut swapped = polynomials.to_vec();
+        swapped.swap(0, 1);
+        assert!(verify_matrix_sampler_batch(&sampler, &swapped).is_err());
+        let mut swapped = streams.clone();
+        swapped.swap(0, 1);
+        assert!(verify_sponge_batch(&bridge, &swapped).is_err());
+        assert!(prove_matrix_sampler_batch(&[]).is_err());
+        assert!(verify_matrix_sampler_batch(&sampler, &matrix.polynomials[..9]).is_err());
+        assert!(verify_matrix_sampler_batch(&sampler, &polynomials[..7]).is_err());
+        assert!(verify_sponge_batch(&bridge, &vec![streams[0].clone(); 9]).is_err());
+        assert!(verify_shake(
+            &streams[0],
+            ShakeKind::Shake128,
+            &streams[0].message,
+            &streams[0].output
+        )
+        .is_err());
+        assert!(verify_matrix_polynomial(
+            &polynomials[0],
+            &[0x73; 32],
+            0,
+            0,
+            &polynomials[0].coefficients
+        )
+        .is_err());
+        // Same endpoints and trace shape, different standalone/batch domain.
+        let legacy_inputs = BatchInputs::single(routing_inputs(&polynomials[0]).unwrap());
+        let legacy = MatrixPolyProver {
+            inputs: legacy_inputs.clone(),
+            options: default_proof_options(),
+        }
+        .prove(trace(&legacy_inputs))
+        .unwrap();
+        assert!(verify_matrix_sampler_batch(
+            &MatrixSamplerBatchProof {
+                version: 1,
+                proof_bytes: legacy.to_bytes()
+            },
+            &polynomials[..1]
+        )
+        .is_err());
+        use crate::production_store::ProductionStore;
+        use shell_storage::{KvStore, MemoryDb};
+        let mut db = MemoryDb::new();
+        let mut job = ProductionStore::open_shared_matrix(&mut db, b"matrix-part", None).unwrap();
+        job.checkpoint(
+            "sender-0-matrix-sampler-0",
+            || Ok(sampler.clone()),
+            |v| verify_matrix_sampler_batch(v, polynomials),
+        )
+        .unwrap();
+        drop(job);
+        let saved = db.scan_all().unwrap();
+        let mut job = ProductionStore::open_compact(&mut db, b"matrix-part", None).unwrap();
+        assert!(job.shared_matrix_encoding());
+        let _: MatrixSamplerBatchProof = job
+            .checkpoint(
+                "sender-0-matrix-sampler-0",
+                || panic!("retained proof regenerated"),
+                |v| verify_matrix_sampler_batch(v, polynomials),
+            )
+            .unwrap();
+        let mut invalid = sampler.clone();
+        invalid.version = 2;
+        assert!(job
+            .checkpoint(
+                "sender-0-matrix-sampler-1",
+                || Ok(invalid),
+                |v| verify_matrix_sampler_batch(v, polynomials)
+            )
+            .is_err());
+        drop(job);
+        assert_eq!(db.scan_all().unwrap(), saved);
+        let mut old = MemoryDb::new();
+        drop(ProductionStore::open_compact(&mut old, b"old", None).unwrap());
+        let saved = old.scan_all().unwrap();
+        let job = ProductionStore::open_shared_matrix(&mut old, b"old", None).unwrap();
+        assert!(!job.shared_matrix_encoding());
+        drop(job);
+        assert_eq!(old.scan_all().unwrap(), saved);
+    }
+    #[test]
+    fn complete_shared_matrix_binds_every_coordinate_and_proof_group() {
+        let rho = [0x51; 32];
+        let p = prove_matrix_batched(&rho).unwrap();
+        let expected: Vec<_> = (0..6)
+            .flat_map(|row| (0..5).map(move |col| native(&rho, row, col)))
+            .collect();
+        verify_matrix(&p, &rho, &expected).unwrap();
+        let mut wrong_expected = expected.clone();
+        wrong_expected[29][255] ^= 1;
+        assert!(verify_matrix(&p, &rho, &wrong_expected).is_err());
+        let encoded = crate::compact_canonical::encode_component(&p).unwrap();
+        let decoded = crate::compact_canonical::decode_component(&encoded).unwrap();
+        verify_matrix(&decoded, &rho, &expected).unwrap();
+        let mut bad = p.clone();
+        bad.polynomials.swap(7, 8);
+        assert!(verify_matrix(&bad, &rho, &expected).is_err());
+        let mut bad = p.clone();
+        bad.batches.as_mut().unwrap().samplers.pop();
+        assert!(verify_matrix(&bad, &rho, &expected).is_err());
+        let mut bad = p.clone();
+        bad.batches.as_mut().unwrap().sponges.swap(0, 1);
+        assert!(verify_matrix(&bad, &rho, &expected).is_err());
+        let mut bad = p.clone();
+        bad.batches.as_mut().unwrap().permutations.swap(0, 1);
+        assert!(verify_matrix(&bad, &rho, &expected).is_err());
+        for index in [0, 7, 8, 29] {
+            let mut bad = p.clone();
+            bad.polynomials[index].xof.permutations[0].rounds[11].theta[24] ^= 1;
+            assert!(verify_matrix(&bad, &rho, &expected).is_err());
+        }
+        let mut bad = p.clone();
+        bad.version = 1;
+        assert!(verify_matrix(&bad, &rho, &expected).is_err());
+        assert!(verify_matrix(&p, &[0x52; 32], &expected).is_err());
+    }
     #[test]
     fn aggregate_matrix_sampler_binds_rho_coordinate_and_full_shake() {
         let rho = [0x69; 32];
@@ -606,7 +1013,7 @@ mod tests {
         let mut rows = public_rows(&i);
         let air = MatrixPolyAir::new(
             TraceInfo::new(TRACE_WIDTH, i.trace_length()),
-            i,
+            BatchInputs::single(i),
             default_proof_options(),
         );
         for row in &mut rows {
@@ -631,7 +1038,7 @@ mod tests {
         }
         let air = MatrixPolyAir::new(
             TraceInfo::new(TRACE_WIDTH, i.trace_length()),
-            i,
+            BatchInputs::single(i),
             default_proof_options(),
         );
         let mut bad = rows[2].clone();
@@ -733,6 +1140,7 @@ mod tests {
             version: 1,
             rho: p.rho.clone(),
             polynomials: vec![p.clone(); 30],
+            batches: None,
         };
         assert!(verify_matrix(&matrix, &p.rho, &expected)
             .unwrap_err()

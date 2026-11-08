@@ -105,6 +105,7 @@ fn load_pipeline(matrix: &Path, equation: &Path) -> Result<EquationPipeline, Err
     }
     Ok(EquationPipeline {
         matrix: MatrixProof {
+            batches: None,
             version: 1,
             rho: key.decoded.rho.clone(),
             polynomials,

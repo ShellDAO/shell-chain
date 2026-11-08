@@ -131,6 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let complete = polynomials.len() == 30;
     let matrix = MatrixProof {
+        batches: None,
         version: 1,
         rho: rho.to_vec(),
         polynomials,

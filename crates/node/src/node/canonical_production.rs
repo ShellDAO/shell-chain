@@ -356,7 +356,7 @@ impl<S: KvStore> ProductionJob<S> {
                 let entries = index["components"]
                     .as_object()
                     .ok_or_else(|| error("production donor index shape"))?;
-                if !matches!(index["version"].as_u64(), Some(1 | 2)) || entries.len() > 2048 {
+                if !matches!(index["version"].as_u64(), Some(1..=3)) || entries.len() > 2048 {
                     return Err(error("production donor index version/count"));
                 }
                 for (name, entry) in entries {
@@ -613,20 +613,47 @@ impl<S: KvStore + 'static> Node<S> {
             let reuse = |name: &str| -> Result<Option<Vec<u8>>, String> {
                 for (hash, donor) in &donors {
                     if let Some(component) = source.reusable_component_from(donor, name) {
-                        let bytes = self
-                            .canonical_production
-                            .job(*hash)
+                        let donor_store = self.canonical_production.job(*hash);
+                        let bytes = donor_store
                             .get(&[b"production/component/", component.as_bytes()].concat())
-                            .map_err(|e| e.to_string())?
-                            .ok_or_else(|| "matching donor certificate missing".to_string())?;
-                        return Ok(Some(bytes));
+                            .map_err(|e| e.to_string())?;
+                        if bytes.is_none()
+                            && ["-matrix-sampler-", "-matrix-sponge-", "-matrix-keccak-"]
+                                .iter()
+                                .any(|v| component.contains(v))
+                        {
+                            let index = donor_store
+                                .get(b"production/index")
+                                .map_err(|e| e.to_string())?
+                                .ok_or("donor index missing")?;
+                            if index.len() > 256 * 1024 {
+                                return Err("production donor index size limit".into());
+                            }
+                            let index: serde_json::Value =
+                                serde_json::from_slice(&index).map_err(|e| e.to_string())?;
+                            // Older layouts have no shared matrix proof parts.
+                            // A missing part in a newer layout remains corruption.
+                            if matches!(index["version"].as_u64(), Some(1 | 2)) {
+                                continue;
+                            }
+                        }
+                        return Ok(Some(bytes.ok_or("matching donor certificate missing")?));
                     }
                 }
                 Ok(None)
             };
             let interrupt =
                 || cancel.load(Ordering::Acquire) || !self.prover_ready.load(Ordering::Acquire);
-            let mut job = if source.block().transactions.len() > 2 {
+            let distinct_senders = source
+                .block()
+                .transactions
+                .iter()
+                .map(|tx| tx.from.as_bytes().to_vec())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            let mut job = if distinct_senders > 8 {
+                ProductionStore::open_shared_matrix(&mut kv, source.identity(), limit)
+            } else if source.block().transactions.len() > 2 {
                 ProductionStore::open_compact(&mut kv, source.identity(), limit)
             } else {
                 ProductionStore::open(&mut kv, source.identity(), limit)

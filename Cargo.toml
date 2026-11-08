@@ -133,3 +133,7 @@ split-debuginfo = "unpacked"
 
 [profile.release]
 strip = "debuginfo"
+
+# Keep test assertions while optimizing the expensive AIR arithmetic.
+[profile.test.package.shell-stark-prover]
+opt-level = 3

@@ -518,7 +518,8 @@ source builds at both ends. The native importer still enforces authority,
 activation, ordered nonce, gas, fees, receipts and resulting state root.
 
 Run the expensive isolated sixteen-transfer acceptance with Python 3, stable Rust
-and the repository's RocksDB prerequisites:
+and the repository's RocksDB prerequisites. The entry builds an optimized local
+verifier with Cargo's release profile for the expensive proving work:
 
 ```sh
 tests/e2e/mldsa-full-proof.sh wide full16-test
@@ -555,7 +556,7 @@ content hashes, and requires native proof verification to refuse it without
 changing any stored data. Repeating `mixed` resumes its
 retained inputs; `verify` never generates proofs.
 
-New matrix certificates in compact jobs use SHAKE version 2: each group of at
+Matrix certificates in checkpoint version 2 jobs use SHAKE version 2: each group of at
 most eight Keccak permutations has one aggregate AIR proof. Every input lane,
 all 24 rounds, permutation order, sponge links and rejection-sampling result
 remain constrained. Aggregation uses a separate public-input domain; empty
@@ -582,3 +583,36 @@ Keccak lane while retaining the genuine aggregate proof, and requires the native
 reader to reject it without state or original-proof writes. These source
 experiments require fresh in-memory test keys and no network funds. Repeating
 `eight-keys` resumes its retained inputs; `verify` generates no proofs.
+
+New jobs with more than eight distinct senders use checkpoint version 3 and
+complete matrix version 2. All thirty ordered coordinates share sampler and
+sponge AIR proofs in groups of at most eight streams. Their permutation states
+are flattened in that same coordinate order into groups of at most eight full
+Keccak permutations. Separate public-input domains bind each count and ordered
+statement. The complete matrix verifier requires every sampler, sponge and
+permutation group; individual version 2 polynomials and version 3 SHAKE routing
+objects have no standalone proof authority.
+
+The producer persists each proof part separately, reconstructs routing only on
+the prover, and verifies every recovered or borrowed part against its exact
+inputs before continuing. The native reader verifies all AIRs without native
+SHAKE or sampling as a substitute. Existing checkpoint versions 1 and 2 retain
+their original bytes and layout, including when reopened by the newer producer.
+No checkpoint, payload, job-count or transport quota is increased.
+
+For sixteen independently registered senders, each making one transfer, and a
+distinct proposer, use a separate fresh directory:
+
+```sh
+tests/e2e/mldsa-full-proof.sh sixteen-keys sixteen-key-test
+tests/e2e/mldsa-full-proof.sh verify sixteen-key-test
+```
+
+This source acceptance profile requires all sixteen sender nonces to reach one,
+then two after the ordinary successor, with all seventeen receipts, balances,
+gas, fees and proposer reward matching independent native execution. It retains
+the same wrong-root rollback, key-substitution and intermediate-lane rejection,
+shutdown/resume and cold historical replay checks. Repeating `sixteen-keys`
+continues the retained inputs; `verify` generates no proofs. Published artifacts,
+network activation, other signature profiles and sustained load require their
+own acceptance evidence.

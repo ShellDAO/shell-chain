@@ -56,7 +56,7 @@ fn prepare(
     sender_count: usize,
 ) -> Result<(), Error> {
     ensure(
-        matches!(sender_count, 1 | 2 | 8) && (sender_count == 1 || batch_count == 16 && full),
+        matches!(sender_count, 1 | 2 | 8 | 16) && (sender_count == 1 || batch_count == 16 && full),
         "invalid registered sender profile",
     )?;
     let batch = batch_count > 1;
@@ -566,24 +566,32 @@ fn main() -> Result<(), Error> {
         "prepare-wide" => prepare(out, false, true, true, 16, 1),
         "prepare-mixed" => prepare(out, false, true, true, 16, 2),
         "prepare-eight-keys" => prepare(out, false, true, true, 16, 8),
+        "prepare-sixteen-keys" => prepare(out, false, true, true, 16, 16),
         "mixed-key-swap" => admission_runtime::mixed_key_refusal(out),
         "matrix-aggregate-refusal" => admission_runtime::aggregate_refusal(out),
-        "wide-pause" | "wide-resume" | "mixed-pause" | "mixed-resume" | "eight-keys-pause"
-        | "eight-keys-resume" => tokio::runtime::Runtime::new()?.block_on(
+        "wide-pause"
+        | "wide-resume"
+        | "mixed-pause"
+        | "mixed-resume"
+        | "eight-keys-pause"
+        | "eight-keys-resume"
+        | "sixteen-keys-pause"
+        | "sixteen-keys-resume" => tokio::runtime::Runtime::new()?.block_on(
             admission_runtime::batch(out, args[0].ends_with("-pause"), true),
         ),
-        "wide-snapshot" | "mixed-snapshot" | "eight-keys-snapshot" => {
+        "wide-snapshot" | "mixed-snapshot" | "eight-keys-snapshot" | "sixteen-keys-snapshot" => {
             admission_runtime::snapshot_wide(out)
         }
-        "wide-verify" | "mixed-verify" | "eight-keys-verify" => {
+        "wide-verify" | "mixed-verify" | "eight-keys-verify" | "sixteen-keys-verify" => {
             admission_runtime::verify_batch(out, false, false, true)
         }
-        "wide-history" | "mixed-history" | "eight-keys-history" => {
+        "wide-history" | "mixed-history" | "eight-keys-history" | "sixteen-keys-history" => {
             admission_runtime::verify_batch(out, true, true, true)
         }
-        "wide-history-verify" | "mixed-history-verify" | "eight-keys-history-verify" => {
-            admission_runtime::verify_batch(out, true, false, true)
-        }
+        "wide-history-verify"
+        | "mixed-history-verify"
+        | "eight-keys-history-verify"
+        | "sixteen-keys-history-verify" => admission_runtime::verify_batch(out, true, false, true),
         "full-pause" | "full-resume" | "full-bad-proposer" => {
             tokio::runtime::Runtime::new()?.block_on(admission_runtime::full(out, &args[0]))
         }

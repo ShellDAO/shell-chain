@@ -76,6 +76,151 @@ pub struct ShakeProof {
     pub permutation_batches: Vec<KeccakBatchProof>,
 }
 
+/// A bridge proof for at most eight ordered SHAKE128 streams. Permutations are
+/// authenticated separately by the complete matrix verifier.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpongeBatchProof {
+    pub version: u8,
+    pub proof_bytes: Vec<u8>,
+}
+pub(crate) const MAX_SPONGE_BATCH: usize = 8;
+
+/// Prover-only routing construction; version three cannot verify standalone.
+pub(crate) fn matrix_shake_witness(
+    message: &[u8],
+    output_bytes: usize,
+) -> Result<ShakeProof, String> {
+    let kind = ShakeKind::Shake128;
+    let (absorbs, total) = schedule(kind, message.len(), output_bytes)?;
+    let rate = kind.rate();
+    let mut state = [0u64; 25];
+    let mut permutations = Vec::with_capacity(total);
+    let mut output = Vec::with_capacity(output_bytes);
+    for step in 0..total {
+        if step < absorbs {
+            for offset in 0..rate {
+                let index = step * rate + offset;
+                let mut value = message.get(index).copied().unwrap_or(0);
+                if index == message.len() {
+                    value ^= kind.suffix();
+                }
+                if step == absorbs - 1 && offset == rate - 1 {
+                    value ^= 0x80;
+                }
+                state[offset / 8] ^= u64::from(value) << (8 * (offset % 8));
+            }
+        }
+        let permutation = permutation_witness(&state);
+        state = permutation.rounds[23].output;
+        permutations.push(permutation);
+        if step >= absorbs - 1 {
+            for offset in 0..rate.min(output_bytes - output.len()) {
+                output.push(byte(&state, offset));
+            }
+        }
+    }
+    Ok(ShakeProof {
+        version: 3,
+        kind,
+        message: message.to_vec(),
+        output,
+        permutations,
+        sponge_proof_bytes: Vec::new(),
+        permutation_batches: Vec::new(),
+    })
+}
+
+pub(crate) fn validate_matrix_shake(p: &ShakeProof) -> Result<(), String> {
+    let (_, count) = schedule(ShakeKind::Shake128, p.message.len(), p.output.len())?;
+    if p.version != 3
+        || p.kind != ShakeKind::Shake128
+        || !p.sponge_proof_bytes.is_empty()
+        || !p.permutation_batches.is_empty()
+        || p.permutations.len() != count
+        || p.permutations
+            .iter()
+            .any(|v| v.version != 1 || v.rounds.len() != 24 || !v.proof_bytes.is_empty())
+    {
+        return Err("invalid matrix SHAKE routing shape".into());
+    }
+    Ok(())
+}
+fn sponge_batch_inputs(streams: &[ShakeProof]) -> Result<BatchInputs, String> {
+    if streams.is_empty() || streams.len() > MAX_SPONGE_BATCH {
+        return Err("invalid sponge batch count".into());
+    }
+    let streams = streams
+        .iter()
+        .map(|p| {
+            validate_matrix_shake(p)?;
+            Ok(Inputs {
+                kind: p.kind,
+                message: p.message.clone(),
+                output: p.output.clone(),
+                steps: p
+                    .permutations
+                    .iter()
+                    .map(|v| Endpoints {
+                        input: v.input,
+                        output: v.rounds[23].output,
+                    })
+                    .collect(),
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    Ok(BatchInputs {
+        streams,
+        aggregate: true,
+    })
+}
+pub(crate) fn prove_sponge_batch(streams: &[ShakeProof]) -> Result<SpongeBatchProof, String> {
+    let inputs = sponge_batch_inputs(streams)?;
+    for p in streams {
+        let expected = matrix_shake_witness(&p.message, p.output.len())?;
+        if expected.output != p.output
+            || expected
+                .permutations
+                .iter()
+                .zip(&p.permutations)
+                .any(|(a, b)| a.input != b.input || a.rounds != b.rounds)
+        {
+            return Err("invalid sponge batch witness".into());
+        }
+    }
+    let prover = SpongeProver {
+        inputs: inputs.clone(),
+        options: default_proof_options(),
+    };
+    let proof = prover
+        .prove(trace(&inputs))
+        .map_err(|e| format!("sponge batch proof: {e:?}"))?;
+    Ok(SpongeBatchProof {
+        version: 1,
+        proof_bytes: proof.to_bytes(),
+    })
+}
+pub(crate) fn verify_sponge_batch(
+    p: &SpongeBatchProof,
+    streams: &[ShakeProof],
+) -> Result<(), String> {
+    let inputs = sponge_batch_inputs(streams)?;
+    if p.version != 1 || p.proof_bytes.is_empty() || p.proof_bytes.len() > MAX_PROOF_BYTES {
+        return Err("invalid sponge batch version or proof size".into());
+    }
+    let proof =
+        Proof::from_bytes(&p.proof_bytes).map_err(|e| format!("sponge batch decode: {e:?}"))?;
+    if proof.trace_info() != &TraceInfo::new(TRACE_WIDTH, inputs.trace_length()) {
+        return Err("unexpected sponge batch trace layout".into());
+    }
+    verify::<SpongeAir, Hasher, Coin, Commitment>(
+        proof,
+        inputs,
+        &AcceptableOptions::OptionSet(vec![default_proof_options()]),
+    )
+    .map_err(|e| format!("sponge batch verification: {e:?}"))
+}
+
 #[derive(Clone)]
 struct Endpoints {
     input: [u64; 25],
@@ -188,22 +333,77 @@ fn public_rows(inputs: &Inputs) -> Vec<Vec<BaseElement>> {
     }
     rows
 }
+// A separate transcript binds every ordered child statement. Legacy inputs
+// retain their exact original public vector, padding and trace layout.
+#[derive(Clone)]
+struct BatchInputs {
+    streams: Vec<Inputs>,
+    aggregate: bool,
+}
+impl BatchInputs {
+    fn single(input: Inputs) -> Self {
+        Self {
+            streams: vec![input],
+            aggregate: false,
+        }
+    }
+    fn slots(&self) -> usize {
+        if self.aggregate {
+            self.streams
+                .iter()
+                .map(|p| p.steps.len() * 200)
+                .sum::<usize>()
+                .next_power_of_two()
+        } else {
+            self.streams[0].slots()
+        }
+    }
+    fn trace_length(&self) -> usize {
+        self.slots() * 2
+    }
+}
+impl ToElements<BaseElement> for BatchInputs {
+    fn to_elements(&self) -> Vec<BaseElement> {
+        if !self.aggregate {
+            return self.streams[0].to_elements();
+        }
+        let mut values = vec![
+            BaseElement::new(u64::from_le_bytes(*b"SHKSPB01") as u128),
+            BaseElement::new(self.streams.len() as u128),
+        ];
+        for input in &self.streams {
+            values.extend(input.to_elements());
+        }
+        values
+    }
+}
+fn batch_rows(inputs: &BatchInputs) -> Vec<Vec<BaseElement>> {
+    if !inputs.aggregate {
+        return public_rows(&inputs.streams[0]);
+    }
+    let mut rows = Vec::with_capacity(inputs.slots());
+    for p in &inputs.streams {
+        rows.extend(public_rows(p).into_iter().take(p.steps.len() * 200));
+    }
+    rows.resize(inputs.slots(), vec![BaseElement::ZERO; TRACE_WIDTH]);
+    rows
+}
 struct SpongeAir {
     context: AirContext<BaseElement>,
-    inputs: Inputs,
+    inputs: BatchInputs,
 }
 fn xor<E: FieldElement>(a: E, b: E) -> E {
     a + b - (a * b + a * b)
 }
 impl Air for SpongeAir {
     type BaseField = BaseElement;
-    type PublicInputs = Inputs;
-    fn new(info: TraceInfo, inputs: Inputs, options: ProofOptions) -> Self {
+    type PublicInputs = BatchInputs;
+    fn new(info: TraceInfo, inputs: BatchInputs, options: ProofOptions) -> Self {
         assert_eq!(info, TraceInfo::new(TRACE_WIDTH, inputs.trace_length()));
         let degrees = (0..CONSTRAINTS)
             .map(|i| {
                 TransitionConstraintDegree::new(
-                    if (i < 8 && inputs.kind.suffix() & (1 << i) != 0) || i == 7 {
+                    if (i < 8 && inputs.streams[0].kind.suffix() & (1 << i) != 0) || i == 7 {
                         3
                     } else {
                         2
@@ -225,7 +425,7 @@ impl Air for SpongeAir {
         let r = frame.current();
         for bit in 0..8 {
             let mut block = r[MESSAGE + bit];
-            if self.inputs.kind.suffix() & (1 << bit) != 0 {
+            if self.inputs.streams[0].kind.suffix() & (1 << bit) != 0 {
                 block = xor(block, r[DOMAIN]);
             }
             if bit == 7 {
@@ -236,7 +436,7 @@ impl Air for SpongeAir {
         }
     }
     fn get_assertions(&self) -> Vec<Assertion<BaseElement>> {
-        let rows = public_rows(&self.inputs);
+        let rows = batch_rows(&self.inputs);
         (0..TRACE_WIDTH)
             .map(|col| Assertion::sequence(col, 0, 2, rows.iter().map(|r| r[col]).collect()))
             .collect()
@@ -245,9 +445,9 @@ impl Air for SpongeAir {
         &self.context
     }
 }
-fn trace(inputs: &Inputs) -> TraceTable<BaseElement> {
+fn trace(inputs: &BatchInputs) -> TraceTable<BaseElement> {
     let mut trace = TraceTable::new(TRACE_WIDTH, inputs.trace_length());
-    for (slot, row) in public_rows(inputs).into_iter().enumerate() {
+    for (slot, row) in batch_rows(inputs).into_iter().enumerate() {
         trace.update_row(slot * 2, &row);
         trace.update_row(slot * 2 + 1, &row);
     }
@@ -271,7 +471,7 @@ type Commitment = MerkleTree<Hasher>;
 type Coin = DefaultRandomCoin<Hasher>;
 
 struct SpongeProver {
-    inputs: Inputs,
+    inputs: BatchInputs,
     options: ProofOptions,
 }
 
@@ -289,7 +489,7 @@ impl Prover for SpongeProver {
     type ConstraintEvaluator<'a, E: FieldElement<BaseField = BaseElement>> =
         DefaultConstraintEvaluator<'a, SpongeAir, E>;
 
-    fn get_pub_inputs(&self, _trace: &Self::Trace) -> Inputs {
+    fn get_pub_inputs(&self, _trace: &Self::Trace) -> BatchInputs {
         self.inputs.clone()
     }
 
@@ -401,11 +601,11 @@ fn prove_shake_inner(
         steps,
     };
     let prover = SpongeProver {
-        inputs: inputs.clone(),
+        inputs: BatchInputs::single(inputs.clone()),
         options: default_proof_options(),
     };
     let inner = prover
-        .prove(trace(&inputs))
+        .prove(trace(&BatchInputs::single(inputs.clone())))
         .map_err(|e| format!("SHAKE sponge proof: {e:?}"))?;
     let permutation_batches = if aggregate {
         permutations
@@ -485,7 +685,7 @@ pub fn verify_shake(
     }
     verify::<SpongeAir, Hasher, Coin, Commitment>(
         inner,
-        inputs.clone(),
+        BatchInputs::single(inputs.clone()),
         &AcceptableOptions::OptionSet(vec![default_proof_options()]),
     )
     .map_err(|e| format!("SHAKE sponge verification: {e:?}"))?;
@@ -588,6 +788,36 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+    #[test]
+    fn singleton_bridge_batch_rejects_standalone_domain_with_identical_inputs() {
+        let stream = matrix_shake_witness(&[0x51; 34], 840).unwrap();
+        let batch = sponge_batch_inputs(std::slice::from_ref(&stream)).unwrap();
+        let single = BatchInputs::single(batch.streams[0].clone());
+        assert_eq!(single.trace_length(), batch.trace_length());
+        let proof = SpongeProver {
+            inputs: single.clone(),
+            options: default_proof_options(),
+        }
+        .prove(trace(&single))
+        .unwrap();
+        assert!(verify_sponge_batch(
+            &SpongeBatchProof {
+                version: 1,
+                proof_bytes: proof.to_bytes()
+            },
+            std::slice::from_ref(&stream)
+        )
+        .is_err());
+        let proof = prove_sponge_batch(std::slice::from_ref(&stream)).unwrap();
+        verify_sponge_batch(&proof, std::slice::from_ref(&stream)).unwrap();
+        let inner = Proof::from_bytes(&proof.proof_bytes).unwrap();
+        assert!(verify::<SpongeAir, Hasher, Coin, Commitment>(
+            inner,
+            single,
+            &AcceptableOptions::OptionSet(vec![default_proof_options()])
+        )
+        .is_err());
     }
     #[test]
     fn aggregate_sponge_crosses_chunk_boundary_and_rejects_mixed_transcripts() {
@@ -751,7 +981,7 @@ mod tests {
         let rows = public_rows(&inputs);
         let air = SpongeAir::new(
             TraceInfo::new(TRACE_WIDTH, inputs.trace_length()),
-            inputs,
+            BatchInputs::single(inputs),
             default_proof_options(),
         );
         assert!(rows

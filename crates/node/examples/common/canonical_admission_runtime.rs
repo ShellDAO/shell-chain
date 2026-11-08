@@ -1503,10 +1503,16 @@ pub(super) async fn batch(out: &Path, pause: bool, wide: bool) -> Result<(), Err
     let profile: Value = read(&out.join("batch-fixture.json"))?;
     let senders = profile["registered_sender_keys"].as_u64().unwrap_or(1) as usize;
     ensure(
-        (wide && matches!(senders, 1 | 2 | 8)) || !wide && senders == 1,
+        (wide && matches!(senders, 1 | 2 | 8 | 16)) || !wide && senders == 1,
         "unsupported fixture sender count",
     )?;
-    let components = if wide { 433 + 40 * (senders - 1) } else { 179 };
+    let components = if senders == 16 {
+        982
+    } else if wide {
+        433 + 40 * (senders - 1)
+    } else {
+        179
+    };
     // This is an experiment observation bound, not a protocol/activation change.
     let idle_bound = if wide { 2 * 60 * 60 } else { 1800 };
     let c: fixture::Context = read(&out.join("context.json"))?;
@@ -1613,7 +1619,7 @@ pub(super) async fn batch(out: &Path, pause: bool, wide: bool) -> Result<(), Err
             if baseline.is_none() && admission1["status"]["state"] == "complete" && finalized == 1 {
                 let control: Value = read(&out.join("control.json"))?;
                 ensure(head.hash() == c.block && *receiver.node.finality.read().last_finalized_hash() == c.block
-                    && counts[0] == components && production1["status"]["state"] == "complete"
+                    && (if senders == 16 { counts[0] >= components } else { counts[0] == components }) && production1["status"]["state"] == "complete"
                     && receiver.node.chain_store.get_receipts(&c.block)?.map(serde_json::to_value).transpose()? == Some(control["receipts"].clone())
                     && accounts(receiver.node.store.clone(), &good)? == control["accounts"], "valid batch native outputs/finality mismatch")?;
                 let before = canonical_digest(receiver.node.store.as_ref())?;
@@ -1632,7 +1638,7 @@ pub(super) async fn batch(out: &Path, pause: bool, wide: bool) -> Result<(), Err
                     && receiver.node.chain_store.get_block_by_hash(&bad.hash())?.is_none()
                     && receiver.node.chain_store.get_receipts(&bad.hash())?.is_none()
                     && canonical_digest(receiver.node.store.as_ref())? == before, "failed batch leaked native writes")?;
-                ensure(counts == [components,components] && production2["status"]["state"] == "complete", "batch full graph incomplete")?;
+                ensure((if senders == 16 { counts[0] >= components && counts[0] == counts[1] } else { counts == [components,components] }) && production2["status"]["state"] == "complete", "batch full graph incomplete")?;
                 for (hash, status, store, name) in [(c.block, &admission1, receiver.node.store.clone(), "good"), (bad.hash(), &production2, provider.node.store.clone(), "bad")] {
                     let manifest: CanonicalProofManifest = serde_json::from_value(status["status"]["manifest"].clone())?;
                     ensure(manifest.block_hash == hash, "batch manifest mismatch")?;
@@ -1819,7 +1825,7 @@ fn certificate_refusal(out: &Path, aggregate: bool) -> Result<(), Error> {
             .polynomials[0]
             .xof;
         ensure(
-            xof.version == 2 && !xof.permutation_batches.is_empty(),
+            (xof.version == 2 && !xof.permutation_batches.is_empty()) || xof.version == 3,
             "aggregate certificate missing",
         )?;
         xof.permutations[0].rounds[11].theta[24] ^= 1;

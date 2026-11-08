@@ -7,6 +7,9 @@ use crate::{
         CanonicalSignatureBatchProof, CanonicalTransactionProof, MAX_CANONICAL_SIGNATURE_BATCH,
     },
     header_hash::{prove_header_hash, verify_header_hash},
+    keccak_permutation::{
+        prove_keccak_batch, verify_keccak_batch, KeccakBatchProof, MAX_KECCAK_BATCH,
+    },
     mldsa_challenge::{prove_challenge, verify_challenge, ChallengeProof},
     mldsa_decode::{prove_signature_decode, verify_signature_decode, SignatureDecodeProof},
     mldsa_equation::{prove_equation, verify_equation, EquationInputs, EquationProof},
@@ -14,8 +17,10 @@ use crate::{
     mldsa_inverse::{prove_inverse_ntt, verify_inverse_ntt, InverseNttProof},
     mldsa_key::{prove_public_key_decode, verify_public_key_decode, PublicKeyDecodeProof},
     mldsa_matrix::{
-        prove_matrix_polynomial, prove_matrix_polynomial_batched, verify_matrix_polynomial,
-        MatrixPolynomialProof, MatrixProof,
+        matrix_witness, prove_matrix_polynomial, prove_matrix_polynomial_batched,
+        prove_matrix_sampler_batch, verify_matrix_polynomial, verify_matrix_sampler_batch,
+        MatrixBatches, MatrixPolynomialProof, MatrixProof, MatrixSamplerBatchProof,
+        MAX_MATRIX_BATCH, MAX_MATRIX_PERMUTATION_BATCHES,
     },
     mldsa_ntt::{prove_ntt, verify_ntt, NttProof, NTT_MODULUS},
     mldsa_source::TransactionSignatureProof,
@@ -26,7 +31,10 @@ use crate::{
     production_store::{bounded_json, ProductionError, ProductionStore},
     proposer_seal::ProposerSealProof,
     registered_signature::{verify_registered_signature_entry, RegisteredSignatureProof},
-    shake_sponge::{prove_shake, verify_shake, ShakeKind, ShakeProof},
+    shake_sponge::{
+        prove_shake, prove_sponge_batch, verify_shake, verify_sponge_batch, ShakeKind, ShakeProof,
+        SpongeBatchProof, MAX_SPONGE_BATCH,
+    },
     SigBatchEntry,
 };
 use alloy_rlp::Encodable;
@@ -36,6 +44,23 @@ use shell_crypto::{MlDsaVerifier, SignatureType, Verifier};
 use shell_primitives::{blake3_hash, keccak256, ShellHash};
 use shell_storage::{ChainConfig, ChainStore, KvStore, MemoryDb, MerkleTrie};
 use std::sync::Arc;
+
+fn matrix_part(suffix: &str) -> bool {
+    let Some((kind, index)) = suffix
+        .strip_prefix("matrix-")
+        .and_then(|v| v.split_once('-'))
+    else {
+        return false;
+    };
+    let max = match kind {
+        "sampler" | "sponge" => 4,
+        "keccak" => MAX_MATRIX_PERMUTATION_BATCHES,
+        _ => return false,
+    };
+    index
+        .parse::<usize>()
+        .is_ok_and(|i| i < max && i.to_string() == index)
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -446,6 +471,7 @@ impl CanonicalProductionSource {
             )
         };
         let stable = matches!(suffix, "key" | "tr")
+            || matrix_part(suffix)
             || suffix
                 .strip_prefix("t1-")
                 .is_some_and(|row| row.parse::<usize>().is_ok_and(|r| r < 6))
@@ -527,6 +553,16 @@ impl CanonicalProductionSource {
             }
             if position < self.input.senders.len() {
                 suffixes.extend(["key-hash".into(), "tagged-key".into(), "account".into()]);
+            }
+            for kind in ["sampler", "sponge", "keccak"] {
+                let max = if kind == "keccak" {
+                    MAX_MATRIX_PERMUTATION_BATCHES
+                } else {
+                    4
+                };
+                for i in 0..max {
+                    suffixes.push(format!("matrix-{kind}-{i}"));
+                }
             }
             for suffix in suffixes {
                 let name = format!("{prefix}-{suffix}");
@@ -696,6 +732,76 @@ fn shake<S: KvStore>(
         },
     )
 }
+fn produce_matrix<S: KvStore>(
+    job: &mut ProductionStore<'_, S>,
+    prefix: &str,
+    rho: &[u8],
+) -> Result<MatrixProof, ProductionError> {
+    if !job.shared_matrix_encoding() {
+        let mut polynomials = Vec::new();
+        let aggregate = job.compact_encoding();
+        for row in 0..6 {
+            for col in 0..5 {
+                let p: MatrixPolynomialProof = job.checkpoint(
+                    &format!("{prefix}-matrix-{row}-{col}"),
+                    || {
+                        if aggregate {
+                            prove_matrix_polynomial_batched(rho, row, col)
+                        } else {
+                            prove_matrix_polynomial(rho, row, col)
+                        }
+                    },
+                    |p| verify_matrix_polynomial(p, rho, row, col, &p.coefficients),
+                )?;
+                polynomials.push(p);
+            }
+        }
+        return Ok(MatrixProof {
+            version: 1,
+            rho: rho.to_vec(),
+            polynomials,
+            batches: None,
+        });
+    }
+    let mut matrix = matrix_witness(rho)?;
+    let mut batches = MatrixBatches {
+        samplers: Vec::new(),
+        sponges: Vec::new(),
+        permutations: Vec::new(),
+    };
+    for (i, group) in matrix.polynomials.chunks(MAX_MATRIX_BATCH).enumerate() {
+        let proof: MatrixSamplerBatchProof = job.checkpoint(
+            &format!("{prefix}-matrix-sampler-{i}"),
+            || prove_matrix_sampler_batch(group),
+            |p| verify_matrix_sampler_batch(p, group),
+        )?;
+        batches.samplers.push(proof);
+    }
+    let streams: Vec<_> = matrix.polynomials.iter().map(|p| p.xof.clone()).collect();
+    for (i, group) in streams.chunks(MAX_SPONGE_BATCH).enumerate() {
+        let proof: SpongeBatchProof = job.checkpoint(
+            &format!("{prefix}-matrix-sponge-{i}"),
+            || prove_sponge_batch(group),
+            |p| verify_sponge_batch(p, group),
+        )?;
+        batches.sponges.push(proof);
+    }
+    let permutations: Vec<_> = streams
+        .iter()
+        .flat_map(|p| p.permutations.iter().cloned())
+        .collect();
+    for (i, group) in permutations.chunks(MAX_KECCAK_BATCH).enumerate() {
+        let proof: KeccakBatchProof = job.checkpoint(
+            &format!("{prefix}-matrix-keccak-{i}"),
+            || prove_keccak_batch(group),
+            |p| verify_keccak_batch(p, group),
+        )?;
+        batches.permutations.push(proof);
+    }
+    matrix.batches = Some(batches);
+    Ok(matrix)
+}
+
 fn prove_mldsa<S: KvStore>(
     job: &mut ProductionStore<'_, S>,
     prefix: &str,
@@ -713,24 +819,7 @@ fn prove_mldsa<S: KvStore>(
         || prove_signature_decode(sig),
         |p| verify_signature_decode(p, sig),
     )?;
-    let mut polynomials = Vec::new();
-    let aggregate = job.compact_encoding();
-    for row in 0..6 {
-        for col in 0..5 {
-            let p: MatrixPolynomialProof = job.checkpoint(
-                &format!("{prefix}-matrix-{row}-{col}"),
-                || {
-                    if aggregate {
-                        prove_matrix_polynomial_batched(&key.decoded.rho, row, col)
-                    } else {
-                        prove_matrix_polynomial(&key.decoded.rho, row, col)
-                    }
-                },
-                |p| verify_matrix_polynomial(p, &key.decoded.rho, row, col, &p.coefficients),
-            )?;
-            polynomials.push(p);
-        }
-    }
+    let matrix = produce_matrix(job, prefix, &key.decoded.rho)?;
     let challenge: ChallengeProof = job.checkpoint(
         &format!("{prefix}-challenge"),
         || prove_challenge(&signature.decoded.challenge),
@@ -775,7 +864,11 @@ fn prove_mldsa<S: KvStore>(
     )?;
     let c_ntt = ntt(job, &format!("{prefix}-c-ntt"), &c_input)?;
     let inputs = EquationInputs {
-        matrix_ntt: polynomials.iter().map(|p| p.coefficients.clone()).collect(),
+        matrix_ntt: matrix
+            .polynomials
+            .iter()
+            .map(|p| p.coefficients.clone())
+            .collect(),
         z_ntt: z_ntt
             .iter()
             .map(|p| last(p).map(|v| v.to_vec()))
@@ -810,11 +903,7 @@ fn prove_mldsa<S: KvStore>(
     let equation = EquationPipeline {
         key,
         signature,
-        matrix: MatrixProof {
-            version: 1,
-            rho: pk[..32].to_vec(),
-            polynomials,
-        },
+        matrix,
         challenge,
         z_ntt,
         t1_ntt,
@@ -971,7 +1060,18 @@ mod recovery_tests {
         next.input.block.header.number += 1;
         next.input.block.transactions[0].tx.nonce += 1;
         for prefix in ["sender-0", "proposer"] {
-            for suffix in ["key", "matrix-0-0", "matrix-5-4", "t1-0", "t1-5", "tr"] {
+            for suffix in [
+                "key",
+                "matrix-0-0",
+                "matrix-5-4",
+                "t1-0",
+                "t1-5",
+                "tr",
+                "matrix-sampler-0",
+                "matrix-sampler-3",
+                "matrix-sponge-3",
+                "matrix-keccak-93",
+            ] {
                 assert!(next.can_reuse_component_from(&donor, &format!("{prefix}-{suffix}")));
             }
             for suffix in [
@@ -990,6 +1090,10 @@ mod recovery_tests {
                 "header",
                 "matrix-6-0",
                 "matrix-0-5",
+                "matrix-sampler-4",
+                "matrix-sponge-4",
+                "matrix-keccak-94",
+                "matrix-keccak-01",
                 "t1-6",
             ] {
                 assert!(

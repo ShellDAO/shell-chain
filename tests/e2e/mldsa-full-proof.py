@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 mode, raw_fixture, raw_output = sys.argv[1:]
-assert mode in ("run", "verify", "consecutive", "batch", "wide", "mixed", "eight-keys")
+assert mode in ("run", "verify", "consecutive", "batch", "wide", "mixed", "eight-keys", "sixteen-keys")
 fixture, out = map(lambda p: Path(p).resolve(), (raw_fixture, raw_output))
 
 def now():
@@ -72,11 +72,11 @@ if mode == "verify" and (out / "network-batch/complete.json").exists():
     historical = (out / "network-batch/history-verified.json").exists()
     run("batch-cold-verify", [fixture, "batch-history-verify" if historical else "batch-verify", out])
     sys.exit(0)
-if mode in ("batch", "wide", "mixed", "eight-keys"):
-    wide = mode in ("wide", "mixed", "eight-keys")
+if mode in ("batch", "wide", "mixed", "eight-keys", "sixteen-keys"):
+    wide = mode in ("wide", "mixed", "eight-keys", "sixteen-keys")
     label = mode
-    registered = 8 if mode == "eight-keys" else 2 if mode == "mixed" else 1
-    unique_components = 433 + 40 * (registered - 1) if wide else 179
+    registered = 16 if mode == "sixteen-keys" else 8 if mode == "eight-keys" else 2 if mode == "mixed" else 1
+    unique_components = 982 if registered == 16 else 433 + 40 * (registered - 1) if wide else 179
     count = 16 if wide else 2
     shared_inputs = 40 * (count - registered) if wide else 40
     funding = 2_000_000 if wide else 1_000_000
@@ -113,28 +113,37 @@ if mode in ("batch", "wide", "mixed", "eight-keys"):
             assert indexed[row["key"]] == row, "retained batch certificate/source changed"
     logs = "\n".join(path.read_text() for label in ((label + "-pause"), (label + "-resume")) for path in (out / "commands").glob(label + "*.log"))
     generated = re.findall(r"^Proving (.+)$", logs, re.M)
-    stable = re.compile(r"^(sender-[0-9]+|proposer)-(key|key-hash|tagged-key|tr|matrix-[0-5]-[0-4]|t1-[0-5])$")
+    stable = re.compile(r"^(sender-[0-9]+|proposer)-(key|key-hash|tagged-key|tr|matrix-(?:[0-5]-[0-4]|(?:sampler|sponge|keccak)-[0-9]+)|t1-[0-5])$")
     shared = [name for name in generated if stable.fullmatch(name)]
     fresh_senders = {name.removesuffix("-key") for name in shared if re.fullmatch(r"sender-[0-9]+-key", name)}
-    assert len(shared) == len(set(shared)) == 77 + 39 * (registered - 1) and len(fresh_senders) == registered, "identical batch key inputs regenerated"
-    assert sum("-matrix-" in name for name in shared) == 30 * (registered + 1), "fresh sender/proposer matrix profile mismatch"
+    matrix_parts = sum("-matrix-" in name for name in shared)
+    expected_shared = 152 + matrix_parts if registered == 16 else 77 + 39 * (registered - 1)
+    assert len(shared) == len(set(shared)) == expected_shared and len(fresh_senders) == registered, "identical batch key inputs regenerated"
+    if registered == 16:
+        assert matrix_parts >= 27 * 17, "shared full-matrix parts missing"
+        assert not any(re.search(r"-matrix-[0-5]-[0-4]$", name) for name in shared), "shared matrix used standalone certificates"
+    else:
+        assert matrix_parts == 30 * (registered + 1), "fresh sender/proposer matrix profile mismatch"
     completed = json.loads((network / "complete.json").read_text())
-    assert completed["production1"]["reused"] >= shared_inputs and completed["production2"]["reused"] >= shared_inputs + 77 + 39 * (registered - 1), "cross-position inputs not reverified"
+    assert completed["production1"]["reused"] >= shared_inputs and completed["production2"]["reused"] >= shared_inputs + expected_shared, "cross-position inputs not reverified"
+    if registered == 16:
+        unique_components = completed["production1"]["components"]
+        assert unique_components >= 982 and completed["production2"]["components"] == unique_components
     if not (network / "verified.json").exists():
         run((label + "-verify"), [fixture, (label + "-verify"), out])
     if not (network / "history-verified.json").exists():
         run((label + "-history"), [fixture, (label + "-history"), out])
     if registered > 1 and not (network / "cross-key-refused.json").exists():
         run("mixed-key-swap", [fixture, "mixed-key-swap", out])
-    if mode == "eight-keys" and not (network / "aggregate-refused.json").exists():
+    if mode in ("eight-keys", "sixteen-keys") and not (network / "aggregate-refused.json").exists():
         run("matrix-aggregate-refusal", [fixture, "matrix-aggregate-refusal", out])
     run((label + "-history-cold"), [fixture, (label + "-history-verify"), out])
     run((label + "-history-cold-again"), [fixture, (label + "-history-verify"), out])
     result = {"two_ordered_transactions_proof_admitted": True,
               "signed_wrong_root_child_executed_and_atomically_refused": True,
               "bad_source_is_byzantine_storage_only": True,
-              "components_per_full_graph": 1033 if wide else 179, "unique_checkpoint_components": unique_components, "transactions_per_block": count, "registered_sender_keys": registered,
-              "unique_fresh_matrix_certificates": 30 * (registered + 1),
+              "components_per_full_graph": unique_components if registered == 16 else 1033 if wide else 179, "unique_checkpoint_components": unique_components, "transactions_per_block": count, "registered_sender_keys": registered,
+              "unique_fresh_matrix_certificates": matrix_parts if registered == 16 else 30 * (registered + 1),
               "physical_checkpoint_bytes": after["physical_checkpoint_bytes"],
               "reused1": completed["production1"]["reused"], "reused2": completed["production2"]["reused"],
               "native_control_and_cold_historic_replay_match": True, "finished_at": now()}
@@ -142,7 +151,7 @@ if mode in ("batch", "wide", "mixed", "eight-keys"):
         refusal = json.loads((network / "cross-key-refused.json").read_text())
         assert refusal["all_kv_unchanged"] and refusal["original_proof_unchanged"] and refusal["new_proofs_generated"] == 0
         result["valid_other_registered_key_certificate_refused"] = True
-    if mode == "eight-keys":
+    if mode in ("eight-keys", "sixteen-keys"):
         refusal = json.loads((network / "aggregate-refused.json").read_text())
         assert refusal["changed_intermediate_lane_with_genuine_aggregate"] and refusal["all_kv_unchanged"] and refusal["original_proof_unchanged"] and refusal["new_proofs_generated"] == 0
         result["altered_aggregate_with_correct_outer_hash_refused"] = True
@@ -182,7 +191,7 @@ if mode == "consecutive":
     logs = "\n".join(path.read_text() for label in ("consecutive-pause", "consecutive-resume") for path in (out / "commands").glob(label + "*.log"))
     generated = re.findall(r"^Proving (.+)$", logs, re.M)
     borrowed = re.findall(r"^Borrowed and reverified (.+)$", logs, re.M)
-    common = re.compile(r"^(sender-0|proposer)-(key|key-hash|tagged-key|tr|matrix-[0-5]-[0-4]|t1-[0-5])$")
+    common = re.compile(r"^(sender-0|proposer)-(key|key-hash|tagged-key|tr|matrix-(?:[0-5]-[0-4]|(?:sampler|sponge|keccak)-[0-9]+)|t1-[0-5])$")
     assert len(generated) == len(set(generated)) == 41 and not any(common.fullmatch(name) for name in generated), "common math was regenerated"
     assert len(borrowed) == len(set(borrowed)) == 77 and all(common.fullmatch(name) for name in borrowed), "common certificates not reverified"
     run("consecutive-verify", [fixture, "consecutive-verify", out])
