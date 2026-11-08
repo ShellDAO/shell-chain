@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 mode, raw_fixture, raw_output = sys.argv[1:]
-assert mode in ("run", "verify", "consecutive", "batch")
+assert mode in ("run", "verify", "consecutive", "batch", "wide")
 fixture, out = map(lambda p: Path(p).resolve(), (raw_fixture, raw_output))
 
 def now():
@@ -64,62 +64,72 @@ def snapshot(label):
 def history_verify():
     run("full-history-verify", [fixture, "full-history-verify", out])
 
+if mode == "verify" and (out / "network-wide/complete.json").exists():
+    historical = (out / "network-wide/history-verified.json").exists()
+    run("wide-cold-verify", [fixture, "wide-history-verify" if historical else "wide-verify", out])
+    sys.exit(0)
 if mode == "verify" and (out / "network-batch/complete.json").exists():
     historical = (out / "network-batch/history-verified.json").exists()
     run("batch-cold-verify", [fixture, "batch-history-verify" if historical else "batch-verify", out])
     sys.exit(0)
-if mode == "batch":
+if mode in ("batch", "wide"):
+    wide = mode == "wide"
+    label = "wide" if wide else "batch"
+    count = 16 if wide else 2
+    funding = 2_000_000 if wide else 1_000_000
     out.mkdir(exist_ok=True)
     if not (out / "control.json").exists():
-        run("prepare-batch", [fixture, "prepare-batch", out])
+        run("prepare-" + label, [fixture, "prepare-" + label, out])
     assert (out / "batch-fixture.json").exists(), "partial batch preparation retained; inspect receipts"
-    for name, count in (("control.json", 2), ("later-control.json", 4)):
+    for name, nonce in (("control.json", count), ("later-control.json", 2 * count)):
         control = json.loads((out / name).read_text())
         sender, recipient, proposer = control["accounts"]
-        assert sender["nonce"] == count and int(sender["balance"], 16) == 1_000_000 - count * 42_001
-        assert int(recipient["balance"], 16) == count and int(proposer["balance"], 16) == count * 42_000
+        assert sender["nonce"] == nonce and int(sender["balance"], 16) == funding - nonce * 42_001
+        assert int(recipient["balance"], 16) == nonce and int(proposer["balance"], 16) == nonce * 42_000
         receipts = control["receipts"]
-        assert len(receipts) == 3 and all(receipt["status"] == 1 for receipt in receipts)
-        assert [receipt["gas_used"] for receipt in receipts] == [21_000, 21_000, 0]
-        assert [receipt["cumulative_gas_used"] for receipt in receipts] == [21_000, 42_000, 42_000]
-    network = out / "network-batch"
+        assert len(receipts) == count + 1 and all(receipt["status"] == 1 for receipt in receipts)
+        assert [receipt["gas_used"] for receipt in receipts] == [21_000] * count + [0]
+        assert [receipt["cumulative_gas_used"] for receipt in receipts] == [21_000 * (i + 1) for i in range(count)] + [21_000 * count]
+    network = out / ("network-" + label)
     if not (network / "paused.json").exists():
-        run("batch-pause", [fixture, "batch-pause", out])
-        save(out / "batch-paused-snapshot.json", json.loads(run("batch-paused-snapshot", [fixture, "batch-snapshot", out])))
-    assert (out / "batch-paused-snapshot.json").exists(), "unrecorded batch pause retained"
+        run((label + "-pause"), [fixture, (label + "-pause"), out])
+        save(out / (label + "-paused-snapshot.json"), json.loads(run((label + "-paused-snapshot"), [fixture, (label + "-snapshot"), out])))
+    assert (out / (label + "-paused-snapshot.json")).exists(), "unrecorded batch pause retained"
     if not (network / "complete.json").exists():
-        run("batch-resume", [fixture, "batch-resume", out])
-    after = json.loads(run("batch-complete-snapshot", [fixture, "batch-snapshot", out]))
-    paused = json.loads((out / "batch-paused-snapshot.json").read_text())
+        run((label + "-resume"), [fixture, (label + "-resume"), out])
+    after = json.loads(run((label + "-complete-snapshot"), [fixture, (label + "-snapshot"), out]))
+    paused = json.loads((out / (label + "-paused-snapshot.json")).read_text())
     assert paused["native_digest"] == after["native_digest"], "batch proving changed Byzantine provider native data"
     indexed = {row["key"]: row for row in after["rows"]}
     for row in paused["rows"]:
         key = bytes.fromhex(row["key"])
         if b"production/component/" in key or b"production/source" in key or b"/source/" in key:
             assert indexed[row["key"]] == row, "retained batch certificate/source changed"
-    logs = "\n".join(path.read_text() for label in ("batch-pause", "batch-resume") for path in (out / "commands").glob(label + "*.log"))
+    logs = "\n".join(path.read_text() for label in ((label + "-pause"), (label + "-resume")) for path in (out / "commands").glob(label + "*.log"))
     generated = re.findall(r"^Proving (.+)$", logs, re.M)
-    stable = re.compile(r"^(sender-[01]|proposer)-(key|key-hash|tagged-key|tr|matrix-[0-5]-[0-4]|t1-[0-5])$")
+    stable = re.compile(r"^(sender-[0-9]+|proposer)-(key|key-hash|tagged-key|tr|matrix-[0-5]-[0-4]|t1-[0-5])$")
     shared = [name for name in generated if stable.fullmatch(name)]
-    assert len(shared) == len(set(shared)) and not any(name.startswith("sender-1-") for name in shared), "identical batch key inputs regenerated"
+    assert len(shared) == len(set(shared)) and all(name.startswith(("sender-0-", "proposer-")) for name in shared), "identical batch key inputs regenerated"
     assert sum("-matrix-" in name for name in shared) == 60, "fresh sender/proposer matrix profile mismatch"
     completed = json.loads((network / "complete.json").read_text())
-    assert completed["production1"]["reused"] >= 40 and completed["production2"]["reused"] >= 117, "cross-position inputs not reverified"
+    assert completed["production1"]["reused"] >= (600 if wide else 40) and completed["production2"]["reused"] >= (677 if wide else 117), "cross-position inputs not reverified"
     if not (network / "verified.json").exists():
-        run("batch-verify", [fixture, "batch-verify", out])
+        run((label + "-verify"), [fixture, (label + "-verify"), out])
     if not (network / "history-verified.json").exists():
-        run("batch-history", [fixture, "batch-history", out])
-    run("batch-history-cold", [fixture, "batch-history-verify", out])
-    run("batch-history-cold-again", [fixture, "batch-history-verify", out])
+        run((label + "-history"), [fixture, (label + "-history"), out])
+    run((label + "-history-cold"), [fixture, (label + "-history-verify"), out])
+    run((label + "-history-cold-again"), [fixture, (label + "-history-verify"), out])
     result = {"two_ordered_transactions_proof_admitted": True,
               "signed_wrong_root_child_executed_and_atomically_refused": True,
               "bad_source_is_byzantine_storage_only": True,
-              "components_per_full_graph": 179,
+              "components_per_full_graph": 1033 if wide else 179, "unique_checkpoint_components": 433 if wide else 179, "transactions_per_block": count,
               "unique_fresh_matrix_certificates": 60,
               "physical_checkpoint_bytes": after["physical_checkpoint_bytes"],
               "reused1": completed["production1"]["reused"], "reused2": completed["production2"]["reused"],
               "native_control_and_cold_historic_replay_match": True, "finished_at": now()}
-    save(out / "batch-result.json", result)
+    if wide:
+        result["sixteen_ordered_transactions_proof_admitted"] = result.pop("two_ordered_transactions_proof_admitted")
+    save(out / (label + "-result.json"), result)
     print(json.dumps(result))
     sys.exit(0)
 if mode == "verify":

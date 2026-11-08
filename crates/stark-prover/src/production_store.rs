@@ -75,6 +75,23 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
         source: &[u8],
         limit: Option<NonZeroUsize>,
     ) -> Result<Self, ProductionError> {
+        Self::open_format(store, source, limit, false)
+    }
+    /// New large jobs store unique mathematical inputs in bounded compact bytes.
+    /// Existing jobs retain their original index/encoding and immutable components.
+    pub fn open_compact(
+        store: &'a mut S,
+        source: &[u8],
+        limit: Option<NonZeroUsize>,
+    ) -> Result<Self, ProductionError> {
+        Self::open_format(store, source, limit, true)
+    }
+    fn open_format(
+        store: &'a mut S,
+        source: &[u8],
+        limit: Option<NonZeroUsize>,
+        compact: bool,
+    ) -> Result<Self, ProductionError> {
         if source.is_empty() || source.len() > MAX_SOURCE_BYTES {
             return Err(failure("production source size limit"));
         }
@@ -83,7 +100,7 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
                 return Err(failure("production index size limit"));
             }
             let index: Index = serde_json::from_slice(&bytes).map_err(failure)?;
-            if index.version != 1
+            if !matches!(index.version, 1 | 2)
                 || index.source_hash != blake3_hash(source)
                 || index.source_bytes != source.len()
                 || store.get(SOURCE).map_err(failure)?.as_deref() != Some(source)
@@ -107,7 +124,7 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
                 return Err(failure("refusing unowned nonempty production store"));
             }
             let index = Index {
-                version: 1,
+                version: if compact { 2 } else { 1 },
                 source_hash: blake3_hash(source),
                 source_bytes: source.len(),
                 components: BTreeMap::new(),
@@ -206,6 +223,18 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
         if self.interrupt.is_some_and(|check| check()) {
             return Err(ProductionError::Paused);
         }
+        let shared = if self.index.version == 2 {
+            self.local_reuse.get(name).cloned()
+        } else {
+            None
+        };
+        if shared
+            .as_ref()
+            .is_some_and(|name| !self.index.components.contains_key(name))
+        {
+            return Err(failure("shared compact input checkpoint missing"));
+        }
+        let name = shared.as_deref().unwrap_or(name);
         let key = component_key(name)?;
         if self.index.components.contains_key(name) {
             let bytes = self
@@ -213,7 +242,7 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
                 .get(&key)
                 .map_err(failure)?
                 .ok_or_else(|| failure("missing production checkpoint"))?;
-            let p = serde_json::from_slice(&bytes).map_err(failure)?;
+            let p = crate::compact_canonical::decode_component(&bytes).map_err(failure)?;
             verify(&p)?;
             self.reused += 1;
             eprintln!("Reverified {name}");
@@ -242,16 +271,26 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
         let borrowed = donor.is_some();
         let remaining = MAX_CHECKPOINT_BYTES - self.progress().checkpoint_bytes;
         let p = if let Some(bytes) = donor {
-            if bytes.len() > remaining {
+            if bytes.len() > MAX_CHECKPOINT_BYTES
+                || (self.index.version == 1 && bytes.len() > remaining)
+            {
                 return Err(failure("production reused checkpoint quota exceeded"));
             }
-            serde_json::from_slice(&bytes).map_err(failure)?
+            crate::compact_canonical::decode_component(&bytes).map_err(failure)?
         } else {
             eprintln!("Proving {name}");
             prove()?
         };
         verify(&p)?;
-        let bytes = bounded_json(&p, remaining)?;
+        let bytes = if self.index.version == 2 {
+            let bytes = crate::compact_canonical::encode_component(&p).map_err(failure)?;
+            if bytes.len() > remaining {
+                return Err(failure("compact checkpoint quota exceeded"));
+            }
+            bytes
+        } else {
+            bounded_json(&p, remaining)?
+        };
         let mut next = self.index.clone();
         next.components.insert(
             name.into(),
@@ -315,6 +354,59 @@ pub fn bounded_json(value: &impl Serialize, limit: usize) -> Result<Vec<u8>, Pro
 mod tests {
     use super::*;
     use shell_storage::MemoryDb;
+    #[test]
+    fn compact_aliases_reverify_without_duplicate_logical_bytes_and_legacy_reopens() {
+        let mut db = MemoryDb::new();
+        let source = b"compact-source";
+        let mut job = ProductionStore::open_compact(&mut db, source, None).unwrap();
+        job.checkpoint(
+            "sender-0-key",
+            || Ok(serde_json::json!({"proof_bytes":vec![7;2048]})),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let before = job.progress().checkpoint_bytes;
+        job.set_local_reuse(BTreeMap::from([(
+            "sender-1-key".into(),
+            "sender-0-key".into(),
+        )]));
+        assert!(job
+            .checkpoint::<serde_json::Value>(
+                "sender-1-key",
+                || panic!("duplicate input reproved"),
+                |_| Err("recipient refuses".into())
+            )
+            .is_err());
+        let value: serde_json::Value = job
+            .checkpoint(
+                "sender-1-key",
+                || panic!("duplicate input reproved"),
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(value["proof_bytes"].as_array().unwrap().len(), 2048);
+        assert_eq!(job.progress().components, 1);
+        assert_eq!(job.progress().checkpoint_bytes, before);
+        drop(job);
+        assert!(db
+            .get(&component_key("sender-1-key").unwrap())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            ProductionStore::open(&mut db, source, None)
+                .unwrap()
+                .progress()
+                .components,
+            1
+        );
+        let mut legacy = MemoryDb::new();
+        let mut old = ProductionStore::open(&mut legacy, b"old", None).unwrap();
+        old.checkpoint("key", || Ok(7u32), |_| Ok(())).unwrap();
+        drop(old);
+        let bytes = legacy.scan_all().unwrap();
+        drop(ProductionStore::open_compact(&mut legacy, b"old", None).unwrap());
+        assert_eq!(legacy.scan_all().unwrap(), bytes);
+    }
     #[test]
     fn local_position_reuse_rechecks_and_persists_without_reproving() {
         let mut db = MemoryDb::new();

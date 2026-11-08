@@ -79,13 +79,8 @@ impl<S: KvStore + 'static> Node<S> {
             .payload(&id)
             .map_err(|e| e.to_string())?;
         let proof: shell_stark_prover::canonical_batch::CanonicalSignatureBatchProof =
-            serde_json::from_slice(&payload).map_err(|e| {
-                format!(
-                    "canonical proof payload decode at {}:{}",
-                    e.line(),
-                    e.column()
-                )
-            })?;
+            shell_stark_prover::compact_canonical::decode_payload(&payload)
+                .map_err(|e| format!("canonical proof payload decode: {e}"))?;
         let tip = self
             .chain_store
             .get_head_hash()

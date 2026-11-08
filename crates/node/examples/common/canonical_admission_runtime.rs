@@ -311,9 +311,14 @@ fn prepare_from(out: &Path, directory: &str, source_path: &Path) -> Result<(), E
     let stores = RocksDbStore::open_all(network.join("receiver/db"), None)?;
     let store = Arc::new(stores.state);
     let mut world = WorldState::new(store.clone());
+    let funding = if out.join("initial-funding.json").exists() {
+        read::<u64>(&out.join("initial-funding.json"))?
+    } else {
+        1_000_000
+    };
     world.set_account(
         &block.transactions[0].from,
-        &Account::new_user_account(blake3_hash(&key), U256::from(1_000_000)),
+        &Account::new_user_account(blake3_hash(&key), U256::from(funding)),
     )?;
     ensure(
         world.state_root()? == c.genesis_root && genesis.header.state_root == c.genesis_root,
@@ -549,6 +554,9 @@ pub(super) fn snapshot_consecutive(out: &Path) -> Result<(), Error> {
 }
 pub(super) fn snapshot_batch(out: &Path) -> Result<(), Error> {
     snapshot_production(out, "network-batch")
+}
+pub(super) fn snapshot_wide(out: &Path) -> Result<(), Error> {
+    snapshot_production(out, "network-wide")
 }
 fn snapshot_production(out: &Path, directory: &str) -> Result<(), Error> {
     let stores = RocksDbStore::open_all(out.join(directory).join("provider/db"), None)?;
@@ -1476,20 +1484,32 @@ pub(super) fn verify_sync(out: &Path) -> Result<(), Error> {
 
 /// Full ordered same-signer batch, followed by a genuinely signed wrong-root child.
 /// The bad child's source is explicitly Byzantine storage, never native execution.
-pub(super) async fn batch(out: &Path, pause: bool) -> Result<(), Error> {
-    let network = out.join("network-batch");
+pub(super) async fn batch(out: &Path, pause: bool, wide: bool) -> Result<(), Error> {
+    let directory = if wide {
+        "network-wide"
+    } else {
+        "network-batch"
+    };
+    let network = out.join(directory);
+    let count = if wide { 16 } else { 2 };
+    let components = if wide { 433 } else { 179 };
+    // This is an experiment observation bound, not a protocol/activation change.
+    let idle_bound = if wide { 2 * 60 * 60 } else { 1800 };
     let c: fixture::Context = read(&out.join("context.json"))?;
     let good: Block = read(&out.join("candidate.json"))?;
     let bad: Block = read(&out.join("batch-bad-block.json"))?;
     let control2: Block = read(&out.join("later-block.json"))?;
     ensure(
-        good.transactions.len() == 2
-            && bad.transactions.len() == 2
-            && good.transactions[0].from == good.transactions[1].from
-            && good.transactions[0].tx.nonce == 0
-            && good.transactions[1].tx.nonce == 1
-            && bad.transactions[0].tx.nonce == 2
-            && bad.transactions[1].tx.nonce == 3
+        good.transactions.len() == count
+            && bad.transactions.len() == count
+            && good
+                .transactions
+                .iter()
+                .enumerate()
+                .all(|(i, tx)| tx.from == good.transactions[0].from && tx.tx.nonce == i as u64)
+            && bad.transactions.iter().enumerate().all(|(i, tx)| {
+                tx.from == good.transactions[0].from && tx.tx.nonce == (i + count) as u64
+            })
             && bad.transactions == control2.transactions
             && bad.header.state_root != control2.header.state_root,
         "ordered batch fixture mismatch",
@@ -1499,7 +1519,7 @@ pub(super) async fn batch(out: &Path, pause: bool) -> Result<(), Error> {
             pause && out.join("batch-fixture.json").exists(),
             "batch preparation required",
         )?;
-        prepare_from(out, "network-batch", &out.join("batch-native/db"))?;
+        prepare_from(out, directory, &out.join("batch-native/db"))?;
     }
     ensure(
         !network.join("complete.json").exists(),
@@ -1539,7 +1559,7 @@ pub(super) async fn batch(out: &Path, pause: bool) -> Result<(), Error> {
     };
     let provider_node = provider.node.clone();
     let result = async {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(6 * 60 * 60);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(if wide { 12 * 60 * 60 } else { 6 * 60 * 60 });
         let mut last_progress = tokio::time::Instant::now();
         let mut prior = None;
         let mut baseline = None;
@@ -1569,7 +1589,7 @@ pub(super) async fn batch(out: &Path, pause: bool) -> Result<(), Error> {
             if baseline.is_none() && admission1["status"]["state"] == "complete" && finalized == 1 {
                 let control: Value = read(&out.join("control.json"))?;
                 ensure(head.hash() == c.block && *receiver.node.finality.read().last_finalized_hash() == c.block
-                    && counts[0] == 179 && production1["status"]["state"] == "complete"
+                    && counts[0] == components && production1["status"]["state"] == "complete"
                     && receiver.node.chain_store.get_receipts(&c.block)?.map(serde_json::to_value).transpose()? == Some(control["receipts"].clone())
                     && accounts(receiver.node.store.clone(), &good)? == control["accounts"], "valid batch native outputs/finality mismatch")?;
                 let before = canonical_digest(receiver.node.store.as_ref())?;
@@ -1582,35 +1602,36 @@ pub(super) async fn batch(out: &Path, pause: bool) -> Result<(), Error> {
             }
             if admission2["status"]["state"] == "failed" {
                 let error = admission2["status"]["error"].as_str().ok_or("missing batch refusal")?;
-                ensure(error.contains("state root mismatch") && error.contains(&format!("{:?}", control2.header.state_root)), &format!("batch failed before both native transactions executed: {error}"))?;
+                ensure(error.contains("state root mismatch") && error.contains(&format!("{:?}", control2.header.state_root)), &format!("batch failed before all ordered native transactions executed: {error}"))?;
                 let before = baseline.ok_or("bad child delivered before finalized parent")?;
                 ensure(head.hash() == c.block && finalized == 1 && admission2["nativeCanonical"] == false
                     && receiver.node.chain_store.get_block_by_hash(&bad.hash())?.is_none()
                     && receiver.node.chain_store.get_receipts(&bad.hash())?.is_none()
                     && canonical_digest(receiver.node.store.as_ref())? == before, "failed batch leaked native writes")?;
-                ensure(counts == [179,179] && production2["status"]["state"] == "complete", "batch full graph incomplete")?;
+                ensure(counts == [components,components] && production2["status"]["state"] == "complete", "batch full graph incomplete")?;
                 for (hash, status, store, name) in [(c.block, &admission1, receiver.node.store.clone(), "good"), (bad.hash(), &production2, provider.node.store.clone(), "bad")] {
                     let manifest: CanonicalProofManifest = serde_json::from_value(status["status"]["manifest"].clone())?;
                     ensure(manifest.block_hash == hash, "batch manifest mismatch")?;
                     let cache = shell_storage::CanonicalProofUploadStore::new(store);
                     if hash == c.block {
-                        ensure(cache.status(&manifest.id())?.result.as_ref().is_some_and(|r| r["proved_sender_signatures"] == 2 && r["proved_proposer_signature"] == true), "native batch did not consume both sender AIRs and proposer AIR")?;
+                        ensure(cache.status(&manifest.id())?.result.as_ref().is_some_and(|r| r["proved_sender_signatures"] == count && r["proved_proposer_signature"] == true), "native batch did not consume all sender AIRs and proposer AIR")?;
                     }
                     let bytes = cache.payload(&manifest.id())?;
-                    let proof: shell_stark_prover::canonical_batch::CanonicalSignatureBatchProof = serde_json::from_slice(&bytes)?;
-                    ensure(proof.version == 2 && proof.proposer.is_some() && proof.transactions.len() == 2, "full batch profile downgraded")?;
+                    let proof = shell_stark_prover::compact_canonical::decode_payload(&bytes)?;
+                    ensure(proof.version == 2 && proof.proposer.is_some() && proof.transactions.len() == count, "full batch profile downgraded")?;
                     use std::io::Write;
-                    let path = network.join(format!("{name}-proof.json"));
+                    let extension = if wide { "cbor" } else { "json" };
+                    let path = network.join(format!("{name}-proof.{extension}"));
                     if path.exists() { ensure(std::fs::read(&path)? == bytes, "retained batch proof changed")?; }
                     else { let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?; file.write_all(&bytes)?; file.sync_all()?; }
                     let path = network.join(format!("{name}-manifest.json"));
                     if path.exists() { ensure(read::<CanonicalProofManifest>(&path)? == manifest, "retained batch manifest changed")?; }
                     else { write(&path, &manifest)?; }
                 }
-                write(&network.join("complete.json"), &json!({"production1":production1["status"],"production2":production2["status"],"admission1":admission1,"admission2":admission2,"native_digest":before,"served_chunks":faults.chunks.load(Ordering::SeqCst),"both_native_transactions_executed_before_wrong_root_refusal":true,"failed_batch_native_unchanged":true,"bad_source_is_storage_only_byzantine_fixture":true,"finalized":finalized}))?;
+                write(&network.join("complete.json"), &json!({"production1":production1["status"],"production2":production2["status"],"admission1":admission1,"admission2":admission2,"native_digest":before,"served_chunks":faults.chunks.load(Ordering::SeqCst),"both_native_transactions_executed_before_wrong_root_refusal":count==2,"native_transactions_executed_before_wrong_root_refusal":count,"failed_batch_native_unchanged":true,"bad_source_is_storage_only_byzantine_fixture":true,"finalized":finalized}))?;
                 break;
             }
-            ensure(tokio::time::Instant::now() < deadline && last_progress.elapsed() < Duration::from_secs(1800), "batch progress bound exceeded")?;
+            ensure(tokio::time::Instant::now() < deadline && last_progress.elapsed() < Duration::from_secs(idle_bound), "batch progress bound exceeded")?;
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
         Ok::<_,Error>(())
@@ -1628,7 +1649,7 @@ pub(super) async fn batch(out: &Path, pause: bool) -> Result<(), Error> {
             production["status"]["state"] == "paused"
                 && production["status"]["components"]
                     .as_u64()
-                    .is_some_and(|n| n > 0 && n < 179),
+                    .is_some_and(|n| n > 0 && n < components as u64),
             "batch producer did not durably pause",
         )?;
         write(&network.join("paused.json"), &production)?;
@@ -1637,15 +1658,29 @@ pub(super) async fn batch(out: &Path, pause: bool) -> Result<(), Error> {
 }
 
 /// Cold replay before/after a separately labelled, ordinarily imported correct child.
-pub(super) fn verify_batch(out: &Path, history: bool, advance: bool) -> Result<(), Error> {
-    let network = out.join("network-batch");
+pub(super) fn verify_batch(
+    out: &Path,
+    history: bool,
+    advance: bool,
+    wide: bool,
+) -> Result<(), Error> {
+    let network = out.join(if wide {
+        "network-wide"
+    } else {
+        "network-batch"
+    });
+    let count = if wide { 16 } else { 2 };
     let completed: Value = read(&network.join("complete.json"))?;
     let c: fixture::Context = read(&out.join("context.json"))?;
     let block: Block = read(&out.join("candidate.json"))?;
     let bad: Block = read(&out.join("batch-bad-block.json"))?;
     let later: Block = read(&out.join("later-block.json"))?;
-    let proof: shell_stark_prover::canonical_batch::CanonicalSignatureBatchProof =
-        read(&network.join("good-proof.json"))?;
+    let proof_path = network.join(if wide {
+        "good-proof.cbor"
+    } else {
+        "good-proof.json"
+    });
+    let proof = shell_stark_prover::compact_canonical::decode_payload(&std::fs::read(proof_path)?)?;
     let stores = RocksDbStore::open_all(network.join("receiver/db"), None)?;
     let store = Arc::new(stores.state);
     let node = fixture::node(store.clone(), c.authority, &c.authority_key)?;
@@ -1690,7 +1725,7 @@ pub(super) fn verify_batch(out: &Path, history: bool, advance: bool) -> Result<(
     let replay = node.replay_canonical_transactions_with_proof(tip, c.block, &proof)?;
     let original: Value = read(&out.join("control.json"))?;
     ensure(
-        replay.proved_sender_signatures == 2
+        replay.proved_sender_signatures == count
             && replay.proved_proposer_signature
             && replay.state_root == block.header.state_root
             && serde_json::to_value(&replay.receipts)? == original["receipts"]
@@ -1711,5 +1746,99 @@ pub(super) fn verify_batch(out: &Path, history: bool, advance: bool) -> Result<(
     write(
         &path,
         &json!({"replay":replay,"current_head":tip,"current_state_root":current.header.state_root,"all_kv_unchanged":true,"ordinary_correct_successor_not_proof_admitted":history}),
+    )
+}
+
+/// Repack an existing genuine full graph and verify it at a cold native history.
+/// Input/output are explicit fixture directories; no private key or proof generation.
+pub(super) fn compact_roundtrip(source: &Path, output: &Path) -> Result<(), Error> {
+    let network = if source.join("network-batch/complete.json").exists() {
+        "network-batch"
+    } else {
+        "network-full"
+    };
+    let original = source.join(if network == "network-batch" {
+        "network-batch/good-proof.json"
+    } else {
+        "job/proof.json"
+    });
+    let original_bytes = std::fs::read(&original)?;
+    let mut proof = shell_stark_prover::compact_canonical::decode_payload(&original_bytes)?;
+    let bytes = shell_stark_prover::compact_canonical::encode_payload(
+        &proof,
+        shell_storage::MAX_CANONICAL_PROOF_BYTES as usize,
+        true,
+    )?;
+    ensure(
+        bytes.len() < original_bytes.len(),
+        "compact representation did not reduce real graph",
+    )?;
+    let c: fixture::Context = read(&source.join("context.json"))?;
+    let control: Value = read(&source.join("control.json"))?;
+    let stores = RocksDbStore::open_all(source.join(network).join("receiver/db"), None)?;
+    let store = Arc::new(stores.state);
+    let node = fixture::node(store.clone(), c.authority, &c.authority_key)?;
+    let tip = node
+        .chain_store
+        .get_head_hash()?
+        .ok_or("compact history tip missing")?;
+    let before = digest(store.as_ref())?;
+    let decoded = shell_stark_prover::compact_canonical::decode_payload(&bytes)?;
+    let replay = node.replay_canonical_transactions_with_proof(tip, c.block, &decoded)?;
+    ensure(
+        replay.proved_sender_signatures == proof.transactions.len()
+            && replay.proved_proposer_signature
+            && replay.state_root.to_string() == control["state_root"].as_str().unwrap_or_default()
+            && serde_json::to_value(&replay.receipts)? == control["receipts"]
+            && digest(store.as_ref())? == before,
+        "compact real AIR/native history output changed",
+    )?;
+    // Rebuild a valid outer frame and all content hashes around a bad AIR proof.
+    // Framing integrity cannot authorize a changed mathematical certificate.
+    proof.transactions[0]
+        .signature
+        .transaction
+        .signature
+        .equation
+        .key
+        .proof_bytes[0] ^= 1;
+    let corrupt = shell_stark_prover::compact_canonical::encode_payload(
+        &proof,
+        shell_storage::MAX_CANONICAL_PROOF_BYTES as usize,
+        true,
+    )?;
+    let corrupted = shell_stark_prover::compact_canonical::decode_payload(&corrupt)?;
+    let error = node
+        .replay_canonical_transactions_with_proof(tip, c.block, &corrupted)
+        .unwrap_err()
+        .to_string();
+    ensure(
+        error.contains("public-key") || error.contains("proof"),
+        "unexpected compact corrupt AIR refusal",
+    )?;
+    ensure(
+        digest(store.as_ref())? == before && std::fs::read(&original)? == original_bytes,
+        "compact negative/replay changed retained data",
+    )?;
+    ensure(
+        !output.exists(),
+        "compact output already exists; retain it for inspection",
+    )?;
+    std::fs::create_dir_all(output)?;
+    use std::io::Write;
+    for (name, data) in [
+        ("proof.cbor", bytes.as_slice()),
+        ("bad-air.cbor", corrupt.as_slice()),
+    ] {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output.join(name))?;
+        file.write_all(data)?;
+        file.sync_all()?;
+    }
+    write(
+        &output.join("complete.json"),
+        &json!({"replay":replay,"original_bytes":original_bytes.len(),"compact_bytes":bytes.len(),"compact_payload_hash":blake3_hash(&bytes),"bad_air_correct_outer_hash":blake3_hash(&corrupt),"bad_air_error":error,"current_head":tip,"all_kv_unchanged":true,"original_bytes_unchanged":true,"new_proofs_generated":0,"scope":"Existing full2 graph compatibility only, not Native16 acceptance"}),
     )
 }

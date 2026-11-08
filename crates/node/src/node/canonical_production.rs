@@ -5,7 +5,7 @@ use shell_crypto::SignatureType;
 use shell_primitives::blake3_hash;
 use shell_stark_prover::{
     canonical_producer::CanonicalProductionSource,
-    production_store::{bounded_json, ProductionError, ProductionStore},
+    production_store::{ProductionError, ProductionStore},
 };
 use shell_storage::{
     CanonicalProofManifest, EntryVisitor, StorageError, WriteBatch, WriteBatchOp,
@@ -356,7 +356,7 @@ impl<S: KvStore> ProductionJob<S> {
                 let entries = index["components"]
                     .as_object()
                     .ok_or_else(|| error("production donor index shape"))?;
-                if index["version"] != 1 || entries.len() > 2048 {
+                if !matches!(index["version"].as_u64(), Some(1 | 2)) || entries.len() > 2048 {
                     return Err(error("production donor index version/count"));
                 }
                 for (name, entry) in entries {
@@ -626,10 +626,14 @@ impl<S: KvStore + 'static> Node<S> {
             };
             let interrupt =
                 || cancel.load(Ordering::Acquire) || !self.prover_ready.load(Ordering::Acquire);
-            let mut job = ProductionStore::open(&mut kv, source.identity(), limit)
-                .map_err(|e| e.to_string())?
-                .with_interrupt(&interrupt)
-                .with_reuse(&reuse);
+            let mut job = if source.block().transactions.len() > 2 {
+                ProductionStore::open_compact(&mut kv, source.identity(), limit)
+            } else {
+                ProductionStore::open(&mut kv, source.identity(), limit)
+            }
+            .map_err(|e| e.to_string())?
+            .with_interrupt(&interrupt)
+            .with_reuse(&reuse);
             let result = source.produce(&mut job);
             let progress = job.progress();
             spent = progress.newly_proved;
@@ -650,8 +654,11 @@ impl<S: KvStore + 'static> Node<S> {
                 status.state = CanonicalProductionState::Paused;
                 return Err("readiness or shutdown pause".into());
             }
-            let payload = bounded_json(&proof, MAX_CANONICAL_PROOF_BYTES as usize)
-                .map_err(|e| e.to_string())?;
+            let payload = shell_stark_prover::compact_canonical::encode_payload(
+                &proof,
+                MAX_CANONICAL_PROOF_BYTES as usize,
+                source.block().transactions.len() > 2,
+            )?;
             let manifest = CanonicalProofManifest {
                 version: 1,
                 chain_id: source.chain_id(),

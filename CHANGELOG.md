@@ -15,6 +15,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add bounded compact certificate encoding and unique input checkpoints for new
+  canonical proof jobs above two transactions. Preserve legacy JSON/checkpoints,
+  full AIR verification, native policy and existing byte quotas; provide a real
+  sixteen-transaction producer/peer/refusal/history regression entry.
+
 - Reverify input-equal ML-DSA certificates across ordered batch positions using
   immutable named direct checkpoint references. Add a full two-transaction peer
   regression with real native outputs, signed wrong-root rollback and cold

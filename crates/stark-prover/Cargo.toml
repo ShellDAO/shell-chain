@@ -17,6 +17,7 @@ tracing.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ciborium = "0.2.2"
 alloy-rlp.workspace = true
 shell-storage = { path = "../storage" }
 

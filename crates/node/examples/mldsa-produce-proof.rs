@@ -48,8 +48,15 @@ fn prepare(
     automatic: bool,
     capture_on_production: bool,
     full: bool,
-    batch: bool,
+    batch_count: usize,
 ) -> Result<(), Error> {
+    let batch = batch_count > 1;
+    let count = if batch { batch_count as u64 } else { 1 };
+    let funding = if batch_count > 2 {
+        2_000_000u64
+    } else {
+        1_000_000u64
+    };
     if out.exists() {
         ensure(
             out.is_dir() && !out.symlink_metadata()?.file_type().is_symlink(),
@@ -64,6 +71,9 @@ fn prepare(
         }
     } else {
         std::fs::create_dir(out)?;
+    }
+    if batch_count > 2 {
+        write(&out.join("initial-funding.json"), &funding)?;
     }
     let sender = MlDsaSigner::generate();
     let proposer: Box<dyn Signer> = if full {
@@ -92,7 +102,7 @@ fn prepare(
         let mut world = WorldState::new(store.clone());
         world.set_account(
             &address,
-            &Account::new_user_account(blake3_hash(sender.public_key()), U256::from(1_000_000)),
+            &Account::new_user_account(blake3_hash(sender.public_key()), U256::from(funding)),
         )?;
         let genesis = Block {
             header: BlockHeader {
@@ -162,7 +172,6 @@ fn prepare(
         max_fee_per_blob_gas: None,
         blob_versioned_hashes: None,
     };
-    let count = if batch { 2u64 } else { 1 };
     for nonce in 0..count {
         let mut tx = tx.clone();
         tx.nonce = nonce;
@@ -181,7 +190,7 @@ fn prepare(
         let world = node.world_state.read();
         ensure(
             world.get_nonce(&address)? == count
-                && world.get_balance(&address)? == U256::from(1_000_000 - count * 42_001)
+                && world.get_balance(&address)? == U256::from(funding - count * 42_001)
                 && world.get_balance(&recipient)? == U256::from(count)
                 && world.get_balance(&authority)? == U256::from(count * 42_000)
                 && block.header.gas_used == count * 21_000,
@@ -374,7 +383,7 @@ fn prepare(
             bad_store.flush()?;
             write(
                 &out.join("batch-fixture.json"),
-                &json!({"good1_natively_executed":true,"control2_natively_executed":true,"bad2_storage_only_byzantine_source":true,"bad2_not_execution_evidence":true,"private_keys_persisted":false,"transactions_per_block":2}),
+                &json!({"good1_natively_executed":true,"control2_natively_executed":true,"bad2_storage_only_byzantine_source":true,"bad2_not_execution_evidence":true,"private_keys_persisted":false,"transactions_per_block":count}),
             )?;
         }
         store.flush()?;
@@ -499,24 +508,35 @@ fn corrupt_cache(out: &Path, role: &str) -> Result<(), Error> {
 }
 fn main() -> Result<(), Error> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|mode| mode == "compact-roundtrip") && args.len() == 3 {
+        return admission_runtime::compact_roundtrip(Path::new(&args[1]), Path::new(&args[2]));
+    }
     ensure(
         args.len() == 2,
         "usage: mldsa-produce-proof prepare|snapshot|follower-snapshot|verify output",
     )?;
     let out = Path::new(&args[1]);
     match args[0].as_str() {
-        "prepare" => prepare(out, false, false, false, false),
-        "prepare-full" => prepare(out, false, true, true, false),
-        "prepare-batch" => prepare(out, false, true, true, true),
+        "prepare" => prepare(out, false, false, false, 0),
+        "prepare-full" => prepare(out, false, true, true, 0),
+        "prepare-batch" => prepare(out, false, true, true, 2),
+        "prepare-wide" => prepare(out, false, true, true, 16),
+        "wide-pause" | "wide-resume" => tokio::runtime::Runtime::new()?
+            .block_on(admission_runtime::batch(out, args[0] == "wide-pause", true)),
+        "wide-snapshot" => admission_runtime::snapshot_wide(out),
+        "wide-verify" => admission_runtime::verify_batch(out, false, false, true),
+        "wide-history" => admission_runtime::verify_batch(out, true, true, true),
+        "wide-history-verify" => admission_runtime::verify_batch(out, true, false, true),
         "full-pause" | "full-resume" | "full-bad-proposer" => {
             tokio::runtime::Runtime::new()?.block_on(admission_runtime::full(out, &args[0]))
         }
-        "batch-pause" | "batch-resume" => tokio::runtime::Runtime::new()?
-            .block_on(admission_runtime::batch(out, args[0] == "batch-pause")),
+        "batch-pause" | "batch-resume" => tokio::runtime::Runtime::new()?.block_on(
+            admission_runtime::batch(out, args[0] == "batch-pause", false),
+        ),
         "batch-snapshot" => admission_runtime::snapshot_batch(out),
-        "batch-verify" => admission_runtime::verify_batch(out, false, false),
-        "batch-history" => admission_runtime::verify_batch(out, true, true),
-        "batch-history-verify" => admission_runtime::verify_batch(out, true, false),
+        "batch-verify" => admission_runtime::verify_batch(out, false, false, false),
+        "batch-history" => admission_runtime::verify_batch(out, true, true, false),
+        "batch-history-verify" => admission_runtime::verify_batch(out, true, false, false),
         "full-verify" => admission_runtime::verify_full(out),
         "full-snapshot" => admission_runtime::snapshot_full(out),
         "consecutive-pause" | "consecutive-resume" => tokio::runtime::Runtime::new()?.block_on(
@@ -529,8 +549,8 @@ fn main() -> Result<(), Error> {
         "full-history" | "full-history-verify" => {
             admission_runtime::history_full(out, args[0] == "full-history")
         }
-        "prepare-runtime" => prepare(out, true, false, false, false),
-        "prepare-production-hook" => prepare(out, false, true, false, false),
+        "prepare-runtime" => prepare(out, true, false, false, 0),
+        "prepare-production-hook" => prepare(out, false, true, false, 0),
         "runtime-pause" | "runtime-resume" => {
             tokio::runtime::Runtime::new()?.block_on(runtime::run(out, args[0] == "runtime-pause"))
         }

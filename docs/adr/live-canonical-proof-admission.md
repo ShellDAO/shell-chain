@@ -191,3 +191,54 @@ through ordinary native verification, and cold historical full-batch replay must
 match original outputs without writing any current KV data. This control is not
 claimed as a second proof-admitted target. Full 16-transaction load, arbitrary
 sender/key layouts and unbounded job retention remain unqualified.
+
+
+## Bounded compact availability for larger jobs
+
+Raw JSON repeats public-key mathematics and encodes opaque STARK bytes as decimal
+arrays. New jobs with more than two transactions use a versioned compact component
+encoding and a certificate pool in their ready payload. The already locked CBOR
+serializer is reused; this adds no new mathematical primitive or recursive proof.
+The native block, genesis, signing messages and proof statement versions do not
+change. Existing one/two-transaction jobs still emit their exact legacy JSON;
+readers accept both availability formats.
+
+Compact checkpoints have index version 2. Input-equal earlier positions use their
+existing canonical checkpoint name rather than publishing another logical copy.
+The recipient still runs the complete verifier against its own expected inputs.
+Only the source-derived equal-key/identical-account map can choose those names;
+message, signature, nonce, transaction identity and header dependencies remain
+separate. Existing jobs retain their original index, bytes and accounting when
+reopened, including old inline and direct references. No legacy large-job migration
+or data eviction is implied. Progress reports distinct stored components while
+reverification counters include every recipient verification.
+
+The compact wire prefix identifies format version 2 independently of the inner
+version 1/2 signature statement. Each pooled object contains an entire ordinary
+mathematical certificate, with named proof byte vectors packed as byte strings.
+The template points directly to immutable pool indices. Content hashes check
+integrity and deduplication only; decoding creates an unverified typed statement.
+Native callers still run complete AIR, account/key/algorithm/nonce policy,
+consensus and atomic execution. Framing or a reported verified flag cannot supply
+an opaque verification token.
+
+The decoder rejects unknown versions, duplicate/changed/unreferenced pool entries,
+missing or malformed references, chained references inside certificates,
+noncanonical encodings, duplicate map fields, trailing bytes and unsupported
+values. It bounds encoded bytes, nesting, templates, individual certificates,
+pool counts, reference counts and expanded data before native publication.
+The existing 256 MiB payload/per-job/global checkpoint limits, two-job retention
+and separate 512 MiB cache remain unchanged. Older readers require a compatible
+build for the new encoding; they must not silently use native signature fallback.
+
+`tests/e2e/mldsa-full-proof.sh wide output` is the fresh sixteen-transfer regression.
+Its independent genesis funds one temporary registered ML-DSA-65 sender with
+2,000,000 test units and uses a distinct ML-DSA-65 proposer. Signing keys exist only
+in preparation memory. The good block must produce 17 receipts, gas 336,000,
+nonce 16 and independent roots/balances, then finalize through actual peer intake.
+The genuine signed wrong-root successor must reach all sixteen VM transactions
+and refuse with unchanged native KV rows. A separately labelled correct ordinary
+successor reaches nonce 32; historical full replay must not change current data.
+The larger experiment's idle observation window is separate from protocol timing.
+Keep all data and receipts across pauses. Distinct-key/witness layouts, full load,
+other algorithms and public release/activation remain separate qualifications.

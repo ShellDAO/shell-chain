@@ -454,10 +454,9 @@ impl<S: KvStore + 'static> Node<S> {
                         .canonical_proof_uploads
                         .payload(&id)
                         .map_err(|e| e.to_string())?;
-                    let proof: CanonicalSignatureBatchProof = serde_json::from_slice(&payload)
-                        .map_err(|e| {
-                            format!("candidate proof decode {}:{}", e.line(), e.column())
-                        })?;
+                    let proof: CanonicalSignatureBatchProof =
+                        shell_stark_prover::compact_canonical::decode_payload(&payload)
+                            .map_err(|e| format!("candidate proof decode: {e}"))?;
                     if node
                         .chain_store
                         .get_block_hash_by_number(body.number())

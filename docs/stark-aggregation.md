@@ -500,3 +500,36 @@ StarkReward system transactions (`shellType: "starkReward"`) carry settlement pa
 - `crates/node/src/prover_service.rs` — `ProverService` implementation
 - `crates/storage/src/chain_store.rs` — `ProofAmendmentStore` (line ~983)
 - `crates/rpc/src/handler/shell_api.rs` — `shell_getProofAmendment` RPC
+
+
+### Compact large canonical proof jobs (Unreleased)
+
+New jobs above two transactions use bounded compact certificate bytes and share
+only source-matched identical inputs. Stored unique checkpoints and all recipient
+AIR checks are counted separately. Legacy jobs keep their original bytes; this
+adds no automatic migration or eviction. The 256 MiB payload/per-job/global
+checkpoint and 512 MiB transport bounds remain unchanged. Availability packing
+is not recursive proof compression or evidence of native execution.
+
+Producer, cached RPC verification, peer intake and offline import accept the new
+versioned encoding. The offline producer writes `proof.cbor` for compact jobs and
+reports that filename; legacy `proof.json` remains unchanged. Use compatible
+source builds at both ends. The native importer still enforces authority,
+activation, ordered nonce, gas, fees, receipts and resulting state root.
+
+Run the expensive isolated sixteen-transfer acceptance with Python 3, stable Rust
+and the repository's RocksDB prerequisites:
+
+```sh
+tests/e2e/mldsa-full-proof.sh wide full16-test
+tests/e2e/mldsa-full-proof.sh verify full16-test
+```
+
+The test creates and funds its own temporary accounts, uses one registered sender
+and a distinct proposer, preserves real shutdown checkpoints, and checks all 17
+receipts, nonce 16, gas 336,000, balances and finality against native execution.
+It also requires atomic refusal of a genuinely signed wrong-root sixteen-transfer
+successor and cold historical replay after a correct ordinary successor. Keys are
+not saved. Repeating `wide` continues retained inputs; `verify` creates no proofs.
+These are source acceptance commands, not public package, arbitrary key layout,
+throughput or network activation claims.

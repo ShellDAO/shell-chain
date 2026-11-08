@@ -41,11 +41,20 @@ pub fn produce_block_proof(
         let block_bytes = bounded_json(source.block(), 2 * 1024 * 1024)?;
         let output = prepare_output(&database, &output)?;
         let mut db = RocksDbStore::open_all(output.join("db"), None)?.state;
-        let mut job = ProductionStore::open(&mut db, source.identity(), component_limit)?;
+        let compact = source.block().transactions.len() > 2;
+        let mut job = if compact {
+            ProductionStore::open_compact(&mut db, source.identity(), component_limit)?
+        } else {
+            ProductionStore::open(&mut db, source.identity(), component_limit)?
+        };
         let produced = source.produce(&mut job);
         println!("{}", serde_json::to_string(&job.progress())?);
         let proof = produced?;
-        let bytes = bounded_json(&proof, MAX_CANONICAL_PROOF_BYTES as usize)?;
+        let bytes = shell_stark_prover::compact_canonical::encode_payload(
+            &proof,
+            MAX_CANONICAL_PROOF_BYTES as usize,
+            compact,
+        )?;
         let manifest = CanonicalProofManifest {
             version: 1,
             chain_id: source.chain_id(),
@@ -55,16 +64,18 @@ pub fn produce_block_proof(
             payload_hash: blake3_hash(&bytes),
         };
         manifest.validate()?;
-        append_artifact(&output.join("proof.json"), &bytes)?;
+        let proof_file = if compact { "proof.cbor" } else { "proof.json" };
+        append_artifact(&output.join(proof_file), &bytes)?;
         append_artifact(&output.join("block.json"), &block_bytes)?;
         append_artifact(
             &output.join("manifest.json"),
             &serde_json::to_vec(&manifest)?,
         )?;
-        println!(
-            "{}",
-            serde_json::json!({"complete":true,"manifest":manifest,"newly_proved":job.progress().newly_proved,"reused":job.progress().reused})
-        );
+        let mut result = serde_json::json!({"complete":true,"manifest":manifest,"newly_proved":job.progress().newly_proved,"reused":job.progress().reused});
+        if compact {
+            result["proof_file"] = serde_json::json!(proof_file);
+        }
+        println!("{result}");
         Ok(())
     }
     #[cfg(not(feature = "rocksdb"))]

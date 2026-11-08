@@ -49,7 +49,7 @@ pub fn import_block_proof(
         {
             return Err("proof import payload size/hash mismatch".into());
         }
-        let proof = serde_json::from_slice(&bytes)?;
+        let proof = shell_stark_prover::compact_canonical::decode_payload(&bytes)?;
         drop(bytes);
         let consensus: ConsensusConfig =
             serde_json::from_slice(&bounded_file(&consensus, 64 * 1024)?)?;

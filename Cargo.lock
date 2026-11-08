@@ -6522,6 +6522,7 @@ version = "0.27.14"
 dependencies = [
  "alloy-rlp",
  "blake3",
+ "ciborium",
  "criterion",
  "serde",
  "serde_json",
