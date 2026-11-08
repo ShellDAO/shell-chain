@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 mode, raw_fixture, raw_output = sys.argv[1:]
-assert mode in ("run", "verify", "consecutive", "batch", "wide")
+assert mode in ("run", "verify", "consecutive", "batch", "wide", "mixed")
 fixture, out = map(lambda p: Path(p).resolve(), (raw_fixture, raw_output))
 
 def now():
@@ -72,25 +72,31 @@ if mode == "verify" and (out / "network-batch/complete.json").exists():
     historical = (out / "network-batch/history-verified.json").exists()
     run("batch-cold-verify", [fixture, "batch-history-verify" if historical else "batch-verify", out])
     sys.exit(0)
-if mode in ("batch", "wide"):
-    wide = mode == "wide"
-    label = "wide" if wide else "batch"
+if mode in ("batch", "wide", "mixed"):
+    wide = mode in ("wide", "mixed")
+    label = mode
+    registered = 2 if mode == "mixed" else 1
+    unique_components = 433 + 40 * (registered - 1) if wide else 179
     count = 16 if wide else 2
+    shared_inputs = 40 * (count - registered) if wide else 40
     funding = 2_000_000 if wide else 1_000_000
     out.mkdir(exist_ok=True)
     if not (out / "control.json").exists():
         run("prepare-" + label, [fixture, "prepare-" + label, out])
     assert (out / "batch-fixture.json").exists(), "partial batch preparation retained; inspect receipts"
+    assert json.loads((out / "control.json").read_text())["raw_fresh_sender_count"] == registered, "retained fixture has a different sender profile"
     for name, nonce in (("control.json", count), ("later-control.json", 2 * count)):
         control = json.loads((out / name).read_text())
-        sender, recipient, proposer = control["accounts"]
-        assert sender["nonce"] == nonce and int(sender["balance"], 16) == funding - nonce * 42_001
+        senders = control["accounts"][:registered]
+        recipient, proposer = control["accounts"][registered:]
+        assert len({row["address"] for row in control["accounts"]}) == registered + 2
+        assert all(sender["nonce"] == nonce // registered and int(sender["balance"], 16) == funding - nonce // registered * 42_001 for sender in senders)
         assert int(recipient["balance"], 16) == nonce and int(proposer["balance"], 16) == nonce * 42_000
         receipts = control["receipts"]
         assert len(receipts) == count + 1 and all(receipt["status"] == 1 for receipt in receipts)
         assert [receipt["gas_used"] for receipt in receipts] == [21_000] * count + [0]
         assert [receipt["cumulative_gas_used"] for receipt in receipts] == [21_000 * (i + 1) for i in range(count)] + [21_000 * count]
-    network = out / ("network-" + label)
+    network = out / ("network-wide" if wide else "network-batch")
     if not (network / "paused.json").exists():
         run((label + "-pause"), [fixture, (label + "-pause"), out])
         save(out / (label + "-paused-snapshot.json"), json.loads(run((label + "-paused-snapshot"), [fixture, (label + "-snapshot"), out])))
@@ -109,24 +115,31 @@ if mode in ("batch", "wide"):
     generated = re.findall(r"^Proving (.+)$", logs, re.M)
     stable = re.compile(r"^(sender-[0-9]+|proposer)-(key|key-hash|tagged-key|tr|matrix-[0-5]-[0-4]|t1-[0-5])$")
     shared = [name for name in generated if stable.fullmatch(name)]
-    assert len(shared) == len(set(shared)) and all(name.startswith(("sender-0-", "proposer-")) for name in shared), "identical batch key inputs regenerated"
-    assert sum("-matrix-" in name for name in shared) == 60, "fresh sender/proposer matrix profile mismatch"
+    fresh_senders = {name.removesuffix("-key") for name in shared if re.fullmatch(r"sender-[0-9]+-key", name)}
+    assert len(shared) == len(set(shared)) == 77 + 39 * (registered - 1) and len(fresh_senders) == registered, "identical batch key inputs regenerated"
+    assert sum("-matrix-" in name for name in shared) == 30 * (registered + 1), "fresh sender/proposer matrix profile mismatch"
     completed = json.loads((network / "complete.json").read_text())
-    assert completed["production1"]["reused"] >= (600 if wide else 40) and completed["production2"]["reused"] >= (677 if wide else 117), "cross-position inputs not reverified"
+    assert completed["production1"]["reused"] >= shared_inputs and completed["production2"]["reused"] >= shared_inputs + 77 + 39 * (registered - 1), "cross-position inputs not reverified"
     if not (network / "verified.json").exists():
         run((label + "-verify"), [fixture, (label + "-verify"), out])
     if not (network / "history-verified.json").exists():
         run((label + "-history"), [fixture, (label + "-history"), out])
+    if registered == 2 and not (network / "cross-key-refused.json").exists():
+        run("mixed-key-swap", [fixture, "mixed-key-swap", out])
     run((label + "-history-cold"), [fixture, (label + "-history-verify"), out])
     run((label + "-history-cold-again"), [fixture, (label + "-history-verify"), out])
     result = {"two_ordered_transactions_proof_admitted": True,
               "signed_wrong_root_child_executed_and_atomically_refused": True,
               "bad_source_is_byzantine_storage_only": True,
-              "components_per_full_graph": 1033 if wide else 179, "unique_checkpoint_components": 433 if wide else 179, "transactions_per_block": count,
-              "unique_fresh_matrix_certificates": 60,
+              "components_per_full_graph": 1033 if wide else 179, "unique_checkpoint_components": unique_components, "transactions_per_block": count, "registered_sender_keys": registered,
+              "unique_fresh_matrix_certificates": 30 * (registered + 1),
               "physical_checkpoint_bytes": after["physical_checkpoint_bytes"],
               "reused1": completed["production1"]["reused"], "reused2": completed["production2"]["reused"],
               "native_control_and_cold_historic_replay_match": True, "finished_at": now()}
+    if registered == 2:
+        refusal = json.loads((network / "cross-key-refused.json").read_text())
+        assert refusal["all_kv_unchanged"] and refusal["original_proof_unchanged"] and refusal["new_proofs_generated"] == 0
+        result["valid_other_registered_key_certificate_refused"] = True
     if wide:
         result["sixteen_ordered_transactions_proof_admitted"] = result.pop("two_ordered_transactions_proof_admitted")
     save(out / (label + "-result.json"), result)

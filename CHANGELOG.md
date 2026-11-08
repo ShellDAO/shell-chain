@@ -15,6 +15,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add a self-contained sixteen-transfer Native proof regression with two
+  independently registered ML-DSA-65 sender keys and a distinct proposer.
+  Check both accounts, complete receipts and fee accounting, persistent
+  pause/resume, signed wrong-root atomic refusal and cold historical replay.
 - Add bounded compact certificate encoding and unique input checkpoints for new
   canonical proof jobs above two transactions. Preserve legacy JSON/checkpoints,
   full AIR verification, native policy and existing byte quotas; provide a real

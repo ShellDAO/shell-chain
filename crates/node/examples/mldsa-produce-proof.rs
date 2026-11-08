@@ -27,6 +27,12 @@ fn ensure(ok: bool, why: &str) -> Result<(), Error> {
 fn digest(db: &impl KvStore) -> Result<ShellHash, Error> {
     Ok(blake3_hash(&serde_json::to_vec(&db.scan_all()?)?))
 }
+fn sender_addresses(block: &Block) -> Vec<Address> {
+    let mut addresses: Vec<_> = block.transactions.iter().map(|tx| tx.from).collect();
+    addresses.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    addresses.dedup();
+    addresses
+}
 fn accounts(store: Arc<RocksDbStore>, block: &Block) -> Result<Value, Error> {
     let world = WorldState::at_root(store, &block.header.state_root)?;
     let tx = block
@@ -34,11 +40,9 @@ fn accounts(store: Arc<RocksDbStore>, block: &Block) -> Result<Value, Error> {
         .first()
         .ok_or("fixture transaction missing")?;
     let mut rows = Vec::new();
-    for address in [
-        tx.from,
-        tx.tx.to.ok_or("recipient missing")?,
-        block.header.proposer,
-    ] {
+    let mut addresses = sender_addresses(block);
+    addresses.extend([tx.tx.to.ok_or("recipient missing")?, block.header.proposer]);
+    for address in addresses {
         rows.push(json!({"address":address,"nonce":world.get_nonce(&address)?,"balance":world.get_balance(&address)?}));
     }
     Ok(json!(rows))
@@ -49,7 +53,9 @@ fn prepare(
     capture_on_production: bool,
     full: bool,
     batch_count: usize,
+    mixed: bool,
 ) -> Result<(), Error> {
+    ensure(!mixed || batch_count == 16 && full, "invalid mixed profile")?;
     let batch = batch_count > 1;
     let count = if batch { batch_count as u64 } else { 1 };
     let funding = if batch_count > 2 {
@@ -75,17 +81,26 @@ fn prepare(
     if batch_count > 2 {
         write(&out.join("initial-funding.json"), &funding)?;
     }
-    let sender = MlDsaSigner::generate();
+    let senders: Vec<_> = (0..if mixed { 2 } else { 1 })
+        .map(|_| MlDsaSigner::generate())
+        .collect();
+    let sender = &senders[0];
     let proposer: Box<dyn Signer> = if full {
         Box::new(MlDsaSigner::generate())
     } else {
         Box::new(DilithiumSigner::generate())
     };
     let address = Address::from_public_key(sender.public_key(), sender.sig_type().as_u8());
+    let addresses: Vec<_> = senders
+        .iter()
+        .map(|s| Address::from_public_key(s.public_key(), s.sig_type().as_u8()))
+        .collect();
     let authority = Address::from_public_key(proposer.public_key(), proposer.sig_type().as_u8());
     let recipient = Address::from([0x11; 32]);
     ensure(
-        address != authority && address != recipient && authority != recipient,
+        addresses.iter().all(|a| *a != authority && *a != recipient)
+            && (!mixed || addresses[0] != addresses[1])
+            && authority != recipient,
         "fixture actor collision",
     )?;
     let mut native = None;
@@ -100,10 +115,12 @@ fn prepare(
         let stores = RocksDbStore::open_all(out.join(role).join("db"), None)?;
         let store = Arc::new(stores.state.clone());
         let mut world = WorldState::new(store.clone());
-        world.set_account(
-            &address,
-            &Account::new_user_account(blake3_hash(sender.public_key()), U256::from(funding)),
-        )?;
+        for (sender, address) in senders.iter().zip(&addresses) {
+            world.set_account(
+                address,
+                &Account::new_user_account(blake3_hash(sender.public_key()), U256::from(funding)),
+            )?;
+        }
         let genesis = Block {
             header: BlockHeader {
                 state_root: world.state_root()?,
@@ -123,7 +140,9 @@ fn prepare(
             genesis_hash = Some(genesis.hash());
         }
         let chain = ChainStore::new(store.clone());
-        chain.put_pubkey(&address, sender.public_key())?;
+        for (sender, address) in senders.iter().zip(&addresses) {
+            chain.put_pubkey(address, sender.public_key())?;
+        }
         chain.put_pubkey(&authority, proposer.public_key())?;
         let cfg: ChainConfig = serde_json::from_value(
             json!({"chain_id":10,"genesis_hash":genesis.hash(),"fee_accounting_activation_height":1,"native_address_context_height":1,"block_commitment_height":1}),
@@ -172,12 +191,16 @@ fn prepare(
         max_fee_per_blob_gas: None,
         blob_versioned_hashes: None,
     };
-    for nonce in 0..count {
+    for position in 0..count {
+        let index = position as usize % senders.len();
+        let sender = &senders[index];
         let mut tx = tx.clone();
-        tx.nonce = nonce;
+        tx.nonce = position / senders.len() as u64;
+        // Distinct signing statements, with both effective prices capped at two.
+        tx.max_priority_fee_per_gas = index as u64 + 1;
         let signature = sender.sign(tx.signing_hash(sender.sig_type().as_u8()).as_bytes())?;
         node.handle_incoming_tx(
-            SignedTransaction::new(address, tx, signature),
+            SignedTransaction::new(addresses[index], tx, signature),
             &MultiVerifier,
         )?;
     }
@@ -188,10 +211,16 @@ fn prepare(
     )?;
     {
         let world = node.world_state.read();
+        for address in &addresses {
+            let transfers = count / senders.len() as u64;
+            ensure(
+                world.get_nonce(address)? == transfers
+                    && world.get_balance(address)? == U256::from(funding - transfers * 42_001),
+                "native sender nonce/balance mismatch",
+            )?;
+        }
         ensure(
-            world.get_nonce(&address)? == count
-                && world.get_balance(&address)? == U256::from(funding - count * 42_001)
-                && world.get_balance(&recipient)? == U256::from(count)
+            world.get_balance(&recipient)? == U256::from(count)
                 && world.get_balance(&authority)? == U256::from(count * 42_000)
                 && block.header.gas_used == count * 21_000,
             "native fresh transfer nonce/value/fee/reward control mismatch",
@@ -218,7 +247,7 @@ fn prepare(
     store.flush()?;
     write(
         &out.join("control.json"),
-        &json!({"native_digest":digest(store.as_ref())?,"parent":block.header.parent_hash,"block":block.hash(),"state_root":block.header.state_root,"receipts":node.chain_store.get_receipts(&block.hash())?,"accounts":accounts(store.clone(), &block)?,"raw_fresh_sender_count":1,"private_keys_persisted":false}),
+        &json!({"native_digest":digest(store.as_ref())?,"parent":block.header.parent_hash,"block":block.hash(),"state_root":block.header.state_root,"receipts":node.chain_store.get_receipts(&block.hash())?,"accounts":accounts(store.clone(), &block)?,"raw_fresh_sender_count":senders.len(),"private_keys_persisted":false}),
     )?;
     if capture_on_production {
         let captured = node
@@ -314,12 +343,15 @@ fn prepare(
                 .create_checkpoint(out.join("batch-native/db"))?;
         }
         node.config.canonical_proof_production = false;
-        for nonce in count..2 * count {
-            let mut next = block.transactions[0].tx.clone();
-            next.nonce = nonce;
+        for position in count..2 * count {
+            let index = position as usize % senders.len();
+            let sender = &senders[index];
+            let mut next = tx.clone();
+            next.nonce = position / senders.len() as u64;
+            next.max_priority_fee_per_gas = index as u64 + 1;
             let signature = sender.sign(next.signing_hash(sender.sig_type().as_u8()).as_bytes())?;
             node.handle_incoming_tx(
-                SignedTransaction::new(address, next, signature),
+                SignedTransaction::new(addresses[index], next, signature),
                 &MultiVerifier,
             )?;
         }
@@ -383,7 +415,7 @@ fn prepare(
             bad_store.flush()?;
             write(
                 &out.join("batch-fixture.json"),
-                &json!({"good1_natively_executed":true,"control2_natively_executed":true,"bad2_storage_only_byzantine_source":true,"bad2_not_execution_evidence":true,"private_keys_persisted":false,"transactions_per_block":count}),
+                &json!({"good1_natively_executed":true,"control2_natively_executed":true,"bad2_storage_only_byzantine_source":true,"bad2_not_execution_evidence":true,"private_keys_persisted":false,"transactions_per_block":count,"registered_sender_keys":senders.len()}),
             )?;
         }
         store.flush()?;
@@ -517,16 +549,25 @@ fn main() -> Result<(), Error> {
     )?;
     let out = Path::new(&args[1]);
     match args[0].as_str() {
-        "prepare" => prepare(out, false, false, false, 0),
-        "prepare-full" => prepare(out, false, true, true, 0),
-        "prepare-batch" => prepare(out, false, true, true, 2),
-        "prepare-wide" => prepare(out, false, true, true, 16),
-        "wide-pause" | "wide-resume" => tokio::runtime::Runtime::new()?
-            .block_on(admission_runtime::batch(out, args[0] == "wide-pause", true)),
-        "wide-snapshot" => admission_runtime::snapshot_wide(out),
-        "wide-verify" => admission_runtime::verify_batch(out, false, false, true),
-        "wide-history" => admission_runtime::verify_batch(out, true, true, true),
-        "wide-history-verify" => admission_runtime::verify_batch(out, true, false, true),
+        "prepare" => prepare(out, false, false, false, 0, false),
+        "prepare-full" => prepare(out, false, true, true, 0, false),
+        "prepare-batch" => prepare(out, false, true, true, 2, false),
+        "prepare-wide" => prepare(out, false, true, true, 16, false),
+        "prepare-mixed" => prepare(out, false, true, true, 16, true),
+        "mixed-key-swap" => admission_runtime::mixed_key_refusal(out),
+        "wide-pause" | "wide-resume" | "mixed-pause" | "mixed-resume" => {
+            tokio::runtime::Runtime::new()?.block_on(admission_runtime::batch(
+                out,
+                args[0].ends_with("-pause"),
+                true,
+            ))
+        }
+        "wide-snapshot" | "mixed-snapshot" => admission_runtime::snapshot_wide(out),
+        "wide-verify" | "mixed-verify" => admission_runtime::verify_batch(out, false, false, true),
+        "wide-history" | "mixed-history" => admission_runtime::verify_batch(out, true, true, true),
+        "wide-history-verify" | "mixed-history-verify" => {
+            admission_runtime::verify_batch(out, true, false, true)
+        }
         "full-pause" | "full-resume" | "full-bad-proposer" => {
             tokio::runtime::Runtime::new()?.block_on(admission_runtime::full(out, &args[0]))
         }
@@ -549,8 +590,8 @@ fn main() -> Result<(), Error> {
         "full-history" | "full-history-verify" => {
             admission_runtime::history_full(out, args[0] == "full-history")
         }
-        "prepare-runtime" => prepare(out, true, false, false, 0),
-        "prepare-production-hook" => prepare(out, false, true, false, 0),
+        "prepare-runtime" => prepare(out, true, false, false, 0, false),
+        "prepare-production-hook" => prepare(out, false, true, false, 0, false),
         "runtime-pause" | "runtime-resume" => {
             tokio::runtime::Runtime::new()?.block_on(runtime::run(out, args[0] == "runtime-pause"))
         }

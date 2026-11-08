@@ -305,9 +305,13 @@ fn prepare_from(out: &Path, directory: &str, source_path: &Path) -> Result<(), E
     let genesis = chain
         .get_block_by_hash(&config.genesis_hash)?
         .ok_or("source genesis absent")?;
-    let key = chain
-        .get_pubkey(&block.transactions[0].from)?
-        .ok_or("parent key absent")?;
+    let keys = sender_addresses(&block)
+        .into_iter()
+        .map(|address| {
+            let key = chain.get_pubkey(&address)?.ok_or("parent key absent")?;
+            Ok((address, key))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
     let stores = RocksDbStore::open_all(network.join("receiver/db"), None)?;
     let store = Arc::new(stores.state);
     let mut world = WorldState::new(store.clone());
@@ -316,16 +320,20 @@ fn prepare_from(out: &Path, directory: &str, source_path: &Path) -> Result<(), E
     } else {
         1_000_000
     };
-    world.set_account(
-        &block.transactions[0].from,
-        &Account::new_user_account(blake3_hash(&key), U256::from(funding)),
-    )?;
+    for (address, key) in &keys {
+        world.set_account(
+            address,
+            &Account::new_user_account(blake3_hash(key), U256::from(funding)),
+        )?;
+    }
     ensure(
         world.state_root()? == c.genesis_root && genesis.header.state_root == c.genesis_root,
         "independent receiver genesis mismatch",
     )?;
     let target = ChainStore::new(store.clone());
-    target.put_pubkey(&block.transactions[0].from, &key)?;
+    for (address, key) in &keys {
+        target.put_pubkey(address, key)?;
+    }
     target.put_pubkey(&c.authority, &c.authority_key)?;
     target.commit_genesis_block(&genesis, &config)?;
     store.flush()?;
@@ -1482,7 +1490,7 @@ pub(super) fn verify_sync(out: &Path) -> Result<(), Error> {
     )
 }
 
-/// Full ordered same-signer batch, followed by a genuinely signed wrong-root child.
+/// Full ordered registered-key batch, followed by a genuinely signed wrong-root child.
 /// The bad child's source is explicitly Byzantine storage, never native execution.
 pub(super) async fn batch(out: &Path, pause: bool, wide: bool) -> Result<(), Error> {
     let directory = if wide {
@@ -1492,24 +1500,40 @@ pub(super) async fn batch(out: &Path, pause: bool, wide: bool) -> Result<(), Err
     };
     let network = out.join(directory);
     let count = if wide { 16 } else { 2 };
-    let components = if wide { 433 } else { 179 };
+    let profile: Value = read(&out.join("batch-fixture.json"))?;
+    let senders = profile["registered_sender_keys"].as_u64().unwrap_or(1) as usize;
+    ensure(
+        (wide && matches!(senders, 1 | 2)) || !wide && senders == 1,
+        "unsupported fixture sender count",
+    )?;
+    let components = if wide { 433 + 40 * (senders - 1) } else { 179 };
     // This is an experiment observation bound, not a protocol/activation change.
     let idle_bound = if wide { 2 * 60 * 60 } else { 1800 };
     let c: fixture::Context = read(&out.join("context.json"))?;
     let good: Block = read(&out.join("candidate.json"))?;
     let bad: Block = read(&out.join("batch-bad-block.json"))?;
     let control2: Block = read(&out.join("later-block.json"))?;
+    let addresses = sender_addresses(&good);
+    let per_sender = count / senders;
+    let ordered = |block: &Block, start: usize| {
+        sender_addresses(block) == addresses
+            && addresses.iter().all(|address| {
+                let nonces: Vec<_> = block
+                    .transactions
+                    .iter()
+                    .filter(|tx| tx.from == *address)
+                    .map(|tx| tx.tx.nonce)
+                    .collect();
+                nonces == (start as u64..(start + per_sender) as u64).collect::<Vec<_>>()
+            })
+    };
     ensure(
         good.transactions.len() == count
             && bad.transactions.len() == count
-            && good
-                .transactions
-                .iter()
-                .enumerate()
-                .all(|(i, tx)| tx.from == good.transactions[0].from && tx.tx.nonce == i as u64)
-            && bad.transactions.iter().enumerate().all(|(i, tx)| {
-                tx.from == good.transactions[0].from && tx.tx.nonce == (i + count) as u64
-            })
+            && addresses.len() == senders
+            && !addresses.contains(&c.authority)
+            && ordered(&good, 0)
+            && ordered(&bad, per_sender)
             && bad.transactions == control2.transactions
             && bad.header.state_root != control2.header.state_root,
         "ordered batch fixture mismatch",
@@ -1746,6 +1770,104 @@ pub(super) fn verify_batch(
     write(
         &path,
         &json!({"replay":replay,"current_head":tip,"current_state_root":current.header.state_root,"all_kv_unchanged":true,"ordinary_correct_successor_not_proof_admitted":history}),
+    )
+}
+
+/// A valid certificate for another registered key cannot authorize this sender.
+pub(super) fn mixed_key_refusal(out: &Path) -> Result<(), Error> {
+    let network = out.join("network-wide");
+    ensure(
+        !network.join("cross-key-refused.json").exists(),
+        "key refusal already recorded",
+    )?;
+    let c: fixture::Context = read(&out.join("context.json"))?;
+    let block: Block = read(&out.join("candidate.json"))?;
+    let other = block
+        .transactions
+        .iter()
+        .position(|tx| tx.from != block.transactions[0].from)
+        .ok_or("second registered sender missing")?;
+    let original_path = network.join("good-proof.cbor");
+    let original = std::fs::read(&original_path)?;
+    let mut proof = shell_stark_prover::compact_canonical::decode_payload(&original)?;
+    let certificate = proof.transactions[other]
+        .signature
+        .transaction
+        .signature
+        .equation
+        .key
+        .clone();
+    ensure(
+        certificate.proof_bytes
+            != proof.transactions[0]
+                .signature
+                .transaction
+                .signature
+                .equation
+                .key
+                .proof_bytes,
+        "distinct key certificates missing",
+    )?;
+    proof.transactions[0]
+        .signature
+        .transaction
+        .signature
+        .equation
+        .key = certificate;
+    let payload = shell_stark_prover::compact_canonical::encode_payload(
+        &proof,
+        shell_storage::MAX_CANONICAL_PROOF_BYTES as usize,
+        true,
+    )?;
+    let hash = blake3_hash(&payload);
+    ensure(
+        hash != blake3_hash(&original),
+        "key replacement did not change payload",
+    )?;
+    let decoded = shell_stark_prover::compact_canonical::decode_payload(&payload)?;
+    let stores = RocksDbStore::open_all(network.join("receiver/db"), None)?;
+    let store = Arc::new(stores.state);
+    let node = fixture::node(store.clone(), c.authority, &c.authority_key)?;
+    let tip = node
+        .chain_store
+        .get_head_hash()?
+        .ok_or("key refusal tip absent")?;
+    let later: Value = read(&out.join("later-control.json"))?;
+    ensure(
+        json!(tip) == later["head"],
+        "key refusal requires advanced native control",
+    )?;
+    let before = digest(store.as_ref())?;
+    let error = node
+        .replay_canonical_transactions_with_proof(tip, c.block, &decoded)
+        .expect_err("another key certificate must not authorize the sender")
+        .to_string();
+    ensure(
+        error.contains("key") || error.contains("proof"),
+        "unexpected cross-key refusal",
+    )?;
+    ensure(
+        digest(store.as_ref())? == before && std::fs::read(original_path)? == original,
+        "key refusal changed native or original proof data",
+    )?;
+    let path = network.join("cross-key-refused.cbor");
+    if path.exists() {
+        ensure(
+            std::fs::read(path)? == payload,
+            "retained key refusal payload differs",
+        )?;
+    } else {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        file.write_all(&payload)?;
+        file.sync_all()?;
+    }
+    write(
+        &network.join("cross-key-refused.json"),
+        &json!({"correct_outer_hash":hash,"valid_other_registered_key_certificate":true,"donor_transaction":other,"error":error,"all_kv_unchanged":true,"original_proof_unchanged":true,"new_proofs_generated":0,"current_head":tip}),
     )
 }
 

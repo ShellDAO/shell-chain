@@ -533,3 +533,24 @@ successor and cold historical replay after a correct ordinary successor. Keys ar
 not saved. Repeating `wide` continues retained inputs; `verify` creates no proofs.
 These are source acceptance commands, not public package, arbitrary key layout,
 throughput or network activation claims.
+
+For two independently registered sender keys, use a separate fresh directory:
+
+```sh
+tests/e2e/mldsa-full-proof.sh mixed mixed16-test
+tests/e2e/mldsa-full-proof.sh verify mixed16-test
+```
+
+This profile executes eight transfers from each sender with a distinct proposer.
+The priority caps are one and two; both effective gas prices are capped at two.
+Both senders must reach nonce 8, and then nonce 16 after the separately labelled
+ordinary successor. Independent genesis reconstruction funds and registers both
+keys. All 17 receipts, value, fees, proposer reward, finality, wrong-root atomic
+refusal and read-only historical replay must match native execution. Shared
+certificates may cross positions or jobs only for identical inputs; different
+keys require different AIR certificates. This two-key experiment does not qualify
+every possible sixteen-key layout or throughput. It also replaces one sender's
+key certificate with the other sender's valid certificate, rebuilds correct
+content hashes, and requires native proof verification to refuse it without
+changing any stored data. Repeating `mixed` resumes its
+retained inputs; `verify` never generates proofs.
