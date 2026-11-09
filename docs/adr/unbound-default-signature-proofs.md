@@ -69,7 +69,7 @@ and restores the same exact parent account, key and MPT witness. The consumer
 still checks all signature, source, account, leaf and transaction-ID predicates.
 Native SDK compatibility is unchanged; SDK FIPS-adapter signatures under tag
 zero are not raw proofs. Bound SDK senders use the separate profile 5 below;
-unbound SDK senders retain ordinary Native handling.
+unbound SDK senders select the distinct profile 6 below.
 
 `tests/e2e/dilithium-full-proof.sh unbound output` requires complete peer Native
 import/finality of the original Embedded first-use and subsequent Reference
@@ -95,4 +95,24 @@ proof batch versions still depend on whether a proposer proof is present.
 The public `sdk` regression uses the exact published candidate's signer and
 provider against local Node RPC, then complete peer proof admission/finality and
 changed-state historical replay. Test-only storage signers are not evidence of
-public SDK execution. This profile does not add unbound SDK or SDK proposer AIR.
+public SDK execution. This bound profile does not add SDK proposer AIR; unbound SDK senders have their
+own profile below.
+
+
+## Unbound Native SDK FIPS profile
+
+Profile 6 combines the existing complete tag-zero derived-address AIR with SDK
+transaction envelope 3 and complete FIPS signature/challenge version 1. It
+requires a zero-commitment default account and the independently captured
+historical key: Embedded at first use, Reference only after registration.
+Frozen source format 4 explicitly selects unbound SDK inputs; source format 3
+stays bound SDK only. Old source/proof versions retain their bytes and meaning.
+The Native raw-or-SDK verifier, activation checks and atomic registration policy
+remain unchanged. A typed signature entry exists only after all mathematical,
+account, address, transaction-ID and leaf predicates succeed.
+
+The `sdk-unbound` public entry uses the documented first-use public-key option,
+real published SDK signing/provider/RPC, two full peer Native graphs and changed-
+state dual-history replay. Genuine-certificate and profile/address substitutions
+must refuse without writing current KV or replacing mathematical inputs. SDK
+proposer and other excluded account arrangements remain separate.

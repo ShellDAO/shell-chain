@@ -134,7 +134,7 @@ pub(crate) fn verify_canonical_unbound_signature<S: KvStore + 'static>(
         || !matches!(
             (proof.version, signed.signature.sig_type),
             (2, shell_crypto::SignatureType::MlDsa65)
-                | (4, shell_crypto::SignatureType::Dilithium3)
+                | (4 | 6, shell_crypto::SignatureType::Dilithium3)
         )
         || signed.signature.data.len() != 3309
         || signed

@@ -20,7 +20,7 @@ use shell_crypto::{CryptoError, PQSignature, SignatureType, Verifier};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegisteredSignatureProof {
-    /// One/two are bound/unbound MLDSA65, three/four bound/unbound raw Dilithium3, five bound Native SDK FIPS tag zero.
+    /// One/two are bound/unbound MLDSA65, three/four bound/unbound raw Dilithium3, five/six bound/unbound Native SDK FIPS tag zero.
     pub version: u8,
     pub transaction: TransactionSignatureProof,
     pub transaction_id: Blake3HashProof,
@@ -161,7 +161,7 @@ pub fn verify_unbound_signature_entry(
 ) -> Result<VerifiedSignatureEntry, String> {
     if !matches!(
         (proof.version, expected.signature.sig_type),
-        (2, SignatureType::MlDsa65) | (4, SignatureType::Dilithium3)
+        (2, SignatureType::MlDsa65) | (4 | 6, SignatureType::Dilithium3)
     ) {
         return Err("invalid unbound signature proof version or algorithm".into());
     }
@@ -229,7 +229,7 @@ fn verify_entry_sources(
     leaf[32..].copy_from_slice(&expected_entry.pk_hash);
     verify_hash(&proof.leaf, &leaf, expected_leaf)
         .map_err(|e| format!("registered entry leaf: {e}"))?;
-    let verify = if proof.version == 5 {
+    let verify = if matches!(proof.version, 5 | 6) {
         verify_sdk_transaction_signature
     } else if matches!(proof.version, 3 | 4) {
         verify_dilithium_transaction_signature

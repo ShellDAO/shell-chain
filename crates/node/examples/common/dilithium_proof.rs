@@ -172,6 +172,9 @@ fn sdk_rpc(
         Ok(serde_json::from_slice::<Value>(&output.stdout)?)
     })
 }
+pub(crate) fn prepare_sdk_unbound(out: &Path) -> Result<(), Error> {
+    prepare_profile(out, true, false, true, true)
+}
 fn prepare_profile(
     out: &Path,
     legacy_sender: bool,
@@ -256,6 +259,23 @@ fn prepare_profile(
             "wrong-derived-address",
             "tampered-signature",
         ] {
+            if sdk {
+                let mode = match name {
+                    "reference-before-registration" => "refuse-reference",
+                    "wrong-derived-address" => "refuse-address",
+                    _ => "refuse",
+                };
+                let before = digest(node.store.as_ref())?;
+                let result = sdk_rpc(&node, out, mode, "0")?;
+                ensure(
+                    result["rejected"] == true
+                        && before == digest(node.store.as_ref())?
+                        && node.chain_store.get_pubkey(&address)?.is_none(),
+                    "SDK unbound refusal wrote state or registered key",
+                )?;
+                cases.push(json!({"case":name,"result":result,"all_kv_unchanged":true,"key_registered":false}));
+                continue;
+            }
             let mut rejected = signed(sender.as_ref(), 0)?;
             if name != "reference-before-registration" {
                 rejected.pubkey_mode =
@@ -446,14 +466,40 @@ fn prepare_profile(
         &control(&node, &successor)?,
     )?;
     if unbound {
-        node.handle_incoming_tx(signed(sender.as_ref(), 2)?, &MultiVerifier)?;
+        if sdk {
+            write(
+                &out.join("sdk-rpc-submitted-3.json"),
+                &sdk_rpc(&node, out, "send", "2")?,
+            )?;
+        } else {
+            node.handle_incoming_tx(signed(sender.as_ref(), 2)?, &MultiVerifier)?;
+        }
         let third = node.produce_block(proposer.as_ref(), 100)?;
+        if sdk {
+            let submitted: Value = read(&out.join("sdk-rpc-submitted-3.json"))?;
+            ensure(
+                third.transactions.len() == 1
+                    && serde_json::to_value(third.transactions[0].hash())? == submitted["hash"],
+                "retained SDK advance did not execute",
+            )?;
+            write(
+                &out.join("sdk-rpc-receipt-3.json"),
+                &sdk_rpc(
+                    &node,
+                    out,
+                    "receipt",
+                    submitted["hash"]
+                        .as_str()
+                        .ok_or("SDK advance hash absent")?,
+                )?,
+            )?;
+        }
         write(&out.join("advance.json"), &third)?;
         write(&out.join("advance-control.json"), &control(&node, &third)?)?;
     }
     write(
         &out.join("actors.json"),
-        &json!({"sender":address,"sender_key":sender.public_key(),"sender_algorithm":sender.sig_type(),"proposer_algorithm":proposer.sig_type(),"private_keys_persisted":false,"unbound_sender":unbound,"native_sdk_fips_sender":sdk,"profile":if sdk {"native-sdk-fips-bound"} else if unbound {"legacy-unbound"} else if legacy_sender && legacy_proposer {"legacy-both"} else if legacy_proposer {"legacy-proposer"} else {"legacy-sender"},"initial_automatic_capture_disabled_native_control":legacy_proposer || unbound || sdk,"native_transcript":"locked pqcrypto-dilithium0.5.0 raw roles; FIPS only where explicitly selected"}),
+        &json!({"sender":address,"sender_key":sender.public_key(),"sender_algorithm":sender.sig_type(),"proposer_algorithm":proposer.sig_type(),"private_keys_persisted":false,"unbound_sender":unbound,"native_sdk_fips_sender":sdk,"profile":if sdk && unbound {"native-sdk-fips-unbound"} else if sdk {"native-sdk-fips-bound"} else if unbound {"legacy-unbound"} else if legacy_sender && legacy_proposer {"legacy-both"} else if legacy_proposer {"legacy-proposer"} else {"legacy-sender"},"initial_automatic_capture_disabled_native_control":legacy_proposer || unbound || sdk,"native_transcript":"locked pqcrypto-dilithium0.5.0 raw roles; FIPS only where explicitly selected"}),
     )?;
     node.store.flush()?;
     drop(node);
@@ -515,7 +561,11 @@ pub(crate) fn probe(out: &Path, recovered: bool) -> Result<(), Error> {
             let input: Value = serde_json::from_slice(source.identity())?;
             let actors: Value = read(&out.join("actors.json"))?;
             let expected_version = if actors["native_sdk_fips_sender"] == true {
-                3
+                if actors["unbound_sender"] == true {
+                    4
+                } else {
+                    3
+                }
             } else {
                 2
             };
@@ -691,7 +741,7 @@ pub(crate) async fn run(out: &Path, pause: bool, reference: bool) -> Result<(), 
                 let proof = shell_stark_prover::compact_canonical::decode_payload(&bytes)?;
                 let sender = &proof.transactions.first().ok_or("Dilithium sender proof absent")?.signature;
                 let equation = &sender.transaction.signature.equation;
-                let (bound, envelope, inner, seed) = if sdk {(5,3,1,48)} else if unbound {(4,2,2,32)} else if legacy_sender {(3,2,2,32)} else {(1,1,1,48)};
+                let (bound, envelope, inner, seed) = if sdk && unbound {(6,3,1,48)} else if sdk {(5,3,1,48)} else if unbound {(4,2,2,32)} else if legacy_sender {(3,2,2,32)} else {(1,1,1,48)};
                 let prop = proof.proposer.as_ref().ok_or("full proposer proof absent")?;
                 let (prop_version, prop_seed) = if legacy_proposer {(2,32)} else {(1,48)};
                 ensure(proof.version == 2 && proof.transactions.len() == 1 && sender.version == bound && sender.transaction.version == envelope && sender.transaction.signature.version == inner && equation.challenge.version == inner && equation.challenge.seed == equation.signature.decoded.challenge[..seed] && prop.version == prop_version && prop.signature.version == prop_version && prop.signature.equation.challenge.version == prop_version && prop.signature.equation.challenge.seed == prop.signature.equation.signature.decoded.challenge[..prop_seed], "Dilithium/FIPS full proof profile mismatch")?;
@@ -709,7 +759,7 @@ pub(crate) async fn run(out: &Path, pause: bool, reference: bool) -> Result<(), 
                 let path = network.join(proof_name);
                 if path.exists() { ensure(std::fs::read(&path)? == bytes, "retained Dilithium proof changed")?; } else { std::fs::write(path, &bytes)?; }
                 write(&network.join(manifest_name), &manifest)?;
-                write(&network.join(complete_name), &json!({"production":production["status"],"admission":admission,"height":height,"finalized":finalized,"unbound_sender":unbound,"both_original_targets_proof_admitted":reference,"genuine_unbound_dilithium_full_proof_admitted":unbound,"native_sdk_fips_sender":sdk,"genuine_sdk_tag0_fips_full_proof_admitted":sdk,"genuine_dilithium_sender_primary_proposer_full_proof_admitted":legacy_sender && !legacy_proposer && !unbound && !sdk,"genuine_dilithium_proposer_primary_sender_full_proof_admitted":legacy_proposer && !legacy_sender,"genuine_dilithium_both_roles_full_proof_admitted":legacy_sender && legacy_proposer,"native_outputs_match":true,"served_chunks":faults.chunks.load(Ordering::SeqCst)}))?;
+                write(&network.join(complete_name), &json!({"production":production["status"],"admission":admission,"height":height,"finalized":finalized,"unbound_sender":unbound,"both_original_targets_proof_admitted":reference,"genuine_unbound_dilithium_full_proof_admitted":unbound && !sdk,"genuine_unbound_sdk_tag0_fips_full_proof_admitted":sdk && unbound,"native_sdk_fips_sender":sdk,"genuine_sdk_tag0_fips_full_proof_admitted":sdk && !unbound,"genuine_dilithium_sender_primary_proposer_full_proof_admitted":legacy_sender && !legacy_proposer && !unbound && !sdk,"genuine_dilithium_proposer_primary_sender_full_proof_admitted":legacy_proposer && !legacy_sender,"genuine_dilithium_both_roles_full_proof_admitted":legacy_sender && legacy_proposer,"native_outputs_match":true,"served_chunks":faults.chunks.load(Ordering::SeqCst)}))?;
                 break;
             }
             ensure(tokio::time::Instant::now() < deadline && last_progress.elapsed() < Duration::from_secs(1800), "Dilithium progress bound exceeded")?;
@@ -932,10 +982,22 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
         cases.extend([
             ("sdk-as-primary-source", "SDK transaction"),
             ("sdk-as-raw-account", "Dilithium3 shape"),
-            ("sdk-as-primary-account", "framing"),
+            (
+                "sdk-as-primary-account",
+                if unbound {
+                    "unbound signature"
+                } else {
+                    "framing"
+                },
+            ),
         ]);
     }
-    if unbound {
+    if sdk && unbound {
+        cases.extend([
+            ("raw-key-without-address-tag", "unbound sender address"),
+            ("bound-sdk-profile-at-first-use", "no registered key"),
+        ]);
+    } else if unbound {
         cases.extend([
             ("raw-key-without-address-tag", "unbound sender address"),
             ("unbound-fips-profile", "unbound signature"),
@@ -959,8 +1021,18 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
             2 => target.completion.commitment = foreign.completion.commitment.clone(),
             3 => target.version = if sdk { 2 } else { 1 },
             4 if sdk => proof.transactions[0].signature.transaction.version = 1,
-            5 if sdk => proof.transactions[0].signature.version = 3,
-            6 if sdk => proof.transactions[0].signature.version = 1,
+            5 if sdk => proof.transactions[0].signature.version = if unbound { 4 } else { 3 },
+            6 if sdk => proof.transactions[0].signature.version = if unbound { 2 } else { 1 },
+            7 if sdk && unbound => {
+                proof.transactions[0].signature.tagged_key = Some(
+                    proof.transactions[0]
+                        .signature
+                        .transaction
+                        .public_key_hash
+                        .clone(),
+                )
+            }
+            8 if sdk && unbound => proof.transactions[0].signature.version = 5,
             4 => {
                 proof.transactions[0].signature.tagged_key = Some(
                     proof.transactions[0]

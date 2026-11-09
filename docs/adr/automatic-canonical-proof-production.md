@@ -152,6 +152,19 @@ of a proposer proof. Recovery rejects unknown, missing or relabelled markers.
 uses its provider through actual local Node RPC. The same original graph must
 complete automatic production, durable recovery, peer Native import/finality,
 changed-state history and genuine/cross-profile refusals. Signed-input Native
-intake and wrong-root rollback controls retain their own scope. SDK unbound
-accounts and SDK-tag-zero proposer proofs remain separate; no defaults, quotas,
+intake and wrong-root rollback controls retain their own scope. SDK-tag-zero proposer proofs remain separate; no defaults, quotas,
 activation or public-release status change.
+
+
+## Funded unbound Native SDK senders
+
+Account profile 6 routes Native tag-zero FIPS inputs to the same complete
+transaction envelope 3/signature version 1 and mandatory full derived-address
+AIR. New source format 4 freezes that unbound SDK choice; old bound source format
+3, genuine raw formats 1/2 and all existing immutable jobs retain their meanings.
+Recovery uses the captured parent MPT/key, never a later registry entry. Original
+Embedded and Reference graphs must independently reach actual peer Native
+import/finality before ordinary advancement and cold read-only dual replay.
+The `sdk-unbound` entry exercises these boundaries through the published SDK and
+keeps ordinary Native intake/registration rollback controls separately labelled.
+There is no quota, default or activation change.

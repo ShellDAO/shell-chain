@@ -239,7 +239,9 @@ fn verify_batch_at_parent<S: KvStore + 'static>(
                     .entry()
                     .clone()
             }
-            2 | 4 => verify_canonical_unbound_signature(view, tx, &item.account, &item.signature)?,
+            2 | 4 | 6 => {
+                verify_canonical_unbound_signature(view, tx, &item.account, &item.signature)?
+            }
             _ => return Err("unsupported canonical sender proof profile".into()),
         };
         if !seen.insert(*entry.transaction_id()) {

@@ -90,7 +90,7 @@ struct SenderSource {
     key: Vec<u8>,
     account: Account,
     nodes: Vec<Vec<u8>>,
-    /// Present only in source format three: explicit Native SDK FIPS signature version.
+    /// Present only in source formats three/four: explicit Native SDK FIPS signature version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sdk_fips: Option<u8>,
 }
@@ -208,7 +208,6 @@ impl CanonicalProductionSource {
                 &signed.signature,
             )?;
             let sdk_fips = if !raw_or_primary
-                && account.pq_pubkey_hash != ShellHash::ZERO
                 && signed.signature.sig_type == SignatureType::Dilithium3
                 && DilithiumVerifier.verify_sdk_transcript(
                     &key,
@@ -262,7 +261,12 @@ impl CanonicalProductionSource {
             _ => None,
         };
         let input = CapturedInputs {
-            version: if senders.iter().any(|s| s.sdk_fips.is_some()) {
+            version: if senders
+                .iter()
+                .any(|s| s.sdk_fips.is_some() && s.account.pq_pubkey_hash == ShellHash::ZERO)
+            {
+                4
+            } else if senders.iter().any(|s| s.sdk_fips.is_some()) {
                 3
             } else if proposer_key.is_some() {
                 2
@@ -319,9 +323,18 @@ impl CanonicalProductionSource {
             .map_err(|e| e.to_string())?
             .ok_or("production chain configuration absent")?;
         let has_sdk = i.senders.iter().any(|s| s.sdk_fips.is_some());
-        if !((i.version == 1 && i.proposer_key.is_none() && !has_sdk)
-            || (i.version == 2 && i.proposer_key.is_some() && !has_sdk)
-            || (i.version == 3 && has_sdk))
+        let has_unbound_sdk = i
+            .senders
+            .iter()
+            .any(|s| s.sdk_fips.is_some() && s.account.pq_pubkey_hash == ShellHash::ZERO);
+        let profile_valid = match i.version {
+            1 => i.proposer_key.is_none() && !has_sdk,
+            2 => i.proposer_key.is_some() && !has_sdk,
+            3 => has_sdk && !has_unbound_sdk,
+            4 => has_unbound_sdk,
+            _ => false,
+        };
+        if !profile_valid
             || cfg.chain_id != i.config.chain_id
             || cfg.genesis_hash != i.config.genesis_hash
             || chain
@@ -428,7 +441,6 @@ impl CanonicalProductionSource {
             if sender.sdk_fips.is_some()
                 && (sender.sdk_fips != Some(1)
                     || tx.signature.sig_type != SignatureType::Dilithium3
-                    || sender.account.pq_pubkey_hash == ShellHash::ZERO
                     || DilithiumVerifier.verify_legacy_transcript(
                         &sender.key,
                         tx.sender_signing_hash().as_bytes(),
@@ -777,7 +789,11 @@ impl CanonicalProductionSource {
                 account,
                 signature: RegisteredSignatureProof {
                     version: if source.sdk_fips == Some(1) {
-                        5
+                        if source.account.pq_pubkey_hash == ShellHash::ZERO {
+                            6
+                        } else {
+                            5
+                        }
                     } else if source.account.pq_pubkey_hash == ShellHash::ZERO {
                         if signed.signature.sig_type == SignatureType::Dilithium3 {
                             4
@@ -1626,6 +1642,55 @@ mod recovery_tests {
             }
             assert_eq!(before, db.scan_all().unwrap());
         }
+    }
+    #[test]
+    fn unbound_sdk_source_requires_new_profile_and_frozen_address() {
+        let (db, source) = fixture_transcript(false, true, false, true);
+        assert_eq!(source.input.version, 4);
+        assert!(source.has_unbound_senders());
+        assert_eq!(source.input.senders[0].sdk_fips, Some(1));
+        let chain = ChainStore::new(db.clone());
+        chain
+            .put_pubkey(&source.block().transactions[0].from, &[9; 1952])
+            .unwrap();
+        let before = db.scan_all().unwrap();
+        let frozen = ChainStore::new(Arc::new(NoTrieReads(db.clone())));
+        assert_eq!(
+            CanonicalProductionSource::restore(&frozen, source.identity())
+                .unwrap()
+                .identity(),
+            source.identity()
+        );
+        for mode in [
+            "old-bound-sdk",
+            "old-raw",
+            "missing-marker",
+            "unknown-marker",
+            "bound-account",
+            "foreign-key",
+        ] {
+            let mut input: CapturedInputs = serde_json::from_slice(source.identity()).unwrap();
+            match mode {
+                "old-bound-sdk" => input.version = 3,
+                "old-raw" => {
+                    input.version = 1;
+                    input.senders[0].sdk_fips = None;
+                }
+                "missing-marker" => input.senders[0].sdk_fips = None,
+                "unknown-marker" => input.senders[0].sdk_fips = Some(2),
+                "bound-account" => {
+                    input.senders[0].account.pq_pubkey_hash = blake3_hash(&input.senders[0].key)
+                }
+                "foreign-key" => input.senders[0].key[0] ^= 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                CanonicalProductionSource::restore(&frozen, &serde_json::to_vec(&input).unwrap())
+                    .is_err(),
+                "{mode}"
+            );
+        }
+        assert_eq!(before, db.scan_all().unwrap());
     }
     #[test]
     fn sdk_source_freezes_explicit_transcript_and_rejects_relabelling() {

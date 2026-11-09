@@ -214,7 +214,7 @@ impl<S: KvStore + 'static> Node<S> {
             }
             // Tag zero also permits an SDK MLDSA adapter in native execution.
             // Full proofs select genuine PQClean default-account signatures or a
-            // bound registered SDK FIPS sender; unsupported cases stay ordinary.
+            // registered bound or derived unbound SDK FIPS senders.
             if tx.signature.sig_type == shell_crypto::SignatureType::Dilithium3
                 && registered
                     .as_deref()
@@ -224,8 +224,8 @@ impl<S: KvStore + 'static> Node<S> {
                             key,
                             tx.sender_signing_hash().as_bytes(),
                             &tx.signature,
-                        ) || (account.pq_pubkey_hash != ShellHash::ZERO
-                            && registered.is_some()
+                        ) || ((account.pq_pubkey_hash == ShellHash::ZERO
+                            || registered.is_some())
                             && shell_crypto::DilithiumVerifier.verify_sdk_transcript(
                                 key,
                                 tx.sender_signing_hash().as_bytes(),

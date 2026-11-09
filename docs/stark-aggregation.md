@@ -862,8 +862,7 @@ imports. The entry refuses retained outputs with a different account profile
 before opening nodes or generating keys. Keep the output directory to resume;
 failed assertions exit nonzero, and `verify` generates no proofs.
 
-This bounded default-account case leaves SDK-adapter unbound tag-zero proofs,
-absent-state account creation, AA/custom validators, same-block Reference after an
+This bounded default-account case leaves absent-state account creation, AA/custom validators, same-block Reference after an
 Embedded first use without a parent key, other activation combinations and
 public release/network activation as separate acceptance work.
 
@@ -884,7 +883,9 @@ the package version and generates memory-only `MlDsa65Adapter` keys through the
 public `ShellSigner("Dilithium3", adapter)` entry. Only its public key and two
 original signed transfers are retained. The real SDK provider submits those
 bytes through an actual local Node RPC server and observes successful receipts.
-The Rust fixture never signs the SDK sender's transactions.
+The Rust fixture never signs the SDK sender's transactions. The bound `sdk`
+mode sends Reference transactions from an already registered account; the
+unbound entry below explicitly includes the public key at first use.
 
 The first transfer uses a funded bound default account with its exact parent
 registered key and an independent ML-DSA-65 proposer. It completes automatic
@@ -910,6 +911,54 @@ Selection is a producer preflight; consumers require complete AIR without Native
 signature fallback.
 
 This bounded case covers one bound SDK sender and a primary proposer. SDK-tag-zero
-proposer proofs, unbound SDK accounts, absent-state creation, AA/custom validators,
+proposer proofs, absent-state creation, AA/custom validators,
 same-block registration sequences, other activations and public binary/network
 acceptance remain separate. Limits, defaults and activation schedules are unchanged.
+
+
+### Funded unbound SDK Dilithium3 first use
+
+```bash
+tests/e2e/dilithium-full-proof.sh sdk-unbound sdk-first-use-output
+tests/e2e/dilithium-full-proof.sh verify sdk-first-use-output
+```
+
+Use the same published SDK candidate, Node.js/npm, Python, Rust and RocksDB
+prerequisites as the bound entry. The SDK's public default omits the key. This
+entry uses the documented `includePublicKey: true` for its original first-use
+transaction, then `false` for the two original Reference transfers. The signing
+keys are disposed after all three public signed inputs are saved; a retained
+output is never a request to replace keys or signatures. Funding a derived
+address leaves its default account's key commitment zero and registry empty.
+
+The real SDK provider submits the Embedded first transaction through local Node
+RPC. Native canonical commit must register the exact key; the later Reference
+transaction resolves that registration. Both original graphs must complete
+automatic production, durable recovery, full mathematics, actual peer Native
+import and finality through height 2. Original Reference advancement to height 3
+changes current balances and nonce before repeated cold read-only historical
+queries replay both proved blocks. Registration, receipts, 21,000 gas, effective
+fee, balances and nonces must match ordinary Native execution.
+
+Unbound SDK sender profile 6 requires complete `BLAKE3(0 || pubkey)` address AIR,
+transaction source envelope 3 and complete FIPS signature/challenge version 1.
+New frozen source format 4 carries unbound SDK selection; old bound SDK source
+format 3 retains its meaning. Bound SDK profile 5, genuine raw profiles 3/4 and
+primary profiles 1/2 remain strict. Neither late registration nor equal key widths
+authorizes borrowing a current key or changing a historical transcript.
+
+The regression rejects genuine foreign key/challenge/commitment certificates,
+wrong transaction/signature/account profiles, a genuine key-hash certificate
+without the address tag, and bound SDK profile 5 before historical registration.
+These full historical predicate refusals preserve original proofs and all KV
+bytes. Real SDK Reference-before-registration, wrong-address and signed-input
+intake refusals, plus signed wrong-root registration rollback, are separate
+ordinary Native controls. They do not claim a new proof-backed bad-block import.
+A retained account/transcript/role mismatch exits before key or proof generation.
+Failed checks exit nonzero; `verify` generates no proofs.
+
+This is a funded default-account case with a primary65 proposer and algorithm
+binding omitted. SDK-tag-zero proposer AIR, absent-state creation, AA/custom
+validators, same-block registration sequences, other activations, forks,
+platforms and sustained load remain separate. Production/admission defaults,
+quotas, activation schedules and public binary/network availability are unchanged.

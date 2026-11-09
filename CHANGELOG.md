@@ -24,6 +24,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Complete funded unbound Native SDK tag-zero FIPS first-use and Reference
+  proofs, with full derived-address AIR, explicit account/source formats and
+  unchanged older profiles. Add real published SDK registration, dual peer
+  Native import/finality, changed-state history and strict refusal controls.
+
 - Complete bound Native tag-zero SDK FIPS sender proofs with explicit source and
   account profiles. Preserve raw and primary transcript formats; add exact
   published SDK signing/RPC inputs, peer Native import/finality, changed-state
