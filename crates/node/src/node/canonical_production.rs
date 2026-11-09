@@ -1,4 +1,5 @@
 //! Bounded opt-in automatic full sender-proof generation, separate from settlement.
+mod compressed;
 use super::*;
 use serde::{Deserialize, Serialize};
 use shell_crypto::SignatureType;
@@ -238,6 +239,41 @@ impl<S: KvStore> CanonicalProductionStore<S> {
         }
         Ok(())
     }
+    fn compact_legacy(&self) -> Result<(), StorageError> {
+        let mut guard = self.lock.lock();
+        self.checked_total(&mut guard)?;
+        let mut candidates = Vec::new();
+        for block in self.ids()? {
+            let prefix = [
+                certificate_prefix(block).as_slice(),
+                b"production/component/",
+            ]
+            .concat();
+            self.store
+                .visit_prefix_range(&prefix, &prefix, None, false, &mut |k, v| {
+                    if compressed::eligible(v) {
+                        if candidates.len() >= MAX_JOBS * 2048 {
+                            return Err(error("legacy compaction component count limit"));
+                        }
+                        candidates.push((k.to_vec(), v.to_vec()));
+                    }
+                    Ok(true)
+                })?;
+        }
+        let mut changes = Vec::new();
+        for (k, original) in candidates {
+            if let Some(packed) = compressed::pack(&original)? {
+                if compressed::restore(packed.clone())? != original {
+                    return Err(error("legacy compaction roundtrip mismatch"));
+                }
+                changes.push((k, packed));
+            }
+        }
+        if !changes.is_empty() {
+            self.write_locked(changes, &mut guard, DATA_CEILING)?;
+        }
+        Ok(())
+    }
     fn status(&self, hash: ShellHash) -> Result<Option<CanonicalProductionStatus>, StorageError> {
         self.store
             .get(&record_key(hash))?
@@ -344,6 +380,7 @@ impl<S: KvStore> ProductionJob<S> {
         Ok(name)
     }
     fn restore_account(&self, bytes: Vec<u8>) -> Result<Vec<u8>, StorageError> {
+        let bytes = compressed::restore(bytes)?;
         let Some(encoded) = bytes.strip_prefix(ACCOUNT_POOL) else {
             return Ok(bytes);
         };
@@ -619,6 +656,7 @@ impl<S: KvStore> KvStore for ProductionJob<S> {
                             value = [REFERENCE, encode(&reference)?.as_slice()].concat();
                         } else {
                             value = self.pool_account(k, v, &mut changes)?;
+                            value = compressed::pack(&value)?.unwrap_or(value);
                         }
                     }
                     changes.insert(physical, value);
@@ -917,6 +955,7 @@ impl<S: KvStore + 'static> Node<S> {
             self.capture_canonical_production(&block);
         }
         self.canonical_production.compact_accounts()?;
+        self.canonical_production.compact_legacy()?;
         // Publish the explicit new-session retry before returning the handle.
         // RPC observers must not mistake the previous session's failure for the
         // new attempt's result while its worker is still waiting for readiness.
@@ -1039,6 +1078,75 @@ fn cancellation_budget_exhausted(budget: Option<NonZeroUsize>, used: usize) -> b
 mod tests {
     use super::*;
     use shell_storage::MemoryDb;
+    #[test]
+    fn legacy_compaction_preserves_original_bytes_references_and_native_state() {
+        let db = Arc::new(MemoryDb::new());
+        db.put(b"HEAD", b"native anchor").unwrap();
+        let owner = CanonicalProductionStore::new(db.clone());
+        let first = ShellHash::from([1; 32]);
+        let second = ShellHash::from([2; 32]);
+        let a = owner.job(first);
+        let b = owner.job(second);
+        let component = b"production/component/key";
+        let original = format!(
+            "{{ \"z\": [{}], \"a\": 7 }}",
+            "17,".repeat(4096).trim_end_matches(',')
+        )
+        .into_bytes();
+        {
+            let mut guard = owner.lock.lock();
+            owner
+                .write_locked(
+                    vec![
+                        (key(b"jobs"), encode(&vec![first, second]).unwrap()),
+                        ([a.prefix.as_slice(), component].concat(), original.clone()),
+                    ],
+                    &mut guard,
+                    DATA_CEILING,
+                )
+                .unwrap();
+        }
+        b.put(component, &original).unwrap();
+        let reference_key = [b.prefix.as_slice(), component].concat();
+        let reference = db.get(&reference_key).unwrap().unwrap();
+        assert!(reference.starts_with(REFERENCE));
+        let before = owner.checked_total(&mut None).unwrap();
+        owner.compact_legacy().unwrap();
+        assert!(owner.checked_total(&mut None).unwrap() < before);
+        let physical = [a.prefix.as_slice(), component].concat();
+        let packed = db.get(&physical).unwrap().unwrap();
+        assert!(packed.starts_with(compressed::PREFIX));
+        let saved = db.scan_all().unwrap();
+        assert_eq!(a.get(component).unwrap().unwrap(), original);
+        assert_eq!(b.get(component).unwrap().unwrap(), original);
+        assert_eq!(
+            a.scan_prefix(b"production/component/").unwrap()[0].1,
+            original
+        );
+        assert_eq!(db.get(&reference_key).unwrap().unwrap(), reference);
+        owner.compact_legacy().unwrap();
+        assert_eq!(saved, db.scan_all().unwrap());
+        let mut changed = packed.clone();
+        let last = changed.len() - 1;
+        changed[last] ^= 1;
+        db.put(&physical, &changed).unwrap();
+        assert!(a.get(component).is_err());
+        assert!(b.get(component).is_err());
+        db.put(&physical, &packed).unwrap();
+        assert_eq!(a.get(component).unwrap().unwrap(), original);
+        let fresh = format!(
+            "{{\"proof_bytes\":[{}]}}",
+            "23,".repeat(4096).trim_end_matches(',')
+        )
+        .into_bytes();
+        a.put(b"production/component/fresh", &fresh).unwrap();
+        assert!(db
+            .get(&[a.prefix.as_slice(), b"production/component/fresh"].concat())
+            .unwrap()
+            .unwrap()
+            .starts_with(compressed::PREFIX));
+        assert_eq!(db.get(b"HEAD").unwrap().unwrap(), b"native anchor");
+    }
     #[test]
     fn account_dictionary_compaction_preserves_logical_bytes_references_and_native_data() {
         use shell_stark_prover::compact_canonical::encode_component;
@@ -1324,6 +1432,13 @@ mod tests {
         batch.put(b"a".to_vec(), b"b".to_vec());
         batch.put(b"c".to_vec(), b"d".to_vec());
         assert!(kv.write_batch(batch).is_err());
+        assert_eq!(before, db.scan_all().unwrap());
+        let legacy = format!(
+            "{{\"proof_bytes\":[{}]}}",
+            "17,".repeat(4096).trim_end_matches(',')
+        )
+        .into_bytes();
+        assert!(kv.put(b"production/component/legacy", &legacy).is_err());
         assert_eq!(before, db.scan_all().unwrap());
     }
     #[test]

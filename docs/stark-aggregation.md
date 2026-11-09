@@ -677,3 +677,28 @@ shutdown/resume and cold historical replay checks. Repeating `sixteen-keys`
 continues the retained inputs; `verify` generates no proofs. Published artifacts,
 network activation, other signature profiles and sustained load require their
 own acceptance evidence.
+
+### Stable account identity after key rotation
+
+```sh
+bash tests/e2e/mldsa-full-proof.sh rotation output
+bash tests/e2e/mldsa-full-proof.sh verify output
+```
+
+This expensive source regression creates fresh memory-only ML-DSA-65 keys and
+independent Native databases. It proof-admits an AccountManager rotation from
+K0 to K1, then a Reference transfer signed by K1 at the original account address.
+The isolated network activates `registered_key_algorithm_height` at height 1;
+the second proof binds the stored algorithm-tagged commitment while the first
+uses the legacy raw commitment at genesis. Both sender and proposer signatures
+require complete AIR, and both targets must reach Native import and finality.
+
+An ordinary further rotation to K2 changes the current registry before cold
+replay of both proofs. Replays must preserve current Native data and resolve
+the historical K0 and K1 keys. A genuine old-key certificate must not authorize
+the new-key transfer. Separate ordinary Native controls check default-disabled
+raw commitments, stale signatures and atomic rollback of a signed wrong-root
+rotation; those controls are not claimed as proof admission. The output directory
+retains public signed inputs, proof checkpoints and command receipts. This
+exercise does not activate a public network or establish other algorithms,
+custom validators, same-block rotation sequences or release availability.

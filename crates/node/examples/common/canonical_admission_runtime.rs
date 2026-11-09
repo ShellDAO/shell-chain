@@ -1,4 +1,6 @@
 //! Real ordinary block sync and dedicated proof transfer, with a cold receiver.
+#[path = "rotation_proof.rs"]
+pub(super) mod rotation;
 use super::*;
 use async_trait::async_trait;
 use shell_network::{
@@ -235,6 +237,9 @@ impl Live {
             ensure(!live.task.is_finished(), "Node.run exited during startup")?;
             if live.call("admin_nodeInfo", json!([])).await.is_ok()
                 && !live.info.read().unwrap().listen_addresses.is_empty()
+                // RPC starts before retained producer checkpoints are prepared.
+                // Wait for the event loop to publish actual producer readiness.
+                && (!production || live.node.metrics.production_ready.get() != 0)
             {
                 break;
             }

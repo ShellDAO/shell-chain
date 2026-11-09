@@ -75,6 +75,24 @@ account, key, receipt or consensus data and grants no admission authority.
 
 ## Validation and limits
 
+Legacy JSON certificates can exhaust the shared physical quota when a rotation
+introduces another independent key. Opt-in producer startup compacts eligible
+inline JSON values in one atomic batch; new legacy values use the same bounded
+zlib representation when it saves space. The envelope records the original byte
+length and BLAKE3 hash. Decoding requires a complete stream, exact input/output
+lengths and the original hash; truncated, trailing, changed or over-limit streams
+refuse. Original JSON property order and whitespace survive exactly. Source
+descriptors, job index versions, logical component hashes, per-job limits and
+full AIR checks are unchanged. Compression uses the already locked implementation
+and adds no mathematical primitive or native verification fallback.
+
+References resolve the original bytes before their existing integrity checks.
+Compressed storage and its metadata count toward the same physical quota.
+Historical reads never rewrite it. Older workers require restored inline bytes
+or the retained pre-compaction database backup before downgrade. No Native chain,
+account, registry, receipt, activation or consensus data is migrated by this local
+representation change.
+
 The self-contained `mldsa-automatic-proof` regression exercises real Node.run,
 fresh signatures, native import to height 130, cold pause/resume, authenticated
 RPC download and independent CLI import/cold replay. Source/store regressions

@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 mode, raw_fixture, raw_output = sys.argv[1:]
-assert mode in ("run", "verify", "consecutive", "batch", "first-use", "wide", "mixed", "eight-keys", "sixteen-keys", "mixed-first-use")
+assert mode in ("run", "verify", "consecutive", "batch", "first-use", "wide", "mixed", "eight-keys", "sixteen-keys", "mixed-first-use", "rotation")
 fixture, out = map(lambda p: Path(p).resolve(), (raw_fixture, raw_output))
 
 def now():
@@ -63,6 +63,45 @@ def snapshot(label):
 
 def history_verify():
     run("full-history-verify", [fixture, "full-history-verify", out])
+
+if mode == "verify" and (out / "network-rotation/complete.json").exists():
+    run("rotation-cold-verify", [fixture, "rotation-verify", out])
+    sys.exit(0)
+if mode == "rotation":
+    out.mkdir(exist_ok=True)
+    if not (out / "rotation.json").exists():
+        run("prepare-rotation", [fixture, "prepare-rotation", out])
+    network = out / "network-rotation"
+    if not (network / "paused.json").exists():
+        run("rotation-pause", [fixture, "rotation-pause", out])
+        save(out / "rotation-paused-snapshot.json", json.loads(run("rotation-paused-snapshot", [fixture, "rotation-snapshot", out])))
+    if not (network / "complete.json").exists():
+        run("rotation-resume", [fixture, "rotation-resume", out])
+    after = json.loads(run("rotation-complete-snapshot", [fixture, "rotation-snapshot", out]))
+    paused = json.loads((out / "rotation-paused-snapshot.json").read_text())
+    assert paused["native_digest"] == after["native_digest"] and after["physical_checkpoint_bytes"] <= 256 * 1024 * 1024
+    if not (network / "verified.json").exists():
+        run("rotation-verify", [fixture, "rotation-verify", out])
+    if not (network / "history-verified.json").exists():
+        run("rotation-history", [fixture, "rotation-history", out])
+    if not (network / "old-key-refused.json").exists():
+        run("rotation-old-key-refusal", [fixture, "rotation-old-key-refusal", out])
+    run("rotation-history-cold", [fixture, "rotation-verify", out])
+    run("rotation-history-cold-again", [fixture, "rotation-verify", out])
+    complete = json.loads((network / "complete.json").read_text())
+    assert complete["both_full_proof_admitted"] and complete["raw_then_tagged_proof_binding"] and complete["height"] == complete["finalized"] == 2
+    assert all(row["state"] == "complete" and row["components"] > 0 for row in complete["production"])
+    assert all(row["nativeCanonical"] and row["status"]["state"] == "complete" for row in complete["admission"])
+    rollback = json.loads((out / "rotation-native-rollback.json").read_text())
+    assert rollback["native_crypto_control_not_proof_admission"] and rollback["all_kv_unchanged"] and rollback["old_key_and_commitment_preserved"]
+    assert all(row["all_kv_unchanged"] for row in json.loads((out / "native-refusals.json").read_text()))
+    for path in network.glob("history-verified*.json"):
+        value = json.loads(path.read_text())
+        assert value["all_kv_unchanged"] and value["current_height"] == 4 and value["ordinary_advance_not_proof_admitted"]
+    refusal = json.loads((network / "old-key-refused.json").read_text())
+    assert refusal["genuine_old_key_certificate"] and refusal["all_kv_unchanged"] and refusal["original_proof_unchanged"] and refusal["new_proofs_generated"] == 0
+    save(out / "rotation-result.json", {"both_full_proof_admitted": True, "finalized": 2, "stable_address": complete["stable_address"], "physical_checkpoint_bytes": after["physical_checkpoint_bytes"], "raw_then_tagged_binding": True, "changed_current_key_history_read_only": True, "finished_at": now()})
+    sys.exit(0)
 
 if mode == "verify" and (out / "network-wide/complete.json").exists():
     historical = (out / "network-wide/history-verified.json").exists()

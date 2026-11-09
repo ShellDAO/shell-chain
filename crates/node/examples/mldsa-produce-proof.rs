@@ -702,6 +702,14 @@ fn main() -> Result<(), Error> {
     )?;
     let out = Path::new(&args[1]);
     match args[0].as_str() {
+        "prepare-rotation" => admission_runtime::rotation::prepare(out),
+        "rotation-pause" | "rotation-resume" => tokio::runtime::Runtime::new()?.block_on(
+            admission_runtime::rotation::run(out, args[0] == "rotation-pause"),
+        ),
+        "rotation-snapshot" => admission_runtime::rotation::snapshot(out),
+        "rotation-verify" => admission_runtime::rotation::verify(out, false),
+        "rotation-history" => admission_runtime::rotation::verify(out, true),
+        "rotation-old-key-refusal" => admission_runtime::rotation::negative(out),
         "prepare" => prepare(out, false, false, false, 0, 1, 0),
         "prepare-full" => prepare(out, false, true, true, 0, 1, 0),
         "prepare-batch" => prepare(out, false, true, true, 2, 1, 0),
