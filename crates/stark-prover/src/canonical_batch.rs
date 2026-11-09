@@ -3,17 +3,43 @@
 //! this is not an AIR proof of body membership, proposer consensus or execution.
 use crate::{
     account_state::AccountStateProof,
-    canonical_signature::{canonical_child_hash, verify_canonical_registered_signature},
+    canonical_signature::{
+        canonical_child_hash, verify_canonical_registered_signature,
+        verify_canonical_unbound_signature,
+    },
+    mldsa_source::VerifiedSignatureEntry,
     proposer_seal::{verify_seal_at_parent, ProposerSealProof, VerifiedProposerSeal},
-    registered_signature::{RegisteredSignatureProof, VerifiedRegisteredSignature},
+    registered_signature::RegisteredSignatureProof,
 };
 use serde::{Deserialize, Serialize};
-use shell_core::Block;
+use shell_core::{Block, PubkeyMode, SignedTransaction, Transaction};
 use shell_crypto::{CryptoError, PQSignature, SignatureType, Verifier};
 use shell_primitives::ShellHash;
 use shell_storage::{CanonicalParentView, ChainStore, KvStore};
 
 pub const MAX_CANONICAL_SIGNATURE_BATCH: usize = 16;
+
+/// Private exact tuple retained only after the account and complete sender predicate pass.
+#[derive(Clone, Debug)]
+struct VerifiedBatchSignature {
+    entry: VerifiedSignatureEntry,
+    transaction: Transaction,
+    mode: PubkeyMode,
+    key: Vec<u8>,
+    signature: PQSignature,
+}
+impl VerifiedBatchSignature {
+    fn matches_transaction(&self, signed: &SignedTransaction) -> bool {
+        signed.from.as_bytes() == self.entry.sender()
+            && signed.tx == self.transaction
+            && signed.pubkey_mode == self.mode
+            && signed.signature == self.signature
+            && signed.aa_bundle.is_none()
+    }
+    fn verifies(&self, key: &[u8], message: &[u8], signature: &PQSignature) -> bool {
+        key == self.key && message == self.entry.entry().msg_hash && signature == &self.signature
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,7 +73,7 @@ pub struct VerifiedCanonicalSignatureBatch {
     parent: ShellHash,
     block: ShellHash,
     chain_id: u64,
-    signatures: Vec<VerifiedRegisteredSignature>,
+    signatures: Vec<VerifiedBatchSignature>,
     proposer: Option<VerifiedProposerSeal>,
 }
 impl VerifiedCanonicalSignatureBatch {
@@ -95,7 +121,7 @@ impl Verifier for VerifiedCanonicalSignatureBatch {
         signature: &PQSignature,
     ) -> Result<bool, CryptoError> {
         for proof in &self.signatures {
-            if proof.verify(key, message, signature)? {
+            if proof.verifies(key, message, signature) {
                 return Ok(true);
             }
         }
@@ -108,8 +134,10 @@ impl Verifier for VerifiedCanonicalSignatureBatch {
 
 /// Verify all ordered senders against one independently frozen historical
 /// parent. The block must equal the captured canonical body, not merely carry
-/// its header. This bounded registered/default-account profile cannot authorize
-/// first-use keys, AA/custom validators, other algorithms or pruned witnesses.
+/// its header. Bound registered accounts use version one; unbound default accounts
+/// use version two with a complete derived-address proof and the historical
+/// registry's Embedded/Reference rules. AA, other algorithms and pruned witnesses
+/// remain outside this profile.
 pub fn verify_canonical_signature_batch<S: KvStore + 'static>(
     view: &CanonicalParentView<S>,
     block: &Block,
@@ -199,13 +227,29 @@ fn verify_batch_at_parent<S: KvStore + 'static>(
     let mut seen = std::collections::HashSet::new();
     let mut signatures = Vec::with_capacity(block.transactions.len());
     for (tx, item) in block.transactions.iter().zip(&proof.transactions) {
-        let checked =
-            verify_canonical_registered_signature(view, tx, &item.account, &item.signature)?;
-        let signature = checked.signature();
-        if !seen.insert(*signature.entry().transaction_id()) {
+        let entry = match item.signature.version {
+            1 => verify_canonical_registered_signature(view, tx, &item.account, &item.signature)?
+                .signature()
+                .entry()
+                .clone(),
+            2 => verify_canonical_unbound_signature(view, tx, &item.account, &item.signature)?,
+            _ => return Err("unsupported canonical sender proof profile".into()),
+        };
+        if !seen.insert(*entry.transaction_id()) {
             return Err("duplicate canonical signature batch source".into());
         }
-        signatures.push(signature.clone());
+        let key = view
+            .registered_key(&tx.from)
+            .map_err(|e| e.to_string())?
+            .or_else(|| tx.pubkey_mode.pubkey_bytes().map(|k| k.to_vec()))
+            .ok_or("verified canonical sender key absent")?;
+        signatures.push(VerifiedBatchSignature {
+            entry,
+            transaction: tx.tx.clone(),
+            mode: tx.pubkey_mode.clone(),
+            key,
+            signature: tx.signature.clone(),
+        });
     }
     Ok(VerifiedCanonicalSignatureBatch {
         tip: view.tip(),

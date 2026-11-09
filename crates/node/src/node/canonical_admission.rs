@@ -196,20 +196,32 @@ impl<S: KvStore + 'static> Node<S> {
             .canonical_parent_view(head.hash(), head.hash())
             .map_err(|e| e.to_string())?;
         for tx in &block.transactions {
-            if view
-                .registered_key(&tx.from)
-                .map_err(|e| e.to_string())?
-                .is_none()
-            {
-                return Ok(false);
-            }
-            if view
+            let registered = view.registered_key(&tx.from).map_err(|e| e.to_string())?;
+            let Some(account) = view
                 .world_state()
                 .map_err(|e| e.to_string())?
                 .get_account(&tx.from)
                 .map_err(|e| e.to_string())?
-                .is_none_or(|a| a.validation_code_hash.is_some())
-            {
+            else {
+                return Ok(false);
+            };
+            if account.validation_code_hash.is_some() {
+                return Ok(false);
+            }
+            if account.pq_pubkey_hash == ShellHash::ZERO {
+                let Some(key) = registered
+                    .as_deref()
+                    .or_else(|| tx.pubkey_mode.pubkey_bytes())
+                else {
+                    return Ok(false);
+                };
+                if key.len() != 1952
+                    || Address::from_public_key(key, shell_crypto::SignatureType::MlDsa65.as_u8())
+                        != tx.from
+                {
+                    return Ok(false);
+                }
+            } else if registered.is_none() {
                 return Ok(false);
             }
         }

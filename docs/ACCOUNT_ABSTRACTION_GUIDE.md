@@ -90,6 +90,14 @@ When the account does not yet exist in world state:
 
 This is the only stage where address derivation itself is re-checked.
 
+Funding an address can create a world-state entry with a zero key commitment
+without registering its public key. Its first Embedded transaction still follows
+the address and signature checks above; successful canonical execution registers
+the key. Mempool admission and failed validation must not register it.
+The opt-in, unreleased [canonical proof path](stark-aggregation.md#unbound-default-account-signatures)
+also supports these funded unbound accounts. It proves the algorithm-tagged
+address in AIR while normal Native execution retains registration and fee policy.
+
 ### 3.2 Layer 2 — default existing-account validation
 
 Once an account exists and uses the built-in validator path:

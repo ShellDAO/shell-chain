@@ -15,6 +15,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Extend complete canonical ML-DSA-65 proofs to funded unbound default accounts:
+  Embedded first use and subsequent registered Reference keys. Prove the full
+  algorithm-tagged sender address in BLAKE3 AIR and retain the bound-account
+  proof format. Add Native registration, rollback and historical replay checks.
 - Share bounded sampler, sponge and permutation AIR proofs across all thirty
   matrix coordinates for new jobs with more than eight distinct senders.
   Persist source-bound proof parts without duplicating routing witnesses;

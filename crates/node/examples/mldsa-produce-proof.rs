@@ -54,6 +54,7 @@ fn prepare(
     full: bool,
     batch_count: usize,
     sender_count: usize,
+    first_use: bool,
 ) -> Result<(), Error> {
     ensure(
         matches!(sender_count, 1 | 2 | 8 | 16) && (sender_count == 1 || batch_count == 16 && full),
@@ -122,7 +123,14 @@ fn prepare(
         for (sender, address) in senders.iter().zip(&addresses) {
             world.set_account(
                 address,
-                &Account::new_user_account(blake3_hash(sender.public_key()), U256::from(funding)),
+                &Account::new_user_account(
+                    if first_use {
+                        ShellHash::ZERO
+                    } else {
+                        blake3_hash(sender.public_key())
+                    },
+                    U256::from(funding),
+                ),
             )?;
         }
         let genesis = Block {
@@ -145,7 +153,9 @@ fn prepare(
         }
         let chain = ChainStore::new(store.clone());
         for (sender, address) in senders.iter().zip(&addresses) {
-            chain.put_pubkey(address, sender.public_key())?;
+            if !first_use {
+                chain.put_pubkey(address, sender.public_key())?;
+            }
         }
         chain.put_pubkey(&authority, proposer.public_key())?;
         let cfg: ChainConfig = serde_json::from_value(
@@ -181,6 +191,11 @@ fn prepare(
     wpoa.chain_id = 10;
     cfg.consensus = ConsensusEngineConfig::WPoa(wpoa);
     let (mut node, _) = NodeBuilder::new(cfg, store.clone()).build()?;
+    let first_use_genesis = if first_use {
+        Some(store.scan_all()?)
+    } else {
+        None
+    };
     let tx = Transaction {
         chain_id: 10,
         nonce: 0,
@@ -195,6 +210,49 @@ fn prepare(
         max_fee_per_blob_gas: None,
         blob_versioned_hashes: None,
     };
+    if first_use {
+        let empty = MlDsaSigner::generate();
+        let empty_address = Address::from_public_key(empty.public_key(), empty.sig_type().as_u8());
+        let mut refusals = Vec::new();
+        for mode in [
+            "reference-before-registration",
+            "wrong-derived-address",
+            "insufficient-funds",
+        ] {
+            let signer = if mode == "insufficient-funds" {
+                &empty
+            } else {
+                sender
+            };
+            let from = match mode {
+                "wrong-derived-address" => recipient,
+                "insufficient-funds" => empty_address,
+                _ => address,
+            };
+            let signature = signer.sign(tx.signing_hash(signer.sig_type().as_u8()).as_bytes())?;
+            let mut signed = SignedTransaction::new(from, tx.clone(), signature);
+            if mode != "reference-before-registration" {
+                signed.pubkey_mode = shell_core::PubkeyMode::Embedded(signer.public_key().to_vec());
+            }
+            let before = digest(store.as_ref())?;
+            let error = node
+                .handle_incoming_tx(signed, &MultiVerifier)
+                .err()
+                .ok_or("invalid first-use transaction entered the mempool")?
+                .to_string();
+            ensure(
+                before == digest(store.as_ref())? && node.chain_store.get_pubkey(&from)?.is_none(),
+                "first-use refusal wrote native data or registered a key",
+            )?;
+            refusals.push(
+                json!({"case":mode,"error":error,"all_kv_unchanged":true,"key_registered":false}),
+            );
+        }
+        write(
+            &out.join("first-use-native-refusals.json"),
+            &json!({"cases":refusals,"real_signatures":true,"private_keys_persisted":false}),
+        )?;
+    }
     for position in 0..count {
         let index = position as usize % senders.len();
         let sender = &senders[index];
@@ -207,12 +265,63 @@ fn prepare(
             tx.gas_limit += index as u64;
         }
         let signature = sender.sign(tx.signing_hash(sender.sig_type().as_u8()).as_bytes())?;
-        node.handle_incoming_tx(
-            SignedTransaction::new(addresses[index], tx, signature),
-            &MultiVerifier,
+        let mut signed = SignedTransaction::new(addresses[index], tx, signature);
+        if first_use {
+            signed.pubkey_mode = shell_core::PubkeyMode::Embedded(sender.public_key().to_vec());
+        }
+        node.handle_incoming_tx(signed, &MultiVerifier)?;
+    }
+    if first_use {
+        ensure(
+            node.chain_store.get_pubkey(&address)?.is_none(),
+            "first-use mempool admission registered the key before canonical execution",
         )?;
     }
     let block = node.produce_block(proposer.as_ref(), 100)?;
+    if first_use {
+        let parent = node
+            .chain_store
+            .canonical_parent_view(block.hash(), block.header.parent_hash)?;
+        for (sender, address) in senders.iter().zip(&addresses) {
+            ensure(
+                parent.registered_key(address)?.is_none()
+                    && parent
+                        .world_state()?
+                        .get_account(address)?
+                        .is_some_and(|a| a.pq_pubkey_hash == ShellHash::ZERO)
+                    && node.chain_store.get_pubkey(address)?.as_deref()
+                        == Some(sender.public_key()),
+                "first-use parent absence or native registration mismatch",
+            )?;
+        }
+        // This independent native control isolates key-registration rollback;
+        // proof-backed wrong-root rejection is tested separately by the peer entry.
+        let failed = Arc::new(shell_storage::MemoryDb::new());
+        for (key, value) in first_use_genesis.ok_or("first-use genesis snapshot absent")? {
+            failed.put(&key, &value)?;
+        }
+        let failed_node = fixture::node(failed.clone(), authority, proposer.public_key())?;
+        let mut bad = block.clone();
+        bad.header.state_root = ShellHash::ZERO;
+        bad.proposer_seal = Some(proposer.sign(bad.hash().as_bytes())?);
+        let before = failed.scan_all()?;
+        let error = failed_node
+            .import_block(bad, &MultiVerifier)
+            .err()
+            .ok_or("wrong-root first-use block was accepted")?
+            .to_string();
+        ensure(
+            error.contains("state root mismatch")
+                && error.contains(&format!("{:?}", block.header.state_root))
+                && before == failed.scan_all()?
+                && failed_node.chain_store.get_pubkey(&address)?.is_none(),
+            "first-use root refusal happened before execution or leaked registration",
+        )?;
+        write(
+            &out.join("first-use-native-root-rollback.json"),
+            &json!({"error":error,"computed_root":block.header.state_root,"native_crypto_control_not_proof_admission":true,"all_kv_unchanged":true,"key_registered":false,"transactions_executed_before_root_refusal":count}),
+        )?;
+    }
     ensure(
         block.transactions.len() == count as usize && block.system_transactions.len() == 1,
         "native production did not execute funded sender",
@@ -255,12 +364,29 @@ fn prepare(
     store.flush()?;
     write(
         &out.join("control.json"),
-        &json!({"native_digest":digest(store.as_ref())?,"parent":block.header.parent_hash,"block":block.hash(),"state_root":block.header.state_root,"receipts":node.chain_store.get_receipts(&block.hash())?,"accounts":accounts(store.clone(), &block)?,"raw_fresh_sender_count":senders.len(),"private_keys_persisted":false}),
+        &json!({"native_digest":digest(store.as_ref())?,"parent":block.header.parent_hash,"block":block.hash(),"state_root":block.header.state_root,"receipts":node.chain_store.get_receipts(&block.hash())?,"accounts":accounts(store.clone(), &block)?,"raw_fresh_sender_count":senders.len(),"first_use_parent_unregistered":first_use,"private_keys_persisted":false}),
     )?;
     if capture_on_production {
-        let captured = node
-            .canonical_production_status(block.hash())?
-            .ok_or("production hook did not capture source")?;
+        let captured = node.canonical_production_status(block.hash())?;
+        if first_use && captured.is_none() {
+            let before = digest(store.as_ref())?;
+            let error = shell_stark_prover::canonical_producer::CanonicalProductionSource::capture(
+                &node.chain_store,
+                block.hash(),
+                block.hash(),
+            )
+            .err()
+            .ok_or("first-use source capture differs from production hook")?;
+            ensure(
+                before == digest(store.as_ref())?,
+                "failed capture changed native data",
+            )?;
+            write(
+                &out.join("capture-rejection.json"),
+                &json!({"block":block.hash(),"tip":block.hash(),"error":error,"native_execution_succeeded":true,"native_unchanged":true,"proofs_generated":0}),
+            )?;
+        }
+        let captured = captured.ok_or("production hook did not capture source")?;
         ensure(
             captured["status"]["state"] == "queued"
                 && captured["block"] == serde_json::to_value(&block)?,
@@ -426,7 +552,7 @@ fn prepare(
             bad_store.flush()?;
             write(
                 &out.join("batch-fixture.json"),
-                &json!({"good1_natively_executed":true,"control2_natively_executed":true,"bad2_storage_only_byzantine_source":true,"bad2_not_execution_evidence":true,"private_keys_persisted":false,"transactions_per_block":count,"registered_sender_keys":senders.len()}),
+                &json!({"good1_natively_executed":true,"control2_natively_executed":true,"bad2_storage_only_byzantine_source":true,"bad2_not_execution_evidence":true,"private_keys_persisted":false,"transactions_per_block":count,"registered_sender_keys":senders.len(),"first_use_parent_unregistered":first_use}),
             )?;
         }
         store.flush()?;
@@ -560,15 +686,17 @@ fn main() -> Result<(), Error> {
     )?;
     let out = Path::new(&args[1]);
     match args[0].as_str() {
-        "prepare" => prepare(out, false, false, false, 0, 1),
-        "prepare-full" => prepare(out, false, true, true, 0, 1),
-        "prepare-batch" => prepare(out, false, true, true, 2, 1),
-        "prepare-wide" => prepare(out, false, true, true, 16, 1),
-        "prepare-mixed" => prepare(out, false, true, true, 16, 2),
-        "prepare-eight-keys" => prepare(out, false, true, true, 16, 8),
-        "prepare-sixteen-keys" => prepare(out, false, true, true, 16, 16),
+        "prepare" => prepare(out, false, false, false, 0, 1, false),
+        "prepare-full" => prepare(out, false, true, true, 0, 1, false),
+        "prepare-batch" => prepare(out, false, true, true, 2, 1, false),
+        "prepare-first-use" => prepare(out, false, true, true, 2, 1, true),
+        "prepare-wide" => prepare(out, false, true, true, 16, 1, false),
+        "prepare-mixed" => prepare(out, false, true, true, 16, 2, false),
+        "prepare-eight-keys" => prepare(out, false, true, true, 16, 8, false),
+        "prepare-sixteen-keys" => prepare(out, false, true, true, 16, 16, false),
         "mixed-key-swap" => admission_runtime::mixed_key_refusal(out),
         "matrix-aggregate-refusal" => admission_runtime::aggregate_refusal(out),
+        "unbound-address-refusal" => admission_runtime::unbound_address_refusal(out),
         "wide-pause"
         | "wide-resume"
         | "mixed-pause"
@@ -595,13 +723,23 @@ fn main() -> Result<(), Error> {
         "full-pause" | "full-resume" | "full-bad-proposer" => {
             tokio::runtime::Runtime::new()?.block_on(admission_runtime::full(out, &args[0]))
         }
-        "batch-pause" | "batch-resume" => tokio::runtime::Runtime::new()?.block_on(
-            admission_runtime::batch(out, args[0] == "batch-pause", false),
-        ),
-        "batch-snapshot" => admission_runtime::snapshot_batch(out),
-        "batch-verify" => admission_runtime::verify_batch(out, false, false, false),
-        "batch-history" => admission_runtime::verify_batch(out, true, true, false),
-        "batch-history-verify" => admission_runtime::verify_batch(out, true, false, false),
+        "batch-pause" | "batch-resume" | "first-use-pause" | "first-use-resume" => {
+            tokio::runtime::Runtime::new()?.block_on(admission_runtime::batch(
+                out,
+                args[0].ends_with("-pause"),
+                false,
+            ))
+        }
+        "batch-snapshot" | "first-use-snapshot" => admission_runtime::snapshot_batch(out),
+        "batch-verify" | "first-use-verify" => {
+            admission_runtime::verify_batch(out, false, false, false)
+        }
+        "batch-history" | "first-use-history" => {
+            admission_runtime::verify_batch(out, true, true, false)
+        }
+        "batch-history-verify" | "first-use-history-verify" => {
+            admission_runtime::verify_batch(out, true, false, false)
+        }
         "full-verify" => admission_runtime::verify_full(out),
         "full-snapshot" => admission_runtime::snapshot_full(out),
         "consecutive-pause" | "consecutive-resume" => tokio::runtime::Runtime::new()?.block_on(
@@ -614,8 +752,8 @@ fn main() -> Result<(), Error> {
         "full-history" | "full-history-verify" => {
             admission_runtime::history_full(out, args[0] == "full-history")
         }
-        "prepare-runtime" => prepare(out, true, false, false, 0, 1),
-        "prepare-production-hook" => prepare(out, false, true, false, 0, 1),
+        "prepare-runtime" => prepare(out, true, false, false, 0, 1, false),
+        "prepare-production-hook" => prepare(out, false, true, false, 0, 1, false),
         "runtime-pause" | "runtime-resume" => {
             tokio::runtime::Runtime::new()?.block_on(runtime::run(out, args[0] == "runtime-pause"))
         }

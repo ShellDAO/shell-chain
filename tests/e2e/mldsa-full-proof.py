@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 mode, raw_fixture, raw_output = sys.argv[1:]
-assert mode in ("run", "verify", "consecutive", "batch", "wide", "mixed", "eight-keys", "sixteen-keys")
+assert mode in ("run", "verify", "consecutive", "batch", "first-use", "wide", "mixed", "eight-keys", "sixteen-keys")
 fixture, out = map(lambda p: Path(p).resolve(), (raw_fixture, raw_output))
 
 def now():
@@ -72,19 +72,29 @@ if mode == "verify" and (out / "network-batch/complete.json").exists():
     historical = (out / "network-batch/history-verified.json").exists()
     run("batch-cold-verify", [fixture, "batch-history-verify" if historical else "batch-verify", out])
     sys.exit(0)
-if mode in ("batch", "wide", "mixed", "eight-keys", "sixteen-keys"):
+if mode in ("batch", "first-use", "wide", "mixed", "eight-keys", "sixteen-keys"):
     wide = mode in ("wide", "mixed", "eight-keys", "sixteen-keys")
+    first_use = mode == "first-use"
     label = mode
     registered = 16 if mode == "sixteen-keys" else 8 if mode == "eight-keys" else 2 if mode == "mixed" else 1
     unique_components = 982 if registered == 16 else 433 + 40 * (registered - 1) if wide else 179
     count = 16 if wide else 2
-    shared_inputs = 40 * (count - registered) if wide else 40
+    shared_inputs = 40 * (count - registered) if wide else 41 if first_use else 40
     funding = 2_000_000 if wide else 1_000_000
     out.mkdir(exist_ok=True)
     if not (out / "control.json").exists():
         run("prepare-" + label, [fixture, "prepare-" + label, out])
     assert (out / "batch-fixture.json").exists(), "partial batch preparation retained; inspect receipts"
     assert json.loads((out / "control.json").read_text())["raw_fresh_sender_count"] == registered, "retained fixture has a different sender profile"
+    if first_use:
+        assert json.loads((out / "control.json").read_text())["first_use_parent_unregistered"]
+        refusals = json.loads((out / "first-use-native-refusals.json").read_text())
+        assert refusals["real_signatures"] and not refusals["private_keys_persisted"]
+        assert {row["case"] for row in refusals["cases"]} == {"reference-before-registration", "wrong-derived-address", "insufficient-funds"}
+        assert all(row["all_kv_unchanged"] and not row["key_registered"] for row in refusals["cases"])
+        rollback = json.loads((out / "first-use-native-root-rollback.json").read_text())
+        assert rollback["native_crypto_control_not_proof_admission"] and rollback["all_kv_unchanged"] and not rollback["key_registered"]
+        assert rollback["transactions_executed_before_root_refusal"] == 2
     for name, nonce in (("control.json", count), ("later-control.json", 2 * count)):
         control = json.loads((out / name).read_text())
         senders = control["accounts"][:registered]
@@ -101,6 +111,9 @@ if mode in ("batch", "wide", "mixed", "eight-keys", "sixteen-keys"):
         run((label + "-pause"), [fixture, (label + "-pause"), out])
         save(out / (label + "-paused-snapshot.json"), json.loads(run((label + "-paused-snapshot"), [fixture, (label + "-snapshot"), out])))
     assert (out / (label + "-paused-snapshot.json")).exists(), "unrecorded batch pause retained"
+    if first_use:
+        initial = json.loads((network / "initial.json").read_text())
+        assert initial["first_use_parent_unregistered"] and initial["initial_registered_sender_keys"] == 0
     if not (network / "complete.json").exists():
         run((label + "-resume"), [fixture, (label + "-resume"), out])
     after = json.loads(run((label + "-complete-snapshot"), [fixture, (label + "-snapshot"), out]))
@@ -117,7 +130,7 @@ if mode in ("batch", "wide", "mixed", "eight-keys", "sixteen-keys"):
     shared = [name for name in generated if stable.fullmatch(name)]
     fresh_senders = {name.removesuffix("-key") for name in shared if re.fullmatch(r"sender-[0-9]+-key", name)}
     matrix_parts = sum("-matrix-" in name for name in shared)
-    expected_shared = 152 + matrix_parts if registered == 16 else 77 + 39 * (registered - 1)
+    expected_shared = 152 + matrix_parts if registered == 16 else 78 if first_use else 77 + 39 * (registered - 1)
     assert len(shared) == len(set(shared)) == expected_shared and len(fresh_senders) == registered, "identical batch key inputs regenerated"
     if registered == 16:
         assert matrix_parts >= 27 * 17, "shared full-matrix parts missing"
@@ -129,28 +142,41 @@ if mode in ("batch", "wide", "mixed", "eight-keys", "sixteen-keys"):
     if registered == 16:
         unique_components = completed["production1"]["components"]
         assert unique_components >= 982 and completed["production2"]["components"] == unique_components
+    elif first_use:
+        unique_components = completed["production1"]["components"]
+        assert unique_components > 0 and completed["production2"]["components"] > 0
+        assert completed["unbound_first_use_registration_verified"]
     if not (network / "verified.json").exists():
         run((label + "-verify"), [fixture, (label + "-verify"), out])
     if not (network / "history-verified.json").exists():
         run((label + "-history"), [fixture, (label + "-history"), out])
-    if registered > 1 and not (network / "cross-key-refused.json").exists():
+    if (registered > 1 or first_use) and not (network / "cross-key-refused.json").exists():
         run("mixed-key-swap", [fixture, "mixed-key-swap", out])
+    if first_use and not (network / "address-refused.json").exists():
+        run("unbound-address-refusal", [fixture, "unbound-address-refusal", out])
     if mode in ("eight-keys", "sixteen-keys") and not (network / "aggregate-refused.json").exists():
         run("matrix-aggregate-refusal", [fixture, "matrix-aggregate-refusal", out])
     run((label + "-history-cold"), [fixture, (label + "-history-verify"), out])
     run((label + "-history-cold-again"), [fixture, (label + "-history-verify"), out])
+    if first_use and not (out / "compact-first-use/complete.json").exists():
+        run("first-use-compact-roundtrip", [fixture, "compact-roundtrip", out, out / "compact-first-use"])
     result = {"two_ordered_transactions_proof_admitted": True,
               "signed_wrong_root_child_executed_and_atomically_refused": True,
               "bad_source_is_byzantine_storage_only": True,
-              "components_per_full_graph": unique_components if registered == 16 else 1033 if wide else 179, "unique_checkpoint_components": unique_components, "transactions_per_block": count, "registered_sender_keys": registered,
+              "components_per_full_graph": unique_components if registered == 16 or first_use else 1033 if wide else 179, "unique_checkpoint_components": unique_components, "checkpoint_components_per_graph": [completed["production1"]["components"], completed["production2"]["components"]], "transactions_per_block": count, "registered_sender_keys": registered,
               "unique_fresh_matrix_certificates": matrix_parts if registered == 16 else 30 * (registered + 1),
               "physical_checkpoint_bytes": after["physical_checkpoint_bytes"],
               "reused1": completed["production1"]["reused"], "reused2": completed["production2"]["reused"],
               "native_control_and_cold_historic_replay_match": True, "finished_at": now()}
-    if registered > 1:
+    if registered > 1 or first_use:
         refusal = json.loads((network / "cross-key-refused.json").read_text())
         assert refusal["all_kv_unchanged"] and refusal["original_proof_unchanged"] and refusal["new_proofs_generated"] == 0
         result["valid_other_registered_key_certificate_refused"] = True
+    if first_use:
+        refusal = json.loads((network / "address-refused.json").read_text())
+        assert refusal["genuine_raw_key_hash_cannot_authorize_unbound_address"] and refusal["all_kv_unchanged"] and refusal["original_proof_unchanged"] and refusal["new_proofs_generated"] == 0
+        result["first_use_parent_unregistered"] = True
+        result["wrong_address_certificate_refused"] = True
     if mode in ("eight-keys", "sixteen-keys"):
         refusal = json.loads((network / "aggregate-refused.json").read_text())
         assert refusal["changed_intermediate_lane_with_genuine_aggregate"] and refusal["all_kv_unchanged"] and refusal["original_proof_unchanged"] and refusal["new_proofs_generated"] == 0

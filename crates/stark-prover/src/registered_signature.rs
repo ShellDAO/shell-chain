@@ -1,7 +1,7 @@
-//! Committed account-key binding and exact proof-backed signature verification.
+//! Default account key/address binding and exact proof-backed signature verification.
 //!
-//! The account snapshot authenticates a key hash, not the separate registry KV
-//! index. Callers must obtain that index, configuration and parent state from
+//! The account snapshot authenticates its key commitment or unbound status,
+//! not the separate registry KV index. Callers must obtain that index, configuration and parent state from
 //! their trusted chain context and still run native account/transaction policy.
 
 use crate::{
@@ -19,11 +19,12 @@ use shell_crypto::{CryptoError, PQSignature, SignatureType, Verifier};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegisteredSignatureProof {
+    /// One binds a registered account commitment; two binds an unbound account's address.
     pub version: u8,
     pub transaction: TransactionSignatureProof,
     pub transaction_id: Blake3HashProof,
     pub leaf: Blake3HashProof,
-    /// Present for the algorithm-tagged account hash (algorithm byte || key).
+    /// Algorithm-tagged account hash in version one, mandatory sender address in version two.
     /// Its activation is a native policy check, not established by this proof.
     pub tagged_key: Option<Blake3HashProof>,
 }
@@ -114,16 +115,6 @@ pub fn verify_registered_signature_entry(
     {
         return Err("registered signature requires a bound default account".into());
     }
-    let key_id = match &expected.pubkey_mode {
-        PubkeyMode::Embedded(key) if key.as_slice() == expected_key => &expected_key[..32],
-        PubkeyMode::Embedded(_) => return Err("registered Embedded key conflict".into()),
-        PubkeyMode::Reference => expected.from.as_bytes().as_slice(),
-    };
-    if expected_entry.msg_hash != proof.transaction.signing_hash.output
-        || expected_entry.pk_hash.as_slice() != key_id
-    {
-        return Err("registered entry message or key identifier mismatch".into());
-    }
     if let Some(tagged) = &proof.tagged_key {
         let mut preimage = Vec::with_capacity(1 + expected_key.len());
         preimage.push(SignatureType::MlDsa65.as_u8());
@@ -132,6 +123,93 @@ pub fn verify_registered_signature_entry(
             .map_err(|e| format!("registered algorithm key binding: {e}"))?;
     } else if account.pq_pubkey_hash.as_bytes() != &proof.transaction.public_key_hash.output {
         return Err("registered raw key binding mismatch".into());
+    }
+    let entry = verify_entry_sources(
+        proof,
+        expected,
+        expected_key,
+        expected_id,
+        expected_entry,
+        expected_leaf,
+    )?;
+    Ok(VerifiedRegisteredSignature {
+        entry,
+        account: state.clone(),
+        transaction: expected.tx.clone(),
+        mode: expected.pubkey_mode.clone(),
+        key: expected_key.to_vec(),
+        signature: expected.signature.clone(),
+    })
+}
+
+/// Verify an unbound default account's complete signature and derived address.
+/// The caller must independently resolve the historical registry: Embedded is
+/// required when it is absent; Reference is allowed only after registration.
+/// Native activation, nonce, funds and atomic key registration remain mandatory.
+pub fn verify_unbound_signature_entry(
+    proof: &RegisteredSignatureProof,
+    expected: &SignedTransaction,
+    expected_key: &[u8],
+    state: &VerifiedAccountState,
+    expected_id: &[u8; 32],
+    expected_entry: &SigBatchEntry,
+    expected_leaf: &[u8; 32],
+) -> Result<VerifiedSignatureEntry, String> {
+    if proof.version != 2 || expected.signature.sig_type != SignatureType::MlDsa65 {
+        return Err("invalid unbound signature proof version or algorithm".into());
+    }
+    if expected.tx.tx_type > 3 || expected.aa_bundle.is_some() || expected_key.len() != 1952 {
+        return Err("unsupported unbound signature framing or key shape".into());
+    }
+    if state.address() != expected.from.as_bytes()
+        || state.account().is_none_or(|account| {
+            account.validation_code_hash.is_some()
+                || account.pq_pubkey_hash != shell_primitives::ShellHash::ZERO
+        })
+    {
+        return Err(
+            "unbound signature requires the expected zero-commitment default account".into(),
+        );
+    }
+    let mut address = Vec::with_capacity(1 + expected_key.len());
+    address.push(SignatureType::MlDsa65.as_u8());
+    address.extend_from_slice(expected_key);
+    verify_hash(
+        proof
+            .tagged_key
+            .as_ref()
+            .ok_or("unbound signature address proof absent")?,
+        &address,
+        expected.from.as_bytes(),
+    )
+    .map_err(|e| format!("unbound sender address: {e}"))?;
+    verify_entry_sources(
+        proof,
+        expected,
+        expected_key,
+        expected_id,
+        expected_entry,
+        expected_leaf,
+    )
+}
+
+fn verify_entry_sources(
+    proof: &RegisteredSignatureProof,
+    expected: &SignedTransaction,
+    expected_key: &[u8],
+    expected_id: &[u8; 32],
+    expected_entry: &SigBatchEntry,
+    expected_leaf: &[u8; 32],
+) -> Result<VerifiedSignatureEntry, String> {
+    let key_id = match &expected.pubkey_mode {
+        PubkeyMode::Embedded(key) if key.as_slice() == expected_key => &expected_key[..32],
+        PubkeyMode::Embedded(_) => return Err("signature Embedded key conflict".into()),
+        PubkeyMode::Reference => expected.from.as_bytes().as_slice(),
+    };
+    if expected_entry.msg_hash != proof.transaction.signing_hash.output
+        || expected_entry.pk_hash.as_slice() != key_id
+    {
+        return Err("signature entry message or key identifier mismatch".into());
     }
     let mut id = Vec::with_capacity(PQTX_ID_DOMAIN.len() + 64);
     id.extend_from_slice(PQTX_ID_DOMAIN);
@@ -151,17 +229,10 @@ pub fn verify_registered_signature_entry(
         &expected.signature.data,
         &proof.transaction.public_key_hash.output,
     )?;
-    Ok(VerifiedRegisteredSignature {
-        entry: VerifiedSignatureEntry::from_verified_parts(
-            expected_entry.clone(),
-            *expected_leaf,
-            *expected_id,
-            *expected.from.as_bytes(),
-        ),
-        account: state.clone(),
-        transaction: expected.tx.clone(),
-        mode: expected.pubkey_mode.clone(),
-        key: expected_key.to_vec(),
-        signature: expected.signature.clone(),
-    })
+    Ok(VerifiedSignatureEntry::from_verified_parts(
+        expected_entry.clone(),
+        *expected_leaf,
+        *expected_id,
+        *expected.from.as_bytes(),
+    ))
 }

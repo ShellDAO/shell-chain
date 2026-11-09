@@ -653,7 +653,7 @@ impl<S: KvStore + 'static> Node<S> {
                 .len();
             let mut job = if distinct_senders > 8 {
                 ProductionStore::open_shared_matrix(&mut kv, source.identity(), limit)
-            } else if source.block().transactions.len() > 2 {
+            } else if source.block().transactions.len() > 2 || source.has_unbound_senders() {
                 ProductionStore::open_compact(&mut kv, source.identity(), limit)
             } else {
                 ProductionStore::open(&mut kv, source.identity(), limit)

@@ -305,10 +305,24 @@ fn prepare_from(out: &Path, directory: &str, source_path: &Path) -> Result<(), E
     let genesis = chain
         .get_block_by_hash(&config.genesis_hash)?
         .ok_or("source genesis absent")?;
+    let control: Value = read(&out.join("control.json"))?;
+    let first_use = control["first_use_parent_unregistered"]
+        .as_bool()
+        .unwrap_or(false);
     let keys = sender_addresses(&block)
         .into_iter()
         .map(|address| {
-            let key = chain.get_pubkey(&address)?.ok_or("parent key absent")?;
+            let key = if first_use {
+                block
+                    .transactions
+                    .iter()
+                    .find(|tx| tx.from == address)
+                    .and_then(|tx| tx.pubkey_mode.pubkey_bytes())
+                    .ok_or("first-use Embedded source key absent")?
+                    .to_vec()
+            } else {
+                chain.get_pubkey(&address)?.ok_or("parent key absent")?
+            };
             Ok((address, key))
         })
         .collect::<Result<Vec<_>, Error>>()?;
@@ -323,7 +337,14 @@ fn prepare_from(out: &Path, directory: &str, source_path: &Path) -> Result<(), E
     for (address, key) in &keys {
         world.set_account(
             address,
-            &Account::new_user_account(blake3_hash(key), U256::from(funding)),
+            &Account::new_user_account(
+                if first_use {
+                    ShellHash::ZERO
+                } else {
+                    blake3_hash(key)
+                },
+                U256::from(funding),
+            ),
         )?;
     }
     ensure(
@@ -332,14 +353,25 @@ fn prepare_from(out: &Path, directory: &str, source_path: &Path) -> Result<(), E
     )?;
     let target = ChainStore::new(store.clone());
     for (address, key) in &keys {
-        target.put_pubkey(address, key)?;
+        if !first_use {
+            target.put_pubkey(address, key)?;
+        }
     }
     target.put_pubkey(&c.authority, &c.authority_key)?;
     target.commit_genesis_block(&genesis, &config)?;
+    let initial_registered =
+        keys.iter()
+            .try_fold(0usize, |count, (address, _)| -> Result<usize, Error> {
+                Ok(count + usize::from(target.get_pubkey(address)?.is_some()))
+            })?;
+    ensure(
+        initial_registered == if first_use { 0 } else { keys.len() },
+        "independent receiver parent registry mismatch",
+    )?;
     store.flush()?;
     write(
         &network.join("initial.json"),
-        &json!({"head":genesis.hash(),"native_digest":canonical_digest(store.as_ref())?,"independent_genesis":true,"private_keys_persisted":false}),
+        &json!({"head":genesis.hash(),"native_digest":canonical_digest(store.as_ref())?,"independent_genesis":true,"first_use_parent_unregistered":first_use,"initial_registered_sender_keys":initial_registered,"private_keys_persisted":false}),
     )?;
     Ok(())
 }
@@ -1501,6 +1533,9 @@ pub(super) async fn batch(out: &Path, pause: bool, wide: bool) -> Result<(), Err
     let network = out.join(directory);
     let count = if wide { 16 } else { 2 };
     let profile: Value = read(&out.join("batch-fixture.json"))?;
+    let first_use = profile["first_use_parent_unregistered"]
+        .as_bool()
+        .unwrap_or(false);
     let senders = profile["registered_sender_keys"].as_u64().unwrap_or(1) as usize;
     ensure(
         (wide && matches!(senders, 1 | 2 | 8 | 16)) || !wide && senders == 1,
@@ -1619,9 +1654,17 @@ pub(super) async fn batch(out: &Path, pause: bool, wide: bool) -> Result<(), Err
             if baseline.is_none() && admission1["status"]["state"] == "complete" && finalized == 1 {
                 let control: Value = read(&out.join("control.json"))?;
                 ensure(head.hash() == c.block && *receiver.node.finality.read().last_finalized_hash() == c.block
-                    && (if senders == 16 { counts[0] >= components } else { counts[0] == components }) && production1["status"]["state"] == "complete"
+                    && (if first_use { counts[0] > 0 } else if senders == 16 { counts[0] >= components } else { counts[0] == components }) && production1["status"]["state"] == "complete"
                     && receiver.node.chain_store.get_receipts(&c.block)?.map(serde_json::to_value).transpose()? == Some(control["receipts"].clone())
                     && accounts(receiver.node.store.clone(), &good)? == control["accounts"], "valid batch native outputs/finality mismatch")?;
+                if first_use {
+                    let parent = receiver.node.chain_store.canonical_parent_view(c.block, good.header.parent_hash)?;
+                    for tx in &good.transactions {
+                        ensure(parent.registered_key(&tx.from)?.is_none()
+                            && receiver.node.chain_store.get_pubkey(&tx.from)?.as_deref() == tx.pubkey_mode.pubkey_bytes(),
+                            "first-use proof admission did not atomically register the exact Embedded key")?;
+                    }
+                }
                 let before = canonical_digest(receiver.node.store.as_ref())?;
                 let path = network.join("rollback-baseline.json");
                 let record = json!({"native_digest":before,"head":head.hash(),"finalized":finalized,"accounts":control["accounts"],"receipts":control["receipts"]});
@@ -1638,7 +1681,7 @@ pub(super) async fn batch(out: &Path, pause: bool, wide: bool) -> Result<(), Err
                     && receiver.node.chain_store.get_block_by_hash(&bad.hash())?.is_none()
                     && receiver.node.chain_store.get_receipts(&bad.hash())?.is_none()
                     && canonical_digest(receiver.node.store.as_ref())? == before, "failed batch leaked native writes")?;
-                ensure((if senders == 16 { counts[0] >= components && counts[0] == counts[1] } else { counts == [components,components] }) && production2["status"]["state"] == "complete", "batch full graph incomplete")?;
+                ensure((if first_use { counts[0] > 0 && counts[1] > 0 } else if senders == 16 { counts[0] >= components && counts[0] == counts[1] } else { counts == [components,components] }) && production2["status"]["state"] == "complete", "batch full graph incomplete")?;
                 for (hash, status, store, name) in [(c.block, &admission1, receiver.node.store.clone(), "good"), (bad.hash(), &production2, provider.node.store.clone(), "bad")] {
                     let manifest: CanonicalProofManifest = serde_json::from_value(status["status"]["manifest"].clone())?;
                     ensure(manifest.block_hash == hash, "batch manifest mismatch")?;
@@ -1658,7 +1701,7 @@ pub(super) async fn batch(out: &Path, pause: bool, wide: bool) -> Result<(), Err
                     if path.exists() { ensure(read::<CanonicalProofManifest>(&path)? == manifest, "retained batch manifest changed")?; }
                     else { write(&path, &manifest)?; }
                 }
-                write(&network.join("complete.json"), &json!({"production1":production1["status"],"production2":production2["status"],"admission1":admission1,"admission2":admission2,"native_digest":before,"served_chunks":faults.chunks.load(Ordering::SeqCst),"both_native_transactions_executed_before_wrong_root_refusal":count==2,"native_transactions_executed_before_wrong_root_refusal":count,"failed_batch_native_unchanged":true,"bad_source_is_storage_only_byzantine_fixture":true,"finalized":finalized}))?;
+                write(&network.join("complete.json"), &json!({"production1":production1["status"],"production2":production2["status"],"admission1":admission1,"admission2":admission2,"native_digest":before,"served_chunks":faults.chunks.load(Ordering::SeqCst),"both_native_transactions_executed_before_wrong_root_refusal":count==2,"native_transactions_executed_before_wrong_root_refusal":count,"unbound_first_use_registration_verified":first_use,"failed_batch_native_unchanged":true,"bad_source_is_storage_only_byzantine_fixture":true,"finalized":finalized}))?;
                 break;
             }
             ensure(tokio::time::Instant::now() < deadline && last_progress.elapsed() < Duration::from_secs(idle_bound), "batch progress bound exceeded")?;
@@ -1781,19 +1824,34 @@ pub(super) fn verify_batch(
 
 /// A valid certificate for another registered key cannot authorize this sender.
 pub(super) fn mixed_key_refusal(out: &Path) -> Result<(), Error> {
-    certificate_refusal(out, false)
+    certificate_refusal(out, CertificateFault::Key)
 }
 /// Changing an intermediate Keccak lane with a genuine aggregate proof and a
 /// freshly computed availability hash must fail full AIR at the native reader.
 pub(super) fn aggregate_refusal(out: &Path) -> Result<(), Error> {
-    certificate_refusal(out, true)
+    certificate_refusal(out, CertificateFault::Keccak)
 }
-fn certificate_refusal(out: &Path, aggregate: bool) -> Result<(), Error> {
-    let network = out.join("network-wide");
-    let label = if aggregate {
-        "aggregate-refused"
+/// A genuine raw-key hash cannot replace the algorithm-tagged address proof.
+pub(super) fn unbound_address_refusal(out: &Path) -> Result<(), Error> {
+    certificate_refusal(out, CertificateFault::Address)
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CertificateFault {
+    Key,
+    Keccak,
+    Address,
+}
+fn certificate_refusal(out: &Path, fault: CertificateFault) -> Result<(), Error> {
+    let wide = out.join("network-wide/complete.json").exists();
+    let network = out.join(if wide {
+        "network-wide"
     } else {
-        "cross-key-refused"
+        "network-batch"
+    });
+    let label = match fault {
+        CertificateFault::Keccak => "aggregate-refused",
+        CertificateFault::Key => "cross-key-refused",
+        CertificateFault::Address => "address-refused",
     };
     ensure(
         !network.join(format!("{label}.json")).exists(),
@@ -1801,21 +1859,18 @@ fn certificate_refusal(out: &Path, aggregate: bool) -> Result<(), Error> {
     )?;
     let c: fixture::Context = read(&out.join("context.json"))?;
     let block: Block = read(&out.join("candidate.json"))?;
-    let other = if aggregate {
-        None
+    let other = block
+        .transactions
+        .iter()
+        .position(|tx| tx.from != block.transactions[0].from);
+    let original_path = network.join(if wide {
+        "good-proof.cbor"
     } else {
-        Some(
-            block
-                .transactions
-                .iter()
-                .position(|tx| tx.from != block.transactions[0].from)
-                .ok_or("second registered sender missing")?,
-        )
-    };
-    let original_path = network.join("good-proof.cbor");
+        "good-proof.json"
+    });
     let original = std::fs::read(&original_path)?;
     let mut proof = shell_stark_prover::compact_canonical::decode_payload(&original)?;
-    if aggregate {
+    if fault == CertificateFault::Keccak {
         let xof = &mut proof.transactions[0]
             .signature
             .transaction
@@ -1829,14 +1884,32 @@ fn certificate_refusal(out: &Path, aggregate: bool) -> Result<(), Error> {
             "aggregate certificate missing",
         )?;
         xof.permutations[0].rounds[11].theta[24] ^= 1;
+    } else if fault == CertificateFault::Address {
+        let signature = &mut proof.transactions[0].signature;
+        ensure(
+            signature.version == 2 && signature.tagged_key.is_some(),
+            "unbound address profile absent",
+        )?;
+        signature.tagged_key = Some(signature.transaction.public_key_hash.clone());
     } else {
-        let certificate = proof.transactions[other.ok_or("donor missing")?]
-            .signature
-            .transaction
-            .signature
-            .equation
-            .key
-            .clone();
+        let certificate = if let Some(index) = other {
+            proof.transactions[index]
+                .signature
+                .transaction
+                .signature
+                .equation
+                .key
+                .clone()
+        } else {
+            proof
+                .proposer
+                .as_ref()
+                .ok_or("distinct proposer donor missing")?
+                .signature
+                .equation
+                .key
+                .clone()
+        };
         ensure(
             certificate.proof_bytes
                 != proof.transactions[0]
@@ -1884,10 +1957,10 @@ fn certificate_refusal(out: &Path, aggregate: bool) -> Result<(), Error> {
         .expect_err("altered certificate must not authorize the sender")
         .to_string();
     ensure(
-        if aggregate {
-            error.contains("Keccak aggregate verification")
-        } else {
-            error.contains("key") || error.contains("proof")
+        match fault {
+            CertificateFault::Keccak => error.contains("Keccak aggregate verification"),
+            CertificateFault::Address => error.contains("unbound sender address"),
+            CertificateFault::Key => error.contains("key") || error.contains("proof"),
         },
         "unexpected certificate refusal",
     )?;
@@ -1912,7 +1985,7 @@ fn certificate_refusal(out: &Path, aggregate: bool) -> Result<(), Error> {
     }
     write(
         &network.join(format!("{label}.json")),
-        &json!({"correct_outer_hash":hash,"valid_other_registered_key_certificate":!aggregate,"changed_intermediate_lane_with_genuine_aggregate":aggregate,"donor_transaction":other,"error":error,"all_kv_unchanged":true,"original_proof_unchanged":true,"new_proofs_generated":0,"current_head":tip}),
+        &json!({"correct_outer_hash":hash,"valid_other_registered_key_certificate":fault==CertificateFault::Key,"changed_intermediate_lane_with_genuine_aggregate":fault==CertificateFault::Keccak,"genuine_raw_key_hash_cannot_authorize_unbound_address":fault==CertificateFault::Address,"donor_transaction":other,"donor_proposer":fault==CertificateFault::Key && other.is_none(),"error":error,"all_kv_unchanged":true,"original_proof_unchanged":true,"new_proofs_generated":0,"current_head":tip}),
     )
 }
 

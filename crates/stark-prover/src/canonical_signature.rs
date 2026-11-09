@@ -4,7 +4,8 @@
 use crate::{
     account_state::{verify_account_state, AccountStateProof},
     registered_signature::{
-        verify_registered_signature_entry, RegisteredSignatureProof, VerifiedRegisteredSignature,
+        verify_registered_signature_entry, verify_unbound_signature_entry,
+        RegisteredSignatureProof, VerifiedRegisteredSignature,
     },
     SigBatchEntry,
 };
@@ -29,6 +30,23 @@ impl CanonicalRegisteredSignature {
         self.parent
     }
 }
+fn signing_source_in_bounds(signed: &SignedTransaction) -> bool {
+    let mut raw_bytes = signed.tx.data.len();
+    for entry in signed.tx.access_list.iter().flatten() {
+        raw_bytes = raw_bytes
+            .saturating_add(32)
+            .saturating_add(entry.storage_keys.len().saturating_mul(32));
+    }
+    raw_bytes = raw_bytes.saturating_add(
+        signed
+            .tx
+            .blob_versioned_hashes
+            .as_ref()
+            .map_or(0, |hashes| hashes.len().saturating_mul(32)),
+    );
+    raw_bytes <= crate::blake3_hash::MAX_HASH_BYTES
+}
+
 /// Resolve the key/account only from the sealed historical view, then prove
 /// the complete registered signature predicate. A key first registered later
 /// must not authorize this profile at an earlier parent. The transaction itself
@@ -54,20 +72,7 @@ pub fn verify_canonical_registered_signature<S: KvStore + 'static>(
     {
         return Err("unsupported canonical registered signature framing".into());
     }
-    let mut raw_bytes = signed.tx.data.len();
-    for entry in signed.tx.access_list.iter().flatten() {
-        raw_bytes = raw_bytes
-            .saturating_add(32)
-            .saturating_add(entry.storage_keys.len().saturating_mul(32));
-    }
-    raw_bytes = raw_bytes.saturating_add(
-        signed
-            .tx
-            .blob_versioned_hashes
-            .as_ref()
-            .map_or(0, |hashes| hashes.len().saturating_mul(32)),
-    );
-    if raw_bytes > crate::blake3_hash::MAX_HASH_BYTES {
+    if !signing_source_in_bounds(signed) {
         return Err("canonical signing source exceeds hash resource bound".into());
     }
     let key = view
@@ -109,6 +114,67 @@ pub fn verify_canonical_registered_signature<S: KvStore + 'static>(
         tip: view.tip(),
         parent: view.parent().hash(),
     })
+}
+
+/// Check the unbound-account profile against the independently frozen parent.
+/// A later registry entry never supplies the key for an earlier first-use transaction.
+pub(crate) fn verify_canonical_unbound_signature<S: KvStore + 'static>(
+    view: &CanonicalParentView<S>,
+    signed: &SignedTransaction,
+    account_proof: &AccountStateProof,
+    proof: &RegisteredSignatureProof,
+) -> Result<crate::mldsa_source::VerifiedSignatureEntry, String> {
+    if signed.tx.chain_id != view.config().chain_id
+        || signed.tx.tx_type > 3
+        || signed.aa_bundle.is_some()
+        || signed.signature.sig_type != shell_crypto::SignatureType::MlDsa65
+        || signed.signature.data.len() != 3309
+        || signed
+            .pubkey_mode
+            .pubkey_bytes()
+            .is_some_and(|key| key.len() != 1952)
+        || !signing_source_in_bounds(signed)
+    {
+        return Err("unsupported canonical unbound signature framing".into());
+    }
+    let registered = view
+        .registered_key(&signed.from)
+        .map_err(|e| e.to_string())?;
+    let key = match (registered, signed.pubkey_mode.pubkey_bytes()) {
+        (Some(key), Some(embedded)) if key.as_slice() != embedded => {
+            return Err("canonical unbound Embedded key conflicts with parent registry".into());
+        }
+        (Some(key), _) => key,
+        (None, Some(embedded)) => embedded.to_vec(),
+        (None, None) => return Err("canonical first use requires an Embedded key".into()),
+    };
+    if key.len() != 1952 {
+        return Err("canonical unbound registry key is not ML-DSA-65 shaped".into());
+    }
+    let account = view
+        .world_state()
+        .map_err(|e| e.to_string())?
+        .get_account(&signed.from)
+        .map_err(|e| e.to_string())?;
+    let state = verify_account_state(
+        account_proof,
+        view.parent().state_root.as_bytes(),
+        signed.from.as_bytes(),
+        account.as_ref(),
+    )?;
+    let mut fresh =
+        SignedTransaction::new(signed.from, signed.tx.clone(), signed.signature.clone());
+    fresh.pubkey_mode = signed.pubkey_mode.clone();
+    let entry = SigBatchEntry::from_signed_transaction(&fresh);
+    verify_unbound_signature_entry(
+        proof,
+        signed,
+        &key,
+        &state,
+        fresh.hash().as_bytes(),
+        &entry,
+        &entry.to_leaf_bytes(),
+    )
 }
 
 /// Full registered signature plus AIR membership at a frozen trusted canonical header.

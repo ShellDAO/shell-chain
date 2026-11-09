@@ -856,12 +856,16 @@ later penalty observations as earlier consensus state.
 ## Native Node historical sender-proof replay
 
 `Node::replay_canonical_transactions_with_proof` consumes a complete ordered
-`CanonicalSignatureBatchProof` for a retained canonical block. Version 1 covers
-one to sixteen ordinary registered ML-DSA-65 senders with default accounts at
-the parent; AA, parent custom validators, first-use keys, other algorithms and
-pruned witnesses are rejected.
-Every transaction has its own account-MPT and complete registered
-source/signature proof. Missing, extra or differently ordered proofs fail.
+`CanonicalSignatureBatchProof` for a retained canonical block. It covers one to
+sixteen ordinary ML-DSA-65 default-account senders at the parent. Sender proof
+version 1 requires a bound registered key; sender proof version 2 supports
+funded zero-commitment accounts with the complete derived-address predicate and
+historical registry checks. AA, parent custom validators, other first-use
+arrangements, other algorithms and pruned witnesses remain outside this profile.
+Every transaction has its own account-MPT and complete source/signature proof.
+Missing, extra or differently ordered proofs fail. See the
+[unbound account entry](stark-aggregation.md#unbound-default-account-signatures)
+for Embedded first use, subsequent Reference mode and the standalone regression.
 
 The expected tip and block are caller trust anchors. The node captures its
 canonical parent, keys, configuration, native body and witnesses before proof
@@ -1214,9 +1218,13 @@ captured through the bounded canonical parent view, including its configuration,
 body, registered keys and account trie witnesses. A different source, damaged
 checkpoint or invalid signature is refused. Retention still limits how far the
 parent can be from the tip; this command does not reserve history for a live
-node. Unsupported first-use, account-abstraction and other signature profiles
-are refused before proving.
+node. Funded zero-commitment default accounts require Embedded keys at first use
+and the full algorithm-tagged derived-address proof; later Reference mode resolves
+the historical registered key. Other first-use arrangements, account abstraction
+and other signature algorithms are refused before proving.
 
+New unbound-account jobs use the existing compact checkpoint format even for
+one or two transactions; existing job indexes and certificates are immutable.
 Each certificate is mathematically verified before atomic checkpoint storage
 and again when reused. After the complete graph verifies, the command writes
 `proof.json`, `manifest.json` and `block.json` in the job directory. Existing

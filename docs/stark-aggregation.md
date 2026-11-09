@@ -64,10 +64,11 @@ shell-node --datadir node-data run --config node.toml --db rocksdb \
 Use a RocksDB-enabled build, a previously initialized node with an activated
 body-commitment schedule and its matching `node.toml` runtime configuration.
 An eligible canonical block contains 1–16 supported ML-DSA-65 user transactions
-and only gas-reward system transactions. The supported profile requires
-parent-registered keys, default account validation, transaction types 0–3 and
-signing payloads within the existing 4096-byte hash limit. AA, first-use key
-registration and other signature algorithms require separate producer work.
+and only gas-reward system transactions. Supported default accounts have either
+a parent-registered committed key or a zero key commitment with the derived-address
+predicate described below. Transaction types remain 0–3 and signing payloads
+remain within the existing 4096-byte hash limit. AA, other signature algorithms
+and other first-use account arrangements require separate producer work.
 After normal production or import,
 the node captures the signed body and parent account/key witnesses. Startup
 also captures an eligible current head. One background worker generates the
@@ -132,6 +133,47 @@ This source feature is not a published binary or network activation.
 
 Design: [Automatic canonical production](adr/automatic-canonical-proof-production.md).
 
+### Unbound default-account signatures
+
+A funded account with `pq_pubkey_hash = 0` and no custom validator can use an
+Embedded ML-DSA-65 key for first use. The parent registry must either be absent
+or contain exactly that key. Reference mode requires the key to be registered
+at that parent. A later registry entry cannot authorize an earlier Reference
+transaction.
+
+Sender proof version 2 verifies `BLAKE3(algo_id || pubkey)` against the full
+32-byte sender address in AIR, together with the actual parent account MPT,
+signing source, transaction ID, leaf and complete signature. It reuses the
+existing `tagged_key` certificate field; no new hash primitive or checkpoint
+layout is introduced. Version 1 still requires a bound registered account and
+retains its existing wire bytes and rotated-address behavior. Historical registry
+selection, activation, funds, nonces and atomic key registration remain Native
+policy. Missing or rejected proofs never become authorization through a status
+flag or native signature fallback.
+
+Run the expensive regression with the same prerequisites as the full proof entry:
+
+```bash
+tests/e2e/mldsa-full-proof.sh first-use first-use-test
+tests/e2e/mldsa-full-proof.sh verify first-use-test
+```
+
+It creates a fresh funded unbound account and a distinct proposer with memory-only
+keys, executes two Embedded transfers, then uses Reference successors. Real
+missing-key, wrong-address and insufficient-funds controls leave the registry
+unchanged. A separate Native crypto control checks fresh first-use registration
+rollback after execution reaches a wrong signed root; it is not proof admission.
+The peer path independently verifies complete sender/proposer AIR, commits and
+finalizes the valid child, and refuses a signed wrong-root Reference child after
+both VM transactions with all Native data unchanged. Genuine foreign-key and
+raw-key-hash certificates cannot replace the sender or address predicate.
+Shutdown/resume and cold read-only replay after ordinary successor execution
+retain all sources and proofs. Account MPT shapes can change certificate counts
+between the two jobs; the complete consumer predicates and execution results
+decide acceptance. Existing quotas and activation settings are unchanged.
+
+Design: [Unbound default-account signature proofs](adr/unbound-default-signature-proofs.md).
+
 ## Ordinary peer admission with complete proofs (unreleased)
 
 A follower can select complete sender verification for supported fresh extensions:
@@ -145,7 +187,7 @@ It defaults off; `[consensus].canonical_proof_admission` and explicit
 `--canonical-proof-admission=false` follow the normal config/CLI precedence.
 Use matching initialized genesis/runtime configuration, an activated body
 commitment schedule and a dedicated proof-capable network implementation.
-Supported blocks have 1–16 registered default-account ML-DSA-65 senders,
+Supported blocks have 1–16 supported default-account ML-DSA-65 senders,
 transaction types 0–3, signing payloads up to 4096 bytes, gas-reward system
 transactions only, and a serialized body up to 2 MiB. Unsupported profiles use
 the existing native path. Selected candidates wait for a full proof; rejected
