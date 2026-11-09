@@ -24,6 +24,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Exercise genuine PQClean Dilithium3 sender and proposer proofs together, with
+  distinct keys, real peer Native import/finality, changed-state historical
+  replay, foreign raw certificate refusals and retained-role checks.
 - Complete genuine PQClean Dilithium3 proposer-seal AIR and header binding for
   automatic production, peer Native import and historical replay. Retain primary
   FIPS and older sender-only formats, and check the actual seal algorithm policy.

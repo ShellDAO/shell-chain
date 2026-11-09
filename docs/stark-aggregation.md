@@ -789,6 +789,36 @@ Repaired acceptance enables actual automatic production on the same original
 Native provider head. Private keys, signed inputs and databases are preserved.
 Previously captured version-1 sender-only jobs retain that meaning; they are not
 silently rewritten into full proposer jobs. SDK FIPS-adapter proposer signatures
-under tag zero still use the older sender-only profile. Both-Dilithium roles,
-other account arrangements and public artifacts/network activation require
-separate acceptance evidence.
+under tag zero still use the older sender-only profile. Other account
+arrangements and public artifacts/network activation require separate acceptance
+evidence.
+
+
+### Genuine Dilithium3 sender and proposer together
+
+```sh
+tests/e2e/dilithium-full-proof.sh both both-output
+tests/e2e/dilithium-full-proof.sh verify both-output
+```
+
+This source regression creates distinct genuine `DilithiumSigner` keys for the
+registered sender and proposer, with optional registered-key algorithm binding
+left disabled. Both signatures use the locked raw transcript described above:
+sender profile 3, transaction/signature/challenge version 2, and proposer seal
+version 2. It keeps the same prerequisites, limits and pause/resume behavior.
+The original signed Native transfer, quorum and ordinary successor are retained;
+automatic production and a separate peer must consume the complete graph and
+reach Native import/finality. Receipts, gas, fees, balances and nonces must match
+ordinary execution. Cold historical replays after the successor advances current
+state must preserve every current database row.
+
+The negative checks substitute the genuine sender's key, challenge and final
+commitment certificates into the distinct proposer's graph, then separately
+relabel the raw signature as FIPS. Each correctly hashed payload must fail the
+full historical predicate without changing original proof bytes or Native data.
+These checks are distinct from new block imports and the ordinary signed
+wrong-root rollback control. `run`, `proposer` and `both` reject retained outputs
+with different algorithm roles before opening nodes or replacing keys or proofs.
+`verify` accepts any of those retained role profiles without generating proofs.
+This bounded source regression does not change public release or network
+activation status, defaults, quotas, or other account and SDK-adapter profiles.

@@ -85,7 +85,8 @@ additionally require equal algorithm tags. No old source descriptor, proof
 version, job quota or activation schedule changes meaning. The standalone
 `dilithium-full-proof` entry covers pause/resume, peer Native import/finality,
 ordinary successor state changes, cold replay and genuine-certificate refusal;
-other Dilithium3 sender/proposer arrangements require separate qualification.
+the `both` mode selects distinct genuine raw sender and proposer keys together.
+Other account and SDK-adapter arrangements require separate qualification.
 
 Genuine locked PQClean proposer seals can also be captured as full version-2
 sources. Seal proof version 2 routes their header-hash message to the existing
@@ -94,7 +95,9 @@ checks the retained Native key/seal evidence for the selected transcript, and
 final verification requires its matching proof version. SDK-adapter tag-zero
 seals and older captured version-1 jobs keep sender-only semantics. The proposer
 regression uses a primary65 sender, real peer Native import/finality and changed-
-current-state historical replay; defaults, quotas and schedules are unchanged.
+current-state historical replay. The `both` regression additionally consumes raw
+sender profile 3 and proposer seal version 2 in the same full graph, with genuine
+foreign raw certificate refusals. Defaults, quotas and schedules are unchanged.
 
 Legacy JSON certificates can exhaust the shared physical quota when a rotation
 introduces another independent key. Opt-in producer startup compacts eligible

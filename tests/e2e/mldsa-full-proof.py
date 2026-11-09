@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 mode, raw_fixture, raw_output = sys.argv[1:]
-assert mode in ("dilithium-run", "dilithium-proposer", "dilithium-verify", "run", "verify", "consecutive", "batch", "first-use", "wide", "mixed", "eight-keys", "sixteen-keys", "mixed-first-use", "rotation", "rotation-raw")
+assert mode in ("dilithium-run", "dilithium-proposer", "dilithium-both", "dilithium-verify", "run", "verify", "consecutive", "batch", "first-use", "wide", "mixed", "eight-keys", "sixteen-keys", "mixed-first-use", "rotation", "rotation-raw")
 fixture, out = map(lambda p: Path(p).resolve(), (raw_fixture, raw_output))
 
 def now():
@@ -64,18 +64,20 @@ def snapshot(label):
 def history_verify():
     run("full-history-verify", [fixture, "full-history-verify", out])
 
-if mode in ("dilithium-run", "dilithium-proposer", "dilithium-verify"):
+if mode in ("dilithium-run", "dilithium-proposer", "dilithium-both", "dilithium-verify"):
     out.mkdir(exist_ok=True)
     network = out / "network-dilithium"
     if mode == "dilithium-verify":
         run("dilithium-cold-verify", [fixture, "dilithium-verify", out])
         sys.exit(0)
-    raw_proposer = mode == "dilithium-proposer"
+    both = mode == "dilithium-both"
+    raw_proposer = mode in ("dilithium-proposer", "dilithium-both")
+    raw_sender = mode in ("dilithium-run", "dilithium-both")
     if not (out / "actors.json").exists():
-        prepare = "prepare-dilithium-proposer" if raw_proposer else "prepare-dilithium"
+        prepare = "prepare-dilithium-both" if both else "prepare-dilithium-proposer" if raw_proposer else "prepare-dilithium"
         run(prepare, [fixture, prepare, out])
     actors = json.loads((out / "actors.json").read_text())
-    assert actors["sender_algorithm"] == ("MlDsa65" if raw_proposer else "Dilithium3") and actors["proposer_algorithm"] == ("Dilithium3" if raw_proposer else "MlDsa65"), "retained algorithm roles differ; choose a new output directory"
+    assert actors["sender_algorithm"] == ("Dilithium3" if raw_sender else "MlDsa65") and actors["proposer_algorithm"] == ("Dilithium3" if raw_proposer else "MlDsa65"), "retained algorithm roles differ; choose a new output directory"
     assert (out / "later-control.json").exists(), "partial preparation retained; inspect receipts"
     original = json.loads((out / "capture-original.json").read_text())
     if not original["supported"] and not (out / "capture-recovered.json").exists():
@@ -103,7 +105,7 @@ if mode in ("dilithium-run", "dilithium-proposer", "dilithium-verify"):
     run("dilithium-history-cold", [fixture, "dilithium-verify", out])
     run("dilithium-history-cold-again", [fixture, "dilithium-verify", out])
     complete = json.loads((network / "complete.json").read_text())
-    key = "genuine_dilithium_proposer_primary_sender_full_proof_admitted" if raw_proposer else "genuine_dilithium_sender_primary_proposer_full_proof_admitted"
+    key = "genuine_dilithium_both_roles_full_proof_admitted" if both else "genuine_dilithium_proposer_primary_sender_full_proof_admitted" if raw_proposer else "genuine_dilithium_sender_primary_proposer_full_proof_admitted"
     assert complete[key] and complete["height"] == complete["finalized"] == 1
     assert complete["production"]["state"] == "complete" and complete["production"]["components"] > 0
     assert complete["admission"]["nativeCanonical"] and complete["admission"]["status"]["state"] == "complete"
@@ -119,9 +121,9 @@ if mode in ("dilithium-run", "dilithium-proposer", "dilithium-verify"):
     rollback = json.loads((out / "native-rollback.json").read_text())
     assert rollback["native_crypto_control_not_proof_admission"] and rollback["all_kv_unchanged"]
     refusals = json.loads((network / "refusals.json").read_text())
-    assert refusals["genuine_primary_certificates"] and len(refusals["cases"]) == 4
+    assert refusals["genuine_foreign_raw_certificates" if both else "genuine_primary_certificates"] and len(refusals["cases"]) == 4
     assert all(v["all_kv_unchanged"] and v["original_proof_unchanged"] and v["new_proofs_generated"] == 0 for v in refusals["cases"])
-    result = {key: True, "legacy_proposer": raw_proposer,
+    result = {key: True, "legacy_proposer": raw_proposer, "legacy_sender": raw_sender,
               "historical_replay_after_native_successor_no_writes": True,
               "foreign_profile_and_genuine_certificate_refusals": 4,
               "physical_checkpoint_bytes": after["physical_checkpoint_bytes"],

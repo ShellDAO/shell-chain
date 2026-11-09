@@ -702,8 +702,9 @@ fn main() -> Result<(), Error> {
     )?;
     let out = Path::new(&args[1]);
     match args[0].as_str() {
-        "prepare-dilithium" => admission_runtime::dilithium::prepare(out, false),
-        "prepare-dilithium-proposer" => admission_runtime::dilithium::prepare(out, true),
+        "prepare-dilithium" => admission_runtime::dilithium::prepare(out, true, false),
+        "prepare-dilithium-proposer" => admission_runtime::dilithium::prepare(out, false, true),
+        "prepare-dilithium-both" => admission_runtime::dilithium::prepare(out, true, true),
         "dilithium-probe" => admission_runtime::dilithium::probe(out, true),
         "dilithium-pause" | "dilithium-resume" => tokio::runtime::Runtime::new()?.block_on(
             admission_runtime::dilithium::run(out, args[0] == "dilithium-pause"),

@@ -116,7 +116,10 @@ retain the sender-only profile. Existing captured sender-only jobs remain
 unchanged. The exact-tuple verifier reports and checks the seal's actual
 algorithm under the trusted parent registry, including retirement. The
 `dilithium-full-proof.sh proposer` entry covers a primary65 sender with a genuine
-raw proposer, full Native import/finality and read-only historical replay.
+raw proposer, full Native import/finality and read-only historical replay. Its
+`both` mode combines distinct genuine raw sender and proposer keys, checks both
+version-2 signature graphs and refuses foreign raw certificates at the full
+historical predicate without current-state writes.
 
 Workers return an opaque exact-tuple proposer verifier only after full AIR
 verification. The serialized native import loop still selects the authority,
