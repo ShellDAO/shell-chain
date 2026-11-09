@@ -702,3 +702,18 @@ rotation; those controls are not claimed as proof admission. The output director
 retains public signed inputs, proof checkpoints and command receipts. This
 exercise does not activate a public network or establish other algorithms,
 custom validators, same-block rotation sequences or release availability.
+
+Use the default-disabled raw binding without scheduling an activation:
+
+```sh
+bash tests/e2e/mldsa-full-proof.sh rotation-raw raw-output
+bash tests/e2e/mldsa-full-proof.sh verify raw-output
+```
+
+This mode requires the same complete proof, Native import/finality, stable address
+and changed-current-key historical replay endpoints. Both rotations retain
+`BLAKE3(pubkey)`; neither proof carries a `tagged_key` certificate. The ordinary
+Native control remains distinct from these two proof-admitted targets. Both modes
+refuse an output prepared for the other activation choice, preserving its keys,
+signed inputs and checkpoints. This source exercise leaves public network
+configuration unchanged.

@@ -702,7 +702,8 @@ fn main() -> Result<(), Error> {
     )?;
     let out = Path::new(&args[1]);
     match args[0].as_str() {
-        "prepare-rotation" => admission_runtime::rotation::prepare(out),
+        "prepare-rotation" => admission_runtime::rotation::prepare(out, true),
+        "prepare-rotation-raw" => admission_runtime::rotation::prepare(out, false),
         "rotation-pause" | "rotation-resume" => tokio::runtime::Runtime::new()?.block_on(
             admission_runtime::rotation::run(out, args[0] == "rotation-pause"),
         ),

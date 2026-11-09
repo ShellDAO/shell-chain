@@ -10,6 +10,13 @@ fn commitment(key: &[u8], tagged: bool) -> ShellHash {
         blake3_hash(key)
     }
 }
+fn activated(info: &Value) -> Result<bool, Error> {
+    match info.get("activation_height") {
+        Some(Value::Null) => Ok(false),
+        Some(value) if value.as_u64() == Some(1) => Ok(true),
+        _ => Err("unsupported rotation activation choice".into()),
+    }
+}
 fn genesis(
     path: &Path,
     keys: &[MlDsaSigner],
@@ -44,11 +51,12 @@ fn genesis(
     let chain = ChainStore::new(Arc::new(store.clone()));
     chain.put_pubkey(&address, keys[0].public_key())?;
     chain.put_pubkey(&authority, proposer.public_key())?;
-    let config: ChainConfig = serde_json::from_value(
-        json!({"chain_id":10,"genesis_hash":block.hash(),
-        "fee_accounting_activation_height":1,"native_address_context_height":1,"block_commitment_height":1,
-        "registered_key_algorithm_height": if active { Some(1) } else { None }}),
-    )?;
+    let mut config = json!({"chain_id":10,"genesis_hash":block.hash(),
+        "fee_accounting_activation_height":1,"native_address_context_height":1,"block_commitment_height":1});
+    if active {
+        config["registered_key_algorithm_height"] = json!(1);
+    }
+    let config: ChainConfig = serde_json::from_value(config)?;
     chain.commit_genesis_block(&block, &config)?;
     store.flush()?;
     Ok(store)
@@ -171,7 +179,7 @@ fn control(
         "accounts":accounts(node.store.clone(),block)?,"address":address,"key":key,"commitment":commitment(key,tagged),"tagged":tagged}),
     )
 }
-pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
+pub(crate) fn prepare(out: &Path, active: bool) -> Result<(), Error> {
     if out.exists() {
         ensure(
             std::fs::read_dir(out)?.all(|e| e.is_ok_and(|e| e.file_name() == "commands")),
@@ -191,7 +199,7 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
             && authority != address,
         "rotation identities not independent",
     )?;
-    let store = Arc::new(genesis(&out.join("native/db"), &keys, &proposer, true)?);
+    let store = Arc::new(genesis(&out.join("native/db"), &keys, &proposer, active)?);
     let genesis_rows = store.scan_all()?;
     let mut node = fixture::node(store.clone(), authority, proposer.public_key())?;
     node.config.proposer_address = Some(authority);
@@ -203,7 +211,7 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
     finalize(&node, &first, &proposer)?;
     write(
         &out.join("control1.json"),
-        &control(&node, &first, address, keys[1].public_key(), true)?,
+        &control(&node, &first, address, keys[1].public_key(), active)?,
     )?;
     let captured = node
         .canonical_production_status(first.hash())?
@@ -254,7 +262,7 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
     finalize(&node, &second, &proposer)?;
     write(
         &out.join("control2.json"),
-        &control(&node, &second, address, keys[1].public_key(), true)?,
+        &control(&node, &second, address, keys[1].public_key(), active)?,
     )?;
     let captured = node
         .canonical_production_status(second.hash())?
@@ -296,7 +304,7 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
         &out.join("network-rotation/receiver/db"),
         &keys,
         &proposer,
-        true,
+        active,
     )?;
     ensure(
         ChainStore::new(Arc::new(receiver.clone())).get_head_hash()? == Some(genesis_block.hash()),
@@ -304,7 +312,7 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
     )?;
     write(
         &out.join("network-rotation/initial.json"),
-        &json!({"independent_genesis":true,"head":genesis_block.hash(),"native_digest":canonical_digest(&receiver)?,"registered_key_algorithm_height":1,"key":keys[0].public_key()}),
+        &json!({"independent_genesis":true,"head":genesis_block.hash(),"native_digest":canonical_digest(&receiver)?,"registered_key_algorithm_height":if active {Some(1)} else {None},"key":keys[0].public_key()}),
     )?;
     drop(receiver);
     let mut advance = Vec::new();
@@ -314,7 +322,7 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
     )?;
     let third = node.produce_block(&proposer, 100)?;
     advance.push(third);
-    binding(&node, address, keys[2].public_key(), true)?;
+    binding(&node, address, keys[2].public_key(), active)?;
     let before = node.store.scan_all()?;
     let error = node
         .handle_incoming_tx(signed(&keys[1], address, 3, None)?, &MultiVerifier)
@@ -330,7 +338,7 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
     let fourth = node.produce_block(&proposer, 100)?;
     write(
         &out.join("advanced-control.json"),
-        &control(&node, &fourth, address, keys[2].public_key(), true)?,
+        &control(&node, &fourth, address, keys[2].public_key(), active)?,
     )?;
     advance.push(fourth);
     write(&out.join("advance-blocks.json"), &advance)?;
@@ -355,7 +363,7 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
     )?;
     write(
         &out.join("rotation.json"),
-        &json!({"address":address,"keys":keys.iter().map(|k|k.public_key().to_vec()).collect::<Vec<_>>(),"private_keys_persisted":false,"activation_height":1}),
+        &json!({"address":address,"keys":keys.iter().map(|k|k.public_key().to_vec()).collect::<Vec<_>>(),"private_keys_persisted":false,"activation_height":if active {Some(1)} else {None}}),
     )?;
     legacy.flush()?;
     Ok(())
@@ -369,6 +377,7 @@ pub(crate) async fn run(out: &Path, pause: bool) -> Result<(), Error> {
     let context: fixture::Context = read(&out.join("context.json"))?;
     let blocks: Vec<Block> = read(&out.join("blocks.json"))?;
     let info: Value = read(&out.join("rotation.json"))?;
+    let active = activated(&info)?;
     let address: Address = serde_json::from_value(info["address"].clone())?;
     let keys: Vec<Vec<u8>> = serde_json::from_value(info["keys"].clone())?;
     let faults = Arc::new(Faults::default());
@@ -419,7 +428,7 @@ pub(crate) async fn run(out: &Path, pause: bool) -> Result<(), Error> {
             if previous.as_ref()!=Some(&progress){previous=Some(progress.clone());last_progress=tokio::time::Instant::now();let tmp=network.join("progress.tmp");std::fs::write(&tmp,serde_json::to_vec(&progress)?)?;std::fs::rename(tmp,network.join("progress.json"))?;println!("rotation components={counts:?}; height={height}; finalized={finalized}");}
             if pause&&counts[0]>0 {ensure(height==0&&finalized==0,"partial rotation proof changed native head")?;break;}
             if height>=1&&finalized>=1 {
-                binding(receiver.node.as_ref(),address,&keys[1],true)?;
+                binding(receiver.node.as_ref(),address,&keys[1],active)?;
                 *faults.withheld_block.write().unwrap()=None;
             }
             if height==2&&finalized==2 {
@@ -432,7 +441,7 @@ pub(crate) async fn run(out: &Path, pause: bool) -> Result<(), Error> {
                     ensure(cache.status(&manifest.id())?.result.as_ref().is_some_and(|v|v["proved_sender_signatures"]==1&&v["proved_proposer_signature"]==true),"rotation admission omitted complete signature AIR")?;
                     let bytes=cache.payload(&manifest.id())?;
                     let proof=shell_stark_prover::compact_canonical::decode_payload(&bytes)?;
-                    ensure(proof.version==2&&proof.proposer.is_some()&&proof.transactions.len()==1&&proof.transactions[0].signature.version==1&&proof.transactions[0].signature.tagged_key.is_some()==(index==1),"rotation raw/tagged signature profile mismatch")?;
+                    ensure(proof.version==2&&proof.proposer.is_some()&&proof.transactions.len()==1&&proof.transactions[0].signature.version==1&&proof.transactions[0].signature.tagged_key.is_some()==(active&&index==1),"rotation raw/tagged signature profile mismatch")?;
                     let path=network.join(format!("proof{}.bin",index+1));
                     if path.exists(){ensure(std::fs::read(&path)?==bytes,"rotation retained proof changed")?;}else{std::fs::write(path,&bytes)?;}
                     write(&network.join(format!("manifest{}.json",index+1)),&manifest)?;
@@ -440,7 +449,7 @@ pub(crate) async fn run(out: &Path, pause: bool) -> Result<(), Error> {
                 let first=receiver.node.chain_store.canonical_parent_view(context.tip,blocks[0].header.parent_hash)?;
                 let second=receiver.node.chain_store.canonical_parent_view(context.tip,blocks[1].header.parent_hash)?;
                 ensure(first.registered_key(&address)?.as_deref()==Some(keys[0].as_slice())&&second.registered_key(&address)?.as_deref()==Some(keys[1].as_slice()),"rotation historical registry resolution drifted")?;
-                write(&network.join("complete.json"),&json!({"production":productions,"admission":admissions,"height":2,"finalized":2,"both_full_proof_admitted":true,"stable_address":address,"initial_key":keys[0],"replacement_key":keys[1],"raw_then_tagged_proof_binding":true,"native_outputs_match":true,"served_chunks":faults.chunks.load(Ordering::SeqCst)}))?;break;
+                write(&network.join("complete.json"),&json!({"production":productions,"admission":admissions,"height":2,"finalized":2,"both_full_proof_admitted":true,"stable_address":address,"initial_key":keys[0],"replacement_key":keys[1],"raw_then_tagged_proof_binding":active,"registered_key_algorithm_height":info["activation_height"],"native_outputs_match":true,"served_chunks":faults.chunks.load(Ordering::SeqCst)}))?;break;
             }
             ensure(tokio::time::Instant::now()<deadline&&last_progress.elapsed()<Duration::from_secs(1800),"rotation progress bound exceeded")?;
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -492,6 +501,7 @@ pub(crate) fn verify(out: &Path, advance: bool) -> Result<(), Error> {
     )?;
     let context: fixture::Context = read(&out.join("context.json"))?;
     let info: Value = read(&out.join("rotation.json"))?;
+    let active = activated(&info)?;
     let address: Address = serde_json::from_value(info["address"].clone())?;
     let keys: Vec<Vec<u8>> = serde_json::from_value(info["keys"].clone())?;
     let blocks: Vec<Block> = read(&out.join("blocks.json"))?;
@@ -520,7 +530,7 @@ pub(crate) fn verify(out: &Path, advance: bool) -> Result<(), Error> {
         .get_head_block()?
         .ok_or("rotation head absent")?;
     let changed = current.number() == 4;
-    binding(&node, address, &keys[if changed { 2 } else { 1 }], true)?;
+    binding(&node, address, &keys[if changed { 2 } else { 1 }], active)?;
     let before = digest(node.store.as_ref())?;
     let mut replays = Vec::new();
     for (index, block) in blocks.iter().enumerate() {

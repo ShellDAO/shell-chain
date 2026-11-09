@@ -24,6 +24,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Cover complete rotation and replacement-key Reference proofs with the optional
+  algorithm binding left disabled, including raw commitments, Native import,
+  historical replay and refusal to mix retained activation configurations.
 - Exercise complete signature proofs for an AccountManager key rotation and a
   subsequent new-key Reference transfer at the original address. Check activated
   tagged commitments, default-off compatibility and historical keys after a

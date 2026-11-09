@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 mode, raw_fixture, raw_output = sys.argv[1:]
-assert mode in ("run", "verify", "consecutive", "batch", "first-use", "wide", "mixed", "eight-keys", "sixteen-keys", "mixed-first-use", "rotation")
+assert mode in ("run", "verify", "consecutive", "batch", "first-use", "wide", "mixed", "eight-keys", "sixteen-keys", "mixed-first-use", "rotation", "rotation-raw")
 fixture, out = map(lambda p: Path(p).resolve(), (raw_fixture, raw_output))
 
 def now():
@@ -67,10 +67,15 @@ def history_verify():
 if mode == "verify" and (out / "network-rotation/complete.json").exists():
     run("rotation-cold-verify", [fixture, "rotation-verify", out])
     sys.exit(0)
-if mode == "rotation":
+if mode in ("rotation", "rotation-raw"):
+    active = mode == "rotation"
+    expected_activation = 1 if active else None
     out.mkdir(exist_ok=True)
     if not (out / "rotation.json").exists():
-        run("prepare-rotation", [fixture, "prepare-rotation", out])
+        prepare = "prepare-rotation" if active else "prepare-rotation-raw"
+        run(prepare, [fixture, prepare, out])
+    info = json.loads((out / "rotation.json").read_text())
+    assert info["activation_height"] == expected_activation, "retained rotation activation differs; preserve this output and choose a new directory"
     network = out / "network-rotation"
     if not (network / "paused.json").exists():
         run("rotation-pause", [fixture, "rotation-pause", out])
@@ -89,7 +94,8 @@ if mode == "rotation":
     run("rotation-history-cold", [fixture, "rotation-verify", out])
     run("rotation-history-cold-again", [fixture, "rotation-verify", out])
     complete = json.loads((network / "complete.json").read_text())
-    assert complete["both_full_proof_admitted"] and complete["raw_then_tagged_proof_binding"] and complete["height"] == complete["finalized"] == 2
+    assert complete["both_full_proof_admitted"] and complete["raw_then_tagged_proof_binding"] == active and complete["height"] == complete["finalized"] == 2
+    assert complete.get("registered_key_algorithm_height", info["activation_height"]) == expected_activation
     assert all(row["state"] == "complete" and row["components"] > 0 for row in complete["production"])
     assert all(row["nativeCanonical"] and row["status"]["state"] == "complete" for row in complete["admission"])
     rollback = json.loads((out / "rotation-native-rollback.json").read_text())
@@ -100,7 +106,7 @@ if mode == "rotation":
         assert value["all_kv_unchanged"] and value["current_height"] == 4 and value["ordinary_advance_not_proof_admitted"]
     refusal = json.loads((network / "old-key-refused.json").read_text())
     assert refusal["genuine_old_key_certificate"] and refusal["all_kv_unchanged"] and refusal["original_proof_unchanged"] and refusal["new_proofs_generated"] == 0
-    save(out / "rotation-result.json", {"both_full_proof_admitted": True, "finalized": 2, "stable_address": complete["stable_address"], "physical_checkpoint_bytes": after["physical_checkpoint_bytes"], "raw_then_tagged_binding": True, "changed_current_key_history_read_only": True, "finished_at": now()})
+    save(out / "rotation-result.json", {"both_full_proof_admitted": True, "finalized": 2, "stable_address": complete["stable_address"], "physical_checkpoint_bytes": after["physical_checkpoint_bytes"], "raw_then_tagged_binding": active, "registered_key_algorithm_height": expected_activation, "changed_current_key_history_read_only": True, "finished_at": now()})
     sys.exit(0)
 
 if mode == "verify" and (out / "network-wide/complete.json").exists():
