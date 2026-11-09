@@ -7,6 +7,7 @@ fn genesis(
     path: &Path,
     sender: &dyn Signer,
     proposer: &dyn Signer,
+    unbound: bool,
 ) -> Result<RocksDbStores, Error> {
     let stores = RocksDbStore::open_all(path, None)?;
     let db = Arc::new(stores.state.clone());
@@ -15,7 +16,14 @@ fn genesis(
     let mut world = WorldState::new(db.clone());
     world.set_account(
         &address,
-        &Account::new_user_account(blake3_hash(sender.public_key()), U256::from(1_000_000)),
+        &Account::new_user_account(
+            if unbound {
+                ShellHash::ZERO
+            } else {
+                blake3_hash(sender.public_key())
+            },
+            U256::from(1_000_000),
+        ),
     )?;
     let block = Block {
         header: BlockHeader {
@@ -31,7 +39,9 @@ fn genesis(
         proposer_seal: None,
     };
     let chain = ChainStore::new(db);
-    chain.put_pubkey(&address, sender.public_key())?;
+    if !unbound {
+        chain.put_pubkey(&address, sender.public_key())?;
+    }
     chain.put_pubkey(&authority, proposer.public_key())?;
     let config: ChainConfig = serde_json::from_value(
         json!({"chain_id":10,"genesis_hash":block.hash(),"fee_accounting_activation_height":1,"native_address_context_height":1,"block_commitment_height":1}),
@@ -77,7 +87,12 @@ fn control(node: &Node<RocksDbStore>, block: &Block) -> Result<Value, Error> {
         json!({"head":block.hash(),"height":block.number(),"state_root":block.header.state_root,"receipts":receipts,"accounts":accounts(node.store.clone(),block)?}),
     )
 }
-pub(crate) fn prepare(out: &Path, legacy_sender: bool, legacy_proposer: bool) -> Result<(), Error> {
+pub(crate) fn prepare(
+    out: &Path,
+    legacy_sender: bool,
+    legacy_proposer: bool,
+    unbound: bool,
+) -> Result<(), Error> {
     if out.exists() {
         ensure(
             std::fs::read_dir(out)?.all(|e| e.is_ok_and(|e| e.file_name() == "commands")),
@@ -110,11 +125,13 @@ pub(crate) fn prepare(out: &Path, legacy_sender: bool, legacy_proposer: bool) ->
         &out.join("native-original/db"),
         sender.as_ref(),
         proposer.as_ref(),
+        unbound,
     )?;
     let receiver = genesis(
         &out.join("network-dilithium/receiver/db"),
         sender.as_ref(),
         proposer.as_ref(),
+        unbound,
     )?;
     let receiver_genesis = ChainStore::new(Arc::new(receiver.state.clone()))
         .get_head_hash()?
@@ -130,8 +147,49 @@ pub(crate) fn prepare(out: &Path, legacy_sender: bool, legacy_proposer: bool) ->
     node.config.node_role = shell_node::NodeRole::ValidatorProver;
     // This ordinary Native proposer control precedes public source collection.
     // Avoid creating a sender-only job whose immutable inputs would be replaced.
-    node.config.canonical_proof_production = !legacy_proposer;
-    let tx = signed(sender.as_ref(), 0)?;
+    node.config.canonical_proof_production = !legacy_proposer && !unbound;
+    if unbound {
+        let mut cases = Vec::new();
+        for name in [
+            "reference-before-registration",
+            "wrong-derived-address",
+            "tampered-signature",
+        ] {
+            let mut rejected = signed(sender.as_ref(), 0)?;
+            if name != "reference-before-registration" {
+                rejected.pubkey_mode =
+                    shell_core::PubkeyMode::Embedded(sender.public_key().to_vec());
+            }
+            if name == "wrong-derived-address" {
+                rejected.from = Address::from([0x11; 32]);
+            }
+            if name == "tampered-signature" {
+                rejected.tx.value = U256::from(2);
+            }
+            let before = digest(node.store.as_ref())?;
+            let error = node
+                .handle_incoming_tx(rejected, &MultiVerifier)
+                .err()
+                .ok_or("invalid unbound legacy transaction accepted")?
+                .to_string();
+            ensure(
+                before == digest(node.store.as_ref())?
+                    && node.chain_store.get_pubkey(&address)?.is_none(),
+                "unbound refusal wrote state or registered key",
+            )?;
+            cases.push(
+                json!({"case":name,"error":error,"all_kv_unchanged":true,"key_registered":false}),
+            );
+        }
+        write(
+            &out.join("first-use-native-refusals.json"),
+            &json!({"cases":cases,"real_signatures":true,"private_keys_persisted":false}),
+        )?;
+    }
+    let mut tx = signed(sender.as_ref(), 0)?;
+    if unbound {
+        tx.pubkey_mode = shell_core::PubkeyMode::Embedded(sender.public_key().to_vec());
+    }
     ensure(
         MultiVerifier.verify(
             sender.public_key(),
@@ -141,7 +199,31 @@ pub(crate) fn prepare(out: &Path, legacy_sender: bool, legacy_proposer: bool) ->
         "genuine legacy crypto refused",
     )?;
     node.handle_incoming_tx(tx, &MultiVerifier)?;
+    if unbound {
+        ensure(
+            node.chain_store.get_pubkey(&address)?.is_none(),
+            "mempool prematurely registered key",
+        )?;
+    }
     let block = node.produce_block(proposer.as_ref(), 100)?;
+    if unbound {
+        let parent = node
+            .chain_store
+            .canonical_parent_view(block.hash(), block.header.parent_hash)?;
+        ensure(
+            parent.registered_key(&address)?.is_none()
+                && parent
+                    .world_state()?
+                    .get_account(&address)?
+                    .is_some_and(|a| a.pq_pubkey_hash == ShellHash::ZERO)
+                && node.chain_store.get_pubkey(&address)?.as_deref() == Some(sender.public_key()),
+            "Native unbound registration differs",
+        )?;
+        write(
+            &out.join("first-use-registration.json"),
+            &json!({"parent_key_absent":true,"parent_account_commitment_zero":true,"native_key_registered":true,"sender":address,"public_key":sender.public_key()}),
+        )?;
+    }
     let vote = proposer.sign(block.hash().as_bytes())?;
     let mut round = shell_consensus::wpoa_state::WPoaRound::new(
         block.number(),
@@ -193,12 +275,13 @@ pub(crate) fn prepare(out: &Path, legacy_sender: bool, legacy_proposer: bool) ->
     ensure(
         error.contains("state root mismatch")
             && error.contains(&format!("{:?}", block.header.state_root))
-            && before == failed.scan_all()?,
+            && before == failed.scan_all()?
+            && (!unbound || failed_node.chain_store.get_pubkey(&address)?.is_none()),
         "legacy wrong-root refusal leaked writes or preceded execution",
     )?;
     write(
         &out.join("native-rollback.json"),
-        &json!({"native_crypto_control_not_proof_admission":true,"all_kv_unchanged":true,"error":error}),
+        &json!({"native_crypto_control_not_proof_admission":true,"all_kv_unchanged":true,"unbound_registration_rolled_back":unbound,"error":error}),
     )?;
     stores.state.flush()?;
     std::fs::create_dir(out.join("network-dilithium/provider"))?;
@@ -211,9 +294,15 @@ pub(crate) fn prepare(out: &Path, legacy_sender: bool, legacy_proposer: bool) ->
         &out.join("later-control.json"),
         &control(&node, &successor)?,
     )?;
+    if unbound {
+        node.handle_incoming_tx(signed(sender.as_ref(), 2)?, &MultiVerifier)?;
+        let third = node.produce_block(proposer.as_ref(), 100)?;
+        write(&out.join("advance.json"), &third)?;
+        write(&out.join("advance-control.json"), &control(&node, &third)?)?;
+    }
     write(
         &out.join("actors.json"),
-        &json!({"sender":address,"sender_key":sender.public_key(),"sender_algorithm":sender.sig_type(),"proposer_algorithm":proposer.sig_type(),"private_keys_persisted":false,"profile":if legacy_sender && legacy_proposer {"legacy-both"} else if legacy_proposer {"legacy-proposer"} else {"legacy-sender"},"initial_automatic_capture_disabled_native_control":legacy_proposer,"native_transcript":"locked pqcrypto-dilithium0.5.0 raw roles; FIPS only where explicitly selected"}),
+        &json!({"sender":address,"sender_key":sender.public_key(),"sender_algorithm":sender.sig_type(),"proposer_algorithm":proposer.sig_type(),"private_keys_persisted":false,"unbound_sender":unbound,"profile":if unbound {"legacy-unbound"} else if legacy_sender && legacy_proposer {"legacy-both"} else if legacy_proposer {"legacy-proposer"} else {"legacy-sender"},"initial_automatic_capture_disabled_native_control":legacy_proposer || unbound,"native_transcript":"locked pqcrypto-dilithium0.5.0 raw roles; FIPS only where explicitly selected"}),
     )?;
     node.store.flush()?;
     drop(node);
@@ -274,16 +363,90 @@ fn legacy_roles(out: &Path) -> Result<(bool, bool), Error> {
         _ => Err("unsupported retained Dilithium role profile".into()),
     }
 }
-pub(crate) async fn run(out: &Path, pause: bool) -> Result<(), Error> {
+pub(crate) async fn run(out: &Path, pause: bool, reference: bool) -> Result<(), Error> {
     let network = out.join("network-dilithium");
+    let complete_name = if reference {
+        "reference-complete.json"
+    } else {
+        "complete.json"
+    };
+    let paused_name = if reference {
+        "reference-paused.json"
+    } else {
+        "paused.json"
+    };
+    let proof_name = if reference {
+        "reference-proof.bin"
+    } else {
+        "proof.bin"
+    };
+    let manifest_name = if reference {
+        "reference-manifest.json"
+    } else {
+        "manifest.json"
+    };
     ensure(
-        !network.join("complete.json").exists(),
+        !network.join(complete_name).exists(),
         "Dilithium proof complete; use verify",
     )?;
-    let context: fixture::Context = read(&out.join("context.json"))?;
-    let block: Block = read(&out.join("candidate.json"))?;
+    let mut context: fixture::Context = read(&out.join("context.json"))?;
+    let block: Block = read(&out.join(if reference {
+        "successor.json"
+    } else {
+        "candidate.json"
+    }))?;
     let (legacy_sender, legacy_proposer) = legacy_roles(out)?;
-    let expected: Value = read(&out.join("control.json"))?;
+    let actors: Value = read(&out.join("actors.json"))?;
+    let unbound = actors["unbound_sender"] == true;
+    let sender_key: Vec<u8> = serde_json::from_value(actors["sender_key"].clone())?;
+    let expected: Value = read(&out.join(if reference {
+        "later-control.json"
+    } else {
+        "control.json"
+    }))?;
+    if reference {
+        ensure(
+            unbound && network.join("complete.json").exists(),
+            "unbound Embedded proof must complete first",
+        )?;
+        let stores = RocksDbStore::open_all(network.join("provider/db"), None)?;
+        let node = fixture::node(
+            Arc::new(stores.state),
+            context.authority,
+            &context.authority_key,
+        )?;
+        if node
+            .chain_store
+            .get_head_block()?
+            .ok_or("reference source head absent")?
+            .number()
+            == 1
+        {
+            node.import_block(block.clone(), &MultiVerifier)?;
+            let mut round = shell_consensus::wpoa_state::WPoaRound::new(
+                2,
+                0,
+                node.consensus.read().validator_weights(),
+            );
+            let _ = round.on_block_proposed(block.hash(), context.authority);
+            *node.wpoa_round.lock() = Some(round);
+            node.handle_wpoa_vote(
+                context.authority,
+                block.hash(),
+                2,
+                block.proposer_seal.clone().ok_or("reference seal absent")?,
+            )
+            .ok_or("reference genuine same-hash quorum absent")?;
+        }
+        ensure(
+            node.chain_store.get_head_hash()? == Some(block.hash())
+                && node.finality.read().last_finalized_number() == 2,
+            "original signed Reference source not finalized",
+        )?;
+        node.store.flush()?;
+        context.block = block.hash();
+        context.tip = block.hash();
+    }
     let faults = Arc::new(Faults::default());
     let provider = Live::start(
         &network.join("provider/db"),
@@ -326,13 +489,13 @@ pub(crate) async fn run(out: &Path, pause: bool) -> Result<(), Error> {
             let progress = json!({"components":count,"production":production["status"],"admission":admission,"height":height,"finalized":finalized});
             if previous.as_ref() != Some(&progress) {
                 previous = Some(progress.clone()); last_progress = tokio::time::Instant::now();
-                let tmp = network.join("progress.tmp");
+                let tmp = network.join(if reference { "reference-progress.tmp" } else { "progress.tmp" });
                 std::fs::write(&tmp, serde_json::to_vec(&progress)?)?;
-                std::fs::rename(tmp, network.join("progress.json"))?;
+                std::fs::rename(tmp, network.join(if reference { "reference-progress.json" } else { "progress.json" }))?;
                 println!("Dilithium components={count}; height={height}; finalized={finalized}");
             }
-            if pause && count > 0 { ensure(height == 0 && finalized == 0, "partial Dilithium proof changed native head")?; break; }
-            if height == 1 && finalized == 1 {
+            if pause && count > 0 { ensure(height == block.number()-1 && finalized == block.number()-1, "partial Dilithium proof changed native head")?; break; }
+            if height == block.number() && finalized == block.number() {
                 ensure(production["status"]["state"] == "complete" && admission["nativeCanonical"] == true && admission["status"]["state"] == "complete", "Dilithium import did not consume its proof")?;
                 ensure(receiver.node.chain_store.get_receipts(&block.hash())?.map(serde_json::to_value).transpose()? == Some(expected["receipts"].clone()) && accounts(receiver.node.store.clone(), &block)? == expected["accounts"], "Dilithium peer native outputs differ")?;
                 let manifest: CanonicalProofManifest = serde_json::from_value(admission["status"]["manifest"].clone())?;
@@ -342,14 +505,25 @@ pub(crate) async fn run(out: &Path, pause: bool) -> Result<(), Error> {
                 let proof = shell_stark_prover::compact_canonical::decode_payload(&bytes)?;
                 let sender = &proof.transactions.first().ok_or("Dilithium sender proof absent")?.signature;
                 let equation = &sender.transaction.signature.equation;
-                let (bound, inner, seed) = if legacy_sender {(3,2,32)} else {(1,1,48)};
+                let (bound, inner, seed) = if unbound {(4,2,32)} else if legacy_sender {(3,2,32)} else {(1,1,48)};
                 let prop = proof.proposer.as_ref().ok_or("full proposer proof absent")?;
                 let (prop_version, prop_seed) = if legacy_proposer {(2,32)} else {(1,48)};
                 ensure(proof.version == 2 && proof.transactions.len() == 1 && sender.version == bound && sender.transaction.version == inner && sender.transaction.signature.version == inner && equation.challenge.version == inner && equation.challenge.seed == equation.signature.decoded.challenge[..seed] && prop.version == prop_version && prop.signature.version == prop_version && prop.signature.equation.challenge.version == prop_version && prop.signature.equation.challenge.seed == prop.signature.equation.signature.decoded.challenge[..prop_seed], "Dilithium/FIPS full proof profile mismatch")?;
-                let path = network.join("proof.bin");
+                if unbound {
+                    let address = sender.tagged_key.as_ref().ok_or("unbound address AIR absent")?;
+                    ensure(address.message.first()==Some(&0) && address.message[1..]==sender_key && address.output == *block.transactions[0].from.as_bytes()
+                        && receiver.node.chain_store.get_pubkey(&block.transactions[0].from)?.as_deref()==Some(sender_key.as_slice())
+                        && receiver.node.world_state.read().get_account(&block.transactions[0].from)?.is_some_and(|a|a.pq_pubkey_hash==ShellHash::ZERO), "unbound address/registration/zero commitment differs")?;
+                }
+                if reference {
+                    let first: Block = read(&out.join("candidate.json"))?;
+                    let first_status=receiver.call("admin_canonicalProofAdmission",json!([first.hash()])).await?;
+                    ensure(first_status["nativeCanonical"]==true && first_status["status"]["state"]=="complete", "first target lost proof admission")?;
+                }
+                let path = network.join(proof_name);
                 if path.exists() { ensure(std::fs::read(&path)? == bytes, "retained Dilithium proof changed")?; } else { std::fs::write(path, &bytes)?; }
-                write(&network.join("manifest.json"), &manifest)?;
-                write(&network.join("complete.json"), &json!({"production":production["status"],"admission":admission,"height":height,"finalized":finalized,"genuine_dilithium_sender_primary_proposer_full_proof_admitted":legacy_sender && !legacy_proposer,"genuine_dilithium_proposer_primary_sender_full_proof_admitted":legacy_proposer && !legacy_sender,"genuine_dilithium_both_roles_full_proof_admitted":legacy_sender && legacy_proposer,"native_outputs_match":true,"served_chunks":faults.chunks.load(Ordering::SeqCst)}))?;
+                write(&network.join(manifest_name), &manifest)?;
+                write(&network.join(complete_name), &json!({"production":production["status"],"admission":admission,"height":height,"finalized":finalized,"unbound_sender":unbound,"both_original_targets_proof_admitted":reference,"genuine_unbound_dilithium_full_proof_admitted":unbound,"genuine_dilithium_sender_primary_proposer_full_proof_admitted":legacy_sender && !legacy_proposer && !unbound,"genuine_dilithium_proposer_primary_sender_full_proof_admitted":legacy_proposer && !legacy_sender,"genuine_dilithium_both_roles_full_proof_admitted":legacy_sender && legacy_proposer,"native_outputs_match":true,"served_chunks":faults.chunks.load(Ordering::SeqCst)}))?;
                 break;
             }
             ensure(tokio::time::Instant::now() < deadline && last_progress.elapsed() < Duration::from_secs(1800), "Dilithium progress bound exceeded")?;
@@ -364,7 +538,7 @@ pub(crate) async fn run(out: &Path, pause: bool) -> Result<(), Error> {
     provider_stop?;
     if pause {
         write(
-            &network.join("paused.json"),
+            &network.join(paused_name),
             &json!({"gracefully_stopped":true}),
         )?;
     }
@@ -402,10 +576,22 @@ pub(crate) fn verify(out: &Path, advance: bool) -> Result<(), Error> {
         network.join("complete.json").exists(),
         "Dilithium proof admission incomplete",
     )?;
+    let actors: Value = read(&out.join("actors.json"))?;
+    let unbound = actors["unbound_sender"] == true;
+    if unbound {
+        ensure(
+            network.join("reference-complete.json").exists(),
+            "Reference full proof incomplete",
+        )?;
+    }
     let context: fixture::Context = read(&out.join("context.json"))?;
     let block: Block = read(&out.join("candidate.json"))?;
-    let expected: Value = read(&out.join("control.json"))?;
-    let later: Block = read(&out.join("successor.json"))?;
+    let second: Block = read(&out.join("successor.json"))?;
+    let later: Block = if unbound {
+        read(&out.join("advance.json"))?
+    } else {
+        second.clone()
+    };
     let stores = RocksDbStore::open_all(network.join("receiver/db"), None)?;
     let node = fixture::node(
         Arc::new(stores.state),
@@ -418,7 +604,7 @@ pub(crate) fn verify(out: &Path, advance: bool) -> Result<(), Error> {
             .get_head_block()?
             .ok_or("Dilithium head absent")?
             .number()
-            == 1
+            == later.number() - 1
     {
         node.import_block(later.clone(), &MultiVerifier)?;
     }
@@ -426,12 +612,21 @@ pub(crate) fn verify(out: &Path, advance: bool) -> Result<(), Error> {
         .chain_store
         .get_head_block()?
         .ok_or("Dilithium head absent")?;
-    let changed = current.number() == 2;
+    let changed = current.number() == later.number();
     ensure(
-        current.hash() == if changed { later.hash() } else { block.hash() },
+        current.hash()
+            == if changed {
+                later.hash()
+            } else if unbound {
+                second.hash()
+            } else {
+                block.hash()
+            },
         "Dilithium current native head differs",
     )?;
-    let control: Value = read(&out.join(if changed {
+    let control: Value = read(&out.join(if changed && unbound {
+        "advance-control.json"
+    } else if changed || unbound {
         "later-control.json"
     } else {
         "control.json"
@@ -444,24 +639,34 @@ pub(crate) fn verify(out: &Path, advance: bool) -> Result<(), Error> {
                 .map(serde_json::to_value)
                 .transpose()?
                 == Some(control["receipts"].clone()),
-        "Dilithium current native state differs",
+        "Dilithium current state differs",
     )?;
     let before = digest(node.store.as_ref())?;
-    let proof = shell_stark_prover::compact_canonical::decode_payload(&std::fs::read(
-        network.join("proof.bin"),
-    )?)?;
-    let replay =
-        node.replay_canonical_transactions_with_proof(current.hash(), block.hash(), &proof)?;
-    ensure(
-        replay.proved_sender_signatures == 1
-            && replay.proved_proposer_signature
-            && replay.state_root.to_string() == expected["state_root"].as_str().unwrap_or_default()
-            && serde_json::to_value(&replay.receipts)? == expected["receipts"],
-        "Dilithium cold historical replay differs",
-    )?;
+    let mut targets = vec![(block, "proof.bin", "control.json")];
+    if unbound {
+        targets.push((second, "reference-proof.bin", "later-control.json"));
+    }
+    let mut replays = Vec::new();
+    for (block, path, control) in targets {
+        let proof = shell_stark_prover::compact_canonical::decode_payload(&std::fs::read(
+            network.join(path),
+        )?)?;
+        let replay =
+            node.replay_canonical_transactions_with_proof(current.hash(), block.hash(), &proof)?;
+        let expected: Value = read(&out.join(control))?;
+        ensure(
+            replay.proved_sender_signatures == 1
+                && replay.proved_proposer_signature
+                && replay.state_root.to_string()
+                    == expected["state_root"].as_str().unwrap_or_default()
+                && serde_json::to_value(&replay.receipts)? == expected["receipts"],
+            "Dilithium cold historical replay differs",
+        )?;
+        replays.push(replay);
+    }
     ensure(
         before == digest(node.store.as_ref())?,
-        "Dilithium historical replay wrote current native KV",
+        "Dilithium history wrote current KV",
     )?;
     let stem = if changed {
         "history-verified"
@@ -476,7 +681,7 @@ pub(crate) fn verify(out: &Path, advance: bool) -> Result<(), Error> {
     }
     write(
         &path,
-        &json!({"all_kv_unchanged":true,"current_head":current.hash(),"current_height":current.number(),"ordinary_successor_not_proof_admitted":changed,"replay":replay}),
+        &json!({"all_kv_unchanged":true,"current_head":current.hash(),"current_height":current.number(),"ordinary_successor_not_proof_admitted":changed,"unbound_sender":unbound,"replay":replays[0],"replays":replays}),
     )?;
     node.store.flush()?;
     Ok(())
@@ -516,6 +721,8 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
         .ok_or("Dilithium negative tip absent")?;
     let before = digest(node.store.as_ref())?;
     let mut results = Vec::new();
+    let actors: Value = read(&out.join("actors.json"))?;
+    let unbound = actors["unbound_sender"] == true;
     let both = legacy_sender && legacy_proposer;
     let cases = if both {
         [
@@ -532,6 +739,14 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
             ("relabelled-fips-profile", "version"),
         ]
     };
+    let mut cases = cases.to_vec();
+    if unbound {
+        cases.extend([
+            ("raw-key-without-address-tag", "unbound sender address"),
+            ("unbound-fips-profile", "unbound signature"),
+            ("bound-profile-at-first-use", "no registered key"),
+        ]);
+    }
     for (index, (name, edge)) in cases.into_iter().enumerate() {
         let mut proof = original.clone();
         let target = if legacy_proposer {
@@ -548,6 +763,17 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
             1 => target.equation.challenge = foreign.equation.challenge.clone(),
             2 => target.completion.commitment = foreign.completion.commitment.clone(),
             3 => target.version = 1,
+            4 => {
+                proof.transactions[0].signature.tagged_key = Some(
+                    proof.transactions[0]
+                        .signature
+                        .transaction
+                        .public_key_hash
+                        .clone(),
+                )
+            }
+            5 => proof.transactions[0].signature.version = 2,
+            6 => proof.transactions[0].signature.version = 3,
             _ => unreachable!(),
         }
         let bytes =
@@ -569,7 +795,7 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
     }
     write(
         &network.join("refusals.json"),
-        &json!({"genuine_primary_certificates":!both,"genuine_foreign_raw_certificates":both,"cases":results,"scope":"full historical predicate refusals, not new native block imports"}),
+        &json!({"genuine_primary_certificates":!both,"genuine_foreign_raw_certificates":both,"genuine_unbound_address_certificate":unbound,"cases":results,"scope":"full historical predicate refusals, not new native block imports"}),
     )?;
     Ok(())
 }

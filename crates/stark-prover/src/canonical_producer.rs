@@ -185,11 +185,10 @@ impl CanonicalProductionSource {
                 return Err("production parent key/default account binding mismatch".into());
             }
             if account.pq_pubkey_hash == ShellHash::ZERO {
-                if signed.signature.sig_type != SignatureType::MlDsa65
-                    || shell_primitives::Address::from_public_key(
-                        &key,
-                        signed.signature.sig_type.as_u8(),
-                    ) != signed.from
+                if shell_primitives::Address::from_public_key(
+                    &key,
+                    signed.signature.sig_type.as_u8(),
+                ) != signed.from
                 {
                     return Err("production unbound sender address mismatch".into());
                 }
@@ -403,11 +402,10 @@ impl CanonicalProductionSource {
             let mut tagged = vec![tx.signature.sig_type.as_u8()];
             tagged.extend_from_slice(&sender.key);
             let binding_matches = if sender.account.pq_pubkey_hash == ShellHash::ZERO {
-                tx.signature.sig_type == SignatureType::MlDsa65
-                    && shell_primitives::Address::from_public_key(
-                        &sender.key,
-                        tx.signature.sig_type.as_u8(),
-                    ) == tx.from
+                shell_primitives::Address::from_public_key(
+                    &sender.key,
+                    tx.signature.sig_type.as_u8(),
+                ) == tx.from
             } else {
                 sender.account.pq_pubkey_hash == blake3_hash(&sender.key)
                     || sender.account.pq_pubkey_hash == blake3_hash(&tagged)
@@ -729,7 +727,11 @@ impl CanonicalProductionSource {
                 account,
                 signature: RegisteredSignatureProof {
                     version: if source.account.pq_pubkey_hash == ShellHash::ZERO {
-                        2
+                        if signed.signature.sig_type == SignatureType::Dilithium3 {
+                            4
+                        } else {
+                            2
+                        }
                     } else if signed.signature.sig_type == SignatureType::Dilithium3 {
                         3
                     } else {
@@ -1331,10 +1333,21 @@ mod recovery_tests {
         fixture_binding(full, false)
     }
     fn fixture_binding(full: bool, unbound: bool) -> (Arc<MemoryDb>, CanonicalProductionSource) {
+        fixture_algorithm(full, unbound, false)
+    }
+    fn fixture_algorithm(
+        full: bool,
+        unbound: bool,
+        legacy: bool,
+    ) -> (Arc<MemoryDb>, CanonicalProductionSource) {
         // Storage-context fixture only; real native execution is exercised by the runtime regression.
         let db = Arc::new(MemoryDb::new());
         let chain = ChainStore::new(db.clone());
-        let signer = MlDsaSigner::generate();
+        let signer: Box<dyn Signer> = if legacy {
+            Box::new(shell_crypto::DilithiumSigner::generate())
+        } else {
+            Box::new(MlDsaSigner::generate())
+        };
         let address = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
         let mut world = shell_storage::WorldState::new(db.clone());
         world
@@ -1492,40 +1505,42 @@ mod recovery_tests {
     }
     #[test]
     fn unbound_first_use_capture_recovers_frozen_inputs_and_rejects_key_or_account_rebinding() {
-        let (db, source) = fixture_binding(false, true);
-        assert!(source.has_unbound_senders());
-        let tx = &source.block().transactions[0];
-        assert!(tx.pubkey_mode.is_embedded());
-        assert_eq!(
-            source.input.senders[0].account.pq_pubkey_hash,
-            ShellHash::ZERO
-        );
-        let chain = ChainStore::new(db.clone());
-        assert!(chain.get_pubkey(&tx.from).unwrap().is_none());
-        // Current registration may change after capture; recovery uses the frozen
-        // parent MPT/key, not live trie nodes or a later registry entry.
-        chain
-            .put_pubkey(&tx.from, &source.input.senders[0].key)
-            .unwrap();
-        let before = db.scan_all().unwrap();
-        let frozen = ChainStore::new(Arc::new(NoTrieReads(db.clone())));
-        let recovered = CanonicalProductionSource::restore(&frozen, source.identity()).unwrap();
-        assert_eq!(recovered.identity(), source.identity());
-        for mode in ["key", "account"] {
-            let mut input: CapturedInputs = serde_json::from_slice(source.identity()).unwrap();
-            if mode == "key" {
-                input.senders[0].key[0] ^= 1;
-            } else {
-                input.senders[0].account.pq_pubkey_hash = blake3_hash(&input.senders[0].key);
-            }
-            let bytes =
-                bounded_json(&serde_json::to_value(input).unwrap(), 4 * 1024 * 1024).unwrap();
-            assert!(
-                CanonicalProductionSource::restore(&frozen, &bytes).is_err(),
-                "{mode}"
+        for legacy in [false, true] {
+            let (db, source) = fixture_algorithm(false, true, legacy);
+            assert!(source.has_unbound_senders());
+            let tx = &source.block().transactions[0];
+            assert!(tx.pubkey_mode.is_embedded());
+            assert_eq!(
+                source.input.senders[0].account.pq_pubkey_hash,
+                ShellHash::ZERO
             );
+            let chain = ChainStore::new(db.clone());
+            assert!(chain.get_pubkey(&tx.from).unwrap().is_none());
+            // Current registration may change after capture; recovery uses the frozen
+            // parent MPT/key, not live trie nodes or a later registry entry.
+            chain
+                .put_pubkey(&tx.from, &source.input.senders[0].key)
+                .unwrap();
+            let before = db.scan_all().unwrap();
+            let frozen = ChainStore::new(Arc::new(NoTrieReads(db.clone())));
+            let recovered = CanonicalProductionSource::restore(&frozen, source.identity()).unwrap();
+            assert_eq!(recovered.identity(), source.identity());
+            for mode in ["key", "account"] {
+                let mut input: CapturedInputs = serde_json::from_slice(source.identity()).unwrap();
+                if mode == "key" {
+                    input.senders[0].key[0] ^= 1;
+                } else {
+                    input.senders[0].account.pq_pubkey_hash = blake3_hash(&input.senders[0].key);
+                }
+                let bytes =
+                    bounded_json(&serde_json::to_value(input).unwrap(), 4 * 1024 * 1024).unwrap();
+                assert!(
+                    CanonicalProductionSource::restore(&frozen, &bytes).is_err(),
+                    "{mode}"
+                );
+            }
+            assert_eq!(before, db.scan_all().unwrap());
         }
-        assert_eq!(before, db.scan_all().unwrap());
     }
     #[test]
     fn full_seal_source_freezes_native_signer_across_registry_change_and_rejects_tampering() {

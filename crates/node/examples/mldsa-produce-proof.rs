@@ -702,12 +702,24 @@ fn main() -> Result<(), Error> {
     )?;
     let out = Path::new(&args[1]);
     match args[0].as_str() {
-        "prepare-dilithium" => admission_runtime::dilithium::prepare(out, true, false),
-        "prepare-dilithium-proposer" => admission_runtime::dilithium::prepare(out, false, true),
-        "prepare-dilithium-both" => admission_runtime::dilithium::prepare(out, true, true),
+        "prepare-dilithium" => admission_runtime::dilithium::prepare(out, true, false, false),
+        "prepare-dilithium-proposer" => {
+            admission_runtime::dilithium::prepare(out, false, true, false)
+        }
+        "prepare-dilithium-both" => admission_runtime::dilithium::prepare(out, true, true, false),
+        "prepare-dilithium-unbound" => {
+            admission_runtime::dilithium::prepare(out, true, false, true)
+        }
+        "dilithium-reference-pause" | "dilithium-reference-resume" => {
+            tokio::runtime::Runtime::new()?.block_on(admission_runtime::dilithium::run(
+                out,
+                args[0] == "dilithium-reference-pause",
+                true,
+            ))
+        }
         "dilithium-probe" => admission_runtime::dilithium::probe(out, true),
         "dilithium-pause" | "dilithium-resume" => tokio::runtime::Runtime::new()?.block_on(
-            admission_runtime::dilithium::run(out, args[0] == "dilithium-pause"),
+            admission_runtime::dilithium::run(out, args[0] == "dilithium-pause", false),
         ),
         "dilithium-snapshot" => admission_runtime::dilithium::snapshot(out),
         "dilithium-verify" => admission_runtime::dilithium::verify(out, false),

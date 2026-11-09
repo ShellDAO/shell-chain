@@ -97,6 +97,12 @@ the key. Mempool admission and failed validation must not register it.
 The opt-in, unreleased [canonical proof path](stark-aggregation.md#unbound-default-account-signatures)
 also supports these funded unbound accounts. It proves the algorithm-tagged
 address in AIR while normal Native execution retains registration and fee policy.
+Genuine locked PQClean Dilithium3 uses unbound sender proof profile 4 with the
+raw signature transcript; ML-DSA-65 keeps profile 2. The
+[unbound Dilithium3 regression](stark-aggregation.md#unbound-genuine-dilithium3-signatures)
+checks separate Embedded first-use and registered Reference blocks through
+complete proofs. SDK-adapter signatures under tag zero require their own proof
+profile. These source capabilities remain opt-in and unreleased.
 
 ### 3.2 Layer 2 — default existing-account validation
 

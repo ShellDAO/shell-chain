@@ -138,8 +138,8 @@ impl Verifier for VerifiedCanonicalSignatureBatch {
 /// Verify all ordered senders against one independently frozen historical
 /// parent. The block must equal the captured canonical body, not merely carry
 /// its header. Registered MLDSA65 and PQClean Dilithium3 use profiles one and
-/// three respectively; unbound MLDSA65 default accounts
-/// use version two with a complete derived-address proof and the historical
+/// three respectively; unbound MLDSA65 and PQClean Dilithium3 default accounts
+/// use versions two/four with a complete derived-address proof and the historical
 /// registry's Embedded/Reference rules. AA, other algorithms and pruned witnesses
 /// remain outside this profile.
 pub fn verify_canonical_signature_batch<S: KvStore + 'static>(
@@ -238,7 +238,7 @@ fn verify_batch_at_parent<S: KvStore + 'static>(
                     .entry()
                     .clone()
             }
-            2 => verify_canonical_unbound_signature(view, tx, &item.account, &item.signature)?,
+            2 | 4 => verify_canonical_unbound_signature(view, tx, &item.account, &item.signature)?,
             _ => return Err("unsupported canonical sender proof profile".into()),
         };
         if !seen.insert(*entry.transaction_id()) {

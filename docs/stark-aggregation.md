@@ -822,3 +822,46 @@ with different algorithm roles before opening nodes or replacing keys or proofs.
 `verify` accepts any of those retained role profiles without generating proofs.
 This bounded source regression does not change public release or network
 activation status, defaults, quotas, or other account and SDK-adapter profiles.
+
+
+### Unbound genuine Dilithium3 signatures
+
+```sh
+tests/e2e/dilithium-full-proof.sh unbound unbound-output
+tests/e2e/dilithium-full-proof.sh verify unbound-output
+```
+
+With the same Python, stable Rust and RocksDB prerequisites, this source entry
+creates a funded zero-commitment default account at the genuine Dilithium3
+address and a distinct primary ML-DSA-65 proposer. Keys exist only in memory.
+The sender initially has no parent registry entry: its first block uses Embedded
+mode, and the next block uses the newly registered Reference key. Both original
+signed blocks require complete sender/address/proposer AIR, real peer Native
+import and finality through height 2. A separately signed ordinary third block
+changes current state before cold full replay of both original graphs. Replays
+must leave every current database row unchanged. Accounts, receipts, gas, fees,
+nonces and successful key registration are checked against ordinary execution.
+
+Unbound sender profile 4 binds `BLAKE3(0 || pubkey)` to the complete native sender
+address and selects raw transaction/signature/challenge version 2. It does not
+turn the zero account commitment into a bound commitment. Historical key
+selection uses the exact parent registry or Embedded key, so first use cannot
+borrow a later registration. Bound Dilithium3 profile 3 and ML-DSA-65 profiles 1/2
+retain their meanings. The existing compact checkpoints serve these jobs under
+the same global quota, job count, payload and cache limits.
+
+Real Reference-before-registration, wrong-address and tampered-signature Native
+controls must refuse without state or key-registration writes. A separately
+signed wrong-root ordinary Native control checks registration rollback. Full
+historical predicate refusals use genuine foreign key/challenge/commitment
+certificates, a genuine raw key-hash certificate without its address tag, and
+relabelled signature/account profiles, each with a correct outer payload hash.
+They preserve original proofs and current state and are distinct from new block
+imports. The entry refuses retained outputs with a different account profile
+before opening nodes or generating keys. Keep the output directory to resume;
+failed assertions exit nonzero, and `verify` generates no proofs.
+
+This bounded default-account case leaves SDK-adapter tag-zero proofs, absent-
+state account creation, AA/custom validators, same-block Reference after an
+Embedded first use without a parent key, other activation combinations and
+public release/network activation as separate acceptance work.

@@ -20,12 +20,12 @@ use shell_crypto::{CryptoError, PQSignature, SignatureType, Verifier};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegisteredSignatureProof {
-    /// One is registered MLDSA65, two unbound MLDSA65, three registered PQClean Dilithium3.
+    /// Profiles one/two are bound/unbound MLDSA65; three/four are bound/unbound PQClean Dilithium3.
     pub version: u8,
     pub transaction: TransactionSignatureProof,
     pub transaction_id: Blake3HashProof,
     pub leaf: Blake3HashProof,
-    /// Algorithm-tagged account hash in registered profiles, mandatory address in profile two.
+    /// Algorithm-tagged account hash in registered profiles, mandatory address in unbound profiles.
     /// Its activation is a native policy check, not established by this proof.
     pub tagged_key: Option<Blake3HashProof>,
 }
@@ -159,7 +159,10 @@ pub fn verify_unbound_signature_entry(
     expected_entry: &SigBatchEntry,
     expected_leaf: &[u8; 32],
 ) -> Result<VerifiedSignatureEntry, String> {
-    if proof.version != 2 || expected.signature.sig_type != SignatureType::MlDsa65 {
+    if !matches!(
+        (proof.version, expected.signature.sig_type),
+        (2, SignatureType::MlDsa65) | (4, SignatureType::Dilithium3)
+    ) {
         return Err("invalid unbound signature proof version or algorithm".into());
     }
     if expected.tx.tx_type > 3 || expected.aa_bundle.is_some() || expected_key.len() != 1952 {
@@ -176,7 +179,7 @@ pub fn verify_unbound_signature_entry(
         );
     }
     let mut address = Vec::with_capacity(1 + expected_key.len());
-    address.push(SignatureType::MlDsa65.as_u8());
+    address.push(expected.signature.sig_type.as_u8());
     address.extend_from_slice(expected_key);
     verify_hash(
         proof
@@ -226,7 +229,7 @@ fn verify_entry_sources(
     leaf[32..].copy_from_slice(&expected_entry.pk_hash);
     verify_hash(&proof.leaf, &leaf, expected_leaf)
         .map_err(|e| format!("registered entry leaf: {e}"))?;
-    let verify = if proof.version == 3 {
+    let verify = if matches!(proof.version, 3 | 4) {
         verify_dilithium_transaction_signature
     } else {
         verify_transaction_signature

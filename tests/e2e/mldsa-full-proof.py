@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 mode, raw_fixture, raw_output = sys.argv[1:]
-assert mode in ("dilithium-run", "dilithium-proposer", "dilithium-both", "dilithium-verify", "run", "verify", "consecutive", "batch", "first-use", "wide", "mixed", "eight-keys", "sixteen-keys", "mixed-first-use", "rotation", "rotation-raw")
+assert mode in ("dilithium-run", "dilithium-proposer", "dilithium-both", "dilithium-unbound", "dilithium-verify", "run", "verify", "consecutive", "batch", "first-use", "wide", "mixed", "eight-keys", "sixteen-keys", "mixed-first-use", "rotation", "rotation-raw")
 fixture, out = map(lambda p: Path(p).resolve(), (raw_fixture, raw_output))
 
 def now():
@@ -64,20 +64,22 @@ def snapshot(label):
 def history_verify():
     run("full-history-verify", [fixture, "full-history-verify", out])
 
-if mode in ("dilithium-run", "dilithium-proposer", "dilithium-both", "dilithium-verify"):
+if mode in ("dilithium-run", "dilithium-proposer", "dilithium-both", "dilithium-unbound", "dilithium-verify"):
     out.mkdir(exist_ok=True)
     network = out / "network-dilithium"
     if mode == "dilithium-verify":
         run("dilithium-cold-verify", [fixture, "dilithium-verify", out])
         sys.exit(0)
+    unbound = mode == "dilithium-unbound"
     both = mode == "dilithium-both"
     raw_proposer = mode in ("dilithium-proposer", "dilithium-both")
-    raw_sender = mode in ("dilithium-run", "dilithium-both")
+    raw_sender = mode in ("dilithium-run", "dilithium-both", "dilithium-unbound")
     if not (out / "actors.json").exists():
-        prepare = "prepare-dilithium-both" if both else "prepare-dilithium-proposer" if raw_proposer else "prepare-dilithium"
+        prepare = "prepare-dilithium-unbound" if unbound else "prepare-dilithium-both" if both else "prepare-dilithium-proposer" if raw_proposer else "prepare-dilithium"
         run(prepare, [fixture, prepare, out])
     actors = json.loads((out / "actors.json").read_text())
     assert actors["sender_algorithm"] == ("Dilithium3" if raw_sender else "MlDsa65") and actors["proposer_algorithm"] == ("Dilithium3" if raw_proposer else "MlDsa65"), "retained algorithm roles differ; choose a new output directory"
+    assert actors.get("unbound_sender", False) == unbound, "retained account profile differs; choose a new output directory"
     assert (out / "later-control.json").exists(), "partial preparation retained; inspect receipts"
     original = json.loads((out / "capture-original.json").read_text())
     if not original["supported"] and not (out / "capture-recovered.json").exists():
@@ -96,6 +98,23 @@ if mode in ("dilithium-run", "dilithium-proposer", "dilithium-both", "dilithium-
         key = bytes.fromhex(row["key"])
         if b"production/component/" in key or b"production/source" in key or b"/source/" in key:
             assert indexed[row["key"]] == row, "original checkpoint changed"
+    if unbound:
+        if not (network / "reference-paused.json").exists():
+            run("dilithium-reference-pause", [fixture, "dilithium-reference-pause", out])
+            save(out / "reference-paused-snapshot.json", json.loads(run("reference-paused-snapshot", [fixture, "dilithium-snapshot", out])))
+        assert (out / "reference-paused-snapshot.json").exists(), "unrecorded Reference pause retained"
+        if not (network / "reference-complete.json").exists():
+            run("dilithium-reference-resume", [fixture, "dilithium-reference-resume", out])
+        after = json.loads(run("reference-complete-snapshot", [fixture, "dilithium-snapshot", out]))
+        reference_pause = json.loads((out / "reference-paused-snapshot.json").read_text())
+        assert reference_pause["native_digest"] == after["native_digest"] and after["physical_checkpoint_bytes"] <= 256 * 1024 * 1024
+        rows = {row["key"]: row for row in after["rows"]}
+        for row in reference_pause["rows"]:
+            key = bytes.fromhex(row["key"])
+            if b"production/component/" in key or b"production/source" in key or b"/source/" in key:
+                assert rows[row["key"]] == row, "retained Reference checkpoint changed"
+        reference = json.loads((network / "reference-complete.json").read_text())
+        assert reference["genuine_unbound_dilithium_full_proof_admitted"] and reference["both_original_targets_proof_admitted"] and reference["height"] == reference["finalized"] == 2
     if not (network / "verified.json").exists():
         run("dilithium-verify", [fixture, "dilithium-verify", out])
     if not (network / "history-verified.json").exists():
@@ -105,11 +124,11 @@ if mode in ("dilithium-run", "dilithium-proposer", "dilithium-both", "dilithium-
     run("dilithium-history-cold", [fixture, "dilithium-verify", out])
     run("dilithium-history-cold-again", [fixture, "dilithium-verify", out])
     complete = json.loads((network / "complete.json").read_text())
-    key = "genuine_dilithium_both_roles_full_proof_admitted" if both else "genuine_dilithium_proposer_primary_sender_full_proof_admitted" if raw_proposer else "genuine_dilithium_sender_primary_proposer_full_proof_admitted"
+    key = "genuine_unbound_dilithium_full_proof_admitted" if unbound else "genuine_dilithium_both_roles_full_proof_admitted" if both else "genuine_dilithium_proposer_primary_sender_full_proof_admitted" if raw_proposer else "genuine_dilithium_sender_primary_proposer_full_proof_admitted"
     assert complete[key] and complete["height"] == complete["finalized"] == 1
     assert complete["production"]["state"] == "complete" and complete["production"]["components"] > 0
     assert complete["admission"]["nativeCanonical"] and complete["admission"]["status"]["state"] == "complete"
-    for name, count in (("control.json", 1), ("later-control.json", 2)):
+    for name, count in (("control.json", 1), ("later-control.json", 2)) + ((("advance-control.json", 3),) if unbound else ()):
         control = json.loads((out / name).read_text())
         sender, recipient, proposer = control["accounts"]
         assert sender["nonce"] == count and int(sender["balance"], 16) == 1_000_000 - count * 42_001
@@ -117,15 +136,15 @@ if mode in ("dilithium-run", "dilithium-proposer", "dilithium-both", "dilithium-
         assert [v["gas_used"] for v in control["receipts"]] == [21_000, 0] and all(v["status"] == 1 for v in control["receipts"])
     for path in network.glob("history-verified*.json"):
         value = json.loads(path.read_text())
-        assert value["all_kv_unchanged"] and value["current_height"] == 2 and value["ordinary_successor_not_proof_admitted"]
+        assert value["all_kv_unchanged"] and value["current_height"] == (3 if unbound else 2) and value["ordinary_successor_not_proof_admitted"]
     rollback = json.loads((out / "native-rollback.json").read_text())
     assert rollback["native_crypto_control_not_proof_admission"] and rollback["all_kv_unchanged"]
     refusals = json.loads((network / "refusals.json").read_text())
-    assert refusals["genuine_foreign_raw_certificates" if both else "genuine_primary_certificates"] and len(refusals["cases"]) == 4
+    assert refusals["genuine_foreign_raw_certificates" if both else "genuine_primary_certificates"] and len(refusals["cases"]) == (7 if unbound else 4)
     assert all(v["all_kv_unchanged"] and v["original_proof_unchanged"] and v["new_proofs_generated"] == 0 for v in refusals["cases"])
-    result = {key: True, "legacy_proposer": raw_proposer, "legacy_sender": raw_sender,
+    result = {key: True, "legacy_proposer": raw_proposer, "legacy_sender": raw_sender, "unbound_sender": unbound,
               "historical_replay_after_native_successor_no_writes": True,
-              "foreign_profile_and_genuine_certificate_refusals": 4,
+              "foreign_profile_and_genuine_certificate_refusals": len(refusals["cases"]),
               "physical_checkpoint_bytes": after["physical_checkpoint_bytes"],
               "components": complete["production"]["components"], "finished_at": now()}
     save(out / "dilithium-result.json", result)

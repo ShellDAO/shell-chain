@@ -24,6 +24,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Complete genuine PQClean Dilithium3 proofs for funded unbound default accounts,
+  including full tag-zero address AIR, Embedded first-use registration and later
+  Reference execution. Keep existing profile meanings, Native SDK handling and
+  limits; add two-block peer import/finality, rollback and historical refusals.
 - Exercise genuine PQClean Dilithium3 sender and proposer proofs together, with
   distinct keys, real peer Native import/finality, changed-state historical
   replay, foreign raw certificate refusals and retained-role checks.

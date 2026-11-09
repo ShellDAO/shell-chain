@@ -213,17 +213,19 @@ impl<S: KvStore + 'static> Node<S> {
                 return Ok(false);
             }
             // Tag zero also permits an SDK MLDSA adapter in native execution.
-            // This proof profile covers only bound genuine PQClean signatures;
+            // This proof profile covers genuine PQClean default-account signatures;
             // unsupported transcripts keep the ordinary native intake path.
             if tx.signature.sig_type == shell_crypto::SignatureType::Dilithium3
-                && (account.pq_pubkey_hash == ShellHash::ZERO
-                    || registered.as_deref().is_none_or(|key| {
+                && registered
+                    .as_deref()
+                    .or_else(|| tx.pubkey_mode.pubkey_bytes())
+                    .is_none_or(|key| {
                         !shell_crypto::DilithiumVerifier.verify_legacy_transcript(
                             key,
                             tx.sender_signing_hash().as_bytes(),
                             &tx.signature,
                         )
-                    }))
+                    })
             {
                 return Ok(false);
             }
@@ -235,8 +237,7 @@ impl<S: KvStore + 'static> Node<S> {
                     return Ok(false);
                 };
                 if key.len() != 1952
-                    || Address::from_public_key(key, shell_crypto::SignatureType::MlDsa65.as_u8())
-                        != tx.from
+                    || Address::from_public_key(key, tx.signature.sig_type.as_u8()) != tx.from
                 {
                     return Ok(false);
                 }

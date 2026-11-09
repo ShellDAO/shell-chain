@@ -127,3 +127,12 @@ must retain their original source identity after the source representation
 change. Opt-in fresh peer admission is specified in
 [live canonical admission](live-canonical-proof-admission.md). Fork/amendment
 consumption, full proposer cryptography and compact settlement graphs remain separate work.
+
+
+Genuine unbound Dilithium3 default senders select account proof profile 4 and the
+same raw signature AIR as bound profile 3. Their mandatory address certificate
+uses the actual tag zero and full public key; initial Embedded and later Reference
+sources resolve keys from their respective historical parents. SDK-adapter tag
+zero is still excluded from raw proving. The `unbound` Dilithium entry requires
+both original blocks to reach full proof-backed Native import/finality and checks
+history after an ordinary third block under unchanged resource limits.

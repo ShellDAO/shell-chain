@@ -131,7 +131,11 @@ pub(crate) fn verify_canonical_unbound_signature<S: KvStore + 'static>(
     if signed.tx.chain_id != view.config().chain_id
         || signed.tx.tx_type > 3
         || signed.aa_bundle.is_some()
-        || signed.signature.sig_type != shell_crypto::SignatureType::MlDsa65
+        || !matches!(
+            (proof.version, signed.signature.sig_type),
+            (2, shell_crypto::SignatureType::MlDsa65)
+                | (4, shell_crypto::SignatureType::Dilithium3)
+        )
         || signed.signature.data.len() != 3309
         || signed
             .pubkey_mode
@@ -153,7 +157,7 @@ pub(crate) fn verify_canonical_unbound_signature<S: KvStore + 'static>(
         (None, None) => return Err("canonical first use requires an Embedded key".into()),
     };
     if key.len() != 1952 {
-        return Err("canonical unbound registry key is not ML-DSA-65 shaped".into());
+        return Err("canonical unbound registry key shape mismatch".into());
     }
     let account = view
         .world_state()

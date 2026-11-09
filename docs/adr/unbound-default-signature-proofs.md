@@ -56,3 +56,25 @@ proposer. Genesis reconstruction and post-import checks use each actual sender's
 mode rather than treating a whole block as bound or unbound. Both full graphs must
 contain eight proofs of each sender version. The later wrong-root child uses
 Reference mode for all sixteen senders and must preserve Native state on refusal.
+
+
+## Genuine Dilithium3 unbound profile
+
+Profiles 1/2 remain bound/unbound ML-DSA-65, and profile 3 remains bound genuine
+PQClean Dilithium3. Profile 4 selects an unbound genuine PQClean sender, the
+existing raw signature/challenge version 2 and mandatory tag-zero address AIR.
+The actual transaction algorithm supplies the address preimage tag; matching
+key widths do not authorize another transcript or profile. The producer captures
+and restores the same exact parent account, key and MPT witness. The consumer
+still checks all signature, source, account, leaf and transaction-ID predicates.
+Native SDK compatibility is unchanged; SDK FIPS-adapter signatures under tag
+zero are not raw proofs and keep ordinary Native handling.
+
+`tests/e2e/dilithium-full-proof.sh unbound output` requires complete peer Native
+import/finality of the original Embedded first-use and subsequent Reference
+blocks, independent registration/receipt/fee/account checks, and cold read-only
+replay of both graphs after ordinary third-block execution. Genuine certificate,
+missing-address-tag and wrong-profile substitutions must refuse without Native
+writes or new mathematical certificates. Separate real-signature Native intake
+and registration-rollback controls retain their own scope. No quota, schedule,
+default or public activation changes; other account arrangements remain open.
