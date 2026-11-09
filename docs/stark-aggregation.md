@@ -1007,3 +1007,36 @@ refusals; the separate ordinary Native wrong-root control is not a new
 proof-backed bad-block import. Missing-parent-key authorities, other sender or
 account combinations, selector/quorum/penalty AIR, other activations/forks and
 public artifact/network acceptance remain separate.
+
+
+### Published SDK sender and proposer together
+
+```bash
+tests/e2e/dilithium-full-proof.sh sdk-both sdk-both-output
+tests/e2e/dilithium-full-proof.sh verify sdk-both-output
+```
+
+Use the exact published candidate and prerequisites above. Two independent SDK
+keys sign the sender's bound-account transfers through the public provider/RPC
+and the proposer's raw 32-byte Native header/vote hashes through public
+`ShellSigner.sign`. Both keys stay inside disposable SDK processes; retained
+outputs contain only public inputs. The original Native flow reaches block 1
+and finality, then executes an ordinary successor and refuses a separately signed
+wrong-root import before proving starts.
+
+This composition uses existing source format 5, sender profile 5 with transaction
+profile 3, and proposer seal profile 3. Both signatures require complete FIPS
+version-1 AIR and 48-byte challenge seeds under Native algorithm tag zero. A
+successful original full capture records supported behavior. The same graph must
+survive pause/reopen/recovery, real peer Native import/finality, receipt/fee/account
+comparison and repeated read-only history after the successor changes state.
+Genuine independent SDK sender certificates cannot authorize the proposer;
+sender/account and proposer/header profile relabelling must also fail while
+preserving the original proof and every KV byte. Retained incompatible role
+requests refuse before signing.
+
+This entry covers the bound default-account combination only. Unbound SDK sender
+with SDK proposer, AA/custom accounts, consensus selector/quorum/penalty AIR,
+other activations/forks/platforms and public release/network acceptance require
+separate evidence. Limits, defaults, Native transcript union and prior frozen
+source meanings remain unchanged.

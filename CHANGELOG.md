@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add a reproducible public SDK bound-sender/SDK-proposer full-proof entry using independent memory-only keys, existing FIPS profiles, genuine cross-role certificate refusals and changed-state history.
+
 ### Fixed
 
 - Store legacy JSON proof checkpoints with bounded lossless compression, keeping
