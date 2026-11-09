@@ -1,10 +1,10 @@
-//! Exact ML-DSA-65 proposer seal against a frozen trusted canonical parent.
+//! Exact primary65 or genuine PQClean proposer seal at a trusted canonical parent.
 //! Selector and registry provenance remain caller/trusted-store inputs; this
 //! does not prove validator weights, penalty history, quorum or consensus.
 use crate::{
     canonical_signature::canonical_child_hash,
     header_hash::{verify_header_hash, BlockHeaderProof},
-    mldsa_verification::{verify_mldsa65, Mldsa65VerificationProof},
+    mldsa_verification::{verify_dilithium3, verify_mldsa65, Mldsa65VerificationProof},
 };
 use serde::{Deserialize, Serialize};
 use shell_core::{Block, BlockHeader};
@@ -15,6 +15,7 @@ use shell_storage::{CanonicalParentView, KvStore};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProposerSealProof {
+    /// One is FIPS MLDSA65, two is the genuine locked PQClean raw transcript.
     pub version: u8,
     pub header: BlockHeaderProof,
     pub signature: Mldsa65VerificationProof,
@@ -53,16 +54,14 @@ impl Verifier for VerifiedProposerSeal {
         message: &[u8],
         signature: &PQSignature,
     ) -> Result<bool, CryptoError> {
-        if !shell_crypto::is_algorithm_allowed(SignatureType::MlDsa65) {
-            return Err(CryptoError::UnsupportedSignatureType(
-                SignatureType::MlDsa65,
-            ));
+        if !shell_crypto::is_algorithm_allowed(self.seal.sig_type) {
+            return Err(CryptoError::UnsupportedSignatureType(self.seal.sig_type));
         }
         // No native signature fallback for any changed tuple.
         Ok(key == self.key && message == self.hash.as_bytes() && signature == &self.seal)
     }
     fn sig_type(&self) -> SignatureType {
-        SignatureType::MlDsa65
+        self.seal.sig_type
     }
 }
 
@@ -104,9 +103,10 @@ pub(crate) fn verify_seal_at_parent<S: KvStore + 'static>(
     seal: &PQSignature,
     proof: &ProposerSealProof,
 ) -> Result<VerifiedProposerSeal, String> {
-    if proof.version != 1
-        || seal.sig_type != SignatureType::MlDsa65
-        || seal.data.len() != 3309
+    if !matches!(
+        (proof.version, seal.sig_type),
+        (1, SignatureType::MlDsa65) | (2, SignatureType::Dilithium3)
+    ) || seal.data.len() != 3309
         || header.proposer != *expected_proposer
         || view.config().chain_id != expected_chain_id
         || view.parent().number.checked_add(1) != Some(header.number)
@@ -119,10 +119,15 @@ pub(crate) fn verify_seal_at_parent<S: KvStore + 'static>(
         .map_err(|e| e.to_string())?
         .ok_or("proposer key absent at canonical parent")?;
     if key.len() != 1952 {
-        return Err("proposer key is not ML-DSA-65 shaped".into());
+        return Err("proposer public key shape mismatch".into());
     }
     verify_header_hash(&proof.header, header, expected_hash)?;
-    verify_mldsa65(&proof.signature, &key, expected_hash.as_bytes(), &seal.data)?;
+    let verify = if seal.sig_type == SignatureType::Dilithium3 {
+        verify_dilithium3
+    } else {
+        verify_mldsa65
+    };
+    verify(&proof.signature, &key, expected_hash.as_bytes(), &seal.data)?;
     Ok(VerifiedProposerSeal {
         hash: *expected_hash,
         proposer: *expected_proposer,
@@ -130,4 +135,52 @@ pub(crate) fn verify_seal_at_parent<S: KvStore + 'static>(
         key,
         seal: seal.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shell_crypto::{AlgorithmRegistry, DilithiumSigner, MlDsaSigner, Signer};
+
+    #[test]
+    fn exact_seal_token_checks_its_actual_algorithm_and_current_policy() {
+        // Token behavior only; the runtime obtains tokens through complete AIR.
+        for signer in [
+            Box::new(MlDsaSigner::generate()) as Box<dyn Signer>,
+            Box::new(DilithiumSigner::generate()) as Box<dyn Signer>,
+        ] {
+            let hash = ShellHash::from([17; 32]);
+            let seal = signer.sign(hash.as_bytes()).unwrap();
+            let token = VerifiedProposerSeal {
+                hash,
+                proposer: Address::from_public_key(signer.public_key(), signer.sig_type().as_u8()),
+                chain_id: 10,
+                key: signer.public_key().to_vec(),
+                seal: seal.clone(),
+            };
+            let mut registry = AlgorithmRegistry::default();
+            shell_crypto::with_algorithm_registry_override(&registry, || {
+                assert_eq!(token.sig_type(), signer.sig_type());
+                assert!(token
+                    .verify(signer.public_key(), hash.as_bytes(), &seal)
+                    .unwrap());
+                assert!(!token.verify(signer.public_key(), &[18; 32], &seal).unwrap());
+                let mut changed = seal.clone();
+                changed.sig_type = if seal.sig_type == SignatureType::MlDsa65 {
+                    SignatureType::Dilithium3
+                } else {
+                    SignatureType::MlDsa65
+                };
+                assert!(!token
+                    .verify(signer.public_key(), hash.as_bytes(), &changed)
+                    .unwrap());
+            });
+            registry.deprecate(signer.sig_type());
+            shell_crypto::with_algorithm_registry_override(&registry, || {
+                assert!(
+                    matches!(token.verify(signer.public_key(), hash.as_bytes(), &seal), Err(CryptoError::UnsupportedSignatureType(t)) if t == signer.sig_type())
+                );
+            });
+        }
+    }
 }

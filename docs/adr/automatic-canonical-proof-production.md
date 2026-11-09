@@ -87,6 +87,15 @@ version, job quota or activation schedule changes meaning. The standalone
 ordinary successor state changes, cold replay and genuine-certificate refusal;
 other Dilithium3 sender/proposer arrangements require separate qualification.
 
+Genuine locked PQClean proposer seals can also be captured as full version-2
+sources. Seal proof version 2 routes their header-hash message to the existing
+raw32/no-context signature AIR; version 1 stays FIPS-only. Source restoration
+checks the retained Native key/seal evidence for the selected transcript, and
+final verification requires its matching proof version. SDK-adapter tag-zero
+seals and older captured version-1 jobs keep sender-only semantics. The proposer
+regression uses a primary65 sender, real peer Native import/finality and changed-
+current-state historical replay; defaults, quotas and schedules are unchanged.
+
 Legacy JSON certificates can exhaust the shared physical quota when a rotation
 introduces another independent key. Opt-in producer startup compacts eligible
 inline JSON values in one atomic batch; new legacy values use the same bounded

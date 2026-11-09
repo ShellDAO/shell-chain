@@ -101,12 +101,22 @@ describes opaque bounded bytes. Both peers need a consumer that understands the
 version 2 payload. Existing default-off production/admission flags and native
 activation parameters are unchanged.
 
-For a native ML-DSA-65 proposer, automatic capture freezes its public key and raw
+For a native ML-DSA-65 or genuine locked PQClean Dilithium3 proposer, automatic
+capture freezes its public key and raw
 seal as version 2 inputs. Restoration checks retained native block-signer
 evidence rather than resampling a later authority key. The same checkpoint store
 generates and rechecks the raw header-hash signature graph plus header hashing;
 one untagged sender and proposer use 118 components. Existing 256 MiB checkpoint
 and payload limits remain, so this is a bounded profile, not indefinite capacity.
+
+Seal proof version 1 selects FIPS ML-DSA-65; version 2 selects the genuine raw
+Dilithium3 transcript and its separately versioned signature/challenge graph.
+Native tag-zero SDK compatibility is not reinterpreted as raw AIR: those seals
+retain the sender-only profile. Existing captured sender-only jobs remain
+unchanged. The exact-tuple verifier reports and checks the seal's actual
+algorithm under the trusted parent registry, including retirement. The
+`dilithium-full-proof.sh proposer` entry covers a primary65 sender with a genuine
+raw proposer, full Native import/finality and read-only historical replay.
 
 Workers return an opaque exact-tuple proposer verifier only after full AIR
 verification. The serialized native import loop still selects the authority,

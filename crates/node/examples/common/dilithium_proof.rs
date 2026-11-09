@@ -1,4 +1,4 @@
-//! Genuine locked Dilithium3 sender, primary proposer and retained native controls.
+//! Genuine locked Dilithium3 role, primary counterpart and retained native controls.
 use super::*;
 use shell_crypto::{DilithiumSigner, MlDsaSigner, Verifier};
 use shell_storage::RocksDbStores;
@@ -77,7 +77,7 @@ fn control(node: &Node<RocksDbStore>, block: &Block) -> Result<Value, Error> {
         json!({"head":block.hash(),"height":block.number(),"state_root":block.header.state_root,"receipts":receipts,"accounts":accounts(node.store.clone(),block)?}),
     )
 }
-pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
+pub(crate) fn prepare(out: &Path, legacy_proposer: bool) -> Result<(), Error> {
     if out.exists() {
         ensure(
             std::fs::read_dir(out)?.all(|e| e.is_ok_and(|e| e.file_name() == "commands")),
@@ -86,19 +86,32 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
     } else {
         std::fs::create_dir(out)?;
     }
-    let sender = DilithiumSigner::generate();
-    let proposer = MlDsaSigner::generate();
+    let (sender, proposer): (Box<dyn Signer>, Box<dyn Signer>) = if legacy_proposer {
+        (
+            Box::new(MlDsaSigner::generate()),
+            Box::new(DilithiumSigner::generate()),
+        )
+    } else {
+        (
+            Box::new(DilithiumSigner::generate()),
+            Box::new(MlDsaSigner::generate()),
+        )
+    };
     let address = Address::from_public_key(sender.public_key(), sender.sig_type().as_u8());
     let authority = Address::from_public_key(proposer.public_key(), proposer.sig_type().as_u8());
     ensure(
         address != authority && address != Address::from([0x11; 32]),
         "legacy actor collision",
     )?;
-    let stores = genesis(&out.join("native-original/db"), &sender, &proposer)?;
+    let stores = genesis(
+        &out.join("native-original/db"),
+        sender.as_ref(),
+        proposer.as_ref(),
+    )?;
     let receiver = genesis(
         &out.join("network-dilithium/receiver/db"),
-        &sender,
-        &proposer,
+        sender.as_ref(),
+        proposer.as_ref(),
     )?;
     let receiver_genesis = ChainStore::new(Arc::new(receiver.state.clone()))
         .get_head_hash()?
@@ -112,8 +125,10 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
     )?;
     node.config.proposer_address = Some(authority);
     node.config.node_role = shell_node::NodeRole::ValidatorProver;
-    node.config.canonical_proof_production = true;
-    let tx = signed(&sender, 0)?;
+    // This ordinary Native proposer control precedes public source collection.
+    // Avoid creating a sender-only job whose immutable inputs would be replaced.
+    node.config.canonical_proof_production = !legacy_proposer;
+    let tx = signed(sender.as_ref(), 0)?;
     ensure(
         MultiVerifier.verify(
             sender.public_key(),
@@ -123,7 +138,7 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
         "genuine legacy crypto refused",
     )?;
     node.handle_incoming_tx(tx, &MultiVerifier)?;
-    let block = node.produce_block(&proposer, 100)?;
+    let block = node.produce_block(proposer.as_ref(), 100)?;
     let vote = proposer.sign(block.hash().as_bytes())?;
     let mut round = shell_consensus::wpoa_state::WPoaRound::new(
         block.number(),
@@ -186,8 +201,8 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
     std::fs::create_dir(out.join("network-dilithium/provider"))?;
     stores.create_checkpoint(out.join("network-dilithium/provider/db"))?;
     node.config.canonical_proof_production = false;
-    node.handle_incoming_tx(signed(&sender, 1)?, &MultiVerifier)?;
-    let successor = node.produce_block(&proposer, 100)?;
+    node.handle_incoming_tx(signed(sender.as_ref(), 1)?, &MultiVerifier)?;
+    let successor = node.produce_block(proposer.as_ref(), 100)?;
     write(&out.join("successor.json"), &successor)?;
     write(
         &out.join("later-control.json"),
@@ -195,7 +210,7 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
     )?;
     write(
         &out.join("actors.json"),
-        &json!({"sender":address,"sender_key":sender.public_key(),"sender_algorithm":sender.sig_type(),"proposer_algorithm":proposer.sig_type(),"private_keys_persisted":false,"native_transcript":"locked pqcrypto-dilithium0.5.0 raw, not MLDSA compatibility"}),
+        &json!({"sender":address,"sender_key":sender.public_key(),"sender_algorithm":sender.sig_type(),"proposer_algorithm":proposer.sig_type(),"private_keys_persisted":false,"profile":if legacy_proposer {"legacy-proposer"} else {"legacy-sender"},"initial_automatic_capture_disabled_native_control":legacy_proposer,"native_transcript":"locked pqcrypto-dilithium0.5.0 raw role; primary65 counterpart"}),
     )?;
     node.store.flush()?;
     drop(node);
@@ -226,11 +241,13 @@ pub(crate) fn probe(out: &Path, recovered: bool) -> Result<(), Error> {
     ensure(!path.exists(), "retained legacy capture receipt exists")?;
     match result {
         Ok(source) => {
+            let input: Value = serde_json::from_slice(source.identity())?;
+            let full = input["version"] == 2 && input["proposer_key"].is_array();
             write(
                 &path,
-                &json!({"supported":true,"identity_hash":blake3_hash(source.identity()),"all_kv_unchanged":true,"native_digest":before}),
+                &json!({"supported":full,"captured_version":input["version"],"proposer_captured":input["proposer_key"].is_array(),"identity_hash":blake3_hash(source.identity()),"all_kv_unchanged":true,"native_digest":before}),
             )?;
-            Ok(())
+            ensure(full, "genuine proposer missing from full production source")
         }
         Err(error) => {
             write(
@@ -242,6 +259,17 @@ pub(crate) fn probe(out: &Path, recovered: bool) -> Result<(), Error> {
     }
 }
 
+fn legacy_proposer(out: &Path) -> Result<bool, Error> {
+    let actors: Value = read(&out.join("actors.json"))?;
+    match (
+        actors["sender_algorithm"].as_str(),
+        actors["proposer_algorithm"].as_str(),
+    ) {
+        (Some("Dilithium3"), Some("MlDsa65")) => Ok(false),
+        (Some("MlDsa65"), Some("Dilithium3")) => Ok(true),
+        _ => Err("unsupported retained Dilithium role profile".into()),
+    }
+}
 pub(crate) async fn run(out: &Path, pause: bool) -> Result<(), Error> {
     let network = out.join("network-dilithium");
     ensure(
@@ -250,6 +278,7 @@ pub(crate) async fn run(out: &Path, pause: bool) -> Result<(), Error> {
     )?;
     let context: fixture::Context = read(&out.join("context.json"))?;
     let block: Block = read(&out.join("candidate.json"))?;
+    let legacy_proposer = legacy_proposer(out)?;
     let expected: Value = read(&out.join("control.json"))?;
     let faults = Arc::new(Faults::default());
     let provider = Live::start(
@@ -309,11 +338,14 @@ pub(crate) async fn run(out: &Path, pause: bool) -> Result<(), Error> {
                 let proof = shell_stark_prover::compact_canonical::decode_payload(&bytes)?;
                 let sender = &proof.transactions.first().ok_or("Dilithium sender proof absent")?.signature;
                 let equation = &sender.transaction.signature.equation;
-                ensure(proof.version == 2 && proof.transactions.len() == 1 && sender.version == 3 && sender.transaction.version == 2 && sender.transaction.signature.version == 2 && equation.challenge.version == 2 && equation.challenge.seed == equation.signature.decoded.challenge[..32] && proof.proposer.as_ref().is_some_and(|p|p.version == 1 && p.signature.version == 1 && p.signature.equation.challenge.version == 1), "Dilithium/FIPS full proof profile mismatch")?;
+                let (bound, inner, seed) = if legacy_proposer {(1,1,48)} else {(3,2,32)};
+                let prop = proof.proposer.as_ref().ok_or("full proposer proof absent")?;
+                let (prop_version, prop_seed) = if legacy_proposer {(2,32)} else {(1,48)};
+                ensure(proof.version == 2 && proof.transactions.len() == 1 && sender.version == bound && sender.transaction.version == inner && sender.transaction.signature.version == inner && equation.challenge.version == inner && equation.challenge.seed == equation.signature.decoded.challenge[..seed] && prop.version == prop_version && prop.signature.version == prop_version && prop.signature.equation.challenge.version == prop_version && prop.signature.equation.challenge.seed == prop.signature.equation.signature.decoded.challenge[..prop_seed], "Dilithium/FIPS full proof profile mismatch")?;
                 let path = network.join("proof.bin");
                 if path.exists() { ensure(std::fs::read(&path)? == bytes, "retained Dilithium proof changed")?; } else { std::fs::write(path, &bytes)?; }
                 write(&network.join("manifest.json"), &manifest)?;
-                write(&network.join("complete.json"), &json!({"production":production["status"],"admission":admission,"height":height,"finalized":finalized,"genuine_dilithium_sender_primary_proposer_full_proof_admitted":true,"native_outputs_match":true,"served_chunks":faults.chunks.load(Ordering::SeqCst)}))?;
+                write(&network.join("complete.json"), &json!({"production":production["status"],"admission":admission,"height":height,"finalized":finalized,"genuine_dilithium_sender_primary_proposer_full_proof_admitted":!legacy_proposer,"genuine_dilithium_proposer_primary_sender_full_proof_admitted":legacy_proposer,"native_outputs_match":true,"served_chunks":faults.chunks.load(Ordering::SeqCst)}))?;
                 break;
             }
             ensure(tokio::time::Instant::now() < deadline && last_progress.elapsed() < Duration::from_secs(1800), "Dilithium progress bound exceeded")?;
@@ -452,10 +484,22 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
     let block: Block = read(&out.join("candidate.json"))?;
     let raw = std::fs::read(network.join("proof.bin"))?;
     let original = shell_stark_prover::compact_canonical::decode_payload(&raw)?;
-    let primary = original
-        .proposer
-        .as_ref()
-        .ok_or("Dilithium primary proposer proof absent")?;
+    let legacy_proposer = legacy_proposer(out)?;
+    let primary = if legacy_proposer {
+        &original
+            .transactions
+            .first()
+            .ok_or("primary sender proof absent")?
+            .signature
+            .transaction
+            .signature
+    } else {
+        &original
+            .proposer
+            .as_ref()
+            .ok_or("primary proposer proof absent")?
+            .signature
+    };
     let stores = RocksDbStore::open_all(network.join("receiver/db"), None)?;
     let node = fixture::node(
         Arc::new(stores.state),
@@ -475,20 +519,22 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
         ("relabelled-fips-profile", "version"),
     ] {
         let mut proof = original.clone();
-        let sender = &mut proof.transactions[0].signature;
+        let target = if legacy_proposer {
+            &mut proof
+                .proposer
+                .as_mut()
+                .ok_or("raw proposer proof absent")?
+                .signature
+        } else {
+            &mut proof.transactions[0].signature.transaction.signature
+        };
         match name {
-            "primary-key" => {
-                sender.transaction.signature.equation.key = primary.signature.equation.key.clone()
-            }
-            "fips-challenge" => {
-                sender.transaction.signature.equation.challenge =
-                    primary.signature.equation.challenge.clone()
-            }
+            "primary-key" => target.equation.key = primary.equation.key.clone(),
+            "fips-challenge" => target.equation.challenge = primary.equation.challenge.clone(),
             "fips-commitment" => {
-                sender.transaction.signature.completion.commitment =
-                    primary.signature.completion.commitment.clone()
+                target.completion.commitment = primary.completion.commitment.clone()
             }
-            "relabelled-fips-profile" => sender.transaction.signature.version = 1,
+            "relabelled-fips-profile" => target.version = 1,
             _ => unreachable!(),
         }
         let bytes =

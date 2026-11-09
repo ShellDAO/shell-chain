@@ -284,7 +284,8 @@ full proposer AIR, multi-sender load behavior or a published/activated network.
 
 Design: [Live canonical admission](adr/live-canonical-proof-admission.md).
 
-The opt-in full signature profile adds ML-DSA-65 proposer-seal and header-hash
+The opt-in full signature profile adds primary ML-DSA-65 or genuine locked
+PQClean Dilithium3 proposer-seal and header-hash
 AIR to the registered sender graph. Its payload version 2 requires a full seal;
 version 1 remains sender-only with native proposer verification. Current
 consumers on both peers are required for version 2. Native authority selection,
@@ -752,8 +753,42 @@ meaning. Shared key, matrix and NTT arithmetic is reverified against exact
 inputs; tagged-key checkpoints also require an equal algorithm tag.
 
 The Native tag-zero verifier continues accepting its existing SDK ML-DSA
-adapter. That adapter, unbound Dilithium3, Dilithium3 proposer AIR, AA and custom
+adapter. That adapter, unbound Dilithium3, AA and custom
 validators require separate proof profiles. Unsupported live candidates retain
 ordinary Native handling; selected full-proof candidates require complete AIR
 without Native signature fallback. Production/admission defaults, quotas,
 activation schedules and public release availability remain unchanged.
+
+### Genuine PQClean Dilithium3 proposer proofs
+
+```sh
+tests/e2e/dilithium-full-proof.sh proposer proposer-output
+tests/e2e/dilithium-full-proof.sh verify proposer-output
+```
+
+This mode uses a fresh primary ML-DSA-65 registered sender and a distinct genuine
+`DilithiumSigner` proposer. It requires the same toolchain and full mathematical,
+peer Native import/finality, receipt/fee/balance, pause/resume and changed-current-
+state historical replay endpoints as the sender mode. Genuine primary sender
+certificates cannot replace the raw proposer's key, challenge or commitment;
+changing the raw signature proof to the FIPS version must also refuse. Mode
+selection refuses outputs prepared with the opposite algorithm roles before
+opening nodes or generating keys. Keep the output; `verify` generates no proofs.
+
+Proposer seal proof version 2 selects the genuine locked raw transcript, with
+signature/challenge version 2 and the 32-byte sampler seed described above.
+Proposer proof version 1 retains primary FIPS semantics. The payload remains
+version 2 with a required complete seal and header proof. Native authority and
+parent-registry selection remain independent of that proof, and the opaque
+verifier checks policy for the actual seal algorithm. A retired algorithm or
+changed input tuple has no Native signature fallback.
+
+The initial ordinary Native control explicitly disables automatic capture; its
+separate source collection records the original missing full-proposer result.
+Repaired acceptance enables actual automatic production on the same original
+Native provider head. Private keys, signed inputs and databases are preserved.
+Previously captured version-1 sender-only jobs retain that meaning; they are not
+silently rewritten into full proposer jobs. SDK FIPS-adapter proposer signatures
+under tag zero still use the older sender-only profile. Both-Dilithium roles,
+other account arrangements and public artifacts/network activation require
+separate acceptance evidence.

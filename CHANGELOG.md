@@ -24,6 +24,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Complete genuine PQClean Dilithium3 proposer-seal AIR and header binding for
+  automatic production, peer Native import and historical replay. Retain primary
+  FIPS and older sender-only formats, and check the actual seal algorithm policy.
 - Produce and admit complete proofs for genuine PQClean Dilithium3 signatures
   from bound registered senders with an ML-DSA-65 proposer. Separate the raw
   32-byte sampler transcript from FIPS proofs, retain Native SDK compatibility,
