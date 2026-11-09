@@ -789,8 +789,8 @@ separate source collection records the original missing full-proposer result.
 Repaired acceptance enables actual automatic production on the same original
 Native provider head. Private keys, signed inputs and databases are preserved.
 Previously captured version-1 sender-only jobs retain that meaning; they are not
-silently rewritten into full proposer jobs. SDK FIPS-adapter proposer signatures
-under tag zero still use the older sender-only profile. Other account
+silently rewritten into full proposer jobs. Previously captured SDK FIPS-adapter sender-only sources retain that scope;
+new full SDK proposer jobs use the distinct profile below. Other account
 arrangements and public artifacts/network activation require separate acceptance
 evidence.
 
@@ -910,8 +910,7 @@ Frozen source format 3 explicitly records the SDK selection; old source formats
 Selection is a producer preflight; consumers require complete AIR without Native
 signature fallback.
 
-This bounded case covers one bound SDK sender and a primary proposer. SDK-tag-zero
-proposer proofs, absent-state creation, AA/custom validators,
+This bounded case covers one bound SDK sender and a primary proposer. Other SDK-proposer/sender combinations beyond the entry below, absent-state creation, AA/custom validators,
 same-block registration sequences, other activations and public binary/network
 acceptance remain separate. Limits, defaults and activation schedules are unchanged.
 
@@ -958,7 +957,53 @@ A retained account/transcript/role mismatch exits before key or proof generation
 Failed checks exit nonzero; `verify` generates no proofs.
 
 This is a funded default-account case with a primary65 proposer and algorithm
-binding omitted. SDK-tag-zero proposer AIR, absent-state creation, AA/custom
+binding omitted. Other SDK-proposer combinations beyond the entry below,
+absent-state creation, AA/custom
 validators, same-block registration sequences, other activations, forks,
 platforms and sustained load remain separate. Production/admission defaults,
 quotas, activation schedules and public binary/network availability are unchanged.
+
+
+### Published SDK Dilithium3 proposer seal
+
+```bash
+tests/e2e/dilithium-full-proof.sh sdk-proposer sdk-proposer-output
+tests/e2e/dilithium-full-proof.sh verify sdk-proposer-output
+```
+
+Use the same exact published SDK candidate, Node.js/npm, Python 3, stable Rust
+and RocksDB prerequisites as the SDK sender entries. This case has an independent
+primary65 registered sender and an SDK Native tag-zero FIPS proposer. A disposable
+SDK process owns the proposer's secret key and calls public `ShellSigner.sign`
+on the exact raw 32-byte Native header hash. The Native signer interface forwards
+only public hash requests and receives public key/signature bytes; it never
+reconstructs or persists the SDK secret key. The process disposes the key and
+stops through a cooperative message before proof production begins.
+
+Actual Native production, quorum/finality and a separately signed wrong-root
+ordinary import control precede complete proof capture. The same original graph
+must complete automatic production, durable recovery, full mathematics and real
+peer Native import/finality. An original ordinary successor changes state before
+repeated cold historical checks compare receipts, 21,000 gas, effective fee,
+accounts and nonce while preserving every KV byte. Keep the outputs to resume;
+retained-role mismatches and failed assertions exit nonzero, and `verify` creates
+no new proofs or signing keys.
+
+New frozen source format 5 explicitly records the SDK proposer transcript. Seal
+profile 3 binds the complete Native header hash to FIPS signature/challenge
+version 1 and its full 48-byte sampler seed under Native algorithm tag zero.
+Primary seal profile 1 and genuine PQClean raw profile 2 keep their distinct
+algorithms/transcripts. Source formats 1/2/3/4 and already captured SDK sender-only
+jobs retain their exact bytes and meaning; recovery does not upgrade them in
+place. Native raw-or-SDK verification, algorithm deprecation policy, consensus
+selector/quorum checks, limits, defaults and activation schedules are unchanged.
+A fully verified proposer token authorizes only its exact key/hash/seal tuple.
+
+The entry refuses genuine foreign primary key/challenge/commitment certificates,
+raw/primary seal relabelling and a complete header-hash certificate for the
+original independently SDK-signed successor, each with a correct outer payload
+hash and unchanged original proof/state. These are full historical predicate
+refusals; the separate ordinary Native wrong-root control is not a new
+proof-backed bad-block import. Missing-parent-key authorities, other sender or
+account combinations, selector/quorum/penalty AIR, other activations/forks and
+public artifact/network acceptance remain separate.

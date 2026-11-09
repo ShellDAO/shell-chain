@@ -92,8 +92,8 @@ Genuine locked PQClean proposer seals can also be captured as full version-2
 sources. Seal proof version 2 routes their header-hash message to the existing
 raw32/no-context signature AIR; version 1 stays FIPS-only. Source restoration
 checks the retained Native key/seal evidence for the selected transcript, and
-final verification requires its matching proof version. SDK-adapter tag-zero
-seals and older captured version-1 jobs keep sender-only semantics. The proposer
+final verification requires its matching proof version. Older captured SDK tag-zero sources and version-1 jobs keep sender-only
+semantics. New SDK proposer sources use the distinct format below. The proposer
 regression uses a primary65 sender, real peer Native import/finality and changed-
 current-state historical replay. The `both` regression additionally consumes raw
 sender profile 3 and proposer seal version 2 in the same full graph, with genuine
@@ -152,7 +152,7 @@ of a proposer proof. Recovery rejects unknown, missing or relabelled markers.
 uses its provider through actual local Node RPC. The same original graph must
 complete automatic production, durable recovery, peer Native import/finality,
 changed-state history and genuine/cross-profile refusals. Signed-input Native
-intake and wrong-root rollback controls retain their own scope. SDK-tag-zero proposer proofs remain separate; no defaults, quotas,
+intake and wrong-root rollback controls retain their own scope. Other SDK proposer combinations remain separate; no defaults, quotas,
 activation or public-release status change.
 
 
@@ -168,3 +168,25 @@ import/finality before ordinary advancement and cold read-only dual replay.
 The `sdk-unbound` entry exercises these boundaries through the published SDK and
 keeps ordinary Native intake/registration rollback controls separately labelled.
 There is no quota, default or activation change.
+
+
+## Native SDK FIPS proposer seals
+
+Frozen source format 5 records an explicit `proposer_sdk_fips` version 1 and the
+exact parent-registered SDK tag-zero proposer key. Strict producer preflight
+selects this transcript only after the genuine raw transcript fails. Complete
+seal proof profile 3 requires the same full header-hash AIR and FIPS signature/
+challenge version-1 predicates, including the 48-byte sampler seed. Existing
+primary seal 1/raw seal 2 and source formats 1/2/3/4 retain their original meanings;
+old immutable sender-only SDK jobs are restored without upgrade or replacement.
+Unknown/missing/relabelled markers, keys, algorithms and transcripts must reject.
+
+The public SDK proposer regression signs the actual raw Native header hash in a
+memory-only SDK process; only public messages/signatures cross its signer
+interface. Actual Native quorum/finality, full peer import and changed-state
+historical replay qualify one primary-sender/SDK-proposer case. The verified
+proposer token still uses the actual Native algorithm for deprecation policy
+and exact tuple matching, with no Native signature fallback for changed inputs.
+Parent registry provenance, validator selection and consensus authorization stay
+trusted Native context rather than newly proved selector or quorum AIR. Other
+combinations, defaults, quotas, activation and release status remain separate.

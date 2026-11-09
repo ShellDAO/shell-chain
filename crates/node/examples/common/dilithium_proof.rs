@@ -93,10 +93,10 @@ pub(crate) fn prepare(
     legacy_proposer: bool,
     unbound: bool,
 ) -> Result<(), Error> {
-    prepare_profile(out, legacy_sender, legacy_proposer, unbound, false)
+    prepare_profile(out, legacy_sender, legacy_proposer, unbound, false, false)
 }
 pub(crate) fn prepare_sdk(out: &Path) -> Result<(), Error> {
-    prepare_profile(out, true, false, false, true)
+    prepare_profile(out, true, false, false, true, false)
 }
 struct SdkPublicKey(Vec<u8>);
 impl Signer for SdkPublicKey {
@@ -173,7 +173,107 @@ fn sdk_rpc(
     })
 }
 pub(crate) fn prepare_sdk_unbound(out: &Path) -> Result<(), Error> {
-    prepare_profile(out, true, false, true, true)
+    prepare_profile(out, true, false, true, true, false)
+}
+pub(crate) fn prepare_sdk_proposer(out: &Path) -> Result<(), Error> {
+    prepare_profile(out, false, true, false, false, true)
+}
+struct SdkProposerClient {
+    child: std::process::Child,
+    input: std::process::ChildStdin,
+    output: std::io::BufReader<std::process::ChildStdout>,
+}
+impl SdkProposerClient {
+    fn receive(&mut self) -> Result<Value, Error> {
+        use std::io::BufRead;
+        let mut line = String::new();
+        ensure(
+            self.output.read_line(&mut line)? > 0,
+            "SDK signer process closed its public response",
+        )?;
+        Ok(serde_json::from_str(&line)?)
+    }
+    fn exchange(&mut self, request: &Value) -> Result<Value, Error> {
+        use std::io::Write;
+        writeln!(self.input, "{request}")?;
+        self.input.flush()?;
+        self.receive()
+    }
+}
+// Only public inputs cross this channel; all SDK secret bytes stay in its
+// disposable process. Native block production invokes the actual public signer.
+struct SdkProposer {
+    key: Vec<u8>,
+    client: std::sync::Mutex<SdkProposerClient>,
+}
+impl SdkProposer {
+    fn start(out: &Path) -> Result<Self, Error> {
+        let mut child = std::process::Command::new("node")
+            .args([
+                "tests/e2e/sdk-dilithium-inputs.mjs",
+                "proposer",
+                &format!("{}.client", out.display()),
+                &out.join("sdk-proposer-public.json").to_string_lossy(),
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()?;
+        let input = child.stdin.take().ok_or("SDK signer input absent")?;
+        let output =
+            std::io::BufReader::new(child.stdout.take().ok_or("SDK signer output absent")?);
+        let mut client = SdkProposerClient {
+            child,
+            input,
+            output,
+        };
+        let ready = client.receive()?;
+        let key: Vec<u8> = serde_json::from_value(ready["public_key"].clone())?;
+        ensure(
+            ready["kind"] == "ready"
+                && ready["version"] == "0.14.0-rc.3"
+                && ready["private_keys_persisted"] == false
+                && key.len() == 1952
+                && ready["address"] == serde_json::to_value(Address::from_public_key(&key, 0))?,
+            "SDK proposer public profile mismatch",
+        )?;
+        Ok(Self {
+            key,
+            client: std::sync::Mutex::new(client),
+        })
+    }
+}
+impl Signer for SdkProposer {
+    fn sign(&self, message: &[u8]) -> Result<shell_crypto::PQSignature, shell_crypto::CryptoError> {
+        let error = |e: String| shell_crypto::CryptoError::SigningFailed(e);
+        let mut client = self.client.lock().map_err(|e| error(e.to_string()))?;
+        let value = client
+            .exchange(&json!({"message":message}))
+            .map_err(|e| error(e.to_string()))?;
+        if value["kind"] != "signature" || value["actual_public_signer"] != true {
+            return Err(error("SDK signature response mismatch".into()));
+        }
+        let sig: shell_crypto::PQSignature =
+            serde_json::from_value(value["signature"].clone()).map_err(|e| error(e.to_string()))?;
+        if sig.sig_type != shell_crypto::SignatureType::Dilithium3 || sig.data.len() != 3309 {
+            return Err(error("SDK signature shape mismatch".into()));
+        }
+        Ok(sig)
+    }
+    fn public_key(&self) -> &[u8] {
+        &self.key
+    }
+    fn sig_type(&self) -> shell_crypto::SignatureType {
+        shell_crypto::SignatureType::Dilithium3
+    }
+}
+impl Drop for SdkProposer {
+    fn drop(&mut self) {
+        if let Ok(client) = self.client.get_mut() {
+            let _ = client.exchange(&json!({"stop":true}));
+            let _ = client.child.wait();
+        }
+    }
 }
 fn prepare_profile(
     out: &Path,
@@ -181,6 +281,7 @@ fn prepare_profile(
     legacy_proposer: bool,
     unbound: bool,
     sdk: bool,
+    sdk_proposer: bool,
 ) -> Result<(), Error> {
     if out.exists() {
         ensure(
@@ -214,7 +315,9 @@ fn prepare_profile(
     } else {
         Box::new(MlDsaSigner::generate())
     };
-    let proposer: Box<dyn Signer> = if legacy_proposer {
+    let proposer: Box<dyn Signer> = if sdk_proposer {
+        Box::new(SdkProposer::start(out)?)
+    } else if legacy_proposer {
         Box::new(DilithiumSigner::generate())
     } else {
         Box::new(MlDsaSigner::generate())
@@ -499,7 +602,7 @@ fn prepare_profile(
     }
     write(
         &out.join("actors.json"),
-        &json!({"sender":address,"sender_key":sender.public_key(),"sender_algorithm":sender.sig_type(),"proposer_algorithm":proposer.sig_type(),"private_keys_persisted":false,"unbound_sender":unbound,"native_sdk_fips_sender":sdk,"profile":if sdk && unbound {"native-sdk-fips-unbound"} else if sdk {"native-sdk-fips-bound"} else if unbound {"legacy-unbound"} else if legacy_sender && legacy_proposer {"legacy-both"} else if legacy_proposer {"legacy-proposer"} else {"legacy-sender"},"initial_automatic_capture_disabled_native_control":legacy_proposer || unbound || sdk,"native_transcript":"locked pqcrypto-dilithium0.5.0 raw roles; FIPS only where explicitly selected"}),
+        &json!({"sender":address,"sender_key":sender.public_key(),"sender_algorithm":sender.sig_type(),"proposer_algorithm":proposer.sig_type(),"private_keys_persisted":false,"unbound_sender":unbound,"native_sdk_fips_sender":sdk,"native_sdk_fips_proposer":sdk_proposer,"profile":if sdk_proposer {"native-sdk-fips-proposer"} else if sdk && unbound {"native-sdk-fips-unbound"} else if sdk {"native-sdk-fips-bound"} else if unbound {"legacy-unbound"} else if legacy_sender && legacy_proposer {"legacy-both"} else if legacy_proposer {"legacy-proposer"} else {"legacy-sender"},"initial_automatic_capture_disabled_native_control":legacy_proposer || unbound || sdk,"native_transcript":"locked pqcrypto-dilithium0.5.0 raw roles; FIPS only where explicitly selected"}),
     )?;
     node.store.flush()?;
     drop(node);
@@ -560,7 +663,42 @@ pub(crate) fn probe(out: &Path, recovered: bool) -> Result<(), Error> {
         Ok(source) => {
             let input: Value = serde_json::from_slice(source.identity())?;
             let actors: Value = read(&out.join("actors.json"))?;
-            let expected_version = if actors["native_sdk_fips_sender"] == true {
+            if actors["native_sdk_fips_proposer"] == true
+                && !recovered
+                && input["version"] == 1
+                && input["proposer_key"].is_null()
+            {
+                std::fs::write(
+                    out.join("sender-only-original-source.json"),
+                    source.identity(),
+                )?;
+            }
+            if actors["native_sdk_fips_proposer"] == true
+                && recovered
+                && out.join("sender-only-original-source.json").exists()
+            {
+                let old = std::fs::read(out.join("sender-only-original-source.json"))?;
+                let restored =
+                    shell_stark_prover::canonical_producer::CanonicalProductionSource::restore(
+                        &chain, &old,
+                    )?;
+                let old_input: Value = serde_json::from_slice(restored.identity())?;
+                ensure(
+                    restored.identity() == old
+                        && old_input["version"] == 1
+                        && old_input["proposer_key"].is_null()
+                        && old_input["proposer_sdk_fips"].is_null()
+                        && before == digest(&stores.state)?,
+                    "original sender-only source upgraded or wrote state",
+                )?;
+                write(
+                    &out.join("sender-only-source-restored.json"),
+                    &json!({"identity_hash":blake3_hash(&old),"exact_original_bytes":true,"still_sender_only":true,"all_kv_unchanged":true}),
+                )?;
+            }
+            let expected_version = if actors["native_sdk_fips_proposer"] == true {
+                5
+            } else if actors["native_sdk_fips_sender"] == true {
                 if actors["unbound_sender"] == true {
                     4
                 } else {
@@ -634,6 +772,7 @@ pub(crate) async fn run(out: &Path, pause: bool, reference: bool) -> Result<(), 
     let actors: Value = read(&out.join("actors.json"))?;
     let unbound = actors["unbound_sender"] == true;
     let sdk = actors["native_sdk_fips_sender"] == true;
+    let sdk_proposer = actors["native_sdk_fips_proposer"] == true;
     let sender_key: Vec<u8> = serde_json::from_value(actors["sender_key"].clone())?;
     let expected: Value = read(&out.join(if reference {
         "later-control.json"
@@ -743,8 +882,9 @@ pub(crate) async fn run(out: &Path, pause: bool, reference: bool) -> Result<(), 
                 let equation = &sender.transaction.signature.equation;
                 let (bound, envelope, inner, seed) = if sdk && unbound {(6,3,1,48)} else if sdk {(5,3,1,48)} else if unbound {(4,2,2,32)} else if legacy_sender {(3,2,2,32)} else {(1,1,1,48)};
                 let prop = proof.proposer.as_ref().ok_or("full proposer proof absent")?;
-                let (prop_version, prop_seed) = if legacy_proposer {(2,32)} else {(1,48)};
-                ensure(proof.version == 2 && proof.transactions.len() == 1 && sender.version == bound && sender.transaction.version == envelope && sender.transaction.signature.version == inner && equation.challenge.version == inner && equation.challenge.seed == equation.signature.decoded.challenge[..seed] && prop.version == prop_version && prop.signature.version == prop_version && prop.signature.equation.challenge.version == prop_version && prop.signature.equation.challenge.seed == prop.signature.equation.signature.decoded.challenge[..prop_seed], "Dilithium/FIPS full proof profile mismatch")?;
+                let (prop_version, prop_seed) = if sdk_proposer {(3,48)} else if legacy_proposer {(2,32)} else {(1,48)};
+                let prop_inner=if sdk_proposer {1} else {prop_version};
+                ensure(proof.version == 2 && proof.transactions.len() == 1 && sender.version == bound && sender.transaction.version == envelope && sender.transaction.signature.version == inner && equation.challenge.version == inner && equation.challenge.seed == equation.signature.decoded.challenge[..seed] && prop.version == prop_version && prop.signature.version == prop_inner && prop.signature.equation.challenge.version == prop_inner && prop.signature.equation.challenge.seed == prop.signature.equation.signature.decoded.challenge[..prop_seed], "Dilithium/FIPS full proof profile mismatch")?;
                 if unbound {
                     let address = sender.tagged_key.as_ref().ok_or("unbound address AIR absent")?;
                     ensure(address.message.first()==Some(&0) && address.message[1..]==sender_key && address.output == *block.transactions[0].from.as_bytes()
@@ -759,7 +899,7 @@ pub(crate) async fn run(out: &Path, pause: bool, reference: bool) -> Result<(), 
                 let path = network.join(proof_name);
                 if path.exists() { ensure(std::fs::read(&path)? == bytes, "retained Dilithium proof changed")?; } else { std::fs::write(path, &bytes)?; }
                 write(&network.join(manifest_name), &manifest)?;
-                write(&network.join(complete_name), &json!({"production":production["status"],"admission":admission,"height":height,"finalized":finalized,"unbound_sender":unbound,"both_original_targets_proof_admitted":reference,"genuine_unbound_dilithium_full_proof_admitted":unbound && !sdk,"genuine_unbound_sdk_tag0_fips_full_proof_admitted":sdk && unbound,"native_sdk_fips_sender":sdk,"genuine_sdk_tag0_fips_full_proof_admitted":sdk && !unbound,"genuine_dilithium_sender_primary_proposer_full_proof_admitted":legacy_sender && !legacy_proposer && !unbound && !sdk,"genuine_dilithium_proposer_primary_sender_full_proof_admitted":legacy_proposer && !legacy_sender,"genuine_dilithium_both_roles_full_proof_admitted":legacy_sender && legacy_proposer,"native_outputs_match":true,"served_chunks":faults.chunks.load(Ordering::SeqCst)}))?;
+                write(&network.join(complete_name), &json!({"production":production["status"],"admission":admission,"height":height,"finalized":finalized,"unbound_sender":unbound,"both_original_targets_proof_admitted":reference,"genuine_unbound_dilithium_full_proof_admitted":unbound && !sdk,"genuine_unbound_sdk_tag0_fips_full_proof_admitted":sdk && unbound,"native_sdk_fips_sender":sdk,"native_sdk_fips_proposer":sdk_proposer,"genuine_sdk_tag0_fips_proposer_full_proof_admitted":sdk_proposer,"genuine_sdk_tag0_fips_full_proof_admitted":sdk && !unbound,"genuine_dilithium_sender_primary_proposer_full_proof_admitted":legacy_sender && !legacy_proposer && !unbound && !sdk,"genuine_dilithium_proposer_primary_sender_full_proof_admitted":legacy_proposer && !legacy_sender && !sdk_proposer,"genuine_dilithium_both_roles_full_proof_admitted":legacy_sender && legacy_proposer,"native_outputs_match":true,"served_chunks":faults.chunks.load(Ordering::SeqCst)}))?;
                 break;
             }
             ensure(tokio::time::Instant::now() < deadline && last_progress.elapsed() < Duration::from_secs(1800), "Dilithium progress bound exceeded")?;
@@ -960,6 +1100,7 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
     let actors: Value = read(&out.join("actors.json"))?;
     let unbound = actors["unbound_sender"] == true;
     let sdk = actors["native_sdk_fips_sender"] == true;
+    let sdk_proposer = actors["native_sdk_fips_proposer"] == true;
     let both = legacy_sender && legacy_proposer;
     let cases = if both {
         [
@@ -977,6 +1118,26 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
         ]
     };
     let mut cases = cases.to_vec();
+    let foreign_header = if sdk_proposer {
+        let path = network.join("sdk-proposer-foreign-header.json");
+        let value = if path.exists() {
+            read(&path)?
+        } else {
+            let successor: Block = read(&out.join("successor.json"))?;
+            let proof = shell_stark_prover::header_hash::prove_header_hash(&successor.header)?;
+            write(&path, &proof)?;
+            proof
+        };
+        cases[3] = ("relabelled-raw-signature", "version");
+        cases.extend([
+            ("sdk-proposer-as-primary-seal", "framing"),
+            ("sdk-proposer-as-raw-seal", "version"),
+            ("foreign-sdk-successor-header", "header"),
+        ]);
+        Some(value)
+    } else {
+        None
+    };
     if sdk {
         cases[3] = ("relabelled-raw-signature", "version");
         cases.extend([
@@ -1019,7 +1180,27 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
             0 => target.equation.key = foreign.equation.key.clone(),
             1 => target.equation.challenge = foreign.equation.challenge.clone(),
             2 => target.completion.commitment = foreign.completion.commitment.clone(),
-            3 => target.version = if sdk { 2 } else { 1 },
+            3 => target.version = if sdk || sdk_proposer { 2 } else { 1 },
+            4 if sdk_proposer => {
+                proof
+                    .proposer
+                    .as_mut()
+                    .ok_or("SDK proposer absent")?
+                    .version = 1
+            }
+            5 if sdk_proposer => {
+                proof
+                    .proposer
+                    .as_mut()
+                    .ok_or("SDK proposer absent")?
+                    .version = 2
+            }
+            6 if sdk_proposer => {
+                proof.proposer.as_mut().ok_or("SDK proposer absent")?.header = foreign_header
+                    .as_ref()
+                    .ok_or("foreign SDK header absent")?
+                    .clone()
+            }
             4 if sdk => proof.transactions[0].signature.transaction.version = 1,
             5 if sdk => proof.transactions[0].signature.version = if unbound { 4 } else { 3 },
             6 if sdk => proof.transactions[0].signature.version = if unbound { 2 } else { 1 },
@@ -1065,7 +1246,7 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
     }
     write(
         &network.join("refusals.json"),
-        &json!({"genuine_primary_certificates":!both,"genuine_foreign_raw_certificates":both,"genuine_unbound_address_certificate":unbound,"native_sdk_fips_sender":sdk,"cases":results,"scope":"full historical predicate refusals, not new native block imports"}),
+        &json!({"genuine_primary_certificates":!both,"genuine_foreign_raw_certificates":both,"genuine_unbound_address_certificate":unbound,"native_sdk_fips_sender":sdk,"native_sdk_fips_proposer":sdk_proposer,"genuine_foreign_sdk_header":sdk_proposer,"cases":results,"scope":"full historical predicate refusals, not new native block imports"}),
     )?;
     Ok(())
 }

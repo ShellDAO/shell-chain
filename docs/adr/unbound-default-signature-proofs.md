@@ -95,8 +95,8 @@ proof batch versions still depend on whether a proposer proof is present.
 The public `sdk` regression uses the exact published candidate's signer and
 provider against local Node RPC, then complete peer proof admission/finality and
 changed-state historical replay. Test-only storage signers are not evidence of
-public SDK execution. This bound profile does not add SDK proposer AIR; unbound SDK senders have their
-own profile below.
+public SDK execution. This bound sender profile is separate from the primary-sender SDK proposer
+entry and from the unbound SDK sender profile below.
 
 
 ## Unbound Native SDK FIPS profile
@@ -114,5 +114,5 @@ account, address, transaction-ID and leaf predicates succeed.
 The `sdk-unbound` public entry uses the documented first-use public-key option,
 real published SDK signing/provider/RPC, two full peer Native graphs and changed-
 state dual-history replay. Genuine-certificate and profile/address substitutions
-must refuse without writing current KV or replacing mathematical inputs. SDK
-proposer and other excluded account arrangements remain separate.
+must refuse without writing current KV or replacing mathematical inputs. Other SDK proposer/sender combinations and excluded account arrangements
+remain separate.

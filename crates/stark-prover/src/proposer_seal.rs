@@ -1,4 +1,4 @@
-//! Exact primary65 or genuine PQClean proposer seal at a trusted canonical parent.
+//! Exact primary65, genuine PQClean or Native SDK FIPS proposer seal at a trusted parent.
 //! Selector and registry provenance remain caller/trusted-store inputs; this
 //! does not prove validator weights, penalty history, quorum or consensus.
 use crate::{
@@ -15,7 +15,7 @@ use shell_storage::{CanonicalParentView, KvStore};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProposerSealProof {
-    /// One is FIPS MLDSA65, two is the genuine locked PQClean raw transcript.
+    /// One is primary FIPS, two genuine PQClean raw, three Native tag-zero SDK FIPS.
     pub version: u8,
     pub header: BlockHeaderProof,
     pub signature: Mldsa65VerificationProof,
@@ -105,7 +105,7 @@ pub(crate) fn verify_seal_at_parent<S: KvStore + 'static>(
 ) -> Result<VerifiedProposerSeal, String> {
     if !matches!(
         (proof.version, seal.sig_type),
-        (1, SignatureType::MlDsa65) | (2, SignatureType::Dilithium3)
+        (1, SignatureType::MlDsa65) | (2 | 3, SignatureType::Dilithium3)
     ) || seal.data.len() != 3309
         || header.proposer != *expected_proposer
         || view.config().chain_id != expected_chain_id
@@ -122,7 +122,7 @@ pub(crate) fn verify_seal_at_parent<S: KvStore + 'static>(
         return Err("proposer public key shape mismatch".into());
     }
     verify_header_hash(&proof.header, header, expected_hash)?;
-    let verify = if seal.sig_type == SignatureType::Dilithium3 {
+    let verify = if proof.version == 2 {
         verify_dilithium3
     } else {
         verify_mldsa65

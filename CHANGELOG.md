@@ -24,6 +24,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Complete Native tag-zero SDK FIPS proposer seal/header AIR with explicit
+  source and seal profiles. Exercise the actual public SDK memory-only signer,
+  real peer Native import/finality, immutable sender-only recovery, changed-state
+  history and genuine foreign header/signature refusals under unchanged policy.
+
 - Complete funded unbound Native SDK tag-zero FIPS first-use and Reference
   proofs, with full derived-address AIR, explicit account/source formats and
   unchanged older profiles. Add real published SDK registration, dual peer

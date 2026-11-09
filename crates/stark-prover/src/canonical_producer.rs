@@ -105,6 +105,9 @@ struct CapturedInputs {
     senders: Vec<SenderSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proposer_key: Option<Vec<u8>>,
+    /// Source format five only: explicit Native SDK FIPS proposer transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proposer_sdk_fips: Option<u8>,
 }
 /// Immutable public proving inputs, never a canonical authorization token.
 /// Capture freezes the native source once; proving makes no live state reads.
@@ -239,29 +242,40 @@ impl CanonicalProductionSource {
                 sdk_fips,
             });
         }
+        let mut proposer_sdk_fips = None;
         let proposer_key = match block.proposer_seal.as_ref() {
             Some(seal) if seal.sig_type == SignatureType::MlDsa65 => Some(
                 view.registered_key(&block.header.proposer)
                     .map_err(|e| e.to_string())?
                     .ok_or("full production requires a parent-registered proposer key")?,
             ),
-            Some(seal) if seal.sig_type == SignatureType::Dilithium3 => {
-                // Missing parent keys and the native SDK adapter keep their
-                // existing sender-only profile, rather than acquiring raw AIR.
-                view.registered_key(&block.header.proposer)
-                    .map_err(|e| e.to_string())?
-                    .filter(|key| {
-                        DilithiumVerifier.verify_legacy_transcript(
-                            key,
-                            block.hash().as_bytes(),
-                            seal,
-                        )
-                    })
-            }
+            Some(seal) if seal.sig_type == SignatureType::Dilithium3 => view
+                .registered_key(&block.header.proposer)
+                .map_err(|e| e.to_string())?
+                .and_then(|key| {
+                    if DilithiumVerifier.verify_legacy_transcript(
+                        &key,
+                        block.hash().as_bytes(),
+                        seal,
+                    ) {
+                        Some(key)
+                    } else if DilithiumVerifier.verify_sdk_transcript(
+                        &key,
+                        block.hash().as_bytes(),
+                        seal,
+                    ) {
+                        proposer_sdk_fips = Some(1);
+                        Some(key)
+                    } else {
+                        None
+                    }
+                }),
             _ => None,
         };
         let input = CapturedInputs {
-            version: if senders
+            version: if proposer_sdk_fips.is_some() {
+                5
+            } else if senders
                 .iter()
                 .any(|s| s.sdk_fips.is_some() && s.account.pq_pubkey_hash == ShellHash::ZERO)
             {
@@ -279,6 +293,7 @@ impl CanonicalProductionSource {
             block,
             senders,
             proposer_key,
+            proposer_sdk_fips,
         };
         let identity = bounded_json(
             &serde_json::to_value(&input).map_err(|e| e.to_string())?,
@@ -327,11 +342,13 @@ impl CanonicalProductionSource {
             .senders
             .iter()
             .any(|s| s.sdk_fips.is_some() && s.account.pq_pubkey_hash == ShellHash::ZERO);
+        let has_sdk_proposer = i.proposer_sdk_fips.is_some();
         let profile_valid = match i.version {
-            1 => i.proposer_key.is_none() && !has_sdk,
-            2 => i.proposer_key.is_some() && !has_sdk,
-            3 => has_sdk && !has_unbound_sdk,
-            4 => has_unbound_sdk,
+            1 => i.proposer_key.is_none() && !has_sdk && !has_sdk_proposer,
+            2 => i.proposer_key.is_some() && !has_sdk && !has_sdk_proposer,
+            3 => has_sdk && !has_unbound_sdk && !has_sdk_proposer,
+            4 => has_unbound_sdk && !has_sdk_proposer,
+            5 => i.proposer_sdk_fips == Some(1) && i.proposer_key.is_some(),
             _ => false,
         };
         if !profile_valid
@@ -397,6 +414,12 @@ impl CanonicalProductionSource {
                 .into_iter()
                 .find(|s| s.address == i.block.header.proposer)
                 .ok_or("full production retained native proposer evidence absent")?;
+            let signature_valid = if i.proposer_sdk_fips == Some(1) {
+                !DilithiumVerifier.verify_legacy_transcript(key, i.block.hash().as_bytes(), seal)
+                    && DilithiumVerifier.verify_sdk_transcript(key, i.block.hash().as_bytes(), seal)
+            } else {
+                verify_production_signature(key, i.block.hash().as_bytes(), seal)?
+            };
             if key.len() != 1952
                 || !matches!(
                     seal.sig_type,
@@ -404,7 +427,7 @@ impl CanonicalProductionSource {
                 )
                 || seal.data.len() != 3309
                 || signer.public_key != *key
-                || !verify_production_signature(key, i.block.hash().as_bytes(), seal)?
+                || !signature_valid
             {
                 return Err("full production frozen proposer key/seal evidence mismatch".into());
             }
@@ -528,14 +551,23 @@ impl CanonicalProductionSource {
         if let (Some(seal), Some(key)) = (&proof.proposer, &self.input.proposer_key) {
             let block = &self.input.block;
             let native_seal = block.proposer_seal.as_ref().ok_or("missing source seal")?;
-            if !matches!(
-                (seal.version, native_seal.sig_type),
-                (1, SignatureType::MlDsa65) | (2, SignatureType::Dilithium3)
-            ) {
+            let expected_version = if self.input.proposer_sdk_fips == Some(1) {
+                3
+            } else if native_seal.sig_type == SignatureType::Dilithium3 {
+                2
+            } else {
+                1
+            };
+            if seal.version != expected_version
+                || !matches!(
+                    (seal.version, native_seal.sig_type),
+                    (1, SignatureType::MlDsa65) | (2 | 3, SignatureType::Dilithium3)
+                )
+            {
                 return Err("unsupported production proposer proof".into());
             }
             verify_header_hash(&seal.header, &block.header, &block.hash())?;
-            let verify = if native_seal.sig_type == SignatureType::Dilithium3 {
+            let verify = if seal.version == 2 {
                 crate::mldsa_verification::verify_dilithium3
             } else {
                 crate::mldsa_verification::verify_mldsa65
@@ -845,7 +877,8 @@ impl CanonicalProductionSource {
                     block
                         .proposer_seal
                         .as_ref()
-                        .is_some_and(|seal| seal.sig_type == SignatureType::Dilithium3),
+                        .is_some_and(|seal| seal.sig_type == SignatureType::Dilithium3)
+                        && self.input.proposer_sdk_fips.is_none(),
                 )?;
                 let header = job.checkpoint(
                     "proposer-header",
@@ -853,7 +886,9 @@ impl CanonicalProductionSource {
                     |p| verify_header_hash(p, &block.header, &block.hash()).map(|_| ()),
                 )?;
                 Some(ProposerSealProof {
-                    version: if block
+                    version: if self.input.proposer_sdk_fips == Some(1) {
+                        3
+                    } else if block
                         .proposer_seal
                         .as_ref()
                         .is_some_and(|seal| seal.sig_type == SignatureType::Dilithium3)
@@ -1343,7 +1378,7 @@ mod recovery_tests {
         assert!(!next.can_reuse_component_from(&donor, "proposer-matrix-0-0"));
     }
     #[test]
-    fn genuine_raw_proposer_capture_keeps_sdk_and_missing_key_sender_only() {
+    fn raw_and_sdk_proposers_freeze_distinct_sources_missing_key_stays_sender_only() {
         use shell_crypto::{DilithiumSigner, MultiVerifier};
         for case in ["raw", "sdk", "missing-key"] {
             // Storage source-selection fixture; the public runtime executes Native blocks.
@@ -1397,11 +1432,78 @@ mod recovery_tests {
             let before = db.scan_all().unwrap();
             let captured =
                 CanonicalProductionSource::capture(&chain, block.hash(), block.hash()).unwrap();
-            assert_eq!(captured.input.version, if case == "raw" { 2 } else { 1 });
-            assert_eq!(captured.input.proposer_key.is_some(), case == "raw");
+            assert_eq!(
+                captured.input.version,
+                if case == "raw" {
+                    2
+                } else if case == "sdk" {
+                    5
+                } else {
+                    1
+                }
+            );
+            assert_eq!(captured.input.proposer_key.is_some(), case != "missing-key");
+            assert_eq!(
+                captured.input.proposer_sdk_fips,
+                if case == "sdk" { Some(1) } else { None }
+            );
+            if case == "sdk" {
+                let mut old: CapturedInputs = serde_json::from_slice(captured.identity()).unwrap();
+                old.version = 1;
+                old.proposer_key = None;
+                old.proposer_sdk_fips = None;
+                let bytes =
+                    bounded_json(&serde_json::to_value(old).unwrap(), 4 * 1024 * 1024).unwrap();
+                let restored = CanonicalProductionSource::restore(&chain, &bytes).unwrap();
+                assert_eq!(restored.identity(), bytes);
+                assert!(restored.input.proposer_key.is_none());
+                for mode in [
+                    "old-version",
+                    "missing-marker",
+                    "unknown-marker",
+                    "wrong-tag",
+                    "foreign-key",
+                ] {
+                    let mut bad: CapturedInputs =
+                        serde_json::from_slice(captured.identity()).unwrap();
+                    match mode {
+                        "old-version" => bad.version = 2,
+                        "missing-marker" => bad.proposer_sdk_fips = None,
+                        "unknown-marker" => bad.proposer_sdk_fips = Some(2),
+                        "wrong-tag" => {
+                            bad.block.proposer_seal.as_mut().unwrap().sig_type =
+                                SignatureType::MlDsa65
+                        }
+                        "foreign-key" => bad.proposer_key.as_mut().unwrap()[0] ^= 1,
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        CanonicalProductionSource::restore(
+                            &chain,
+                            &serde_json::to_vec(&bad).unwrap()
+                        )
+                        .is_err(),
+                        "{mode}"
+                    );
+                }
+            }
             CanonicalProductionSource::restore(&chain, captured.identity()).unwrap();
             assert_eq!(db.scan_all().unwrap(), before);
         }
+    }
+    #[test]
+    fn sdk_proposer_marker_cannot_relabel_primary_or_raw_seal() {
+        let (db, source) = fixture_profile(true);
+        let chain = ChainStore::new(db.clone());
+        let before = db.scan_all().unwrap();
+        let mut input: CapturedInputs = serde_json::from_slice(source.identity()).unwrap();
+        input.version = 5;
+        input.proposer_sdk_fips = Some(1);
+        assert!(
+            CanonicalProductionSource::restore(&chain, &serde_json::to_vec(&input).unwrap())
+                .is_err()
+        );
+        assert_eq!(before, db.scan_all().unwrap());
     }
     fn fixture_profile(full: bool) -> (Arc<MemoryDb>, CanonicalProductionSource) {
         fixture_binding(full, false)

@@ -16,7 +16,32 @@ if(!child) {
 const pkg=JSON.parse(await readFile(join(consumer,'node_modules/shell-sdk/package.json'),'utf8'));
 if(pkg.version!=='0.14.0-rc.3') throw new Error('exact published SDK candidate required');
 const api=async name=>import(`shell-sdk/${name}`);
-if(mode==='prepare'||mode==='prepare-unbound') {
+if(mode==='proposer') {
+  const {createInterface}=await import('node:readline');
+  const {MlDsa65Adapter}=await api('adapters');
+  const {ShellSigner}=await api('signer');
+  const signer=new ShellSigner('Dilithium3',MlDsa65Adapter.generate());
+  const data={version:pkg.version,native_algorithm:'Dilithium3',public_key:Array.from(signer.getPublicKey()),address:signer.getAddress(),requests:[],private_keys_persisted:false,disposed:false};
+  const emit=value=>new Promise((resolve,reject)=>process.stdout.write(JSON.stringify(value)+'\n',error=>error?reject(error):resolve()));
+  const save=()=>writeFile(inputs,JSON.stringify(data,null,2)+'\n');
+  await writeFile(inputs,JSON.stringify(data,null,2)+'\n',{flag:'wx'});
+  await emit({kind:'ready',version:pkg.version,public_key:data.public_key,address:data.address,private_keys_persisted:false});
+  const lines=createInterface({input:process.stdin,crlfDelay:Infinity});
+  try {
+    for await (const line of lines) {
+      const request=JSON.parse(line);
+      if(request.stop===true) break;
+      if(!Array.isArray(request.message)||request.message.length!==32) throw new Error('raw32 Native header/vote hash required');
+      const signature={sig_type:'Dilithium3',data:Array.from(await signer.sign(Uint8Array.from(request.message)))};
+      data.requests.push({message:request.message,signature,actual_public_signer:true});
+      await save();
+      await emit({kind:'signature',signature,actual_public_signer:true});
+    }
+  } finally { lines.close();signer.dispose();data.disposed=true;await save(); }
+  await emit({kind:'stopped',disposed:true});
+  process.stdin.pause();
+  process.exit(0);
+} else if(mode==='prepare'||mode==='prepare-unbound') {
   const unbound=mode==='prepare-unbound';
   const {MlDsa65Adapter}=await api('adapters');
   const {ShellSigner}=await api('signer');
