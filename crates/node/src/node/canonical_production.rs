@@ -685,10 +685,12 @@ impl<S: KvStore + 'static> Node<S> {
         }
         if block.transactions.len()
             > shell_stark_prover::canonical_batch::MAX_CANONICAL_SIGNATURE_BATCH
-            || block
-                .transactions
-                .iter()
-                .any(|t| t.signature.sig_type != SignatureType::MlDsa65)
+            || block.transactions.iter().any(|t| {
+                !matches!(
+                    t.signature.sig_type,
+                    SignatureType::MlDsa65 | SignatureType::Dilithium3
+                )
+            })
         {
             return;
         }

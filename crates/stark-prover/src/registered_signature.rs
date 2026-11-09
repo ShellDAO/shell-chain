@@ -8,7 +8,8 @@ use crate::{
     account_state::VerifiedAccountState,
     blake3_hash::{verify_hash, Blake3HashProof},
     mldsa_source::{
-        verify_transaction_signature, TransactionSignatureProof, VerifiedSignatureEntry,
+        verify_dilithium_transaction_signature, verify_transaction_signature,
+        TransactionSignatureProof, VerifiedSignatureEntry,
     },
     SigBatchEntry,
 };
@@ -19,12 +20,12 @@ use shell_crypto::{CryptoError, PQSignature, SignatureType, Verifier};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegisteredSignatureProof {
-    /// One binds a registered account commitment; two binds an unbound account's address.
+    /// One is registered MLDSA65, two unbound MLDSA65, three registered PQClean Dilithium3.
     pub version: u8,
     pub transaction: TransactionSignatureProof,
     pub transaction_id: Blake3HashProof,
     pub leaf: Blake3HashProof,
-    /// Algorithm-tagged account hash in version one, mandatory sender address in version two.
+    /// Algorithm-tagged account hash in registered profiles, mandatory address in profile two.
     /// Its activation is a native policy check, not established by this proof.
     pub tagged_key: Option<Blake3HashProof>,
 }
@@ -76,12 +77,12 @@ impl Verifier for VerifiedRegisteredSignature {
     }
 
     fn sig_type(&self) -> SignatureType {
-        SignatureType::MlDsa65
+        self.signature.sig_type
     }
 }
 
 /// Verify a registered account's committed raw or algorithm-tagged key binding,
-/// complete ML-DSA-65 source/signature, canonical ID and native batch leaf.
+/// complete selected signature transcript, canonical ID and native batch leaf.
 /// Embedded keys must equal the expected registry key; Reference leaves use
 /// the retained full sender address. No derived-address equality is imposed.
 ///
@@ -98,7 +99,10 @@ pub fn verify_registered_signature_entry(
     expected_entry: &SigBatchEntry,
     expected_leaf: &[u8; 32],
 ) -> Result<VerifiedRegisteredSignature, String> {
-    if proof.version != 1 || expected.signature.sig_type != SignatureType::MlDsa65 {
+    if !matches!(
+        (proof.version, expected.signature.sig_type),
+        (1, SignatureType::MlDsa65) | (3, SignatureType::Dilithium3)
+    ) {
         return Err("invalid registered signature proof version or algorithm".into());
     }
     if expected.tx.tx_type > 3 || expected.aa_bundle.is_some() || expected_key.len() != 1952 {
@@ -117,7 +121,7 @@ pub fn verify_registered_signature_entry(
     }
     if let Some(tagged) = &proof.tagged_key {
         let mut preimage = Vec::with_capacity(1 + expected_key.len());
-        preimage.push(SignatureType::MlDsa65.as_u8());
+        preimage.push(expected.signature.sig_type.as_u8());
         preimage.extend_from_slice(expected_key);
         verify_hash(tagged, &preimage, account.pq_pubkey_hash.as_bytes())
             .map_err(|e| format!("registered algorithm key binding: {e}"))?;
@@ -222,7 +226,12 @@ fn verify_entry_sources(
     leaf[32..].copy_from_slice(&expected_entry.pk_hash);
     verify_hash(&proof.leaf, &leaf, expected_leaf)
         .map_err(|e| format!("registered entry leaf: {e}"))?;
-    verify_transaction_signature(
+    let verify = if proof.version == 3 {
+        verify_dilithium_transaction_signature
+    } else {
+        verify_transaction_signature
+    };
+    verify(
         &proof.transaction,
         &expected.tx,
         expected_key,

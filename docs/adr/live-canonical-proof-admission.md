@@ -14,11 +14,22 @@ A producer's completed job and a cache's verified flag are never authorization.
 At ordinary `NewBlock` and `BlockResponse` intake, a separately enabled follower
 stages an eligible signed extension as an untrusted immutable local source.
 Keep at most two retained bodies, each at most 2 MiB. Admit only the existing
-1–16 registered default-account ML-DSA-65 sender profile after body-commitment
+1–16 supported default-account ML-DSA-65 or bound genuine PQClean Dilithium3
+sender profile after body-commitment
 activation. Native proposer consensus, body commitments, economics, witnesses,
 execution, rollback and canonical parent checks still apply. Unsupported
 profiles follow existing native admission; a selected proof-backed candidate's
 proof failure does not fall back to native sender verification.
+
+Registered Dilithium3 uses sender profile 3, transaction/signature proof version
+2 and a separate version-2, 32-byte-seed challenge AIR domain. It authenticates
+the locked PQClean raw transcript, including all 48 c-tilde commitment bytes;
+it does not relabel an ML-DSA certificate. Native tag-zero SDK compatibility,
+unbound Dilithium3 and Dilithium3 proposer proofs remain outside this profile.
+The Native transcript check only selects supported candidates; the complete
+proof verifier has no Native signature fallback. Existing proof versions,
+defaults and activation schedules retain their meaning. See the runnable
+[Dilithium3 regression](../stark-aggregation.md#genuine-pqclean-dilithium3-sender-proofs).
 
 Use authenticated Identify protocol advertisements to select discovery peers.
 Offer `/shell/canonical-proof/2` alongside the existing chunk protocol version 1.

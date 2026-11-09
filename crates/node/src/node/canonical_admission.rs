@@ -158,7 +158,11 @@ impl<S: KvStore + 'static> Node<S> {
             || block.transactions.iter().any(|tx| {
                 tx.tx.tx_type > 3
                     || tx.aa_bundle.is_some()
-                    || tx.signature.sig_type != shell_crypto::SignatureType::MlDsa65
+                    || !matches!(
+                        tx.signature.sig_type,
+                        shell_crypto::SignatureType::MlDsa65
+                            | shell_crypto::SignatureType::Dilithium3
+                    )
                     || tx.signature.data.len() != 3309
                     || tx.tx.signing_payload(tx.signature.sig_type.as_u8()).len() > 4096
             })
@@ -206,6 +210,21 @@ impl<S: KvStore + 'static> Node<S> {
                 return Ok(false);
             };
             if account.validation_code_hash.is_some() {
+                return Ok(false);
+            }
+            // Tag zero also permits an SDK MLDSA adapter in native execution.
+            // This proof profile covers only bound genuine PQClean signatures;
+            // unsupported transcripts keep the ordinary native intake path.
+            if tx.signature.sig_type == shell_crypto::SignatureType::Dilithium3
+                && (account.pq_pubkey_hash == ShellHash::ZERO
+                    || registered.as_deref().is_none_or(|key| {
+                        !shell_crypto::DilithiumVerifier.verify_legacy_transcript(
+                            key,
+                            tx.sender_signing_hash().as_bytes(),
+                            &tx.signature,
+                        )
+                    }))
+            {
                 return Ok(false);
             }
             if account.pq_pubkey_hash == ShellHash::ZERO {

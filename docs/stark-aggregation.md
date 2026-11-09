@@ -54,7 +54,7 @@ semantics to the accumulator proof or selecting a new proof carrier or schedule.
 
 ## Automatic complete sender proofs (unreleased)
 
-A dedicated prover can opt into full ML-DSA-65 sender-certificate generation:
+A dedicated prover can opt into complete sender-certificate generation:
 
 ```bash
 shell-node --datadir node-data run --config node.toml --db rocksdb \
@@ -63,11 +63,13 @@ shell-node --datadir node-data run --config node.toml --db rocksdb \
 
 Use a RocksDB-enabled build, a previously initialized node with an activated
 body-commitment schedule and its matching `node.toml` runtime configuration.
-An eligible canonical block contains 1–16 supported ML-DSA-65 user transactions
+An eligible canonical block contains 1–16 supported ML-DSA-65 or genuine PQClean
+Dilithium3 user transactions
 and only gas-reward system transactions. Supported default accounts have either
 a parent-registered committed key or a zero key commitment with the derived-address
-predicate described below. Transaction types remain 0–3 and signing payloads
-remain within the existing 4096-byte hash limit. AA, other signature algorithms
+predicate described below. Dilithium3 requires a bound parent-registered default
+account and the raw transcript described below. Transaction types remain 0–3 and signing payloads
+remain within the existing 4096-byte hash limit. AA, other signature transcripts
 and other first-use account arrangements require separate producer work.
 After normal production or import,
 the node captures the signed body and parent account/key witnesses. Startup
@@ -206,7 +208,8 @@ It defaults off; `[consensus].canonical_proof_admission` and explicit
 `--canonical-proof-admission=false` follow the normal config/CLI precedence.
 Use matching initialized genesis/runtime configuration, an activated body
 commitment schedule and a dedicated proof-capable network implementation.
-Supported blocks have 1–16 supported default-account ML-DSA-65 senders,
+Supported blocks have 1–16 supported default-account ML-DSA-65 or bound genuine
+PQClean Dilithium3 senders,
 transaction types 0–3, signing payloads up to 4096 bytes, gas-reward system
 transactions only, and a serialized body up to 2 MiB. Unsupported profiles use
 the existing native path. Selected candidates wait for a full proof; rejected
@@ -717,3 +720,40 @@ Native control remains distinct from these two proof-admitted targets. Both mode
 refuse an output prepared for the other activation choice, preserving its keys,
 signed inputs and checkpoints. This source exercise leaves public network
 configuration unchanged.
+
+### Genuine PQClean Dilithium3 sender proofs
+
+```sh
+tests/e2e/dilithium-full-proof.sh run dilithium-output
+tests/e2e/dilithium-full-proof.sh verify dilithium-output
+```
+
+Use Python 3, stable Rust and the RocksDB C/C++/libclang prerequisites above.
+This expensive source regression generates a `DilithiumSigner` sender and an
+independent ML-DSA-65 proposer, retaining only public signed inputs. It pauses
+and resumes the complete graph, requires peer Native import and finality, and
+checks receipts, fees and balances against ordinary Native execution. An
+ordinary signed successor changes current balances and nonce before three cold
+historical replays check that the full proof does not write current state.
+Genuine foreign key, FIPS challenge and commitment certificates, and a relabelled
+profile must be refused. A separate signed wrong-root ordinary Native control
+checks rollback; it is not proof admission. Keep the output to resume; failed
+assertions exit nonzero and `verify` generates no new certificates.
+
+The supported sender transcript is the implementation in locked
+`pqcrypto-dilithium 0.5.0`: a 1952-byte key, 3309-byte signature, 48-byte
+c-tilde, a SampleInBall seed restricted to its first 32 bytes, and
+`mu = SHAKE256(tr || message, 64)` without FIPS empty-context framing. All 48
+c-tilde bytes still participate in the final commitment check. The sampler has
+a separate AIR domain and version 2; full signature and outer transaction
+proofs also use version 2, and the registered-account sender profile is version
+3. Existing FIPS version-1 proofs and unbound ML-DSA-65 profile 2 keep their
+meaning. Shared key, matrix and NTT arithmetic is reverified against exact
+inputs; tagged-key checkpoints also require an equal algorithm tag.
+
+The Native tag-zero verifier continues accepting its existing SDK ML-DSA
+adapter. That adapter, unbound Dilithium3, Dilithium3 proposer AIR, AA and custom
+validators require separate proof profiles. Unsupported live candidates retain
+ordinary Native handling; selected full-proof candidates require complete AIR
+without Native signature fallback. Production/admission defaults, quotas,
+activation schedules and public release availability remain unchanged.

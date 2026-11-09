@@ -53,7 +53,11 @@ impl<S: KvStore + 'static> Node<S> {
             || block.transactions.iter().any(|tx| {
                 tx.tx.tx_type > 3
                     || tx.aa_bundle.is_some()
-                    || tx.signature.sig_type != shell_crypto::SignatureType::MlDsa65
+                    || !matches!(
+                        tx.signature.sig_type,
+                        shell_crypto::SignatureType::MlDsa65
+                            | shell_crypto::SignatureType::Dilithium3
+                    )
                     || tx.signature.data.len() != 3309
             })
             || block

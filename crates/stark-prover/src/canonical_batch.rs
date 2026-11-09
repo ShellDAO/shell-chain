@@ -128,13 +128,17 @@ impl Verifier for VerifiedCanonicalSignatureBatch {
         Ok(false)
     }
     fn sig_type(&self) -> SignatureType {
-        SignatureType::MlDsa65
+        self.signatures
+            .first()
+            .map(|s| s.signature.sig_type)
+            .unwrap_or(SignatureType::MlDsa65)
     }
 }
 
 /// Verify all ordered senders against one independently frozen historical
 /// parent. The block must equal the captured canonical body, not merely carry
-/// its header. Bound registered accounts use version one; unbound default accounts
+/// its header. Registered MLDSA65 and PQClean Dilithium3 use profiles one and
+/// three respectively; unbound MLDSA65 default accounts
 /// use version two with a complete derived-address proof and the historical
 /// registry's Embedded/Reference rules. AA, other algorithms and pruned witnesses
 /// remain outside this profile.
@@ -228,10 +232,12 @@ fn verify_batch_at_parent<S: KvStore + 'static>(
     let mut signatures = Vec::with_capacity(block.transactions.len());
     for (tx, item) in block.transactions.iter().zip(&proof.transactions) {
         let entry = match item.signature.version {
-            1 => verify_canonical_registered_signature(view, tx, &item.account, &item.signature)?
-                .signature()
-                .entry()
-                .clone(),
+            1 | 3 => {
+                verify_canonical_registered_signature(view, tx, &item.account, &item.signature)?
+                    .signature()
+                    .entry()
+                    .clone()
+            }
             2 => verify_canonical_unbound_signature(view, tx, &item.account, &item.signature)?,
             _ => return Err("unsupported canonical sender proof profile".into()),
         };

@@ -105,6 +105,20 @@ const DILITHIUM3_PUBLIC_KEY_BYTES: usize = 1952;
 const DILITHIUM3_SIGNATURE_BYTES: usize = 3309;
 
 impl DilithiumVerifier {
+    /// Select the genuine locked PQClean transcript for proof production only.
+    /// Native verification continues accepting its existing MLDSA adapter too.
+    pub fn verify_legacy_transcript(
+        &self,
+        pubkey: &[u8],
+        message: &[u8],
+        signature: &PQSignature,
+    ) -> bool {
+        signature.sig_type == SignatureType::Dilithium3
+            && pubkey.len() == DILITHIUM3_PUBLIC_KEY_BYTES
+            && signature.data.len() == DILITHIUM3_SIGNATURE_BYTES
+            && self.verify_legacy_dilithium(pubkey, message, &signature.data)
+    }
+
     fn verify_legacy_dilithium(&self, pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
         let Ok(pk) = dilithium3::PublicKey::from_bytes(pubkey) else {
             return false;

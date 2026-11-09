@@ -63,7 +63,11 @@ pub fn verify_canonical_registered_signature<S: KvStore + 'static>(
     }
     if signed.tx.tx_type > 3
         || signed.aa_bundle.is_some()
-        || signed.signature.sig_type != shell_crypto::SignatureType::MlDsa65
+        || !matches!(
+            (proof.version, signed.signature.sig_type),
+            (1, shell_crypto::SignatureType::MlDsa65)
+                | (3, shell_crypto::SignatureType::Dilithium3)
+        )
         || signed.signature.data.len() != 3309
         || signed
             .pubkey_mode
@@ -80,7 +84,7 @@ pub fn verify_canonical_registered_signature<S: KvStore + 'static>(
         .map_err(|e| e.to_string())?
         .ok_or("no registered key at canonical parent; first-use profile requires its own proof")?;
     if key.len() != 1952 {
-        return Err("canonical registry key is not ML-DSA-65 shaped".into());
+        return Err("canonical registry key shape mismatch".into());
     }
     let account = view
         .world_state()

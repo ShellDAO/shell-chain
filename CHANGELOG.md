@@ -24,6 +24,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Produce and admit complete proofs for genuine PQClean Dilithium3 signatures
+  from bound registered senders with an ML-DSA-65 proposer. Separate the raw
+  32-byte sampler transcript from FIPS proofs, retain Native SDK compatibility,
+  and cover durable production, peer import, finality and historical replay.
 - Cover complete rotation and replacement-key Reference proofs with the optional
   algorithm binding left disabled, including raw commitments, Native import,
   historical replay and refusal to mix retained activation configurations.

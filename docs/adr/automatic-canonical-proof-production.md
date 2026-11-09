@@ -75,6 +75,18 @@ account, key, receipt or consensus data and grants no admission authority.
 
 ## Validation and limits
 
+Bound registered genuine Dilithium3 senders use an explicitly versioned PQClean
+raw transcript: SampleInBall consumes the first 32 of 48 c-tilde bytes, and mu
+omits FIPS empty-context framing. The producer selects only signatures accepted
+by that transcript; its final graph verifies the distinct challenge domain and
+complete commitment through AIR. The existing Native verifier's SDK adapter
+remains available through ordinary handling. Shared tagged-key checkpoints
+additionally require equal algorithm tags. No old source descriptor, proof
+version, job quota or activation schedule changes meaning. The standalone
+`dilithium-full-proof` entry covers pause/resume, peer Native import/finality,
+ordinary successor state changes, cold replay and genuine-certificate refusal;
+other Dilithium3 sender/proposer arrangements require separate qualification.
+
 Legacy JSON certificates can exhaust the shared physical quota when a rotation
 introduces another independent key. Opt-in producer startup compacts eligible
 inline JSON values in one atomic batch; new legacy values use the same bounded

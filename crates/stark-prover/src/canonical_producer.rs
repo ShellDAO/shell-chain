@@ -10,7 +10,10 @@ use crate::{
     keccak_permutation::{
         prove_keccak_batch, verify_keccak_batch, KeccakBatchProof, MAX_KECCAK_BATCH,
     },
-    mldsa_challenge::{prove_challenge, verify_challenge, ChallengeProof},
+    mldsa_challenge::{
+        prove_challenge, prove_dilithium_challenge, verify_challenge, verify_dilithium_challenge,
+        ChallengeProof,
+    },
     mldsa_decode::{prove_signature_decode, verify_signature_decode, SignatureDecodeProof},
     mldsa_equation::{prove_equation, verify_equation, EquationInputs, EquationProof},
     mldsa_finish::{prove_finish, verify_finish, FinishProof},
@@ -25,8 +28,8 @@ use crate::{
     mldsa_ntt::{prove_ntt, verify_ntt, NttProof, NTT_MODULUS},
     mldsa_source::TransactionSignatureProof,
     mldsa_verification::{
-        verify_completion, verify_equation_pipeline, CompletionProof, EquationPipeline,
-        Mldsa65VerificationProof,
+        verify_completion, verify_dilithium_equation_pipeline, verify_equation_pipeline,
+        CompletionProof, EquationPipeline, Mldsa65VerificationProof,
     },
     production_store::{bounded_json, ProductionError, ProductionStore},
     proposer_seal::ProposerSealProof,
@@ -42,10 +45,27 @@ use crate::{
 use alloy_rlp::Encodable;
 use serde::{Deserialize, Serialize};
 use shell_core::{Account, Block, BlockHeader, PQTX_ID_DOMAIN};
-use shell_crypto::{MlDsaVerifier, SignatureType, Verifier};
+use shell_crypto::{DilithiumVerifier, MlDsaVerifier, SignatureType, Verifier};
 use shell_primitives::{blake3_hash, keccak256, ShellHash};
 use shell_storage::{ChainConfig, ChainStore, KvStore, MemoryDb, MerkleTrie};
 use std::sync::Arc;
+
+// Support selection in the producer only; final acceptance always verifies AIRs.
+fn verify_production_signature(
+    key: &[u8],
+    message: &[u8],
+    signature: &shell_crypto::PQSignature,
+) -> Result<bool, String> {
+    match signature.sig_type {
+        SignatureType::MlDsa65 => MlDsaVerifier
+            .verify(key, message, signature)
+            .map_err(|e| e.to_string()),
+        SignatureType::Dilithium3 => {
+            Ok(DilithiumVerifier.verify_legacy_transcript(key, message, signature))
+        }
+        _ => Ok(false),
+    }
+}
 
 fn matrix_part(suffix: &str) -> bool {
     let Some((kind, index)) = suffix
@@ -128,11 +148,14 @@ impl CanonicalProductionSource {
             if signed.tx.tx_type > 3
                 || signed.aa_bundle.is_some()
                 || signed.tx.chain_id != view.config().chain_id
-                || signed.signature.sig_type != SignatureType::MlDsa65
+                || !matches!(
+                    signed.signature.sig_type,
+                    SignatureType::MlDsa65 | SignatureType::Dilithium3
+                )
                 || signed.signature.data.len() != 3309
                 || signed
                     .tx
-                    .signing_payload(SignatureType::MlDsa65.as_u8())
+                    .signing_payload(signed.signature.sig_type.as_u8())
                     .len()
                     > crate::blake3_hash::MAX_HASH_BYTES
                 || !seen.insert(signed.hash())
@@ -153,7 +176,7 @@ impl CanonicalProductionSource {
                 .get_account(&signed.from)
                 .map_err(|e| e.to_string())?
                 .ok_or("production requires a parent account")?;
-            let mut tagged = vec![SignatureType::MlDsa65.as_u8()];
+            let mut tagged = vec![signed.signature.sig_type.as_u8()];
             tagged.extend_from_slice(&key);
             if key.len() != 1952
                 || signed.pubkey_mode.pubkey_bytes().is_some_and(|p| p != key)
@@ -162,8 +185,11 @@ impl CanonicalProductionSource {
                 return Err("production parent key/default account binding mismatch".into());
             }
             if account.pq_pubkey_hash == ShellHash::ZERO {
-                if shell_primitives::Address::from_public_key(&key, SignatureType::MlDsa65.as_u8())
-                    != signed.from
+                if signed.signature.sig_type != SignatureType::MlDsa65
+                    || shell_primitives::Address::from_public_key(
+                        &key,
+                        signed.signature.sig_type.as_u8(),
+                    ) != signed.from
                 {
                     return Err("production unbound sender address mismatch".into());
                 }
@@ -174,14 +200,11 @@ impl CanonicalProductionSource {
                 return Err("production bound account requires its parent-registered key".into());
             }
             // Producer preflight only. Reuse and final acceptance still run full AIR verification.
-            if !MlDsaVerifier
-                .verify(
-                    &key,
-                    signed.sender_signing_hash().as_bytes(),
-                    &signed.signature,
-                )
-                .map_err(|e| e.to_string())?
-            {
+            if !verify_production_signature(
+                &key,
+                signed.sender_signing_hash().as_bytes(),
+                &signed.signature,
+            )? {
                 return Err("invalid raw production signature".into());
             }
             let nodes = MerkleTrie::at_root(view.store(), view.parent().state_root.as_bytes())
@@ -346,11 +369,14 @@ impl CanonicalProductionSource {
             if tx.tx.chain_id != cfg.chain_id
                 || tx.tx.tx_type > 3
                 || tx.aa_bundle.is_some()
-                || tx.signature.sig_type != SignatureType::MlDsa65
+                || !matches!(
+                    tx.signature.sig_type,
+                    SignatureType::MlDsa65 | SignatureType::Dilithium3
+                )
                 || tx.signature.data.len() != 3309
                 || sender.key.len() != 1952
                 || !seen.insert(tx.uncached_hash())
-                || tx.tx.signing_payload(SignatureType::MlDsa65.as_u8()).len()
+                || tx.tx.signing_payload(tx.signature.sig_type.as_u8()).len()
                     > crate::blake3_hash::MAX_HASH_BYTES
                 || tx
                     .pubkey_mode
@@ -365,13 +391,14 @@ impl CanonicalProductionSource {
             {
                 return Err("production source sender profile/resource mismatch".into());
             }
-            let mut tagged = vec![SignatureType::MlDsa65.as_u8()];
+            let mut tagged = vec![tx.signature.sig_type.as_u8()];
             tagged.extend_from_slice(&sender.key);
             let binding_matches = if sender.account.pq_pubkey_hash == ShellHash::ZERO {
-                shell_primitives::Address::from_public_key(
-                    &sender.key,
-                    SignatureType::MlDsa65.as_u8(),
-                ) == tx.from
+                tx.signature.sig_type == SignatureType::MlDsa65
+                    && shell_primitives::Address::from_public_key(
+                        &sender.key,
+                        tx.signature.sig_type.as_u8(),
+                    ) == tx.from
             } else {
                 sender.account.pq_pubkey_hash == blake3_hash(&sender.key)
                     || sender.account.pq_pubkey_hash == blake3_hash(&tagged)
@@ -391,14 +418,11 @@ impl CanonicalProductionSource {
             if actual.as_deref() != Some(encoded.as_slice()) {
                 return Err("production source native MPT/account mismatch".into());
             }
-            if !MlDsaVerifier
-                .verify(
-                    &sender.key,
-                    tx.sender_signing_hash().as_bytes(),
-                    &tx.signature,
-                )
-                .map_err(|e| e.to_string())?
-            {
+            if !verify_production_signature(
+                &sender.key,
+                tx.sender_signing_hash().as_bytes(),
+                &tx.signature,
+            )? {
                 return Err("invalid raw production signature".into());
             }
         }
@@ -553,8 +577,10 @@ impl CanonicalProductionSource {
                 let current = &self.input.senders[index];
                 let old = &donor.input.senders[old_index];
                 if suffix == "tagged-key"
-                    && ((current.account.pq_pubkey_hash != ShellHash::ZERO
-                        && current.account.pq_pubkey_hash == blake3_hash(key))
+                    && (self.input.block.transactions[index].signature.sig_type
+                        != donor.input.block.transactions[old_index].signature.sig_type
+                        || (current.account.pq_pubkey_hash != ShellHash::ZERO
+                            && current.account.pq_pubkey_hash == blake3_hash(key))
                         || (old.account.pq_pubkey_hash != ShellHash::ZERO
                             && old.account.pq_pubkey_hash == blake3_hash(old_key)))
                 {
@@ -640,12 +666,13 @@ impl CanonicalProductionSource {
             .enumerate()
         {
             let prefix = format!("sender-{i}");
-            let signature = prove_mldsa(
+            let signature = prove_signature(
                 job,
                 &prefix,
                 &source.key,
                 signed.sender_signing_hash().as_bytes(),
                 &signed.signature.data,
+                signed.signature.sig_type == SignatureType::Dilithium3,
             )?;
             let account = job.checkpoint(
                 &format!("{prefix}-account"),
@@ -660,7 +687,7 @@ impl CanonicalProductionSource {
                     .map(|_| ())
                 },
             )?;
-            let signing_payload = signed.tx.signing_payload(SignatureType::MlDsa65.as_u8());
+            let signing_payload = signed.tx.signing_payload(signed.signature.sig_type.as_u8());
             let signing_hash = hash(job, &format!("{prefix}-signing-hash"), &signing_payload)?;
             let public_key_hash = hash(job, &format!("{prefix}-key-hash"), &source.key)?;
             let mut id = PQTX_ID_DOMAIN.to_vec();
@@ -676,7 +703,7 @@ impl CanonicalProductionSource {
             {
                 None
             } else {
-                let mut bytes = vec![SignatureType::MlDsa65.as_u8()];
+                let mut bytes = vec![signed.signature.sig_type.as_u8()];
                 bytes.extend_from_slice(&source.key);
                 Some(hash(job, &format!("{prefix}-tagged-key"), &bytes)?)
             };
@@ -685,11 +712,17 @@ impl CanonicalProductionSource {
                 signature: RegisteredSignatureProof {
                     version: if source.account.pq_pubkey_hash == ShellHash::ZERO {
                         2
+                    } else if signed.signature.sig_type == SignatureType::Dilithium3 {
+                        3
                     } else {
                         1
                     },
                     transaction: TransactionSignatureProof {
-                        version: 1,
+                        version: if signed.signature.sig_type == SignatureType::Dilithium3 {
+                            2
+                        } else {
+                            1
+                        },
                         signing_hash,
                         public_key_hash,
                         signature,
@@ -705,7 +738,7 @@ impl CanonicalProductionSource {
             transactions,
             proposer: if let Some(key) = &self.input.proposer_key {
                 let block = &self.input.block;
-                let signature = prove_mldsa(
+                let signature = prove_signature(
                     job,
                     "proposer",
                     key,
@@ -715,6 +748,7 @@ impl CanonicalProductionSource {
                         .as_ref()
                         .ok_or_else(|| "full source seal missing".to_string())?
                         .data,
+                    false,
                 )?;
                 let header = job.checkpoint(
                     "proposer-header",
@@ -851,12 +885,13 @@ fn produce_matrix<S: KvStore>(
     Ok(matrix)
 }
 
-fn prove_mldsa<S: KvStore>(
+fn prove_signature<S: KvStore>(
     job: &mut ProductionStore<'_, S>,
     prefix: &str,
     pk: &[u8],
     message: &[u8],
     sig: &[u8],
+    legacy_transcript: bool,
 ) -> Result<Mldsa65VerificationProof, ProductionError> {
     let key: PublicKeyDecodeProof = job.checkpoint(
         &format!("{prefix}-key"),
@@ -869,16 +904,23 @@ fn prove_mldsa<S: KvStore>(
         |p| verify_signature_decode(p, sig),
     )?;
     let matrix = produce_matrix(job, prefix, &key.decoded.rho)?;
+    let (seed, prove, verify) = if legacy_transcript {
+        (
+            &signature.decoded.challenge[..32],
+            prove_dilithium_challenge as fn(&[u8]) -> Result<ChallengeProof, String>,
+            verify_dilithium_challenge as fn(&ChallengeProof, &[u8], &[i8]) -> Result<(), String>,
+        )
+    } else {
+        (
+            signature.decoded.challenge.as_slice(),
+            prove_challenge as fn(&[u8]) -> Result<ChallengeProof, String>,
+            verify_challenge as fn(&ChallengeProof, &[u8], &[i8]) -> Result<(), String>,
+        )
+    };
     let challenge: ChallengeProof = job.checkpoint(
         &format!("{prefix}-challenge"),
-        || prove_challenge(&signature.decoded.challenge),
-        |p| {
-            verify_challenge(
-                p,
-                &signature.decoded.challenge,
-                p.challenge().ok_or("missing challenge endpoint")?,
-            )
-        },
+        || prove(seed),
+        |p| verify(p, seed, p.challenge().ok_or("missing challenge endpoint")?),
     )?;
     let mut z_ntt = Vec::new();
     for col in 0..5 {
@@ -960,7 +1002,11 @@ fn prove_mldsa<S: KvStore>(
         equation,
         inverse,
     };
-    let token = verify_equation_pipeline(&equation, pk, sig)?;
+    let token = if legacy_transcript {
+        verify_dilithium_equation_pipeline(&equation, pk, sig)?
+    } else {
+        verify_equation_pipeline(&equation, pk, sig)?
+    };
     let finish: FinishProof = job.checkpoint(
         &format!("{prefix}-finish"),
         || prove_finish(token.finish_inputs()),
@@ -968,7 +1014,9 @@ fn prove_mldsa<S: KvStore>(
     )?;
     let tr = shake(job, &format!("{prefix}-tr"), pk, 64)?;
     let mut mu_input = tr.output.clone();
-    mu_input.extend_from_slice(&[0, 0]);
+    if !legacy_transcript {
+        mu_input.extend_from_slice(&[0, 0]);
+    }
     mu_input.extend_from_slice(message);
     let mu = shake(job, &format!("{prefix}-mu"), &mu_input, 64)?;
     let mut commitment_input = mu.output.clone();
@@ -982,7 +1030,7 @@ fn prove_mldsa<S: KvStore>(
     };
     verify_completion(&token, message, &completion)?;
     Ok(Mldsa65VerificationProof {
-        version: 1,
+        version: if legacy_transcript { 2 } else { 1 },
         equation,
         completion,
     })
@@ -1180,6 +1228,10 @@ mod recovery_tests {
         donor.input.senders[0].account.pq_pubkey_hash = blake3_hash(&bytes);
         next.input.senders[0].account.pq_pubkey_hash = blake3_hash(&bytes);
         assert!(next.can_reuse_component_from(&donor, "sender-0-tagged-key"));
+        next.input.block.transactions[0].signature.sig_type = SignatureType::Dilithium3;
+        assert!(!next.can_reuse_component_from(&donor, "sender-0-tagged-key"));
+        assert!(next.can_reuse_component_from(&donor, "sender-0-key-hash"));
+        next.input.block.transactions[0].signature.sig_type = SignatureType::MlDsa65;
         next.input.senders[0].key[0] ^= 1;
         next.input.proposer_key.as_mut().unwrap()[0] ^= 1;
         assert!(!next.can_reuse_component_from(&donor, "sender-0-key"));

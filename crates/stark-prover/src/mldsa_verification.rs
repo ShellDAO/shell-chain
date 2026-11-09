@@ -3,10 +3,11 @@
 //! Every mathematical/hash step is verified by its component certificate. This
 //! verifier routes authenticated outputs; it never calls a native signature,
 //! SHAKE, NTT, sampling, Decompose, UseHint or norm implementation. It supports
-//! the FIPS 204 pure signature interface with an empty context only.
+//! FIPS 204 with an empty context, and the distinct locked PQClean Dilithium3
+//! raw transcript. Proof versions select the transcript explicitly.
 
 use crate::{
-    mldsa_challenge::{verify_challenge, ChallengeProof},
+    mldsa_challenge::{verify_challenge, verify_dilithium_challenge, ChallengeProof},
     mldsa_decode::{verify_signature_decode, SignatureDecodeProof},
     mldsa_equation::{verify_equation, EquationInputs, EquationProof},
     mldsa_finish::{verify_finish, FinishInputs, FinishProof},
@@ -40,6 +41,7 @@ pub struct EquationPipeline {
 /// pipeline. It permits a producer to verify the expensive prefix once, then
 /// generate and verify the completion without repeating the matrix checks.
 pub struct VerifiedEquation {
+    legacy_transcript: bool,
     public_key: Vec<u8>,
     challenge_seed: Vec<u8>,
     finish: FinishInputs,
@@ -72,6 +74,23 @@ pub fn verify_equation_pipeline(
     expected_key: &[u8],
     expected_signature: &[u8],
 ) -> Result<VerifiedEquation, String> {
+    verify_equation_profile(p, expected_key, expected_signature, false)
+}
+
+/// Authenticate the locked PQClean equation, including its 32-byte sampler seed.
+pub fn verify_dilithium_equation_pipeline(
+    p: &EquationPipeline,
+    expected_key: &[u8],
+    expected_signature: &[u8],
+) -> Result<VerifiedEquation, String> {
+    verify_equation_profile(p, expected_key, expected_signature, true)
+}
+fn verify_equation_profile(
+    p: &EquationPipeline,
+    expected_key: &[u8],
+    expected_signature: &[u8],
+    legacy_transcript: bool,
+) -> Result<VerifiedEquation, String> {
     if expected_key.len() != 1952
         || expected_signature.len() != 3309
         || p.z_ntt.len() != 5
@@ -96,8 +115,12 @@ pub fn verify_equation_pipeline(
         .challenge
         .challenge()
         .ok_or("missing challenge endpoint")?;
-    verify_challenge(&p.challenge, &p.signature.decoded.challenge, c)
-        .map_err(|e| format!("challenge: {e}"))?;
+    if legacy_transcript {
+        verify_dilithium_challenge(&p.challenge, &p.signature.decoded.challenge[..32], c)
+    } else {
+        verify_challenge(&p.challenge, &p.signature.decoded.challenge, c)
+    }
+    .map_err(|e| format!("challenge: {e}"))?;
     let c: Vec<_> = c
         .iter()
         .map(|&v| match v {
@@ -149,6 +172,7 @@ pub fn verify_equation_pipeline(
         w_approx.push(output.to_vec());
     }
     Ok(VerifiedEquation {
+        legacy_transcript,
         public_key: expected_key.to_vec(),
         challenge_seed: p.signature.decoded.challenge.clone(),
         finish: FinishInputs {
@@ -170,6 +194,7 @@ pub struct CompletionProof {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mldsa65VerificationProof {
+    /// One is FIPS empty context; two is the locked PQClean raw transcript.
     pub version: u8,
     pub equation: EquationPipeline,
     pub completion: CompletionProof,
@@ -194,7 +219,9 @@ pub fn verify_completion(
     verify_shake(&p.tr, ShakeKind::Shake256, &token.public_key, &p.tr.output)
         .map_err(|e| format!("tr hash: {e}"))?;
     let mut mu_input = p.tr.output.clone();
-    mu_input.extend_from_slice(&[0, 0]);
+    if !token.legacy_transcript {
+        mu_input.extend_from_slice(&[0, 0]);
+    }
     mu_input.extend_from_slice(expected_message);
     verify_shake(&p.mu, ShakeKind::Shake256, &mu_input, &p.mu.output)
         .map_err(|e| format!("mu hash: {e}"))?;
@@ -225,5 +252,23 @@ pub fn verify_mldsa65(
         return Err("unsupported signature proof version or message length".into());
     }
     let token = verify_equation_pipeline(&proof.equation, expected_key, expected_signature)?;
+    verify_completion(&token, expected_message, &proof.completion)
+}
+
+/// Verify genuine locked PQClean Dilithium3 through the full component graph.
+/// All 48 commitment bytes remain authenticated even though SampleInBall uses
+/// only the first 32. SDK MLDSA compatibility signatures require a different
+/// profile; the native union verifier is never a proof-verification fallback.
+pub fn verify_dilithium3(
+    proof: &Mldsa65VerificationProof,
+    expected_key: &[u8],
+    expected_message: &[u8],
+    expected_signature: &[u8],
+) -> Result<(), String> {
+    if proof.version != 2 || expected_message.len() > MAX_MESSAGE_BYTES {
+        return Err("unsupported Dilithium3 proof version or message length".into());
+    }
+    let token =
+        verify_dilithium_equation_pipeline(&proof.equation, expected_key, expected_signature)?;
     verify_completion(&token, expected_message, &proof.completion)
 }

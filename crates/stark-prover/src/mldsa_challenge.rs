@@ -62,6 +62,7 @@ impl ChallengeProof {
 }
 #[derive(Clone)]
 struct Inputs {
+    version: u8,
     seed: Vec<u8>,
     stream: Vec<u8>,
     indices: Vec<u8>,
@@ -90,7 +91,11 @@ fn signed(value: i8) -> BaseElement {
 impl ToElements<BaseElement> for Inputs {
     fn to_elements(&self) -> Vec<BaseElement> {
         let mut result = vec![
-            BaseElement::new(u64::from_le_bytes(*b"MLCHAL01") as u128),
+            BaseElement::new(u64::from_le_bytes(if self.version == 1 {
+                *b"MLCHAL01"
+            } else {
+                *b"DLCHAL01"
+            }) as u128),
             BaseElement::new(self.stream.len() as u128),
             BaseElement::new(self.attempts() as u128),
         ];
@@ -108,7 +113,7 @@ impl ToElements<BaseElement> for Inputs {
 }
 
 // Native witness construction only. Verification never invokes this sampler.
-fn sample(seed: &[u8], stream: &[u8]) -> Option<Inputs> {
+fn sample(seed: &[u8], stream: &[u8], version: u8) -> Option<Inputs> {
     if stream.len() < 8 {
         return None;
     }
@@ -128,6 +133,7 @@ fn sample(seed: &[u8], stream: &[u8]) -> Option<Inputs> {
         counts.push(indices.len() as u8);
         if indices.len() == CHALLENGE_WEIGHT {
             return Some(Inputs {
+                version,
                 seed: seed.to_vec(),
                 stream: stream.to_vec(),
                 indices,
@@ -355,13 +361,29 @@ impl Prover for ChallengeProver {
 /// Prove ML-DSA-65 SampleInBall for a 48-byte commitment seed.
 /// The existing bounded SHAKE component limits exceptional stream expansion.
 pub fn prove_challenge(seed: &[u8]) -> Result<ChallengeProof, String> {
-    if seed.len() != CHALLENGE_SEED_BYTES {
-        return Err("ML-DSA-65 challenge seed must be 48 bytes".into());
+    prove_profile(seed, 1)
+}
+
+/// Prove the locked PQClean Dilithium3 sampler over the first 32 commitment bytes.
+/// A separate proof version and AIR domain prevent FIPS profile substitution.
+pub fn prove_dilithium_challenge(seed: &[u8]) -> Result<ChallengeProof, String> {
+    prove_profile(seed, 2)
+}
+fn seed_bytes(version: u8) -> usize {
+    if version == 1 {
+        CHALLENGE_SEED_BYTES
+    } else {
+        32
+    }
+}
+fn prove_profile(seed: &[u8], version: u8) -> Result<ChallengeProof, String> {
+    if seed.len() != seed_bytes(version) {
+        return Err("challenge seed length differs from the selected transcript".into());
     }
     let mut length = 128;
     let (xof, inputs) = loop {
         let xof = prove_shake(ShakeKind::Shake256, seed, length)?;
-        if let Some(inputs) = sample(seed, &xof.output) {
+        if let Some(inputs) = sample(seed, &xof.output, version) {
             break (xof, inputs);
         }
         if length == MAX_SHAKE_OUTPUT_BYTES {
@@ -377,7 +399,7 @@ pub fn prove_challenge(seed: &[u8]) -> Result<ChallengeProof, String> {
         .prove(trace(&inputs))
         .map_err(|e| format!("challenge proof: {e:?}"))?;
     Ok(ChallengeProof {
-        version: 1,
+        version,
         seed: seed.to_vec(),
         xof,
         indices: inputs.indices,
@@ -386,13 +408,22 @@ pub fn prove_challenge(seed: &[u8]) -> Result<ChallengeProof, String> {
         proof_bytes: inner.to_bytes(),
     })
 }
+#[cfg(test)]
 fn validate_shape(
     proof: &ChallengeProof,
     expected_seed: &[u8],
     expected_output: &[i8],
 ) -> Result<(), String> {
-    if proof.version != 1
-        || expected_seed.len() != CHALLENGE_SEED_BYTES
+    validate_profile_shape(proof, expected_seed, expected_output, 1)
+}
+fn validate_profile_shape(
+    proof: &ChallengeProof,
+    expected_seed: &[u8],
+    expected_output: &[i8],
+    version: u8,
+) -> Result<(), String> {
+    if proof.version != version
+        || expected_seed.len() != seed_bytes(version)
         || proof.seed != expected_seed
         || proof.xof.output.len() < 9
         || proof.xof.output.len() > MAX_SHAKE_OUTPUT_BYTES
@@ -419,8 +450,26 @@ pub fn verify_challenge(
     expected_seed: &[u8],
     expected_output: &[i8],
 ) -> Result<(), String> {
-    validate_shape(proof, expected_seed, expected_output)?;
+    verify_profile(proof, expected_seed, expected_output, 1)
+}
+
+/// Verify the explicit version-two, 32-byte PQClean transcript using only AIRs.
+pub fn verify_dilithium_challenge(
+    proof: &ChallengeProof,
+    expected_seed: &[u8],
+    expected_output: &[i8],
+) -> Result<(), String> {
+    verify_profile(proof, expected_seed, expected_output, 2)
+}
+fn verify_profile(
+    proof: &ChallengeProof,
+    expected_seed: &[u8],
+    expected_output: &[i8],
+    version: u8,
+) -> Result<(), String> {
+    validate_profile_shape(proof, expected_seed, expected_output, version)?;
     let inputs = Inputs {
+        version,
         seed: proof.seed.clone(),
         stream: proof.xof.output.clone(),
         indices: proof.indices.clone(),
@@ -504,6 +553,47 @@ mod tests {
         })
     }
     #[test]
+    fn dilithium_raw_sampler_has_distinct_seed_version_and_air_domain() {
+        use shell_crypto::{DilithiumSigner, DilithiumVerifier};
+        let signer = DilithiumSigner::generate();
+        let message = b"genuine PQClean raw transcript";
+        let signature = signer.sign(message).unwrap();
+        assert!(DilithiumVerifier.verify_legacy_transcript(
+            signer.public_key(),
+            message,
+            &signature
+        ));
+        for seed in [vec![0; 32], vec![255; 32], signature.data[..32].to_vec()] {
+            let expected = native(&seed);
+            let p = prove_dilithium_challenge(&seed).unwrap();
+            verify_dilithium_challenge(&p, &seed, &expected).unwrap();
+            assert!(verify_challenge(&p, &seed, &expected).is_err());
+            let mut relabelled = p.clone();
+            relabelled.version = 1;
+            relabelled.seed.extend_from_slice(&[0; 16]);
+            assert!(verify_challenge(&relabelled, &relabelled.seed, &expected).is_err());
+            let mut wrong = p.clone();
+            wrong.version = 3;
+            assert!(verify_dilithium_challenge(&wrong, &seed, &expected).is_err());
+            let mut wrong = p.clone();
+            wrong.seed[0] ^= 1;
+            assert!(verify_dilithium_challenge(&wrong, &wrong.seed, &expected).is_err());
+        }
+        assert!(prove_dilithium_challenge(&signature.data[..48]).is_err());
+        assert!(prove_challenge(&signature.data[..32]).is_err());
+        let adapter = MlDsaSigner::generate();
+        let mut signature = adapter.sign(message).unwrap();
+        signature.sig_type = shell_crypto::SignatureType::Dilithium3;
+        assert!(DilithiumVerifier
+            .verify(adapter.public_key(), message, &signature)
+            .unwrap());
+        assert!(!DilithiumVerifier.verify_legacy_transcript(
+            adapter.public_key(),
+            message,
+            &signature
+        ));
+    }
+    #[test]
     fn zero_ff_and_genuine_seed_real_proofs_match_streaming_oracle() {
         for p in cases() {
             let expected = native(&p.seed);
@@ -572,7 +662,7 @@ mod tests {
             }
             stream.push(if repeat_zero { 0 } else { i as u8 });
         }
-        sample(&[0; 48], &stream).unwrap()
+        sample(&[0; 48], &stream, 1).unwrap()
     }
     #[test]
     fn rejection_self_index_and_repeated_index_update_every_coefficient() {
@@ -610,8 +700,8 @@ mod tests {
             invalid[NEW] = BaseElement::ONE;
             assert_ne!(residuals(&air, &invalid)[19], BaseElement::ZERO);
         }
-        assert!(sample(&[0; 48], &[0; 8]).is_none());
-        assert!(sample(&[0; 48], &[255; 128]).is_none());
+        assert!(sample(&[0; 48], &[0; 8], 1).is_none());
+        assert!(sample(&[0; 48], &[255; 128], 1).is_none());
     }
     #[test]
     fn bit_bounds_stop_a_forged_acceptance_despite_linear_equalities() {

@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 mode, raw_fixture, raw_output = sys.argv[1:]
-assert mode in ("run", "verify", "consecutive", "batch", "first-use", "wide", "mixed", "eight-keys", "sixteen-keys", "mixed-first-use", "rotation", "rotation-raw")
+assert mode in ("dilithium-run", "dilithium-verify", "run", "verify", "consecutive", "batch", "first-use", "wide", "mixed", "eight-keys", "sixteen-keys", "mixed-first-use", "rotation", "rotation-raw")
 fixture, out = map(lambda p: Path(p).resolve(), (raw_fixture, raw_output))
 
 def now():
@@ -63,6 +63,67 @@ def snapshot(label):
 
 def history_verify():
     run("full-history-verify", [fixture, "full-history-verify", out])
+
+if mode in ("dilithium-run", "dilithium-verify"):
+    out.mkdir(exist_ok=True)
+    network = out / "network-dilithium"
+    if mode == "dilithium-verify":
+        run("dilithium-cold-verify", [fixture, "dilithium-verify", out])
+        sys.exit(0)
+    if not (out / "actors.json").exists():
+        run("prepare-dilithium", [fixture, "prepare-dilithium", out])
+    assert (out / "later-control.json").exists(), "partial preparation retained; inspect receipts"
+    original = json.loads((out / "capture-original.json").read_text())
+    if not original["supported"] and not (out / "capture-recovered.json").exists():
+        run("dilithium-probe", [fixture, "dilithium-probe", out])
+    if not (network / "paused.json").exists():
+        run("dilithium-pause", [fixture, "dilithium-pause", out])
+        save(out / "dilithium-paused-snapshot.json", json.loads(run("dilithium-paused-snapshot", [fixture, "dilithium-snapshot", out])))
+    assert (out / "dilithium-paused-snapshot.json").exists(), "unrecorded pause retained; inspect receipts"
+    if not (network / "complete.json").exists():
+        run("dilithium-resume", [fixture, "dilithium-resume", out])
+    after = json.loads(run("dilithium-complete-snapshot", [fixture, "dilithium-snapshot", out]))
+    paused = json.loads((out / "dilithium-paused-snapshot.json").read_text())
+    assert paused["native_digest"] == after["native_digest"] and after["physical_checkpoint_bytes"] <= 256 * 1024 * 1024
+    indexed = {row["key"]: row for row in after["rows"]}
+    for row in paused["rows"]:
+        key = bytes.fromhex(row["key"])
+        if b"production/component/" in key or b"production/source" in key or b"/source/" in key:
+            assert indexed[row["key"]] == row, "original checkpoint changed"
+    if not (network / "verified.json").exists():
+        run("dilithium-verify", [fixture, "dilithium-verify", out])
+    if not (network / "history-verified.json").exists():
+        run("dilithium-history", [fixture, "dilithium-history", out])
+    if not (network / "refusals.json").exists():
+        run("dilithium-refusal", [fixture, "dilithium-refusal", out])
+    run("dilithium-history-cold", [fixture, "dilithium-verify", out])
+    run("dilithium-history-cold-again", [fixture, "dilithium-verify", out])
+    complete = json.loads((network / "complete.json").read_text())
+    assert complete["genuine_dilithium_sender_primary_proposer_full_proof_admitted"] and complete["height"] == complete["finalized"] == 1
+    assert complete["production"]["state"] == "complete" and complete["production"]["components"] > 0
+    assert complete["admission"]["nativeCanonical"] and complete["admission"]["status"]["state"] == "complete"
+    for name, count in (("control.json", 1), ("later-control.json", 2)):
+        control = json.loads((out / name).read_text())
+        sender, recipient, proposer = control["accounts"]
+        assert sender["nonce"] == count and int(sender["balance"], 16) == 1_000_000 - count * 42_001
+        assert int(recipient["balance"], 16) == count and int(proposer["balance"], 16) == count * 42_000
+        assert [v["gas_used"] for v in control["receipts"]] == [21_000, 0] and all(v["status"] == 1 for v in control["receipts"])
+    for path in network.glob("history-verified*.json"):
+        value = json.loads(path.read_text())
+        assert value["all_kv_unchanged"] and value["current_height"] == 2 and value["ordinary_successor_not_proof_admitted"]
+    rollback = json.loads((out / "native-rollback.json").read_text())
+    assert rollback["native_crypto_control_not_proof_admission"] and rollback["all_kv_unchanged"]
+    refusals = json.loads((network / "refusals.json").read_text())
+    assert refusals["genuine_primary_certificates"] and len(refusals["cases"]) == 4
+    assert all(v["all_kv_unchanged"] and v["original_proof_unchanged"] and v["new_proofs_generated"] == 0 for v in refusals["cases"])
+    result = {"genuine_dilithium_sender_primary_proposer_full_proof_admitted": True,
+              "historical_replay_after_native_successor_no_writes": True,
+              "foreign_profile_and_genuine_certificate_refusals": 4,
+              "physical_checkpoint_bytes": after["physical_checkpoint_bytes"],
+              "components": complete["production"]["components"], "finished_at": now()}
+    save(out / "dilithium-result.json", result)
+    print(json.dumps(result))
+    sys.exit(0)
 
 if mode == "verify" and (out / "network-rotation/complete.json").exists():
     run("rotation-cold-verify", [fixture, "rotation-verify", out])

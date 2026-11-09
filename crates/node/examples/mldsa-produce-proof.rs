@@ -702,6 +702,15 @@ fn main() -> Result<(), Error> {
     )?;
     let out = Path::new(&args[1]);
     match args[0].as_str() {
+        "prepare-dilithium" => admission_runtime::dilithium::prepare(out),
+        "dilithium-probe" => admission_runtime::dilithium::probe(out, true),
+        "dilithium-pause" | "dilithium-resume" => tokio::runtime::Runtime::new()?.block_on(
+            admission_runtime::dilithium::run(out, args[0] == "dilithium-pause"),
+        ),
+        "dilithium-snapshot" => admission_runtime::dilithium::snapshot(out),
+        "dilithium-verify" => admission_runtime::dilithium::verify(out, false),
+        "dilithium-history" => admission_runtime::dilithium::verify(out, true),
+        "dilithium-refusal" => admission_runtime::dilithium::negative(out),
         "prepare-rotation" => admission_runtime::rotation::prepare(out, true),
         "prepare-rotation-raw" => admission_runtime::rotation::prepare(out, false),
         "rotation-pause" | "rotation-resume" => tokio::runtime::Runtime::new()?.block_on(

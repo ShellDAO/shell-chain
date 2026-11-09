@@ -1,11 +1,11 @@
-//! Joint public verification of canonical outer signing sources and ML-DSA-65.
+//! Joint verification of canonical outer sources and explicit signature transcripts.
 //!
 //! The caller supplies the expected transaction, raw key/signature and key hash.
 //! This does not authenticate chain history, account authority or an AA bundle.
 
 use crate::{
     blake3_hash::{verify_hash, verify_transaction_signing_hash, Blake3HashProof},
-    mldsa_verification::{verify_mldsa65, Mldsa65VerificationProof},
+    mldsa_verification::{verify_dilithium3, verify_mldsa65, Mldsa65VerificationProof},
 };
 use serde::{Deserialize, Serialize};
 use shell_crypto::SignatureType;
@@ -272,6 +272,44 @@ pub fn verify_transaction_signature(
     )
     .map_err(|e| format!("public key source: {e}"))?;
     verify_mldsa65(
+        &proof.signature,
+        expected_key,
+        &proof.signing_hash.output,
+        expected_signature,
+    )
+    .map_err(|e| format!("signature: {e}"))
+}
+
+/// Verify a version-two native tag-zero source and the genuine PQClean raw transcript.
+pub fn verify_dilithium_transaction_signature(
+    proof: &TransactionSignatureProof,
+    expected_transaction: &shell_core::Transaction,
+    expected_key: &[u8],
+    expected_signature: &[u8],
+    expected_public_key_hash: &[u8; 32],
+) -> Result<(), String> {
+    if proof.version != 2 || expected_key.len() != 1952 || expected_signature.len() != 3309 {
+        return Err("invalid transaction signature proof version or Dilithium3 shape".into());
+    }
+    if expected_transaction.tx_type > 3 {
+        return Err(
+            "unsupported outer transaction type; AA sender bundle framing is not proved".into(),
+        );
+    }
+    verify_transaction_signing_hash(
+        &proof.signing_hash,
+        expected_transaction,
+        SignatureType::Dilithium3.as_u8(),
+        &proof.signing_hash.output,
+    )
+    .map_err(|e| format!("transaction source: {e}"))?;
+    verify_hash(
+        &proof.public_key_hash,
+        expected_key,
+        expected_public_key_hash,
+    )
+    .map_err(|e| format!("public key source: {e}"))?;
+    verify_dilithium3(
         &proof.signature,
         expected_key,
         &proof.signing_hash.output,

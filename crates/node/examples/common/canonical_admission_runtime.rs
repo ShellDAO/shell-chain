@@ -1,4 +1,6 @@
 //! Real ordinary block sync and dedicated proof transfer, with a cold receiver.
+#[path = "dilithium_proof.rs"]
+pub(super) mod dilithium;
 #[path = "rotation_proof.rs"]
 pub(super) mod rotation;
 use super::*;
