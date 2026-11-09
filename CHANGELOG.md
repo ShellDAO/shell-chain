@@ -24,6 +24,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Complete bound Native tag-zero SDK FIPS sender proofs with explicit source and
+  account profiles. Preserve raw and primary transcript formats; add exact
+  published SDK signing/RPC inputs, peer Native import/finality, changed-state
+  history and cross-profile refusal checks.
+
 - Complete genuine PQClean Dilithium3 proofs for funded unbound default accounts,
   including full tag-zero address AIR, Embedded first-use registration and later
   Reference execution. Keep existing profile meanings, Native SDK handling and

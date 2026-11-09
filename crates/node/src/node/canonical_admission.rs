@@ -213,18 +213,24 @@ impl<S: KvStore + 'static> Node<S> {
                 return Ok(false);
             }
             // Tag zero also permits an SDK MLDSA adapter in native execution.
-            // This proof profile covers genuine PQClean default-account signatures;
-            // unsupported transcripts keep the ordinary native intake path.
+            // Full proofs select genuine PQClean default-account signatures or a
+            // bound registered SDK FIPS sender; unsupported cases stay ordinary.
             if tx.signature.sig_type == shell_crypto::SignatureType::Dilithium3
                 && registered
                     .as_deref()
                     .or_else(|| tx.pubkey_mode.pubkey_bytes())
                     .is_none_or(|key| {
-                        !shell_crypto::DilithiumVerifier.verify_legacy_transcript(
+                        !(shell_crypto::DilithiumVerifier.verify_legacy_transcript(
                             key,
                             tx.sender_signing_hash().as_bytes(),
                             &tx.signature,
-                        )
+                        ) || (account.pq_pubkey_hash != ShellHash::ZERO
+                            && registered.is_some()
+                            && shell_crypto::DilithiumVerifier.verify_sdk_transcript(
+                                key,
+                                tx.sender_signing_hash().as_bytes(),
+                                &tx.signature,
+                            )))
                     })
             {
                 return Ok(false);

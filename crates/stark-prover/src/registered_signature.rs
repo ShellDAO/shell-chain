@@ -8,8 +8,8 @@ use crate::{
     account_state::VerifiedAccountState,
     blake3_hash::{verify_hash, Blake3HashProof},
     mldsa_source::{
-        verify_dilithium_transaction_signature, verify_transaction_signature,
-        TransactionSignatureProof, VerifiedSignatureEntry,
+        verify_dilithium_transaction_signature, verify_sdk_transaction_signature,
+        verify_transaction_signature, TransactionSignatureProof, VerifiedSignatureEntry,
     },
     SigBatchEntry,
 };
@@ -20,7 +20,7 @@ use shell_crypto::{CryptoError, PQSignature, SignatureType, Verifier};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegisteredSignatureProof {
-    /// Profiles one/two are bound/unbound MLDSA65; three/four are bound/unbound PQClean Dilithium3.
+    /// One/two are bound/unbound MLDSA65, three/four bound/unbound raw Dilithium3, five bound Native SDK FIPS tag zero.
     pub version: u8,
     pub transaction: TransactionSignatureProof,
     pub transaction_id: Blake3HashProof,
@@ -101,7 +101,7 @@ pub fn verify_registered_signature_entry(
 ) -> Result<VerifiedRegisteredSignature, String> {
     if !matches!(
         (proof.version, expected.signature.sig_type),
-        (1, SignatureType::MlDsa65) | (3, SignatureType::Dilithium3)
+        (1, SignatureType::MlDsa65) | (3 | 5, SignatureType::Dilithium3)
     ) {
         return Err("invalid registered signature proof version or algorithm".into());
     }
@@ -229,7 +229,9 @@ fn verify_entry_sources(
     leaf[32..].copy_from_slice(&expected_entry.pk_hash);
     verify_hash(&proof.leaf, &leaf, expected_leaf)
         .map_err(|e| format!("registered entry leaf: {e}"))?;
-    let verify = if matches!(proof.version, 3 | 4) {
+    let verify = if proof.version == 5 {
+        verify_sdk_transaction_signature
+    } else if matches!(proof.version, 3 | 4) {
         verify_dilithium_transaction_signature
     } else {
         verify_transaction_signature

@@ -140,7 +140,8 @@ impl Verifier for VerifiedCanonicalSignatureBatch {
 /// its header. Registered MLDSA65 and PQClean Dilithium3 use profiles one and
 /// three respectively; unbound MLDSA65 and PQClean Dilithium3 default accounts
 /// use versions two/four with a complete derived-address proof and the historical
-/// registry's Embedded/Reference rules. AA, other algorithms and pruned witnesses
+/// registry's Embedded/Reference rules. Bound Native tag-zero SDK FIPS uses profile five.
+/// AA, other algorithms and pruned witnesses
 /// remain outside this profile.
 pub fn verify_canonical_signature_batch<S: KvStore + 'static>(
     view: &CanonicalParentView<S>,
@@ -232,7 +233,7 @@ fn verify_batch_at_parent<S: KvStore + 'static>(
     let mut signatures = Vec::with_capacity(block.transactions.len());
     for (tx, item) in block.transactions.iter().zip(&proof.transactions) {
         let entry = match item.signature.version {
-            1 | 3 => {
+            1 | 3 | 5 => {
                 verify_canonical_registered_signature(view, tx, &item.account, &item.signature)?
                     .signature()
                     .entry()

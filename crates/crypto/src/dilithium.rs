@@ -119,6 +119,20 @@ impl DilithiumVerifier {
             && self.verify_legacy_dilithium(pubkey, message, &signature.data)
     }
 
+    /// Select the existing Native tag-zero SDK FIPS transcript for proof production.
+    /// This does not change the Native raw-or-SDK compatibility verifier.
+    pub fn verify_sdk_transcript(
+        &self,
+        pubkey: &[u8],
+        message: &[u8],
+        signature: &PQSignature,
+    ) -> bool {
+        signature.sig_type == SignatureType::Dilithium3
+            && pubkey.len() == DILITHIUM3_PUBLIC_KEY_BYTES
+            && signature.data.len() == DILITHIUM3_SIGNATURE_BYTES
+            && self.verify_ml_dsa_compat(pubkey, message, &signature.data)
+    }
+
     fn verify_legacy_dilithium(&self, pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
         let Ok(pk) = dilithium3::PublicKey::from_bytes(pubkey) else {
             return false;
@@ -200,6 +214,8 @@ mod tests {
         let verifier = DilithiumVerifier;
         let valid = verifier.verify(signer.public_key(), message, &sig).unwrap();
         assert!(valid);
+        assert!(verifier.verify_legacy_transcript(signer.public_key(), message, &sig));
+        assert!(!verifier.verify_sdk_transcript(signer.public_key(), message, &sig));
     }
 
     #[test]
@@ -394,5 +410,10 @@ mod tests {
         let sig = PQSignature::new(SignatureType::Dilithium3, signature);
 
         assert!(verifier.verify(&pubkey, &message, &sig).unwrap());
+        assert!(verifier.verify_sdk_transcript(&pubkey, &message, &sig));
+        assert!(!verifier.verify_legacy_transcript(&pubkey, &message, &sig));
+        assert!(!verifier.verify_sdk_transcript(&pubkey, b"wrong", &sig));
+        let relabelled = PQSignature::new(SignatureType::MlDsa65, sig.data);
+        assert!(!verifier.verify_sdk_transcript(&pubkey, &message, &relabelled));
     }
 }

@@ -66,7 +66,7 @@ pub fn verify_canonical_registered_signature<S: KvStore + 'static>(
         || !matches!(
             (proof.version, signed.signature.sig_type),
             (1, shell_crypto::SignatureType::MlDsa65)
-                | (3, shell_crypto::SignatureType::Dilithium3)
+                | (3 | 5, shell_crypto::SignatureType::Dilithium3)
         )
         || signed.signature.data.len() != 3309
         || signed

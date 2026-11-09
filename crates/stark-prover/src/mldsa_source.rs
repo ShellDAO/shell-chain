@@ -280,6 +280,44 @@ pub fn verify_transaction_signature(
     .map_err(|e| format!("signature: {e}"))
 }
 
+/// Verify source envelope three: Native tag zero with a genuine FIPS signature proof one.
+pub fn verify_sdk_transaction_signature(
+    proof: &TransactionSignatureProof,
+    expected_transaction: &shell_core::Transaction,
+    expected_key: &[u8],
+    expected_signature: &[u8],
+    expected_public_key_hash: &[u8; 32],
+) -> Result<(), String> {
+    if proof.version != 3 || expected_key.len() != 1952 || expected_signature.len() != 3309 {
+        return Err("invalid SDK transaction signature proof version or FIPS shape".into());
+    }
+    if expected_transaction.tx_type > 3 {
+        return Err(
+            "unsupported outer transaction type; AA sender bundle framing is not proved".into(),
+        );
+    }
+    verify_transaction_signing_hash(
+        &proof.signing_hash,
+        expected_transaction,
+        SignatureType::Dilithium3.as_u8(),
+        &proof.signing_hash.output,
+    )
+    .map_err(|e| format!("transaction source: {e}"))?;
+    verify_hash(
+        &proof.public_key_hash,
+        expected_key,
+        expected_public_key_hash,
+    )
+    .map_err(|e| format!("public key source: {e}"))?;
+    verify_mldsa65(
+        &proof.signature,
+        expected_key,
+        &proof.signing_hash.output,
+        expected_signature,
+    )
+    .map_err(|e| format!("signature: {e}"))
+}
+
 /// Verify a version-two native tag-zero source and the genuine PQClean raw transcript.
 pub fn verify_dilithium_transaction_signature(
     proof: &TransactionSignatureProof,

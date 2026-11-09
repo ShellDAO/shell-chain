@@ -90,6 +90,9 @@ struct SenderSource {
     key: Vec<u8>,
     account: Account,
     nodes: Vec<Vec<u8>>,
+    /// Present only in source format three: explicit Native SDK FIPS signature version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sdk_fips: Option<u8>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -198,12 +201,25 @@ impl CanonicalProductionSource {
             {
                 return Err("production bound account requires its parent-registered key".into());
             }
-            // Producer preflight only. Reuse and final acceptance still run full AIR verification.
-            if !verify_production_signature(
+            // Select once from actual signature bytes; final acceptance still verifies full AIR.
+            let raw_or_primary = verify_production_signature(
                 &key,
                 signed.sender_signing_hash().as_bytes(),
                 &signed.signature,
-            )? {
+            )?;
+            let sdk_fips = if !raw_or_primary
+                && account.pq_pubkey_hash != ShellHash::ZERO
+                && signed.signature.sig_type == SignatureType::Dilithium3
+                && DilithiumVerifier.verify_sdk_transcript(
+                    &key,
+                    signed.sender_signing_hash().as_bytes(),
+                    &signed.signature,
+                ) {
+                Some(1)
+            } else {
+                None
+            };
+            if !raw_or_primary && sdk_fips.is_none() {
                 return Err("invalid raw production signature".into());
             }
             let nodes = MerkleTrie::at_root(view.store(), view.parent().state_root.as_bytes())
@@ -221,6 +237,7 @@ impl CanonicalProductionSource {
                 key,
                 account,
                 nodes,
+                sdk_fips,
             });
         }
         let proposer_key = match block.proposer_seal.as_ref() {
@@ -245,7 +262,13 @@ impl CanonicalProductionSource {
             _ => None,
         };
         let input = CapturedInputs {
-            version: if proposer_key.is_some() { 2 } else { 1 },
+            version: if senders.iter().any(|s| s.sdk_fips.is_some()) {
+                3
+            } else if proposer_key.is_some() {
+                2
+            } else {
+                1
+            },
             tip,
             config: view.config().clone(),
             parent: view.parent().clone(),
@@ -295,10 +318,11 @@ impl CanonicalProductionSource {
             .get_chain_config()
             .map_err(|e| e.to_string())?
             .ok_or("production chain configuration absent")?;
-        if !matches!(
-            (i.version, i.proposer_key.is_some()),
-            (1, false) | (2, true)
-        ) || cfg.chain_id != i.config.chain_id
+        let has_sdk = i.senders.iter().any(|s| s.sdk_fips.is_some());
+        if !((i.version == 1 && i.proposer_key.is_none() && !has_sdk)
+            || (i.version == 2 && i.proposer_key.is_some() && !has_sdk)
+            || (i.version == 3 && has_sdk))
+            || cfg.chain_id != i.config.chain_id
             || cfg.genesis_hash != i.config.genesis_hash
             || chain
                 .get_block_hash_by_number(0)
@@ -401,6 +425,18 @@ impl CanonicalProductionSource {
             }
             let mut tagged = vec![tx.signature.sig_type.as_u8()];
             tagged.extend_from_slice(&sender.key);
+            if sender.sdk_fips.is_some()
+                && (sender.sdk_fips != Some(1)
+                    || tx.signature.sig_type != SignatureType::Dilithium3
+                    || sender.account.pq_pubkey_hash == ShellHash::ZERO
+                    || DilithiumVerifier.verify_legacy_transcript(
+                        &sender.key,
+                        tx.sender_signing_hash().as_bytes(),
+                        &tx.signature,
+                    ))
+            {
+                return Err("production SDK source profile mismatch".into());
+            }
             let binding_matches = if sender.account.pq_pubkey_hash == ShellHash::ZERO {
                 shell_primitives::Address::from_public_key(
                     &sender.key,
@@ -425,11 +461,20 @@ impl CanonicalProductionSource {
             if actual.as_deref() != Some(encoded.as_slice()) {
                 return Err("production source native MPT/account mismatch".into());
             }
-            if !verify_production_signature(
-                &sender.key,
-                tx.sender_signing_hash().as_bytes(),
-                &tx.signature,
-            )? {
+            let signature_valid = if sender.sdk_fips == Some(1) {
+                DilithiumVerifier.verify_sdk_transcript(
+                    &sender.key,
+                    tx.sender_signing_hash().as_bytes(),
+                    &tx.signature,
+                )
+            } else {
+                verify_production_signature(
+                    &sender.key,
+                    tx.sender_signing_hash().as_bytes(),
+                    &tx.signature,
+                )?
+            };
+            if !signature_valid {
                 return Err("invalid raw production signature".into());
             }
         }
@@ -457,7 +502,12 @@ impl CanonicalProductionSource {
     /// Verify complete mathematics against captured public inputs only. Callers
     /// must independently recheck canonicality and native execution/admission.
     pub fn verify(&self, proof: &CanonicalSignatureBatchProof) -> Result<(), String> {
-        if proof.version != self.input.version
+        if proof.version
+            != (if self.input.proposer_key.is_some() {
+                2
+            } else {
+                1
+            })
             || proof.transactions.len() != self.input.senders.len()
             || proof.proposer.is_some() != self.input.proposer_key.is_some()
         {
@@ -688,7 +738,7 @@ impl CanonicalProductionSource {
                 &source.key,
                 signed.sender_signing_hash().as_bytes(),
                 &signed.signature.data,
-                signed.signature.sig_type == SignatureType::Dilithium3,
+                signed.signature.sig_type == SignatureType::Dilithium3 && source.sdk_fips.is_none(),
             )?;
             let account = job.checkpoint(
                 &format!("{prefix}-account"),
@@ -726,7 +776,9 @@ impl CanonicalProductionSource {
             transactions.push(CanonicalTransactionProof {
                 account,
                 signature: RegisteredSignatureProof {
-                    version: if source.account.pq_pubkey_hash == ShellHash::ZERO {
+                    version: if source.sdk_fips == Some(1) {
+                        5
+                    } else if source.account.pq_pubkey_hash == ShellHash::ZERO {
                         if signed.signature.sig_type == SignatureType::Dilithium3 {
                             4
                         } else {
@@ -738,7 +790,9 @@ impl CanonicalProductionSource {
                         1
                     },
                     transaction: TransactionSignatureProof {
-                        version: if signed.signature.sig_type == SignatureType::Dilithium3 {
+                        version: if source.sdk_fips == Some(1) {
+                            3
+                        } else if signed.signature.sig_type == SignatureType::Dilithium3 {
                             2
                         } else {
                             1
@@ -754,7 +808,11 @@ impl CanonicalProductionSource {
             });
         }
         let proof = CanonicalSignatureBatchProof {
-            version: self.input.version,
+            version: if self.input.proposer_key.is_some() {
+                2
+            } else {
+                1
+            },
             transactions,
             proposer: if let Some(key) = &self.input.proposer_key {
                 let block = &self.input.block;
@@ -1171,7 +1229,7 @@ mod tests {
 mod recovery_tests {
     use super::*;
     use shell_core::{SignedTransaction, Transaction, TransactionReceipt};
-    use shell_crypto::{MlDsaSigner, Signer};
+    use shell_crypto::{MlDsaSigner, PQSignature, Signer};
     use shell_primitives::{Address, U256};
     use shell_storage::{OverlayStore, StorageError};
     fn fixture() -> (Arc<MemoryDb>, CanonicalProductionSource) {
@@ -1340,10 +1398,37 @@ mod recovery_tests {
         unbound: bool,
         legacy: bool,
     ) -> (Arc<MemoryDb>, CanonicalProductionSource) {
+        fixture_transcript(full, unbound, legacy, false)
+    }
+    // Test-only FIPS signer with the existing Native SDK algorithm tag. Actual
+    // published SDK signing and RPC execution have a separate runtime entry.
+    struct SdkTaggedSigner(MlDsaSigner);
+    impl Signer for SdkTaggedSigner {
+        fn sign(&self, message: &[u8]) -> Result<PQSignature, shell_crypto::CryptoError> {
+            Ok(PQSignature::new(
+                SignatureType::Dilithium3,
+                self.0.sign(message)?.data,
+            ))
+        }
+        fn public_key(&self) -> &[u8] {
+            self.0.public_key()
+        }
+        fn sig_type(&self) -> SignatureType {
+            SignatureType::Dilithium3
+        }
+    }
+    fn fixture_transcript(
+        full: bool,
+        unbound: bool,
+        legacy: bool,
+        sdk: bool,
+    ) -> (Arc<MemoryDb>, CanonicalProductionSource) {
         // Storage-context fixture only; real native execution is exercised by the runtime regression.
         let db = Arc::new(MemoryDb::new());
         let chain = ChainStore::new(db.clone());
-        let signer: Box<dyn Signer> = if legacy {
+        let signer: Box<dyn Signer> = if sdk {
+            Box::new(SdkTaggedSigner(MlDsaSigner::generate()))
+        } else if legacy {
             Box::new(shell_crypto::DilithiumSigner::generate())
         } else {
             Box::new(MlDsaSigner::generate())
@@ -1541,6 +1626,55 @@ mod recovery_tests {
             }
             assert_eq!(before, db.scan_all().unwrap());
         }
+    }
+    #[test]
+    fn sdk_source_freezes_explicit_transcript_and_rejects_relabelling() {
+        let (db, source) = fixture_transcript(false, false, false, true);
+        assert_eq!(source.input.version, 3);
+        assert_eq!(source.input.senders[0].sdk_fips, Some(1));
+        assert_eq!(
+            source.block().transactions[0].signature.sig_type,
+            SignatureType::Dilithium3
+        );
+        let before = db.scan_all().unwrap();
+        let frozen = ChainStore::new(Arc::new(NoTrieReads(db.clone())));
+        assert_eq!(
+            CanonicalProductionSource::restore(&frozen, source.identity())
+                .unwrap()
+                .identity(),
+            source.identity()
+        );
+        for mode in ["old-format", "missing-marker", "unknown-marker", "unbound"] {
+            let mut input: CapturedInputs = serde_json::from_slice(source.identity()).unwrap();
+            match mode {
+                "old-format" => input.version = 1,
+                "missing-marker" => input.senders[0].sdk_fips = None,
+                "unknown-marker" => input.senders[0].sdk_fips = Some(2),
+                "unbound" => input.senders[0].account.pq_pubkey_hash = ShellHash::ZERO,
+                _ => unreachable!(),
+            }
+            assert!(
+                CanonicalProductionSource::restore(&frozen, &serde_json::to_vec(&input).unwrap())
+                    .is_err(),
+                "{mode}"
+            );
+        }
+        for legacy in [false, true] {
+            let (old_db, old) = fixture_algorithm(false, false, legacy);
+            assert_eq!(old.input.version, 1);
+            assert!(!std::str::from_utf8(old.identity())
+                .unwrap()
+                .contains("sdk_fips"));
+            let mut input: CapturedInputs = serde_json::from_slice(old.identity()).unwrap();
+            input.version = 3;
+            input.senders[0].sdk_fips = Some(1);
+            assert!(CanonicalProductionSource::restore(
+                &ChainStore::new(old_db),
+                &serde_json::to_vec(&input).unwrap()
+            )
+            .is_err());
+        }
+        assert_eq!(before, db.scan_all().unwrap());
     }
     #[test]
     fn full_seal_source_freezes_native_signer_across_registry_change_and_rejects_tampering() {

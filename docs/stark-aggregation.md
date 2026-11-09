@@ -753,8 +753,9 @@ meaning. Shared key, matrix and NTT arithmetic is reverified against exact
 inputs; tagged-key checkpoints also require an equal algorithm tag.
 
 The Native tag-zero verifier continues accepting its existing SDK ML-DSA
-adapter. That adapter, unbound Dilithium3, AA and custom
-validators require separate proof profiles. Unsupported live candidates retain
+adapter. Bound SDK signatures have the distinct profile described below;
+unbound raw signatures use profile 4. AA and custom validators require separate
+proof profiles. Unsupported live candidates retain
 ordinary Native handling; selected full-proof candidates require complete AIR
 without Native signature fallback. Production/admission defaults, quotas,
 activation schedules and public release availability remain unchanged.
@@ -861,7 +862,54 @@ imports. The entry refuses retained outputs with a different account profile
 before opening nodes or generating keys. Keep the output directory to resume;
 failed assertions exit nonzero, and `verify` generates no proofs.
 
-This bounded default-account case leaves SDK-adapter tag-zero proofs, absent-
-state account creation, AA/custom validators, same-block Reference after an
+This bounded default-account case leaves SDK-adapter unbound tag-zero proofs,
+absent-state account creation, AA/custom validators, same-block Reference after an
 Embedded first use without a parent key, other activation combinations and
 public release/network activation as separate acceptance work.
+
+
+### Published SDK Dilithium3 bound sender
+
+```bash
+tests/e2e/dilithium-full-proof.sh sdk sdk-output
+tests/e2e/dilithium-full-proof.sh verify sdk-output
+```
+
+This source regression additionally needs Node.js 20 or newer and npm registry
+access. It installs the exact published `shell-sdk@0.14.0-rc.3` candidate into
+`sdk-output.client` with a local npm cache. The candidate targets the maintained
+V2 transaction codec; this is not a claim of public testnet activation. A retained
+incomplete consumer fails instead of replacing dependencies. The driver checks
+the package version and generates memory-only `MlDsa65Adapter` keys through the
+public `ShellSigner("Dilithium3", adapter)` entry. Only its public key and two
+original signed transfers are retained. The real SDK provider submits those
+bytes through an actual local Node RPC server and observes successful receipts.
+The Rust fixture never signs the SDK sender's transactions.
+
+The first transfer uses a funded bound default account with its exact parent
+registered key and an independent ML-DSA-65 proposer. It completes automatic
+production, durable recovery, full mathematical verification, real peer Native
+import and finality. A separately signed original SDK successor advances current
+state to height 2 before repeated cold read-only historical checks. Receipt,
+21,000-gas, effective-fee, account and nonce results must match ordinary Native
+execution. Genuine foreign certificates, cross-profile substitutions and SDK
+signed-input tampering must refuse. Native intake and signed wrong-root rollback
+controls are labelled separately from full proof admission and historical
+predicate refusal. Failed assertions exit nonzero; keep the outputs to resume.
+
+Native algorithm tag 0 accepts both its locked PQClean raw transcript and the
+SDK FIPS adapter. Their equal key/signature widths do not make their transcripts
+interchangeable. Bound SDK sender account profile 5 requires transaction source
+envelope 3, the Native tag-zero signing hash, and complete FIPS signature and
+challenge proofs of version 1, including the 48-byte sampler seed and empty-
+context framing. Raw bound/unbound profiles 3/4 keep transaction/signature version
+2 and the raw 32-byte sampler seed. Primary ML-DSA profiles 1/2 remain unchanged.
+Frozen source format 3 explicitly records the SDK selection; old source formats
+1/2 and proof batch formats retain their original meanings and exact bytes.
+Selection is a producer preflight; consumers require complete AIR without Native
+signature fallback.
+
+This bounded case covers one bound SDK sender and a primary proposer. SDK-tag-zero
+proposer proofs, unbound SDK accounts, absent-state creation, AA/custom validators,
+same-block registration sequences, other activations and public binary/network
+acceptance remain separate. Limits, defaults and activation schedules are unchanged.

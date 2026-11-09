@@ -80,13 +80,13 @@ raw transcript: SampleInBall consumes the first 32 of 48 c-tilde bytes, and mu
 omits FIPS empty-context framing. The producer selects only signatures accepted
 by that transcript; its final graph verifies the distinct challenge domain and
 complete commitment through AIR. The existing Native verifier's SDK adapter
-remains available through ordinary handling. Shared tagged-key checkpoints
+keeps its Native behavior and uses a distinct bound proof profile below. Shared tagged-key checkpoints
 additionally require equal algorithm tags. No old source descriptor, proof
 version, job quota or activation schedule changes meaning. The standalone
 `dilithium-full-proof` entry covers pause/resume, peer Native import/finality,
 ordinary successor state changes, cold replay and genuine-certificate refusal;
 the `both` mode selects distinct genuine raw sender and proposer keys together.
-Other account and SDK-adapter arrangements require separate qualification.
+Other account arrangements require separate qualification.
 
 Genuine locked PQClean proposer seals can also be captured as full version-2
 sources. Seal proof version 2 routes their header-hash message to the existing
@@ -136,3 +136,22 @@ sources resolve keys from their respective historical parents. SDK-adapter tag
 zero is still excluded from raw proving. The `unbound` Dilithium entry requires
 both original blocks to reach full proof-backed Native import/finality and checks
 history after an ordinary third block under unchanged resource limits.
+
+
+## Bound Native SDK FIPS senders
+
+A parent-registered bound SDK sender under Native algorithm tag zero selects
+account profile 5, transaction source envelope 3 and complete FIPS signature/
+challenge version 1. The producer freezes that explicit selection in source
+format 3. Its 48-byte sampler seed and empty-context framing remain distinct
+from raw version 2. Old source formats 1/2 omit the selection field and retain
+their exact bytes and meaning; outer batch versions still indicate the presence
+of a proposer proof. Recovery rejects unknown, missing or relabelled markers.
+
+`dilithium-full-proof.sh sdk output` retains real published SDK signer inputs and
+uses its provider through actual local Node RPC. The same original graph must
+complete automatic production, durable recovery, peer Native import/finality,
+changed-state history and genuine/cross-profile refusals. Signed-input Native
+intake and wrong-root rollback controls retain their own scope. SDK unbound
+accounts and SDK-tag-zero proposer proofs remain separate; no defaults, quotas,
+activation or public-release status change.

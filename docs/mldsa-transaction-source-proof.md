@@ -1297,3 +1297,15 @@ The correct successor is a history control, not a proof-admitted target. The
 output includes both raw graphs, manifests, native controls and command receipts.
 These source tests do not establish public binary release, network activation,
 full 16-transaction load, arbitrary key layouts or recursive compression.
+
+
+### Native SDK tag-zero FIPS envelope
+
+Transaction signature source version 3 binds the existing Native tag-zero signing
+hash to a complete FIPS ML-DSA-65 signature proof of version 1. Registered sender
+profile 5 selects it only for a bound default account and its exact historical
+key. Source version 1 remains primary tag-one FIPS, and version 2 remains genuine
+PQClean tag-zero raw Dilithium3. These envelopes require the same complete signing
+hash, public-key hash and signature predicates; equal widths do not authorize
+relabelled transcripts. See the [published SDK regression](stark-aggregation.md#published-sdk-dilithium3-bound-sender)
+for public signing/RPC inputs, full peer Native import and historical refusals.

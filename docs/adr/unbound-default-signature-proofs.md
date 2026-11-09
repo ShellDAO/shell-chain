@@ -68,7 +68,8 @@ key widths do not authorize another transcript or profile. The producer captures
 and restores the same exact parent account, key and MPT witness. The consumer
 still checks all signature, source, account, leaf and transaction-ID predicates.
 Native SDK compatibility is unchanged; SDK FIPS-adapter signatures under tag
-zero are not raw proofs and keep ordinary Native handling.
+zero are not raw proofs. Bound SDK senders use the separate profile 5 below;
+unbound SDK senders retain ordinary Native handling.
 
 `tests/e2e/dilithium-full-proof.sh unbound output` requires complete peer Native
 import/finality of the original Embedded first-use and subsequent Reference
@@ -78,3 +79,20 @@ missing-address-tag and wrong-profile substitutions must refuse without Native
 writes or new mathematical certificates. Separate real-signature Native intake
 and registration-rollback controls retain their own scope. No quota, schedule,
 default or public activation changes; other account arrangements remain open.
+
+
+## Bound Native SDK FIPS profile
+
+Profile 5 binds a nonzero default-account key commitment and the exact historical
+registered Native tag-zero key to transaction source envelope 3. That envelope
+proves the tag-zero signing hash with complete FIPS signature/challenge version-1
+AIR. Native raw-or-SDK verification remains unchanged. The producer selects the
+strict FIPS transcript only after the raw transcript fails, freezes the explicit
+selection in source format 3, and rejects relabelled or unknown selections on
+restore. Old source formats 1/2 omit this field and keep their bytes and meaning;
+proof batch versions still depend on whether a proposer proof is present.
+
+The public `sdk` regression uses the exact published candidate's signer and
+provider against local Node RPC, then complete peer proof admission/finality and
+changed-state historical replay. Test-only storage signers are not evidence of
+public SDK execution. This profile does not add unbound SDK or SDK proposer AIR.
