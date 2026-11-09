@@ -41,19 +41,28 @@ if(mode==='proposer') {
   await emit({kind:'stopped',disposed:true});
   process.stdin.pause();
   process.exit(0);
-} else if(mode==='prepare'||mode==='prepare-unbound') {
-  const unbound=mode==='prepare-unbound';
+} else if(mode==='prepare'||mode==='prepare-unbound'||mode==='prepare-unbound-joint') {
+  const joint=mode==='prepare-unbound-joint';
+  const unbound=mode==='prepare-unbound'||joint;
   const {MlDsa65Adapter}=await api('adapters');
   const {ShellSigner}=await api('signer');
-  const {buildTransferTransaction}=await api('transactions');
+  const {buildTransferTransaction,buildSignedTransaction}=await api('transactions');
   const adapter=MlDsa65Adapter.generate(), signer=new ShellSigner('Dilithium3',adapter);
   try {
     const signed=[];
+    let originalDefaultReference;
     for(const nonce of (unbound?[0,1,2]:[0,1])) {
       const tx=buildTransferTransaction({chainId:10,nonce,to:`0x${'11'.repeat(32)}`,value:1n,gasLimit:21000,maxFeePerGas:2,maxPriorityFeePerGas:1});
-      signed.push(await signer.buildSignedTransaction(unbound&&nonce===0?{tx,includePublicKey:true}:{tx,includePublicKey:false}));
+      const original=await signer.buildSignedTransaction(joint&&nonce===0?{tx}:unbound&&nonce===0?{tx,includePublicKey:true}:{tx,includePublicKey:false});
+      if(joint&&nonce===0) {
+        if(original.sender_pubkey!==null) throw new Error('actual default Reference profile differs');
+        originalDefaultReference=structuredClone(original);
+        const embedded=buildSignedTransaction({from:original.from,tx:original.tx,signature:original.signature.data,signatureType:'Dilithium3',senderPubkey:adapter.getPublicKey()});
+        if(JSON.stringify(embedded.tx)!==JSON.stringify(original.tx)||JSON.stringify(embedded.signature)!==JSON.stringify(original.signature)) throw new Error('first-use public builder changed original signed bytes');
+        signed.push(embedded);
+      } else { signed.push(original); }
     }
-    await writeFile(inputs,JSON.stringify({package:'shell-sdk',version:pkg.version,signature_type:'Dilithium3',public_key:Array.from(adapter.getPublicKey()),address:signer.getAddress(),signed,private_keys_persisted:false,...(unbound?{unbound_sender:true}:{})},null,2)+'\n',{flag:'wx'});
+    await writeFile(inputs,JSON.stringify({package:'shell-sdk',version:pkg.version,signature_type:'Dilithium3',public_key:Array.from(adapter.getPublicKey()),address:signer.getAddress(),signed,private_keys_persisted:false,...(unbound?{unbound_sender:true}:{}),...(joint?{original_default_reference:originalDefaultReference,embedded_first_use_from_same_signature:true}:{})},null,2)+'\n',{flag:'wx'});
   } finally { signer.dispose(); }
 } else if(mode==='send') {
   const {createShellProvider}=await api('provider');
@@ -66,7 +75,7 @@ if(mode==='proposer') {
 } else if(['refuse','refuse-reference','refuse-address'].includes(mode)) {
   const {createShellProvider}=await api('provider');
   const data=JSON.parse(await readFile(inputs,'utf8'));
-  const signed=structuredClone(data.signed[Number(rawIndex)]);
+  const signed=structuredClone(mode==='refuse-reference'&&Number(rawIndex)===0&&data.original_default_reference?data.original_default_reference:data.signed[Number(rawIndex)]);
   if(mode==='refuse-reference') { signed.sender_pubkey=null; }
   else if(mode==='refuse-address') { signed.from=`0x${'11'.repeat(32)}`; }
   else { signed.tx.value='0x2'; }

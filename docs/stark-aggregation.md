@@ -1040,3 +1040,38 @@ with SDK proposer, AA/custom accounts, consensus selector/quorum/penalty AIR,
 other activations/forks/platforms and public release/network acceptance require
 separate evidence. Limits, defaults, Native transcript union and prior frozen
 source meanings remain unchanged.
+
+
+### Published SDK first use with an SDK proposer
+
+```bash
+tests/e2e/dilithium-full-proof.sh sdk-both-unbound sdk-first-use-output
+tests/e2e/dilithium-full-proof.sh verify sdk-first-use-output
+```
+
+Use the published candidate and prerequisites above. The sender has a funded
+default account with zero key commitment and no registered key; the independent
+SDK proposer has a parent-registered key. The SDK's original default Reference
+first-use envelope is retained and must be refused. The public transaction builder
+adds only the sender's original public key to that same signed envelope for
+Embedded first use; transaction and signature bytes stay unchanged. This is the
+explicit first-use public-key requirement, without re-signing or replacing keys.
+
+Actual provider/RPC execution must register the sender's key in block 1. Reference
+transfers then execute in blocks 2 and 3. Both original block-1 Embedded and block-2
+Reference proof graphs must complete automatic durable recovery, real peer Native
+import/finality and receipt/fee/account comparisons. Ordinary block 3 precedes
+repeated read-only history for both targets. Existing source format 5 combines
+sender profile 6 and tag-zero address AIR for both retained zero-commitment
+targets, transaction profile 3 and SDK proposer seal profile 3. Registration
+adds the Native key lookup for Reference use; the account commitment stays zero. Both roles
+require full FIPS signature/challenge version 1 with 48-byte seeds.
+
+Genuine cross-role SDK certificates, foreign header proofs, raw/primary profiles,
+untagged address and bound-at-first-use substitutions must fail without changing
+original proofs or KV bytes. Default Reference, wrong-address and signed-tamper
+intake controls and a separately signed wrong-root ordinary import must leave
+state and key registration unchanged. These remain separate from proof-backed
+bad-block imports. Both SDK keys are memory-only; keep public outputs to resume.
+Other account/role combinations, consensus selector/quorum/penalty AIR and public
+release/network acceptance remain separate; limits and defaults are unchanged.

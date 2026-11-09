@@ -181,6 +181,9 @@ pub(crate) fn prepare_sdk_proposer(out: &Path) -> Result<(), Error> {
 pub(crate) fn prepare_sdk_both(out: &Path) -> Result<(), Error> {
     prepare_profile(out, true, true, false, true, true)
 }
+pub(crate) fn prepare_sdk_both_unbound(out: &Path) -> Result<(), Error> {
+    prepare_profile(out, true, true, true, true, true)
+}
 struct SdkProposerClient {
     child: std::process::Child,
     input: std::process::ChildStdin,
@@ -605,7 +608,7 @@ fn prepare_profile(
     }
     write(
         &out.join("actors.json"),
-        &json!({"sender":address,"sender_key":sender.public_key(),"sender_algorithm":sender.sig_type(),"proposer_algorithm":proposer.sig_type(),"private_keys_persisted":false,"unbound_sender":unbound,"native_sdk_fips_sender":sdk,"native_sdk_fips_proposer":sdk_proposer,"profile":if sdk && sdk_proposer {"native-sdk-fips-both"} else if sdk_proposer {"native-sdk-fips-proposer"} else if sdk && unbound {"native-sdk-fips-unbound"} else if sdk {"native-sdk-fips-bound"} else if unbound {"legacy-unbound"} else if legacy_sender && legacy_proposer {"legacy-both"} else if legacy_proposer {"legacy-proposer"} else {"legacy-sender"},"initial_automatic_capture_disabled_native_control":legacy_proposer || unbound || sdk,"native_transcript":"locked pqcrypto-dilithium0.5.0 raw roles; FIPS only where explicitly selected"}),
+        &json!({"sender":address,"sender_key":sender.public_key(),"sender_algorithm":sender.sig_type(),"proposer_algorithm":proposer.sig_type(),"private_keys_persisted":false,"unbound_sender":unbound,"native_sdk_fips_sender":sdk,"native_sdk_fips_proposer":sdk_proposer,"profile":if sdk && sdk_proposer && unbound {"native-sdk-fips-both-unbound"} else if sdk && sdk_proposer {"native-sdk-fips-both"} else if sdk_proposer {"native-sdk-fips-proposer"} else if sdk && unbound {"native-sdk-fips-unbound"} else if sdk {"native-sdk-fips-bound"} else if unbound {"legacy-unbound"} else if legacy_sender && legacy_proposer {"legacy-both"} else if legacy_proposer {"legacy-proposer"} else {"legacy-sender"},"initial_automatic_capture_disabled_native_control":legacy_proposer || unbound || sdk,"native_transcript":"locked pqcrypto-dilithium0.5.0 raw roles; FIPS only where explicitly selected"}),
     )?;
     node.store.flush()?;
     drop(node);
@@ -1145,7 +1148,14 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
         cases.extend([
             ("sdk-sender-as-primary-source", "SDK transaction"),
             ("sdk-sender-as-raw-account", "Dilithium3 shape"),
-            ("sdk-sender-as-primary-account", "framing"),
+            (
+                "sdk-sender-as-primary-account",
+                if unbound {
+                    "unbound signature"
+                } else {
+                    "framing"
+                },
+            ),
         ]);
     } else if sdk {
         cases[3] = ("relabelled-raw-signature", "version");
@@ -1211,8 +1221,22 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
                     .clone()
             }
             7 if sdk && sdk_proposer => proof.transactions[0].signature.transaction.version = 1,
-            8 if sdk && sdk_proposer => proof.transactions[0].signature.version = 3,
-            9 if sdk && sdk_proposer => proof.transactions[0].signature.version = 1,
+            8 if sdk && sdk_proposer => {
+                proof.transactions[0].signature.version = if unbound { 4 } else { 3 }
+            }
+            9 if sdk && sdk_proposer => {
+                proof.transactions[0].signature.version = if unbound { 2 } else { 1 }
+            }
+            10 if sdk && sdk_proposer && unbound => {
+                proof.transactions[0].signature.tagged_key = Some(
+                    proof.transactions[0]
+                        .signature
+                        .transaction
+                        .public_key_hash
+                        .clone(),
+                )
+            }
+            11 if sdk && sdk_proposer && unbound => proof.transactions[0].signature.version = 5,
             4 if sdk => proof.transactions[0].signature.transaction.version = 1,
             5 if sdk => proof.transactions[0].signature.version = if unbound { 4 } else { 3 },
             6 if sdk => proof.transactions[0].signature.version = if unbound { 2 } else { 1 },
