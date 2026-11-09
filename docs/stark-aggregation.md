@@ -172,6 +172,25 @@ retain all sources and proofs. Account MPT shapes can change certificate counts
 between the two jobs; the complete consumer predicates and execution results
 decide acceptance. Existing quotas and activation settings are unchanged.
 
+The mixed full-batch entry creates sixteen independently funded sender keys and
+a distinct proposer. Eight senders start bound and registered in Reference mode;
+eight start unbound and unregistered in Embedded mode:
+
+```bash
+tests/e2e/mldsa-full-proof.sh mixed-first-use mixed-first-use-test
+tests/e2e/mldsa-full-proof.sh verify mixed-first-use-test
+```
+
+It reconstructs the eight/eight genesis independently and checks both sender
+proof versions in each complete graph. The valid first child registers the eight
+fresh keys. A later all-Reference signed wrong-root child must pass full AIR and
+execute all sixteen VM transactions before refusal without Native writes. The
+ordinary correct successor changes current state for cold historical replay.
+Genuine foreign-key/address certificates and an altered intermediate Keccak lane
+must fail. Existing checkpoint, payload and transport limits remain in force;
+this isolated regression does not establish other account distributions,
+sustained capacity, publication or network activation.
+
 Design: [Unbound default-account signature proofs](adr/unbound-default-signature-proofs.md).
 
 ## Ordinary peer admission with complete proofs (unreleased)

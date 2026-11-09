@@ -54,10 +54,13 @@ fn prepare(
     full: bool,
     batch_count: usize,
     sender_count: usize,
-    first_use: bool,
+    unbound_count: usize,
 ) -> Result<(), Error> {
+    let first_use = unbound_count > 0;
     ensure(
-        matches!(sender_count, 1 | 2 | 8 | 16) && (sender_count == 1 || batch_count == 16 && full),
+        matches!(sender_count, 1 | 2 | 8 | 16)
+            && unbound_count <= sender_count
+            && (sender_count == 1 || batch_count == 16 && full),
         "invalid registered sender profile",
     )?;
     let batch = batch_count > 1;
@@ -120,11 +123,11 @@ fn prepare(
         let stores = RocksDbStore::open_all(out.join(role).join("db"), None)?;
         let store = Arc::new(stores.state.clone());
         let mut world = WorldState::new(store.clone());
-        for (sender, address) in senders.iter().zip(&addresses) {
+        for (index, (sender, address)) in senders.iter().zip(&addresses).enumerate() {
             world.set_account(
                 address,
                 &Account::new_user_account(
-                    if first_use {
+                    if index < unbound_count {
                         ShellHash::ZERO
                     } else {
                         blake3_hash(sender.public_key())
@@ -152,8 +155,8 @@ fn prepare(
             genesis_hash = Some(genesis.hash());
         }
         let chain = ChainStore::new(store.clone());
-        for (sender, address) in senders.iter().zip(&addresses) {
-            if !first_use {
+        for (index, (sender, address)) in senders.iter().zip(&addresses).enumerate() {
+            if index >= unbound_count {
                 chain.put_pubkey(address, sender.public_key())?;
             }
         }
@@ -266,31 +269,37 @@ fn prepare(
         }
         let signature = sender.sign(tx.signing_hash(sender.sig_type().as_u8()).as_bytes())?;
         let mut signed = SignedTransaction::new(addresses[index], tx, signature);
-        if first_use {
+        if index < unbound_count {
             signed.pubkey_mode = shell_core::PubkeyMode::Embedded(sender.public_key().to_vec());
         }
         node.handle_incoming_tx(signed, &MultiVerifier)?;
     }
     if first_use {
-        ensure(
-            node.chain_store.get_pubkey(&address)?.is_none(),
-            "first-use mempool admission registered the key before canonical execution",
-        )?;
+        for address in addresses.iter().take(unbound_count) {
+            ensure(
+                node.chain_store.get_pubkey(address)?.is_none(),
+                "first-use mempool admission registered a key before canonical execution",
+            )?;
+        }
     }
     let block = node.produce_block(proposer.as_ref(), 100)?;
     if first_use {
         let parent = node
             .chain_store
             .canonical_parent_view(block.hash(), block.header.parent_hash)?;
-        for (sender, address) in senders.iter().zip(&addresses) {
+        for (index, (sender, address)) in senders.iter().zip(&addresses).enumerate() {
+            let parent_key = parent.registered_key(address)?;
+            let account = parent
+                .world_state()?
+                .get_account(address)?
+                .ok_or("parent account absent")?;
             ensure(
-                parent.registered_key(address)?.is_none()
-                    && parent
-                        .world_state()?
-                        .get_account(address)?
-                        .is_some_and(|a| a.pq_pubkey_hash == ShellHash::ZERO)
-                    && node.chain_store.get_pubkey(address)?.as_deref()
-                        == Some(sender.public_key()),
+                (if index < unbound_count {
+                    parent_key.is_none() && account.pq_pubkey_hash == ShellHash::ZERO
+                } else {
+                    parent_key.as_deref() == Some(sender.public_key())
+                        && account.pq_pubkey_hash == blake3_hash(sender.public_key())
+                }) && node.chain_store.get_pubkey(address)?.as_deref() == Some(sender.public_key()),
                 "first-use parent absence or native registration mismatch",
             )?;
         }
@@ -310,16 +319,23 @@ fn prepare(
             .err()
             .ok_or("wrong-root first-use block was accepted")?
             .to_string();
+        let unbound_keys_absent =
+            addresses
+                .iter()
+                .take(unbound_count)
+                .try_fold(true, |ok, address| {
+                    Ok::<_, Error>(ok && failed_node.chain_store.get_pubkey(address)?.is_none())
+                })?;
         ensure(
             error.contains("state root mismatch")
                 && error.contains(&format!("{:?}", block.header.state_root))
                 && before == failed.scan_all()?
-                && failed_node.chain_store.get_pubkey(&address)?.is_none(),
+                && unbound_keys_absent,
             "first-use root refusal happened before execution or leaked registration",
         )?;
         write(
             &out.join("first-use-native-root-rollback.json"),
-            &json!({"error":error,"computed_root":block.header.state_root,"native_crypto_control_not_proof_admission":true,"all_kv_unchanged":true,"key_registered":false,"transactions_executed_before_root_refusal":count}),
+            &json!({"error":error,"computed_root":block.header.state_root,"native_crypto_control_not_proof_admission":true,"all_kv_unchanged":true,"key_registered":false,"unbound_key_count":unbound_count,"transactions_executed_before_root_refusal":count}),
         )?;
     }
     ensure(
@@ -364,7 +380,7 @@ fn prepare(
     store.flush()?;
     write(
         &out.join("control.json"),
-        &json!({"native_digest":digest(store.as_ref())?,"parent":block.header.parent_hash,"block":block.hash(),"state_root":block.header.state_root,"receipts":node.chain_store.get_receipts(&block.hash())?,"accounts":accounts(store.clone(), &block)?,"raw_fresh_sender_count":senders.len(),"first_use_parent_unregistered":first_use,"private_keys_persisted":false}),
+        &json!({"native_digest":digest(store.as_ref())?,"parent":block.header.parent_hash,"block":block.hash(),"state_root":block.header.state_root,"receipts":node.chain_store.get_receipts(&block.hash())?,"accounts":accounts(store.clone(), &block)?,"raw_fresh_sender_count":senders.len(),"first_use_parent_unregistered":first_use,"unbound_sender_count":unbound_count,"unbound_sender_addresses":addresses[..unbound_count],"private_keys_persisted":false}),
     )?;
     if capture_on_production {
         let captured = node.canonical_production_status(block.hash())?;
@@ -552,7 +568,7 @@ fn prepare(
             bad_store.flush()?;
             write(
                 &out.join("batch-fixture.json"),
-                &json!({"good1_natively_executed":true,"control2_natively_executed":true,"bad2_storage_only_byzantine_source":true,"bad2_not_execution_evidence":true,"private_keys_persisted":false,"transactions_per_block":count,"registered_sender_keys":senders.len(),"first_use_parent_unregistered":first_use}),
+                &json!({"good1_natively_executed":true,"control2_natively_executed":true,"bad2_storage_only_byzantine_source":true,"bad2_not_execution_evidence":true,"private_keys_persisted":false,"transactions_per_block":count,"registered_sender_keys":senders.len(),"first_use_parent_unregistered":first_use,"unbound_sender_count":unbound_count}),
             )?;
         }
         store.flush()?;
@@ -686,14 +702,15 @@ fn main() -> Result<(), Error> {
     )?;
     let out = Path::new(&args[1]);
     match args[0].as_str() {
-        "prepare" => prepare(out, false, false, false, 0, 1, false),
-        "prepare-full" => prepare(out, false, true, true, 0, 1, false),
-        "prepare-batch" => prepare(out, false, true, true, 2, 1, false),
-        "prepare-first-use" => prepare(out, false, true, true, 2, 1, true),
-        "prepare-wide" => prepare(out, false, true, true, 16, 1, false),
-        "prepare-mixed" => prepare(out, false, true, true, 16, 2, false),
-        "prepare-eight-keys" => prepare(out, false, true, true, 16, 8, false),
-        "prepare-sixteen-keys" => prepare(out, false, true, true, 16, 16, false),
+        "prepare" => prepare(out, false, false, false, 0, 1, 0),
+        "prepare-full" => prepare(out, false, true, true, 0, 1, 0),
+        "prepare-batch" => prepare(out, false, true, true, 2, 1, 0),
+        "prepare-first-use" => prepare(out, false, true, true, 2, 1, 1),
+        "prepare-wide" => prepare(out, false, true, true, 16, 1, 0),
+        "prepare-mixed" => prepare(out, false, true, true, 16, 2, 0),
+        "prepare-eight-keys" => prepare(out, false, true, true, 16, 8, 0),
+        "prepare-sixteen-keys" => prepare(out, false, true, true, 16, 16, 0),
+        "prepare-mixed-first-use" => prepare(out, false, true, true, 16, 16, 8),
         "mixed-key-swap" => admission_runtime::mixed_key_refusal(out),
         "matrix-aggregate-refusal" => admission_runtime::aggregate_refusal(out),
         "unbound-address-refusal" => admission_runtime::unbound_address_refusal(out),
@@ -704,22 +721,33 @@ fn main() -> Result<(), Error> {
         | "eight-keys-pause"
         | "eight-keys-resume"
         | "sixteen-keys-pause"
-        | "sixteen-keys-resume" => tokio::runtime::Runtime::new()?.block_on(
+        | "sixteen-keys-resume"
+        | "mixed-first-use-pause"
+        | "mixed-first-use-resume" => tokio::runtime::Runtime::new()?.block_on(
             admission_runtime::batch(out, args[0].ends_with("-pause"), true),
         ),
-        "wide-snapshot" | "mixed-snapshot" | "eight-keys-snapshot" | "sixteen-keys-snapshot" => {
-            admission_runtime::snapshot_wide(out)
-        }
-        "wide-verify" | "mixed-verify" | "eight-keys-verify" | "sixteen-keys-verify" => {
-            admission_runtime::verify_batch(out, false, false, true)
-        }
-        "wide-history" | "mixed-history" | "eight-keys-history" | "sixteen-keys-history" => {
-            admission_runtime::verify_batch(out, true, true, true)
-        }
+        "wide-snapshot"
+        | "mixed-snapshot"
+        | "eight-keys-snapshot"
+        | "sixteen-keys-snapshot"
+        | "mixed-first-use-snapshot" => admission_runtime::snapshot_wide(out),
+        "wide-verify"
+        | "mixed-verify"
+        | "eight-keys-verify"
+        | "sixteen-keys-verify"
+        | "mixed-first-use-verify" => admission_runtime::verify_batch(out, false, false, true),
+        "wide-history"
+        | "mixed-history"
+        | "eight-keys-history"
+        | "sixteen-keys-history"
+        | "mixed-first-use-history" => admission_runtime::verify_batch(out, true, true, true),
         "wide-history-verify"
         | "mixed-history-verify"
         | "eight-keys-history-verify"
-        | "sixteen-keys-history-verify" => admission_runtime::verify_batch(out, true, false, true),
+        | "sixteen-keys-history-verify"
+        | "mixed-first-use-history-verify" => {
+            admission_runtime::verify_batch(out, true, false, true)
+        }
         "full-pause" | "full-resume" | "full-bad-proposer" => {
             tokio::runtime::Runtime::new()?.block_on(admission_runtime::full(out, &args[0]))
         }
@@ -752,8 +780,8 @@ fn main() -> Result<(), Error> {
         "full-history" | "full-history-verify" => {
             admission_runtime::history_full(out, args[0] == "full-history")
         }
-        "prepare-runtime" => prepare(out, true, false, false, 0, 1, false),
-        "prepare-production-hook" => prepare(out, false, true, false, 0, 1, false),
+        "prepare-runtime" => prepare(out, true, false, false, 0, 1, 0),
+        "prepare-production-hook" => prepare(out, false, true, false, 0, 1, 0),
         "runtime-pause" | "runtime-resume" => {
             tokio::runtime::Runtime::new()?.block_on(runtime::run(out, args[0] == "runtime-pause"))
         }

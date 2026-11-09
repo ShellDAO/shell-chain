@@ -312,18 +312,22 @@ fn prepare_from(out: &Path, directory: &str, source_path: &Path) -> Result<(), E
     let keys = sender_addresses(&block)
         .into_iter()
         .map(|address| {
-            let key = if first_use {
-                block
-                    .transactions
-                    .iter()
-                    .find(|tx| tx.from == address)
-                    .and_then(|tx| tx.pubkey_mode.pubkey_bytes())
+            let transaction = block
+                .transactions
+                .iter()
+                .find(|tx| tx.from == address)
+                .ok_or("source transaction absent")?;
+            let unbound = first_use && transaction.pubkey_mode.is_embedded();
+            let key = if unbound {
+                transaction
+                    .pubkey_mode
+                    .pubkey_bytes()
                     .ok_or("first-use Embedded source key absent")?
                     .to_vec()
             } else {
                 chain.get_pubkey(&address)?.ok_or("parent key absent")?
             };
-            Ok((address, key))
+            Ok((address, key, unbound))
         })
         .collect::<Result<Vec<_>, Error>>()?;
     let stores = RocksDbStore::open_all(network.join("receiver/db"), None)?;
@@ -334,11 +338,11 @@ fn prepare_from(out: &Path, directory: &str, source_path: &Path) -> Result<(), E
     } else {
         1_000_000
     };
-    for (address, key) in &keys {
+    for (address, key, unbound) in &keys {
         world.set_account(
             address,
             &Account::new_user_account(
-                if first_use {
+                if *unbound {
                     ShellHash::ZERO
                 } else {
                     blake3_hash(key)
@@ -352,8 +356,8 @@ fn prepare_from(out: &Path, directory: &str, source_path: &Path) -> Result<(), E
         "independent receiver genesis mismatch",
     )?;
     let target = ChainStore::new(store.clone());
-    for (address, key) in &keys {
-        if !first_use {
+    for (address, key, unbound) in &keys {
+        if !unbound {
             target.put_pubkey(address, key)?;
         }
     }
@@ -361,17 +365,18 @@ fn prepare_from(out: &Path, directory: &str, source_path: &Path) -> Result<(), E
     target.commit_genesis_block(&genesis, &config)?;
     let initial_registered =
         keys.iter()
-            .try_fold(0usize, |count, (address, _)| -> Result<usize, Error> {
+            .try_fold(0usize, |count, (address, _, _)| -> Result<usize, Error> {
                 Ok(count + usize::from(target.get_pubkey(address)?.is_some()))
             })?;
+    let initial_unbound = keys.iter().filter(|(_, _, unbound)| *unbound).count();
     ensure(
-        initial_registered == if first_use { 0 } else { keys.len() },
+        initial_registered == keys.len() - initial_unbound,
         "independent receiver parent registry mismatch",
     )?;
     store.flush()?;
     write(
         &network.join("initial.json"),
-        &json!({"head":genesis.hash(),"native_digest":canonical_digest(store.as_ref())?,"independent_genesis":true,"first_use_parent_unregistered":first_use,"initial_registered_sender_keys":initial_registered,"private_keys_persisted":false}),
+        &json!({"head":genesis.hash(),"native_digest":canonical_digest(store.as_ref())?,"independent_genesis":true,"first_use_parent_unregistered":first_use,"initial_registered_sender_keys":initial_registered,"initial_unbound_sender_keys":initial_unbound,"private_keys_persisted":false}),
     )?;
     Ok(())
 }
@@ -1536,9 +1541,14 @@ pub(super) async fn batch(out: &Path, pause: bool, wide: bool) -> Result<(), Err
     let first_use = profile["first_use_parent_unregistered"]
         .as_bool()
         .unwrap_or(false);
+    let unbound_senders = profile["unbound_sender_count"]
+        .as_u64()
+        .unwrap_or(u64::from(first_use)) as usize;
     let senders = profile["registered_sender_keys"].as_u64().unwrap_or(1) as usize;
     ensure(
-        (wide && matches!(senders, 1 | 2 | 8 | 16)) || !wide && senders == 1,
+        ((wide && matches!(senders, 1 | 2 | 8 | 16)) || !wide && senders == 1)
+            && unbound_senders <= senders
+            && first_use == (unbound_senders > 0),
         "unsupported fixture sender count",
     )?;
     let components = if senders == 16 {
@@ -1660,9 +1670,17 @@ pub(super) async fn batch(out: &Path, pause: bool, wide: bool) -> Result<(), Err
                 if first_use {
                     let parent = receiver.node.chain_store.canonical_parent_view(c.block, good.header.parent_hash)?;
                     for tx in &good.transactions {
-                        ensure(parent.registered_key(&tx.from)?.is_none()
-                            && receiver.node.chain_store.get_pubkey(&tx.from)?.as_deref() == tx.pubkey_mode.pubkey_bytes(),
-                            "first-use proof admission did not atomically register the exact Embedded key")?;
+                        let prior_key = parent.registered_key(&tx.from)?;
+                        let current_key = receiver.node.chain_store.get_pubkey(&tx.from)?;
+                        let account = parent.world_state()?.get_account(&tx.from)?.ok_or("historical sender absent")?;
+                        let valid = if let Some(embedded) = tx.pubkey_mode.pubkey_bytes() {
+                            prior_key.is_none() && account.pq_pubkey_hash == ShellHash::ZERO
+                                && current_key.as_deref() == Some(embedded)
+                        } else {
+                            prior_key.as_ref().is_some_and(|key| account.pq_pubkey_hash == blake3_hash(key))
+                                && current_key == prior_key
+                        };
+                        ensure(valid, "proof admission did not preserve the exact mixed parent/registered key bindings")?;
                     }
                 }
                 let before = canonical_digest(receiver.node.store.as_ref())?;
@@ -1682,6 +1700,7 @@ pub(super) async fn batch(out: &Path, pause: bool, wide: bool) -> Result<(), Err
                     && receiver.node.chain_store.get_receipts(&bad.hash())?.is_none()
                     && canonical_digest(receiver.node.store.as_ref())? == before, "failed batch leaked native writes")?;
                 ensure((if first_use { counts[0] > 0 && counts[1] > 0 } else if senders == 16 { counts[0] >= components && counts[0] == counts[1] } else { counts == [components,components] }) && production2["status"]["state"] == "complete", "batch full graph incomplete")?;
+                let mut sender_profiles = Vec::new();
                 for (hash, status, store, name) in [(c.block, &admission1, receiver.node.store.clone(), "good"), (bad.hash(), &production2, provider.node.store.clone(), "bad")] {
                     let manifest: CanonicalProofManifest = serde_json::from_value(status["status"]["manifest"].clone())?;
                     ensure(manifest.block_hash == hash, "batch manifest mismatch")?;
@@ -1692,6 +1711,26 @@ pub(super) async fn batch(out: &Path, pause: bool, wide: bool) -> Result<(), Err
                     let bytes = cache.payload(&manifest.id())?;
                     let proof = shell_stark_prover::compact_canonical::decode_payload(&bytes)?;
                     ensure(proof.version == 2 && proof.proposer.is_some() && proof.transactions.len() == count, "full batch profile downgraded")?;
+                    let profiles: Vec<_> = proof.transactions.iter().map(|tx| tx.signature.version).collect();
+                    let unbound_proofs = unbound_senders * per_sender;
+                    ensure(profiles.iter().filter(|&&version| version == 2).count() == unbound_proofs
+                        && profiles.iter().filter(|&&version| version == 1).count() == count - unbound_proofs,
+                        "actual bound/unbound sender proof composition differs from genesis")?;
+                    let body = if hash == c.block { &good } else { &bad };
+                    let mut senders = Vec::new();
+                    for (entry, transaction) in proof.transactions.iter().zip(&body.transactions) {
+                        let address_certificate = if entry.signature.version == 2 {
+                            let address = entry.signature.tagged_key.as_ref().ok_or("unbound address certificate absent")?;
+                            let key = &entry.signature.transaction.public_key_hash.message;
+                            ensure(key.len() == 1952 && address.message.len() == 1953
+                                && address.message[0] == shell_crypto::SignatureType::MlDsa65.as_u8()
+                                && address.message[1..] == *key
+                                && &address.output == transaction.from.as_bytes(), "unbound proof does not bind the full sender/key")?;
+                            Some(blake3_hash(&serde_json::to_vec(address)?))
+                        } else { None };
+                        senders.push(json!({"from":transaction.from,"version":entry.signature.version,"embedded":transaction.pubkey_mode.is_embedded(),"address_certificate_hash":address_certificate}));
+                    }
+                    sender_profiles.push(json!({"target":name,"profiles":profiles,"senders":senders}));
                     use std::io::Write;
                     let extension = if wide { "cbor" } else { "json" };
                     let path = network.join(format!("{name}-proof.{extension}"));
@@ -1701,7 +1740,7 @@ pub(super) async fn batch(out: &Path, pause: bool, wide: bool) -> Result<(), Err
                     if path.exists() { ensure(read::<CanonicalProofManifest>(&path)? == manifest, "retained batch manifest changed")?; }
                     else { write(&path, &manifest)?; }
                 }
-                write(&network.join("complete.json"), &json!({"production1":production1["status"],"production2":production2["status"],"admission1":admission1,"admission2":admission2,"native_digest":before,"served_chunks":faults.chunks.load(Ordering::SeqCst),"both_native_transactions_executed_before_wrong_root_refusal":count==2,"native_transactions_executed_before_wrong_root_refusal":count,"unbound_first_use_registration_verified":first_use,"failed_batch_native_unchanged":true,"bad_source_is_storage_only_byzantine_fixture":true,"finalized":finalized}))?;
+                write(&network.join("complete.json"), &json!({"production1":production1["status"],"production2":production2["status"],"admission1":admission1,"admission2":admission2,"native_digest":before,"served_chunks":faults.chunks.load(Ordering::SeqCst),"both_native_transactions_executed_before_wrong_root_refusal":count==2,"native_transactions_executed_before_wrong_root_refusal":count,"unbound_first_use_registration_verified":first_use,"sender_profiles":sender_profiles,"failed_batch_native_unchanged":true,"bad_source_is_storage_only_byzantine_fixture":true,"finalized":finalized}))?;
                 break;
             }
             ensure(tokio::time::Instant::now() < deadline && last_progress.elapsed() < Duration::from_secs(idle_bound), "batch progress bound exceeded")?;
@@ -1885,7 +1924,12 @@ fn certificate_refusal(out: &Path, fault: CertificateFault) -> Result<(), Error>
         )?;
         xof.permutations[0].rounds[11].theta[24] ^= 1;
     } else if fault == CertificateFault::Address {
-        let signature = &mut proof.transactions[0].signature;
+        let signature = &mut proof
+            .transactions
+            .iter_mut()
+            .find(|tx| tx.signature.version == 2)
+            .ok_or("unbound sender proof absent")?
+            .signature;
         ensure(
             signature.version == 2 && signature.tagged_key.is_some(),
             "unbound address profile absent",

@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep complete BLAKE3 hash containers in one bounded availability dictionary
+  entry, preserving every compression proof and version-2/JSON decoding. Recheck a
+  retained failed producer job once when a new worker starts after repair.
+- Share complete account-MPT subcertificates in bounded local checkpoints,
+  reconstructing original component bytes and hashes before full AIR checks.
+  Keep atomic global quota accounting and read-only historical queries.
 - Continue ordinary synchronization from the next native height after a
   proof-backed child is committed or recovered. Preserve finality certificate
   discovery, continue requested unfinalized announcements with a new nonce,
@@ -15,6 +21,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add a fresh sixteen-sender mixed bound/unbound full-proof regression with
+  independent genesis registration checks, real key registration, all-Reference
+  rollback, historical replay and genuine-certificate refusal controls.
 - Extend complete canonical ML-DSA-65 proofs to funded unbound default accounts:
   Embedded first use and subsequent registered Reference keys. Prove the full
   algorithm-tagged sender address in BLAKE3 AIR and retain the bound-account

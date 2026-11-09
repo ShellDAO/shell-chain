@@ -11,6 +11,7 @@ use std::{
 };
 
 const PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v2/";
+const HASH_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v3/";
 const COMPONENT: &[u8] = b"\0canonical-component/cbor/v1/";
 const REF: &str = "$certificate";
 const MAX_BYTES: usize = 256 * 1024 * 1024;
@@ -259,12 +260,40 @@ fn has_reference(v: &Value) -> bool {
         _ => false,
     }
 }
+fn hash_container(v: &Map<String, Value>) -> bool {
+    v.len() == 4
+        && v.contains_key("version")
+        && ["compressions", "message", "output"]
+            .iter()
+            .all(|k| v.get(*k).is_some_and(Value::is_array))
+}
 #[derive(Default)]
 struct Packer {
     certificates: Vec<Certificate>,
     indexed: HashMap<ShellHash, usize>,
 }
 impl Packer {
+    fn reference(&mut self, bytes: Vec<u8>) -> Result<Value, String> {
+        let hash = blake3_hash(&bytes);
+        let index = if let Some(index) = self.indexed.get(&hash) {
+            if self.certificates[*index].data.0 != bytes {
+                return Err("certificate hash collision".into());
+            }
+            *index
+        } else {
+            if self.certificates.len() >= MAX_CERTIFICATES {
+                return Err("certificate pool count limit".into());
+            }
+            let index = self.certificates.len();
+            self.certificates.push(Certificate {
+                hash,
+                data: Bytes(bytes),
+            });
+            self.indexed.insert(hash, index);
+            index
+        };
+        Ok(serde_json::json!({(REF):index}))
+    }
     fn pack(&mut self, v: Value, remaining: usize) -> Result<Value, String> {
         let next = depth(remaining)?;
         match v {
@@ -275,32 +304,28 @@ impl Packer {
                 if v.values().any(has_reference) {
                     return Err("reserved nested certificate reference".into());
                 }
-                let bytes = encode_value(Value::Object(v), MAX_CERTIFICATE_BYTES)?;
-                let hash = blake3_hash(&bytes);
-                let index = if let Some(index) = self.indexed.get(&hash) {
-                    if self.certificates[*index].data.0 != bytes {
-                        return Err("certificate hash collision".into());
-                    }
-                    *index
-                } else {
-                    if self.certificates.len() >= MAX_CERTIFICATES {
-                        return Err("certificate pool count limit".into());
-                    }
-                    let index = self.certificates.len();
-                    self.certificates.push(Certificate {
-                        hash,
-                        data: Bytes(bytes),
-                    });
-                    self.indexed.insert(hash, index);
-                    index
-                };
-                Ok(serde_json::json!({(REF):index}))
+                self.reference(encode_value(Value::Object(v), MAX_CERTIFICATE_BYTES)?)
             }
-            Value::Object(v) => Ok(Value::Object(
-                v.into_iter()
-                    .map(|(k, v)| Ok((k, self.pack(v, next)?)))
-                    .collect::<Result<_, String>>()?,
-            )),
+            Value::Object(v) => {
+                // A bounded complete hash shares one pool slot, retaining every
+                // original compression certificate and its exact public inputs.
+                // Larger body hashes retain the original per-child framing.
+                if hash_container(&v) {
+                    if v.values().any(has_reference) {
+                        return Err("reserved nested certificate reference".into());
+                    }
+                    match encode_value(Value::Object(v.clone()), MAX_CERTIFICATE_BYTES) {
+                        Ok(bytes) => return self.reference(bytes),
+                        Err(error) if error.contains("byte limit") => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(Value::Object(
+                    v.into_iter()
+                        .map(|(k, v)| Ok((k, self.pack(v, next)?)))
+                        .collect::<Result<_, String>>()?,
+                ))
+            }
             Value::Array(v) => Ok(Value::Array(
                 v.into_iter()
                     .map(|v| self.pack(v, next))
@@ -334,9 +359,10 @@ struct Unpacker<'a> {
     uses: Vec<bool>,
     references: usize,
     pool_json: usize,
+    hash_containers: bool,
 }
 impl<'a> Unpacker<'a> {
-    fn new(certificates: &'a [Certificate]) -> Result<Self, String> {
+    fn new(certificates: &'a [Certificate], hash_containers: bool) -> Result<Self, String> {
         if certificates.len() > MAX_CERTIFICATES {
             return Err("certificate pool count limit".into());
         }
@@ -352,6 +378,7 @@ impl<'a> Unpacker<'a> {
             uses: vec![false; certificates.len()],
             references: 0,
             pool_json: 0,
+            hash_containers,
         })
     }
     fn expand(&mut self, v: Value, budget: &mut usize, remaining: usize) -> Result<Value, String> {
@@ -374,9 +401,9 @@ impl<'a> Unpacker<'a> {
                 // Each recipient gets a freshly decoded untrusted value and full AIR.
                 let value = decode_value(&self.certificates[index].data.0)?;
                 if has_reference(&value)
-                    || !value
-                        .as_object()
-                        .is_some_and(|v| v.keys().any(|k| byte_field(k)))
+                    || !value.as_object().is_some_and(|v| {
+                        v.keys().any(|k| byte_field(k)) || self.hash_containers && hash_container(v)
+                    })
                 {
                     return Err("chained or invalid compact certificate".into());
                 }
@@ -466,7 +493,7 @@ pub fn encode_payload(
         })
         .transpose()?;
     let frame = Frame {
-        format_version: 2,
+        format_version: 3,
         proof_version: proof.version,
         transactions,
         proposer,
@@ -476,11 +503,69 @@ pub fn encode_payload(
     let bytes = cbor(
         &frame,
         limit
-            .checked_sub(PAYLOAD.len())
+            .checked_sub(HASH_PAYLOAD.len())
             .ok_or("compact payload byte limit")?,
     )?;
-    Ok([PAYLOAD, bytes.as_slice()].concat())
+    Ok([HASH_PAYLOAD, bytes.as_slice()].concat())
 }
+/// Lossless component dictionary for local checkpoint storage. No proof is
+/// accepted here; restoration is followed by the producer's full AIR checks.
+pub struct CheckpointParts {
+    pub template: String,
+    pub certificates: Vec<Vec<u8>>,
+}
+pub fn split_checkpoint(bytes: &[u8]) -> Result<Option<CheckpointParts>, String> {
+    let Some(body) = bytes.strip_prefix(COMPONENT) else {
+        return Ok(None);
+    };
+    if body.len() > MAX_CERTIFICATE_BYTES {
+        return Err("checkpoint component byte limit".into());
+    }
+    let value = decode_value(body)?;
+    if encode_value(value.clone(), MAX_CERTIFICATE_BYTES)? != body {
+        return Err("noncanonical checkpoint component".into());
+    }
+    let mut packer = Packer::default();
+    let packed = packer.pack(value, MAX_DEPTH)?;
+    if packer.certificates.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(CheckpointParts {
+        template: String::from_utf8(template(&packed)?.0).map_err(|e| e.to_string())?,
+        certificates: packer.certificates.into_iter().map(|c| c.data.0).collect(),
+    }))
+}
+pub fn restore_checkpoint(template: &str, certificates: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    if template.len() > MAX_TEMPLATE_BYTES || certificates.len() > MAX_CERTIFICATES {
+        return Err("checkpoint dictionary template/count limit".into());
+    }
+    let mut total = 0usize;
+    for part in certificates {
+        total = total
+            .checked_add(part.len())
+            .ok_or("checkpoint dictionary size overflow")?;
+        if part.len() > MAX_CERTIFICATE_BYTES
+            || total > MAX_CERTIFICATE_BYTES + MAX_CERTIFICATES * 64
+        {
+            return Err("checkpoint dictionary certificate byte limit".into());
+        }
+    }
+    let value: Value = serde_json::from_str(template).map_err(|e| e.to_string())?;
+    let pool: Vec<_> = certificates
+        .iter()
+        .map(|data| Certificate {
+            hash: blake3_hash(data),
+            data: Bytes(data.clone()),
+        })
+        .collect();
+    let mut unpacker = Unpacker::new(&pool, true)?;
+    let mut budget = 4 * MAX_CERTIFICATE_BYTES;
+    let value = unpacker.expand(value, &mut budget, MAX_DEPTH)?;
+    unpacker.finish()?;
+    let body = encode_value(value, MAX_CERTIFICATE_BYTES)?;
+    Ok([COMPONENT, body.as_slice()].concat())
+}
+
 fn template_bound(frame: &Frame) -> Result<(), String> {
     let bytes = frame
         .transactions
@@ -500,11 +585,15 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
     if bytes.len() > MAX_BYTES {
         return Err("canonical payload byte limit".into());
     }
-    let Some(bytes) = bytes.strip_prefix(PAYLOAD) else {
+    let (bytes, version) = if let Some(bytes) = bytes.strip_prefix(HASH_PAYLOAD) {
+        (bytes, 3)
+    } else if let Some(bytes) = bytes.strip_prefix(PAYLOAD) {
+        (bytes, 2)
+    } else {
         return serde_json::from_slice(bytes).map_err(|e| e.to_string());
     };
     let frame: Frame = uncbor(bytes)?;
-    if frame.format_version != 2
+    if frame.format_version != version
         || frame.transactions.is_empty()
         || frame.transactions.len() > MAX_CANONICAL_SIGNATURE_BATCH
         || !matches!(
@@ -518,7 +607,7 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
     if cbor(&frame, MAX_BYTES)? != bytes {
         return Err("noncanonical compact frame".into());
     }
-    let mut unpacker = Unpacker::new(&frame.certificates)?;
+    let mut unpacker = Unpacker::new(&frame.certificates, version == 3)?;
     let mut transactions = Vec::with_capacity(frame.transactions.len());
     for bytes in frame.transactions {
         let value: Value = serde_json::from_slice(&bytes.0).map_err(|e| e.to_string())?;
@@ -547,6 +636,92 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn checkpoint_dictionary_restores_exact_bytes_and_rejects_missing_or_unused_parts() {
+        let value = json!({"version":1,"address_hash":{"proof_bytes":[1,2]},
+            "nodes":[{"proof_bytes":[3,4]}, {"proof_bytes":[1,2]}]});
+        let original = encode_component(&value).unwrap();
+        let parts = split_checkpoint(&original).unwrap().unwrap();
+        assert_eq!(parts.certificates.len(), 2);
+        assert_eq!(
+            restore_checkpoint(&parts.template, &parts.certificates).unwrap(),
+            original
+        );
+        assert!(restore_checkpoint(&parts.template, &parts.certificates[..1]).is_err());
+        let mut extra = parts.certificates.clone();
+        extra.push(encode_value(json!({"proof_bytes":[7]}), MAX_CERTIFICATE_BYTES).unwrap());
+        assert!(restore_checkpoint(&parts.template, &extra).is_err());
+        assert!(split_checkpoint(br#"{"version":1}"#).unwrap().is_none());
+        assert!(
+            split_checkpoint(&encode_component(&json!({"proof_bytes":[1]})).unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[test]
+    fn bounded_hash_containers_pool_without_losing_compressions_or_legacy_readability() {
+        // Codec-only values; successful decoding never grants cryptographic authority.
+        let children: Vec<_> = (0..32)
+            .map(|i| json!({"version":1,"input":i,"operations":[i,7],"proof_bytes":[i,42]}))
+            .collect();
+        let value =
+            json!({"version":1,"message":[1,2],"output":vec![3;32],"compressions":children});
+        let mut current = Packer::default();
+        let packed = current.pack(value.clone(), MAX_DEPTH).unwrap();
+        assert_eq!(current.certificates.len(), 1);
+        assert_eq!(current.pack(value.clone(), MAX_DEPTH).unwrap(), packed);
+        let mut old_reader = Unpacker::new(&current.certificates, false).unwrap();
+        let mut old_budget = MAX_BYTES;
+        assert!(old_reader
+            .expand(packed.clone(), &mut old_budget, MAX_DEPTH)
+            .is_err());
+        let mut reader = Unpacker::new(&current.certificates, true).unwrap();
+        let mut budget = MAX_BYTES;
+        assert_eq!(
+            reader.expand(packed, &mut budget, MAX_DEPTH).unwrap(),
+            value
+        );
+        reader.finish().unwrap();
+        let mut legacy = Packer::default();
+        let mut template = value.clone();
+        for child in template["compressions"].as_array_mut().unwrap() {
+            *child = legacy.pack(child.clone(), MAX_DEPTH).unwrap();
+        }
+        assert_eq!(legacy.certificates.len(), 32);
+        let mut reader = Unpacker::new(&legacy.certificates, false).unwrap();
+        let mut budget = MAX_BYTES;
+        assert_eq!(
+            reader.expand(template, &mut budget, MAX_DEPTH).unwrap(),
+            value
+        );
+        reader.finish().unwrap();
+        let reserved = json!({"compressions":[{"proof_bytes":[1],"nested":{(REF):0}}],"message":[],"output":[]});
+        assert!(Packer::default()
+            .pack(reserved, MAX_DEPTH)
+            .unwrap_err()
+            .contains("reserved"));
+    }
+    #[test]
+    fn oversized_hash_container_keeps_bounded_child_framing() {
+        let value = json!({"version":2,"message":[],"output":[],"compressions":[
+            {"input":0,"operations":vec![u64::MAX;500_000],"proof_bytes":[1]},
+            {"input":1,"operations":vec![u64::MAX;500_000],"proof_bytes":[2]}]});
+        let mut packer = Packer::default();
+        let template = packer.pack(value.clone(), MAX_DEPTH).unwrap();
+        assert!(template.get("compressions").is_some());
+        assert_eq!(packer.certificates.len(), 2);
+        assert!(packer
+            .certificates
+            .iter()
+            .all(|c| c.data.0.len() <= MAX_CERTIFICATE_BYTES));
+        let mut reader = Unpacker::new(&packer.certificates, false).unwrap();
+        let mut budget = MAX_BYTES;
+        assert_eq!(
+            reader.expand(template, &mut budget, MAX_DEPTH).unwrap(),
+            value
+        );
+        reader.finish().unwrap();
+    }
     #[test]
     fn template_bytes_and_list_limits_precede_untrusted_tree_expansion() {
         let frames = [
@@ -596,7 +771,7 @@ mod tests {
         let b = p.pack(v.clone(), MAX_DEPTH).unwrap();
         assert_eq!(a, b);
         assert_eq!(p.certificates.len(), 1);
-        let mut u = Unpacker::new(&p.certificates).unwrap();
+        let mut u = Unpacker::new(&p.certificates, false).unwrap();
         let mut budget = MAX_BYTES;
         assert_eq!(u.expand(a, &mut budget, MAX_DEPTH).unwrap(), v);
         u.finish().unwrap();
@@ -619,21 +794,24 @@ mod tests {
         let mut p = Packer::default();
         let a = p.pack(v, MAX_DEPTH).unwrap();
         let mut budget = MAX_BYTES;
-        assert!(Unpacker::new(&p.certificates)
+        assert!(Unpacker::new(&p.certificates, false)
             .unwrap()
             .expand(json!({(REF):99}), &mut budget, MAX_DEPTH)
             .is_err());
-        assert!(Unpacker::new(&p.certificates).unwrap().finish().is_err());
-        let mut u = Unpacker::new(&p.certificates).unwrap();
+        assert!(Unpacker::new(&p.certificates, false)
+            .unwrap()
+            .finish()
+            .is_err());
+        let mut u = Unpacker::new(&p.certificates, false).unwrap();
         assert!(u.expand(a.clone(), &mut 0, MAX_DEPTH).is_err());
         p.certificates[0].data.0.push(0);
-        assert!(Unpacker::new(&p.certificates).is_err());
+        assert!(Unpacker::new(&p.certificates, false).is_err());
         p.certificates[0].data.0.pop();
         p.certificates.push(Certificate {
             hash: p.certificates[0].hash,
             data: p.certificates[0].data.clone(),
         });
-        assert!(Unpacker::new(&p.certificates).is_err());
+        assert!(Unpacker::new(&p.certificates, false).is_err());
         let mut p = Packer::default();
         assert!(p.pack(json!({(REF):0}), MAX_DEPTH).is_err());
         let bytes = encode_value(
@@ -645,7 +823,7 @@ mod tests {
             hash: blake3_hash(&bytes),
             data: Bytes(bytes),
         }];
-        assert!(Unpacker::new(&c)
+        assert!(Unpacker::new(&c, false)
             .unwrap()
             .expand(a, &mut budget, MAX_DEPTH)
             .is_err());

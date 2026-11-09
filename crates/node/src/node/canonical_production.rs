@@ -23,6 +23,20 @@ const MAX_JOBS: usize = 2;
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
 const DATA_CEILING: u64 = MAX_BYTES - 64 * 1024;
 const REFERENCE: &[u8] = b"\0canonical-certificate/v1/";
+const ACCOUNT_POOL: &[u8] = b"\0canonical-account-pool/v1/";
+const MAX_ACCOUNT_COMPONENT: usize = 8 * 1024 * 1024 + 64;
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountCertificate {
+    version: u8,
+    bytes: usize,
+    hash: ShellHash,
+    template: String,
+    certificates: Vec<ShellHash>,
+}
+fn account_part_key(hash: ShellHash) -> Vec<u8> {
+    key(&[b"account-parts/".as_slice(), hash.as_bytes()].concat())
+}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CertificateReference {
@@ -159,17 +173,70 @@ impl<S: KvStore> CanonicalProductionStore<S> {
             total = total
                 .checked_add((k.len() + v.len()) as u64)
                 .ok_or_else(|| error("canonical production size overflow"))?;
-            if total > ceiling {
-                return Err(error(
-                    "canonical production global checkpoint quota exceeded",
-                ));
-            }
             batch.put(k, v);
+        }
+        if total > ceiling {
+            return Err(error(
+                "canonical production global checkpoint quota exceeded",
+            ));
         }
         batch.put(key(b"bytes"), total.to_be_bytes().to_vec());
         self.store.write_batch(batch)?;
         *observed = Some(total);
         self.store.flush()
+    }
+    // Writer-only compaction of reconstructible local checkpoints. Historical
+    // reads never call this, and Native chain/state/receipt keys are untouched.
+    fn compact_accounts(&self) -> Result<(), StorageError> {
+        let mut guard = self.lock.lock();
+        let old = self.checked_total(&mut guard)?;
+        let mut changes = BTreeMap::new();
+        let mut candidates = Vec::new();
+        for block in self.ids()? {
+            let job = self.job(block);
+            let prefix = [job.prefix.as_slice(), b"production/component/"].concat();
+            self.store
+                .visit_prefix_range(&prefix, &prefix, None, false, &mut |k, v| {
+                    let local = &k[job.prefix.len()..];
+                    if local.ends_with(b"-account")
+                        && !v.starts_with(REFERENCE)
+                        && !v.starts_with(ACCOUNT_POOL)
+                    {
+                        if candidates.len()
+                            >= MAX_JOBS
+                                * shell_stark_prover::canonical_batch::MAX_CANONICAL_SIGNATURE_BATCH
+                        {
+                            return Err(error("account dictionary component count limit"));
+                        }
+                        candidates.push((block, k.to_vec(), local.to_vec(), v.to_vec()));
+                    }
+                    Ok(true)
+                })?;
+        }
+        // Finish the storage iterator before looking up shared parts; some KV
+        // implementations hold a read guard while visiting their entries.
+        for (block, physical, local, bytes) in candidates {
+            let pooled = self.job(block).pool_account(&local, &bytes, &mut changes)?;
+            if pooled != bytes {
+                changes.insert(physical, pooled);
+            }
+        }
+        let mut total = old;
+        for (k, v) in &changes {
+            if let Some(prior) = self.store.get(k)? {
+                total = total
+                    .checked_sub((k.len() + prior.len()) as u64)
+                    .ok_or_else(|| error("account pool accounting corrupt"))?;
+            }
+            total = total
+                .checked_add((k.len() + v.len()) as u64)
+                .ok_or_else(|| error("account pool size overflow"))?;
+        }
+        // Do not rewrite an inline component merely to add dictionary overhead.
+        if total < old {
+            self.write_locked(changes.into_iter().collect(), &mut guard, DATA_CEILING)?;
+        }
+        Ok(())
     }
     fn status(&self, hash: ShellHash) -> Result<Option<CanonicalProductionStatus>, StorageError> {
         self.store
@@ -276,6 +343,100 @@ impl<S: KvStore> ProductionJob<S> {
         }
         Ok(name)
     }
+    fn restore_account(&self, bytes: Vec<u8>) -> Result<Vec<u8>, StorageError> {
+        let Some(encoded) = bytes.strip_prefix(ACCOUNT_POOL) else {
+            return Ok(bytes);
+        };
+        if encoded.len() > MAX_ACCOUNT_COMPONENT {
+            return Err(error("account dictionary envelope byte limit"));
+        }
+        let account: AccountCertificate = serde_json::from_slice(encoded).map_err(error)?;
+        if account.version != 1
+            || account.bytes > MAX_ACCOUNT_COMPONENT
+            || account.certificates.len() > 2048
+            || account.template.len() > 4 * 1024 * 1024
+        {
+            return Err(error("account dictionary metadata limit"));
+        }
+        let mut parts = Vec::new();
+        let mut total = 0usize;
+        for hash in account.certificates {
+            let part = self
+                .store
+                .get(&account_part_key(hash))?
+                .ok_or_else(|| error("missing account dictionary certificate"))?;
+            total = total
+                .checked_add(part.len())
+                .ok_or_else(|| error("account dictionary size overflow"))?;
+            if part.len() > 8 * 1024 * 1024
+                || total > MAX_ACCOUNT_COMPONENT + 2048 * 64
+                || blake3_hash(&part) != hash
+            {
+                return Err(error(
+                    "account dictionary certificate integrity/size mismatch",
+                ));
+            }
+            parts.push(part);
+        }
+        let restored =
+            shell_stark_prover::compact_canonical::restore_checkpoint(&account.template, &parts)
+                .map_err(error)?;
+        if restored.len() != account.bytes || blake3_hash(&restored) != account.hash {
+            return Err(error("account dictionary component integrity mismatch"));
+        }
+        Ok(restored)
+    }
+    fn pool_account(
+        &self,
+        k: &[u8],
+        bytes: &[u8],
+        changes: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<Vec<u8>, StorageError> {
+        if !Self::component_name(k)?.ends_with("-account") {
+            return Ok(bytes.to_vec());
+        }
+        let Some(parts) =
+            shell_stark_prover::compact_canonical::split_checkpoint(bytes).map_err(error)?
+        else {
+            return Ok(bytes.to_vec());
+        };
+        // Roundtrip before replacing any physical bytes. The original index,
+        // length and hash continue to describe exactly the same logical value.
+        if shell_stark_prover::compact_canonical::restore_checkpoint(
+            &parts.template,
+            &parts.certificates,
+        )
+        .map_err(error)?
+            != bytes
+        {
+            return Err(error("account dictionary roundtrip mismatch"));
+        }
+        let mut certificates = Vec::new();
+        for part in parts.certificates {
+            let hash = blake3_hash(&part);
+            let key = account_part_key(hash);
+            if let Some(prior) = changes.get(&key).cloned().or(self.store.get(&key)?) {
+                if prior != part {
+                    return Err(error("account dictionary certificate hash collision"));
+                }
+            } else {
+                changes.insert(key, part);
+            }
+            certificates.push(hash);
+        }
+        let envelope = AccountCertificate {
+            version: 1,
+            bytes: bytes.len(),
+            hash: blake3_hash(bytes),
+            template: parts.template,
+            certificates,
+        };
+        let encoded = encode(&envelope)?;
+        if encoded.len() > MAX_ACCOUNT_COMPONENT {
+            return Err(error("account dictionary envelope byte limit"));
+        }
+        Ok([ACCOUNT_POOL, encoded.as_slice()].concat())
+    }
     fn anchor(
         &self,
         k: &[u8],
@@ -283,7 +444,7 @@ impl<S: KvStore> ProductionJob<S> {
     ) -> Result<(Vec<u8>, ShellHash, String), StorageError> {
         let name = Self::component_name(k)?;
         let Some(encoded) = bytes.strip_prefix(REFERENCE) else {
-            return Ok((bytes, self.block, name.into()));
+            return Ok((self.restore_account(bytes)?, self.block, name.into()));
         };
         if encoded.len() > 1024 {
             return Err(error("production certificate reference size limit"));
@@ -317,10 +478,11 @@ impl<S: KvStore> ProductionJob<S> {
                 .concat(),
             )?
             .ok_or_else(|| error("missing production certificate reference target"))?;
-        if target.starts_with(REFERENCE)
-            || target.len() != reference.bytes
-            || blake3_hash(&target) != reference.hash
-        {
+        if target.starts_with(REFERENCE) {
+            return Err(error("chained production certificate reference"));
+        }
+        let target = self.restore_account(target)?;
+        if target.len() != reference.bytes || blake3_hash(&target) != reference.hash {
             return Err(error("production certificate reference integrity mismatch"));
         }
         Ok((target, reference.block, target_name.into()))
@@ -438,7 +600,7 @@ impl<S: KvStore> KvStore for ProductionJob<S> {
     }
     fn write_batch(&self, b: WriteBatch) -> Result<(), StorageError> {
         let mut guard = self.lock.lock();
-        let mut changes = Vec::new();
+        let mut changes = BTreeMap::new();
         for op in b.ops() {
             match op {
                 WriteBatchOp::Put { key: k, value: v } => {
@@ -455,9 +617,11 @@ impl<S: KvStore> KvStore for ProductionJob<S> {
                             value = existing;
                         } else if let Some(reference) = self.reference_to(k, v)? {
                             value = [REFERENCE, encode(&reference)?.as_slice()].concat();
+                        } else {
+                            value = self.pool_account(k, v, &mut changes)?;
                         }
                     }
-                    changes.push((physical, value));
+                    changes.insert(physical, value);
                 }
                 WriteBatchOp::Delete { .. } => {
                     return Err(error("canonical production checkpoint deletion refused"))
@@ -468,7 +632,7 @@ impl<S: KvStore> KvStore for ProductionJob<S> {
             store: self.store.clone(),
             lock: self.lock.clone(),
         }
-        .write_locked(changes, &mut guard, DATA_CEILING)
+        .write_locked(changes.into_iter().collect(), &mut guard, DATA_CEILING)
     }
 }
 
@@ -752,6 +916,27 @@ impl<S: KvStore + 'static> Node<S> {
         if let Some(block) = self.chain_store.get_head_block()? {
             self.capture_canonical_production(&block);
         }
+        self.canonical_production.compact_accounts()?;
+        // Publish the explicit new-session retry before returning the handle.
+        // RPC observers must not mistake the previous session's failure for the
+        // new attempt's result while its worker is still waiting for readiness.
+        {
+            let owner = &self.canonical_production;
+            let mut guard = owner.lock.lock();
+            let mut changes = Vec::new();
+            for hash in owner.ids()? {
+                if let Some(mut status) = owner.status(hash)? {
+                    if status.state == CanonicalProductionState::Failed {
+                        status.state = CanonicalProductionState::Queued;
+                        status.error = None;
+                        changes.push((record_key(hash), encode(&status)?));
+                    }
+                }
+            }
+            if !changes.is_empty() {
+                owner.write_locked(changes, &mut guard, MAX_BYTES)?;
+            }
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let node = self.clone();
@@ -768,11 +953,11 @@ impl<S: KvStore + 'static> Node<S> {
                                 continue;
                             }
                             if let Some(s) = node.canonical_production.status(hash)? {
-                                if !matches!(
-                                    s.state,
-                                    CanonicalProductionState::Complete
-                                        | CanonicalProductionState::Failed
-                                ) {
+                                // A new worker session may recover a failed attempt
+                                // after its cause is fixed. The attempted set still
+                                // prevents repeated failure dispatch in this session;
+                                // source and all retained AIR certificates are rechecked.
+                                if s.state != CanonicalProductionState::Complete {
                                     return Ok(Some(s));
                                 }
                             }
@@ -854,6 +1039,130 @@ fn cancellation_budget_exhausted(budget: Option<NonZeroUsize>, used: usize) -> b
 mod tests {
     use super::*;
     use shell_storage::MemoryDb;
+    #[test]
+    fn account_dictionary_compaction_preserves_logical_bytes_references_and_native_data() {
+        use shell_stark_prover::compact_canonical::encode_component;
+        let db = Arc::new(MemoryDb::new());
+        db.put(b"HEAD", b"native anchor").unwrap();
+        let owner = CanonicalProductionStore::new(db.clone());
+        let first = ShellHash::from([1; 32]);
+        let second = ShellHash::from([2; 32]);
+        let a = owner.job(first);
+        let b = owner.job(second);
+        // Codec/storage values only; these never claim mathematical authority.
+        let account = |tag| {
+            encode_component(&serde_json::json!({"version":1,
+            "address_hash":{"proof_bytes":vec![1;4096]},
+            "nodes":[{"proof_bytes":vec![2;4096]}, {"proof_bytes":vec![tag;4096]}]}))
+            .unwrap()
+        };
+        let one = account(3);
+        let two = account(4);
+        let k0 = b"production/component/sender-0-account";
+        let k1 = b"production/component/sender-1-account";
+        {
+            let mut guard = owner.lock.lock();
+            owner
+                .write_locked(
+                    vec![
+                        (key(b"jobs"), encode(&vec![first, second]).unwrap()),
+                        ([a.prefix.as_slice(), k0].concat(), one.clone()),
+                        ([a.prefix.as_slice(), k1].concat(), two.clone()),
+                    ],
+                    &mut guard,
+                    DATA_CEILING,
+                )
+                .unwrap();
+        }
+        b.put(k0, &one).unwrap();
+        let reference_key = [b.prefix.as_slice(), k0].concat();
+        let reference = db.get(&reference_key).unwrap().unwrap();
+        assert!(reference.starts_with(REFERENCE));
+        let old = owner.checked_total(&mut None).unwrap();
+        owner.compact_accounts().unwrap();
+        assert!(owner.checked_total(&mut None).unwrap() < old);
+        assert_eq!(db.get(&reference_key).unwrap().unwrap(), reference);
+        let physical = [a.prefix.as_slice(), k0].concat();
+        let envelope = db.get(&physical).unwrap().unwrap();
+        assert!(envelope.starts_with(ACCOUNT_POOL));
+        let before = db.scan_all().unwrap();
+        assert_eq!(a.get(k0).unwrap().unwrap(), one);
+        assert_eq!(a.get(k1).unwrap().unwrap(), two);
+        assert_eq!(b.get(k0).unwrap().unwrap(), one);
+        assert_eq!(a.scan_prefix(b"production/component/").unwrap().len(), 2);
+        owner.compact_accounts().unwrap();
+        assert_eq!(before, db.scan_all().unwrap());
+        let parts_before = db.scan_prefix(&key(b"account-parts/")).unwrap().len();
+        let three = account(5);
+        b.put(b"production/component/sender-2-account", &three)
+            .unwrap();
+        assert_eq!(
+            db.scan_prefix(&key(b"account-parts/")).unwrap().len(),
+            parts_before + 1
+        );
+        assert_eq!(
+            b.get(b"production/component/sender-2-account")
+                .unwrap()
+                .unwrap(),
+            three
+        );
+        let row: AccountCertificate =
+            serde_json::from_slice(envelope.strip_prefix(ACCOUNT_POOL).unwrap()).unwrap();
+        let part_key = account_part_key(row.certificates[0]);
+        let original = db.get(&part_key).unwrap().unwrap();
+        let mut bad = original.clone();
+        bad[0] ^= 1;
+        db.put(&part_key, &bad).unwrap();
+        assert!(a.get(k0).is_err());
+        assert!(b.get(k0).is_err());
+        db.delete(&part_key).unwrap();
+        assert!(a.get(k0).is_err());
+        db.put(&part_key, &original).unwrap();
+        let mut row = row;
+        row.hash = ShellHash::ZERO;
+        db.put(
+            &physical,
+            &[ACCOUNT_POOL, encode(&row).unwrap().as_slice()].concat(),
+        )
+        .unwrap();
+        assert!(a.get(k0).is_err());
+        db.put(&physical, &envelope).unwrap();
+        assert_eq!(a.get(k0).unwrap().unwrap(), one);
+        assert_eq!(db.get(b"HEAD").unwrap().unwrap(), b"native anchor");
+    }
+    #[test]
+    fn atomic_checkpoint_replacement_checks_final_quota_and_refuses_orphan_parts() {
+        let db = Arc::new(MemoryDb::new());
+        let owner = CanonicalProductionStore::new(db.clone());
+        let mut guard = owner.lock.lock();
+        owner
+            .write_locked(vec![(key(b"z"), vec![0; 4096])], &mut guard, DATA_CEILING)
+            .unwrap();
+        let old = owner.checked_total(&mut guard).unwrap();
+        owner
+            .write_locked(
+                vec![(key(b"a"), vec![1; 2048]), (key(b"z"), vec![2; 1024])],
+                &mut guard,
+                old,
+            )
+            .unwrap();
+        assert!(owner.checked_total(&mut None).unwrap() < old);
+        drop(guard);
+        // Simulated counter boundary, not a claim of real 256MiB stress.
+        *owner.lock.lock() = Some(MAX_BYTES - 1);
+        db.put(&key(b"bytes"), &(MAX_BYTES - 1).to_be_bytes())
+            .unwrap();
+        let account = shell_stark_prover::compact_canonical::encode_component(&serde_json::json!({
+            "address_hash":{"proof_bytes":[1]},"nodes":[{"proof_bytes":[2]}]}))
+        .unwrap();
+        let before = db.scan_all().unwrap();
+        assert!(owner
+            .job(ShellHash::ZERO)
+            .put(b"production/component/sender-0-account", &account)
+            .is_err());
+        assert_eq!(before, db.scan_all().unwrap());
+        assert!(db.scan_prefix(&key(b"account-parts/")).unwrap().is_empty());
+    }
     #[test]
     fn named_local_references_and_cross_job_flattening_preserve_inline_anchor() {
         let db = Arc::new(MemoryDb::new());
@@ -1043,5 +1352,98 @@ mod tests {
         assert!(node.start_canonical_production().is_err());
         assert_eq!(before, db.scan_all().unwrap());
         assert!(db.scan_prefix(PREFIX).unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn failed_job_is_rechecked_once_per_worker_session_without_native_writes() {
+        let mut cfg = NodeConfig::dev(Address::ZERO);
+        cfg.node_role = crate::NodeRole::Prover;
+        cfg.canonical_proof_production = true;
+        let db = Arc::new(MemoryDb::new());
+        let (node, _) = crate::NodeBuilder::new(cfg, db.clone()).build().unwrap();
+        let node = Arc::new(node);
+        let native = db.scan_all().unwrap();
+        let block = ShellHash::from([0x31; 32]);
+        let source = br#"{"invalid":true}"#.to_vec();
+        let status = CanonicalProductionStatus {
+            version: 1,
+            block_hash: block,
+            block_number: 1,
+            source_hash: blake3_hash(&source),
+            state: CanonicalProductionState::Failed,
+            components: 0,
+            checkpoint_bytes: 0,
+            newly_proved: 0,
+            reused: 0,
+            manifest: None,
+            error: Some("previous failure".into()),
+        };
+        {
+            let owner = &node.canonical_production;
+            let mut guard = owner.lock.lock();
+            owner
+                .write_locked(
+                    vec![
+                        (key(b"jobs"), encode(&vec![block]).unwrap()),
+                        (record_key(block), encode(&status).unwrap()),
+                        (source_key(block), source.clone()),
+                    ],
+                    &mut guard,
+                    DATA_CEILING,
+                )
+                .unwrap();
+        }
+        node.prover_ready.store(true, Ordering::Release);
+        let first = node.start_canonical_production().unwrap().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let error = loop {
+            let status = node.canonical_production.status(block).unwrap().unwrap();
+            if status.state == CanonicalProductionState::Failed
+                && status.error.as_deref() != Some("previous failure")
+            {
+                break status.error.unwrap();
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(!error.contains("hash/size mismatch"));
+        // Same-size tampering keeps quota accounting valid, but must fail the
+        // independent source-hash check when a new worker explicitly retries.
+        let mut corrupted = source;
+        corrupted[0] ^= 1;
+        db.put(&source_key(block), &corrupted).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            node.canonical_production
+                .status(block)
+                .unwrap()
+                .unwrap()
+                .error
+                .as_deref(),
+            Some(error.as_str())
+        );
+        first.shutdown().await;
+        let second = node.start_canonical_production().unwrap().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let status = node.canonical_production.status(block).unwrap().unwrap();
+            if status
+                .error
+                .as_deref()
+                .is_some_and(|s| s.contains("source hash/size mismatch"))
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        second.shutdown().await;
+        assert_eq!(
+            native,
+            db.scan_all()
+                .unwrap()
+                .into_iter()
+                .filter(|(k, _)| !k.starts_with(PREFIX))
+                .collect::<Vec<_>>()
+        );
     }
 }

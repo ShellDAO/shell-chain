@@ -49,3 +49,10 @@ replay. A separate Native crypto control checks fresh-registration rollback;
 it is explicitly separate from proof admission. Existing registered proof graphs
 must still verify without regeneration. Publication and coordinated activation
 remain separate delivery steps.
+
+The `mixed-first-use` entry exercises sixteen independent senders with eight
+registered bound accounts and eight unregistered unbound accounts, plus a distinct
+proposer. Genesis reconstruction and post-import checks use each actual sender's
+mode rather than treating a whole block as bound or unbound. Both full graphs must
+contain eight proofs of each sender version. The later wrong-root child uses
+Reference mode for all sixteen senders and must preserve Native state on refusal.
