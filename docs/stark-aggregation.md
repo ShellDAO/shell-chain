@@ -1075,3 +1075,37 @@ state and key registration unchanged. These remain separate from proof-backed
 bad-block imports. Both SDK keys are memory-only; keep public outputs to resume.
 Other account/role combinations, consensus selector/quorum/penalty AIR and public
 release/network acceptance remain separate; limits and defaults are unchanged.
+
+
+### Published SDK sender with a genuine raw proposer
+
+```bash
+tests/e2e/dilithium-full-proof.sh sdk-raw-proposer sdk-raw-output
+tests/e2e/dilithium-full-proof.sh verify sdk-raw-output
+```
+
+Use the same published SDK candidate and prerequisites above. This case combines
+an actual SDK Native tag-zero FIPS bound sender with an independent genuine
+locked PQClean raw Native tag-zero proposer. The SDK signs and submits retained
+transfers through its public provider and Node RPC. Ordinary Native block 1,
+quorum/finality, a successor and a separately signed wrong-root control precede
+the supported original full source capture; no missing capability is assumed.
+
+Existing source format 3 combines sender profile 5 and transaction profile 3
+with complete FIPS signature/challenge version 1 and a 48-byte seed. Proposer
+seal profile 2 independently requires the complete genuine raw signature/challenge
+version 2 and its 32-byte seed. A shared Native algorithm tag does not make their
+signing domains or certificate inputs interchangeable. The same original graph
+must complete automatic durable recovery and real peer Native import/finality,
+matching receipts, fees, accounts and nonce. Repeated read-only history follows
+the ordinary successor.
+
+Genuine SDK key/challenge/commitment certificates cannot authorize the raw
+proposer. FIPS/SDK/primary seal relabelling, a complete header proof for the
+original independently raw-signed successor and SDK sender source/account
+relabelling must fail without altering original proofs or KV bytes. Separate
+Native signed-tamper and wrong-root controls remain distinct from proof-backed
+bad-block import. Keys remain memory-only; retained-role mismatches refuse before
+signing. Other role/account combinations, consensus selector/quorum/penalty AIR
+and public release/network acceptance remain separate. Limits, Native transcript
+union, defaults and frozen source meanings are unchanged.

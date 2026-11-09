@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add public SDK FIPS-sender/genuine-raw-proposer full-proof coverage with separate transcript domains, cross-role certificate refusals and historical replay.
+
 - Extend the public SDK sender/proposer proof entry to first-use registration and subsequent Reference transactions, preserving original signed bytes and adding address/profile refusal coverage.
 
 - Add a reproducible public SDK bound-sender/SDK-proposer full-proof entry using independent memory-only keys, existing FIPS profiles, genuine cross-role certificate refusals and changed-state history.
