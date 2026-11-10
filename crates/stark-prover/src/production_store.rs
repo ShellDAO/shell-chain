@@ -70,6 +70,9 @@ pub struct ProductionStore<'a, S: KvStore> {
     local_reuse: BTreeMap<String, String>,
 }
 impl<'a, S: KvStore> ProductionStore<'a, S> {
+    pub(crate) fn slh_encoding(&self) -> bool {
+        self.index.version == 4
+    }
     pub(crate) fn compact_encoding(&self) -> bool {
         self.index.version >= 2
     }
@@ -89,6 +92,16 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
         limit: Option<NonZeroUsize>,
     ) -> Result<Self, ProductionError> {
         Self::open_format(store, source, limit, 2)
+    }
+    /// Explicit source-six encoding; old jobs are never rewritten or reinterpreted.
+    /// The same checkpoint quota bounds stored v2 component bytes, and the
+    /// decoder retains the existing per-certificate expansion bound.
+    pub fn open_slh(
+        store: &'a mut S,
+        source: &[u8],
+        limit: Option<NonZeroUsize>,
+    ) -> Result<Self, ProductionError> {
+        Self::open_format(store, source, limit, 4)
     }
     /// New high-diversity jobs persist shared matrix proof parts. Existing
     /// index-one/two jobs keep their immutable layout when reopened.
@@ -117,13 +130,18 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
                 return Err(failure("production index size limit"));
             }
             let index: Index = serde_json::from_slice(&bytes).map_err(failure)?;
-            if !matches!(index.version, 1..=3)
+            if !matches!(index.version, 1..=4)
                 || index.source_hash != blake3_hash(source)
                 || index.source_bytes != source.len()
                 || store.get(SOURCE).map_err(failure)?.as_deref() != Some(source)
                 || index.components.len() > MAX_COMPONENTS
             {
                 return Err(failure("production source/index mismatch"));
+            }
+            if (format == 4 || index.version == 4) && format != index.version {
+                return Err(failure(
+                    "checkpoint encoding differs; retain existing job and use a new owned output",
+                ));
             }
             index
         } else {
@@ -300,7 +318,12 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
         };
         verify(&p)?;
         let bytes = if self.index.version >= 2 {
-            let bytes = crate::compact_canonical::encode_component(&p).map_err(failure)?;
+            let bytes = if self.index.version == 4 {
+                crate::compact_canonical::encode_slh_component(&p)
+            } else {
+                crate::compact_canonical::encode_component(&p)
+            }
+            .map_err(failure)?;
             if bytes.len() > remaining {
                 return Err(failure("compact checkpoint quota exceeded"));
             }
@@ -371,6 +394,38 @@ pub fn bounded_json(value: &impl Serialize, limit: usize) -> Result<Vec<u8>, Pro
 mod tests {
     use super::*;
     use shell_storage::MemoryDb;
+    #[test]
+    fn explicit_slh_checkpoint_format_never_rewrites_an_existing_job() {
+        let mut old = MemoryDb::new();
+        drop(ProductionStore::open_compact(&mut old, b"source", None).unwrap());
+        let before = old.scan_all().unwrap();
+        assert!(ProductionStore::open_slh(&mut old, b"source", None).is_err());
+        assert_eq!(old.scan_all().unwrap(), before);
+        let mut current = MemoryDb::new();
+        let mut job = ProductionStore::open_slh(&mut current, b"source", None).unwrap();
+        assert!(job.slh_encoding());
+        job.checkpoint(
+            "first",
+            || Ok(7u8),
+            |v| {
+                if *v == 7 {
+                    Ok(())
+                } else {
+                    Err("wrong value".into())
+                }
+            },
+        )
+        .unwrap();
+        drop(job);
+        let before = current.scan_all().unwrap();
+        assert!(ProductionStore::open_compact(&mut current, b"source", None).is_err());
+        assert_eq!(current.scan_all().unwrap(), before);
+        let mut job = ProductionStore::open_slh(&mut current, b"source", None).unwrap();
+        assert!(job
+            .checkpoint("first", || Ok(7u8), |_: &u8| Err("must reverify".into()))
+            .is_err());
+        assert_eq!(job.progress().newly_proved, 0);
+    }
     #[test]
     fn compact_aliases_reverify_without_duplicate_logical_bytes_and_legacy_reopens() {
         let mut db = MemoryDb::new();

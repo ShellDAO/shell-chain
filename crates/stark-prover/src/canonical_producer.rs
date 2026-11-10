@@ -45,7 +45,7 @@ use crate::{
 use alloy_rlp::Encodable;
 use serde::{Deserialize, Serialize};
 use shell_core::{Account, Block, BlockHeader, PQTX_ID_DOMAIN};
-use shell_crypto::{DilithiumVerifier, MlDsaVerifier, SignatureType, Verifier};
+use shell_crypto::{DilithiumVerifier, MlDsaVerifier, SignatureType, SphincsVerifier, Verifier};
 use shell_primitives::{blake3_hash, keccak256, ShellHash};
 use shell_storage::{ChainConfig, ChainStore, KvStore, MemoryDb, MerkleTrie};
 use std::sync::Arc;
@@ -63,7 +63,39 @@ fn verify_production_signature(
         SignatureType::Dilithium3 => {
             Ok(DilithiumVerifier.verify_legacy_transcript(key, message, signature))
         }
-        _ => Ok(false),
+        SignatureType::SphincsSha2256f => SphincsVerifier
+            .verify(key, message, signature)
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// Resource/framing preflight only. Complete AIR verification and native policy
+/// are mandatory before any canonical proof can authorize execution.
+pub fn supports_production_senders(block: &Block) -> bool {
+    let slh = block
+        .transactions
+        .iter()
+        .any(|t| t.signature.sig_type == SignatureType::SphincsSha2256f);
+    if slh && (block.transactions.len() != 1 || block.proposer_seal.is_none()) {
+        return false;
+    }
+    !block.transactions.is_empty()
+        && block.transactions.len() <= MAX_CANONICAL_SIGNATURE_BATCH
+        && block.transactions.iter().all(|t| {
+            t.tx.tx_type <= 3
+                && t.aa_bundle.is_none()
+                && match t.signature.sig_type {
+                    SignatureType::MlDsa65 | SignatureType::Dilithium3 => {
+                        t.signature.data.len() == 3309
+                    }
+                    SignatureType::SphincsSha2256f => t.signature.data.len() == 49_856,
+                }
+        })
+}
+fn sender_shape(kind: SignatureType, key: usize, signature: usize) -> bool {
+    match kind {
+        SignatureType::MlDsa65 | SignatureType::Dilithium3 => key == 1952 && signature == 3309,
+        SignatureType::SphincsSha2256f => key == 64 && signature == 49_856,
     }
 }
 
@@ -90,7 +122,7 @@ struct SenderSource {
     key: Vec<u8>,
     account: Account,
     nodes: Vec<Vec<u8>>,
-    /// Present only in source formats three/four: explicit Native SDK FIPS signature version.
+    /// Native SDK FIPS sender transcript marker in source formats three through five.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sdk_fips: Option<u8>,
 }
@@ -105,7 +137,7 @@ struct CapturedInputs {
     senders: Vec<SenderSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proposer_key: Option<Vec<u8>>,
-    /// Source format five only: explicit Native SDK FIPS proposer transcript.
+    /// Native SDK FIPS proposer transcript marker in source formats five/six.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proposer_sdk_fips: Option<u8>,
 }
@@ -128,7 +160,7 @@ impl CanonicalProductionSource {
             .ok_or("production block unavailable")?;
         if block.hash() != hash
             || block.transactions.is_empty()
-            || block.transactions.len() > MAX_CANONICAL_SIGNATURE_BATCH
+            || !supports_production_senders(&block)
         {
             return Err("production canonical block hash/count/profile mismatch".into());
         }
@@ -154,11 +186,6 @@ impl CanonicalProductionSource {
             if signed.tx.tx_type > 3
                 || signed.aa_bundle.is_some()
                 || signed.tx.chain_id != view.config().chain_id
-                || !matches!(
-                    signed.signature.sig_type,
-                    SignatureType::MlDsa65 | SignatureType::Dilithium3
-                )
-                || signed.signature.data.len() != 3309
                 || signed
                     .tx
                     .signing_payload(signed.signature.sig_type.as_u8())
@@ -184,11 +211,19 @@ impl CanonicalProductionSource {
                 .ok_or("production requires a parent account")?;
             let mut tagged = vec![signed.signature.sig_type.as_u8()];
             tagged.extend_from_slice(&key);
-            if key.len() != 1952
-                || signed.pubkey_mode.pubkey_bytes().is_some_and(|p| p != key)
+            if !sender_shape(
+                signed.signature.sig_type,
+                key.len(),
+                signed.signature.data.len(),
+            ) || signed.pubkey_mode.pubkey_bytes().is_some_and(|p| p != key)
                 || account.validation_code_hash.is_some()
             {
                 return Err("production parent key/default account binding mismatch".into());
+            }
+            if signed.signature.sig_type == SignatureType::SphincsSha2256f
+                && account.pq_pubkey_hash == ShellHash::ZERO
+            {
+                return Err("canonical SLH source requires a bound parent account".into());
             }
             if account.pq_pubkey_hash == ShellHash::ZERO {
                 if shell_primitives::Address::from_public_key(
@@ -273,7 +308,16 @@ impl CanonicalProductionSource {
             _ => None,
         };
         let input = CapturedInputs {
-            version: if proposer_sdk_fips.is_some() {
+            version: if block
+                .transactions
+                .iter()
+                .any(|tx| tx.signature.sig_type == SignatureType::SphincsSha2256f)
+            {
+                if proposer_key.is_none() {
+                    return Err("canonical SLH requires a supported registered proposer".into());
+                }
+                6
+            } else if proposer_sdk_fips.is_some() {
                 5
             } else if senders
                 .iter()
@@ -343,14 +387,30 @@ impl CanonicalProductionSource {
             .iter()
             .any(|s| s.sdk_fips.is_some() && s.account.pq_pubkey_hash == ShellHash::ZERO);
         let has_sdk_proposer = i.proposer_sdk_fips.is_some();
-        let profile_valid = match i.version {
-            1 => i.proposer_key.is_none() && !has_sdk && !has_sdk_proposer,
-            2 => i.proposer_key.is_some() && !has_sdk && !has_sdk_proposer,
-            3 => has_sdk && !has_unbound_sdk && !has_sdk_proposer,
-            4 => has_unbound_sdk && !has_sdk_proposer,
-            5 => i.proposer_sdk_fips == Some(1) && i.proposer_key.is_some(),
-            _ => false,
-        };
+        let has_slh = i
+            .block
+            .transactions
+            .iter()
+            .any(|t| t.signature.sig_type == SignatureType::SphincsSha2256f);
+        let profile_valid = (!has_slh || i.version == 6)
+            && match i.version {
+                1 => i.proposer_key.is_none() && !has_sdk && !has_sdk_proposer,
+                2 => i.proposer_key.is_some() && !has_sdk && !has_sdk_proposer,
+                3 => has_sdk && !has_unbound_sdk && !has_sdk_proposer,
+                4 => has_unbound_sdk && !has_sdk_proposer,
+                5 => i.proposer_sdk_fips == Some(1) && i.proposer_key.is_some(),
+                6 => {
+                    has_slh
+                        && matches!(i.proposer_sdk_fips, None | Some(1))
+                        && i.block.transactions.len() == 1
+                        && i.proposer_key.is_some()
+                        && !has_sdk
+                        && i.senders
+                            .iter()
+                            .all(|s| s.account.pq_pubkey_hash != ShellHash::ZERO)
+                }
+                _ => false,
+            };
         if !profile_valid
             || cfg.chain_id != i.config.chain_id
             || cfg.genesis_hash != i.config.genesis_hash
@@ -437,12 +497,11 @@ impl CanonicalProductionSource {
             if tx.tx.chain_id != cfg.chain_id
                 || tx.tx.tx_type > 3
                 || tx.aa_bundle.is_some()
-                || !matches!(
+                || !sender_shape(
                     tx.signature.sig_type,
-                    SignatureType::MlDsa65 | SignatureType::Dilithium3
+                    sender.key.len(),
+                    tx.signature.data.len(),
                 )
-                || tx.signature.data.len() != 3309
-                || sender.key.len() != 1952
                 || !seen.insert(tx.uncached_hash())
                 || tx.tx.signing_payload(tx.signature.sig_type.as_u8()).len()
                     > crate::blake3_hash::MAX_HASH_BYTES
@@ -521,6 +580,10 @@ impl CanonicalProductionSource {
     pub fn block(&self) -> &Block {
         &self.input.block
     }
+    /// Explicit large registered-sender source; always requires compact checkpoints.
+    pub fn has_slh_senders(&self) -> bool {
+        self.input.version == 6
+    }
     /// Unbound address certificates need compact checkpoints even in small batches.
     pub fn has_unbound_senders(&self) -> bool {
         self.input
@@ -538,12 +601,20 @@ impl CanonicalProductionSource {
     /// must independently recheck canonicality and native execution/admission.
     pub fn verify(&self, proof: &CanonicalSignatureBatchProof) -> Result<(), String> {
         if proof.version
-            != (if self.input.proposer_key.is_some() {
+            != (if self.has_slh_senders() {
+                3
+            } else if self.input.proposer_key.is_some() {
                 2
             } else {
                 1
             })
-            || proof.transactions.len() != self.input.senders.len()
+            || (if self.has_slh_senders() {
+                proof.slh_transactions.as_ref().map_or(0, Vec::len)
+            } else {
+                proof.transactions.len()
+            }) != self.input.senders.len()
+            || (self.has_slh_senders() && !proof.transactions.is_empty())
+            || (!self.has_slh_senders() && proof.slh_transactions.is_some())
             || proof.proposer.is_some() != self.input.proposer_key.is_some()
         {
             return Err("production proof source/count mismatch".into());
@@ -582,6 +653,18 @@ impl CanonicalProductionSource {
                     .ok_or("missing source seal")?
                     .data,
             )?;
+        }
+        if self.has_slh_senders() {
+            crate::canonical_slh::verify_at_source(
+                &proof.slh_transactions.as_ref().ok_or("SLH proof absent")?[0],
+                &self.input.parent,
+                &self.input.block.header,
+                &self.input.block.transactions[0],
+                0,
+                &self.input.senders[0].key,
+                &self.input.senders[0].account,
+            )?;
+            return Ok(());
         }
         for ((tx, sender), p) in self
             .input
@@ -760,6 +843,13 @@ impl CanonicalProductionSource {
         &self,
         job: &mut ProductionStore<'_, J>,
     ) -> Result<CanonicalSignatureBatchProof, ProductionError> {
+        if self.has_slh_senders() != job.slh_encoding() {
+            return Err(
+                "production source requires its explicit checkpoint encoding"
+                    .to_string()
+                    .into(),
+            );
+        }
         if !job.matches_source(&self.identity) {
             return Err("production job belongs to another canonical source"
                 .to_string()
@@ -767,6 +857,18 @@ impl CanonicalProductionSource {
         }
         job.set_local_reuse(self.local_reuse_components());
         let mut transactions = Vec::new();
+        let mut slh_transactions = None;
+        if self.has_slh_senders() {
+            let sender = &self.input.senders[0];
+            slh_transactions = Some(vec![crate::canonical_slh_producer::produce(
+                job,
+                &self.input.parent,
+                &self.input.block,
+                &sender.key,
+                &sender.account,
+                &sender.nodes,
+            )?]);
+        }
         for (i, (signed, source)) in self
             .input
             .block
@@ -775,6 +877,9 @@ impl CanonicalProductionSource {
             .zip(&self.input.senders)
             .enumerate()
         {
+            if self.has_slh_senders() {
+                break;
+            }
             let prefix = format!("sender-{i}");
             let signature = prove_signature(
                 job,
@@ -856,7 +961,10 @@ impl CanonicalProductionSource {
             });
         }
         let proof = CanonicalSignatureBatchProof {
-            version: if self.input.proposer_key.is_some() {
+            slh_transactions,
+            version: if self.has_slh_senders() {
+                3
+            } else if self.input.proposer_key.is_some() {
                 2
             } else {
                 1
@@ -1912,5 +2020,49 @@ mod recovery_tests {
         let before = db.scan_all().unwrap();
         assert!(CanonicalProductionSource::restore(&chain, source.identity()).is_err());
         assert_eq!(before, db.scan_all().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod slh_profile_tests {
+    use super::*;
+    use shell_core::{SignedTransaction, Transaction};
+    use shell_crypto::PQSignature;
+    use shell_primitives::Address;
+    #[test]
+    fn slh_requires_one_sender_and_a_seal_without_relaxing_old_shapes() {
+        let transaction = SignedTransaction::new(
+            Address::ZERO,
+            Transaction {
+                chain_id: 10,
+                nonce: 0,
+                to: None,
+                value: Default::default(),
+                data: Default::default(),
+                gas_limit: 21_000,
+                max_fee_per_gas: 2,
+                max_priority_fee_per_gas: 1,
+                access_list: None,
+                tx_type: 0,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            },
+            PQSignature::new(SignatureType::SphincsSha2256f, vec![0; 49_856]),
+        );
+        let mut block = Block {
+            header: BlockHeader::default(),
+            transactions: vec![transaction.clone()],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        assert!(!supports_production_senders(&block));
+        block.proposer_seal = Some(PQSignature::new(SignatureType::MlDsa65, vec![0; 3309]));
+        // Framing is not authority; no signature verification takes place here.
+        assert!(supports_production_senders(&block));
+        block.transactions.push(transaction);
+        assert!(!supports_production_senders(&block));
+        assert!(!sender_shape(SignatureType::MlDsa65, 64, 49_856));
+        assert!(!sender_shape(SignatureType::SphincsSha2256f, 1952, 3309));
+        assert!(!sender_shape(SignatureType::SphincsSha2256f, 64, 49_855));
     }
 }

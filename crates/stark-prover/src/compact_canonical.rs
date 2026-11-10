@@ -1,5 +1,7 @@
 //! Bounded, lossless certificate availability encoding. Decoding grants no authority.
 //! Legacy JSON remains byte-for-byte available; native callers still verify full AIR.
+mod slh;
+mod witness;
 use crate::canonical_batch::{CanonicalSignatureBatchProof, MAX_CANONICAL_SIGNATURE_BATCH};
 use ciborium::Value as Cbor;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -12,6 +14,8 @@ use std::{
 
 const PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v2/";
 const HASH_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v3/";
+const SLH_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v4/";
+const WITNESS_COMPONENT: &[u8] = b"\0canonical-component/cbor/v2/";
 const COMPONENT: &[u8] = b"\0canonical-component/cbor/v1/";
 const REF: &str = "$certificate";
 const MAX_BYTES: usize = 256 * 1024 * 1024;
@@ -157,8 +161,16 @@ pub fn encode_component<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
     )?;
     Ok([COMPONENT, bytes.as_slice()].concat())
 }
+/// Explicit component v2 omits deterministic SHA2 witness words only after
+/// checking exact reconstruction. Its decoder still grants no authority.
+pub fn encode_slh_component<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
+    let bytes = witness::encode(serde_json::to_value(value).map_err(|e| e.to_string())?)?;
+    Ok([WITNESS_COMPONENT, bytes.as_slice()].concat())
+}
 pub fn decode_component<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
-    if let Some(bytes) = bytes.strip_prefix(COMPONENT) {
+    if let Some(bytes) = bytes.strip_prefix(WITNESS_COMPONENT) {
+        serde_json::from_value(witness::decode(bytes)?).map_err(|e| e.to_string())
+    } else if let Some(bytes) = bytes.strip_prefix(COMPONENT) {
         serde_json::from_value(decode_value(bytes)?).map_err(|e| e.to_string())
     } else {
         serde_json::from_slice(bytes).map_err(|e| e.to_string())
@@ -267,10 +279,27 @@ fn hash_container(v: &Map<String, Value>) -> bool {
             .iter()
             .all(|k| v.get(*k).is_some_and(Value::is_array))
 }
+fn compression_group(v: &Map<String, Value>) -> bool {
+    v.len() == 1
+        && v.get("compression_group")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                !items.is_empty()
+                    && items.len() <= 16
+                    && items.iter().all(|p| {
+                        p.as_object().is_some_and(|p| {
+                            p.contains_key("proof_bytes")
+                                && p.contains_key("input")
+                                && p.contains_key("operations")
+                        })
+                    })
+            })
+}
 #[derive(Default)]
 struct Packer {
     certificates: Vec<Certificate>,
     indexed: HashMap<ShellHash, usize>,
+    witnesses: bool,
 }
 impl Packer {
     fn reference(&mut self, bytes: Vec<u8>) -> Result<Value, String> {
@@ -304,7 +333,11 @@ impl Packer {
                 if v.values().any(has_reference) {
                     return Err("reserved nested certificate reference".into());
                 }
-                self.reference(encode_value(Value::Object(v), MAX_CERTIFICATE_BYTES)?)
+                self.reference(if self.witnesses {
+                    witness::encode(Value::Object(v))?
+                } else {
+                    encode_value(Value::Object(v), MAX_CERTIFICATE_BYTES)?
+                })
             }
             Value::Object(v) => {
                 // A bounded complete hash shares one pool slot, retaining every
@@ -360,6 +393,7 @@ struct Unpacker<'a> {
     references: usize,
     pool_json: usize,
     hash_containers: bool,
+    grouped: bool,
 }
 impl<'a> Unpacker<'a> {
     fn new(certificates: &'a [Certificate], hash_containers: bool) -> Result<Self, String> {
@@ -379,6 +413,7 @@ impl<'a> Unpacker<'a> {
             references: 0,
             pool_json: 0,
             hash_containers,
+            grouped: false,
         })
     }
     fn expand(&mut self, v: Value, budget: &mut usize, remaining: usize) -> Result<Value, String> {
@@ -399,10 +434,16 @@ impl<'a> Unpacker<'a> {
                 }
                 // Retain only size metadata, never inflated JSON certificate trees.
                 // Each recipient gets a freshly decoded untrusted value and full AIR.
-                let value = decode_value(&self.certificates[index].data.0)?;
+                let value = if self.grouped {
+                    witness::decode(&self.certificates[index].data.0)?
+                } else {
+                    decode_value(&self.certificates[index].data.0)?
+                };
                 if has_reference(&value)
                     || !value.as_object().is_some_and(|v| {
-                        v.keys().any(|k| byte_field(k)) || self.hash_containers && hash_container(v)
+                        v.keys().any(|k| byte_field(k))
+                            || self.hash_containers && hash_container(v)
+                            || self.grouped && compression_group(v)
                     })
                 {
                     return Err("chained or invalid compact certificate".into());
@@ -454,6 +495,46 @@ pub fn encode_payload(
     limit: usize,
     compact: bool,
 ) -> Result<Vec<u8>, String> {
+    if proof.version == 3 {
+        if !proof.transactions.is_empty()
+            || proof.proposer.is_none()
+            || proof.slh_transactions.as_ref().is_none_or(|v| v.len() != 1)
+        {
+            return Err("compact SLH profile/count mismatch".into());
+        }
+        let mut packer = Packer {
+            witnesses: true,
+            ..Default::default()
+        };
+        let sender = slh::encode(
+            &mut packer,
+            &proof.slh_transactions.as_ref().ok_or("SLH source absent")?[0],
+        )?;
+        let proposer = packer.pack(
+            serde_json::to_value(proof.proposer.as_ref().ok_or("SLH proposer absent")?)
+                .map_err(|e| e.to_string())?,
+            MAX_DEPTH,
+        )?;
+        let frame = Frame {
+            format_version: 4,
+            proof_version: 3,
+            transactions: vec![sender],
+            proposer: Some(template(&proposer)?),
+            certificates: packer.certificates,
+        };
+        template_bound(&frame)?;
+        let body = cbor(
+            &frame,
+            limit
+                .min(MAX_BYTES)
+                .checked_sub(SLH_PAYLOAD.len())
+                .ok_or("compact payload byte limit")?,
+        )?;
+        return Ok([SLH_PAYLOAD, body.as_slice()].concat());
+    }
+    if proof.slh_transactions.is_some() {
+        return Err("legacy compact profile cannot contain SLH senders".into());
+    }
     let limit = limit.min(MAX_BYTES);
     if !compact {
         return crate::production_store::bounded_json(proof, limit).map_err(|e| e.to_string());
@@ -585,7 +666,9 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
     if bytes.len() > MAX_BYTES {
         return Err("canonical payload byte limit".into());
     }
-    let (bytes, version) = if let Some(bytes) = bytes.strip_prefix(HASH_PAYLOAD) {
+    let (bytes, version) = if let Some(bytes) = bytes.strip_prefix(SLH_PAYLOAD) {
+        (bytes, 4)
+    } else if let Some(bytes) = bytes.strip_prefix(HASH_PAYLOAD) {
         (bytes, 3)
     } else if let Some(bytes) = bytes.strip_prefix(PAYLOAD) {
         (bytes, 2)
@@ -596,10 +679,14 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
     if frame.format_version != version
         || frame.transactions.is_empty()
         || frame.transactions.len() > MAX_CANONICAL_SIGNATURE_BATCH
-        || !matches!(
-            (frame.proof_version, frame.proposer.is_some()),
-            (1, false) | (2, true)
-        )
+        || (if version == 4 {
+            frame.proof_version != 3 || frame.transactions.len() != 1 || frame.proposer.is_none()
+        } else {
+            !matches!(
+                (frame.proof_version, frame.proposer.is_some()),
+                (1, false) | (2, true)
+            )
+        })
     {
         return Err("compact canonical profile/count mismatch".into());
     }
@@ -607,25 +694,41 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
     if cbor(&frame, MAX_BYTES)? != bytes {
         return Err("noncanonical compact frame".into());
     }
-    let mut unpacker = Unpacker::new(&frame.certificates, version == 3)?;
+    let mut unpacker = Unpacker::new(&frame.certificates, version >= 3)?;
+    unpacker.grouped = version == 4;
+    let mut slh_transactions = (version == 4).then(Vec::new);
+    let mut slh_budget = MAX_POOL_JSON;
     let mut transactions = Vec::with_capacity(frame.transactions.len());
     for bytes in frame.transactions {
-        let value: Value = serde_json::from_slice(&bytes.0).map_err(|e| e.to_string())?;
-        let mut budget = MAX_BYTES - bytes.0.len();
-        let value = unpacker.expand(value, &mut budget, MAX_DEPTH)?;
-        transactions.push(serde_json::from_value(value).map_err(|e| e.to_string())?);
+        if let Some(slh) = &mut slh_transactions {
+            slh.push(slh::decode(&mut unpacker, bytes, &mut slh_budget)?);
+        } else {
+            let value: Value = serde_json::from_slice(&bytes.0).map_err(|e| e.to_string())?;
+            let mut budget = MAX_BYTES - bytes.0.len();
+            let value = unpacker.expand(value, &mut budget, MAX_DEPTH)?;
+            transactions.push(serde_json::from_value(value).map_err(|e| e.to_string())?);
+        }
     }
     let proposer = frame
         .proposer
         .map(|bytes| {
             let value: Value = serde_json::from_slice(&bytes.0).map_err(|e| e.to_string())?;
             let mut budget = MAX_BYTES - bytes.0.len();
-            serde_json::from_value(unpacker.expand(value, &mut budget, MAX_DEPTH)?)
-                .map_err(|e| e.to_string())
+            serde_json::from_value(unpacker.expand(
+                value,
+                if version == 4 {
+                    &mut slh_budget
+                } else {
+                    &mut budget
+                },
+                MAX_DEPTH,
+            )?)
+            .map_err(|e| e.to_string())
         })
         .transpose()?;
     unpacker.finish()?;
     Ok(CanonicalSignatureBatchProof {
+        slh_transactions,
         version: frame.proof_version,
         transactions,
         proposer,
@@ -636,6 +739,34 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn slh_group_certificates_cannot_enter_old_frame_or_chain_references() {
+        let group = json!({"compression_group":[{"proof_bytes":[1,2],"input":{},"operations":[]}]});
+        let mut packer = Packer::default();
+        let reference = packer
+            .reference(encode_value(group.clone(), MAX_CERTIFICATE_BYTES).unwrap())
+            .unwrap();
+        let mut old = Unpacker::new(&packer.certificates, true).unwrap();
+        assert!(old
+            .expand(reference.clone(), &mut { MAX_BYTES }, MAX_DEPTH)
+            .is_err());
+        let mut current = Unpacker::new(&packer.certificates, true).unwrap();
+        current.grouped = true;
+        assert_eq!(
+            current
+                .expand(reference, &mut { MAX_BYTES }, MAX_DEPTH)
+                .unwrap(),
+            group
+        );
+        current.finish().unwrap();
+        let mut packer = Packer::default();
+        let reference=packer.reference(encode_value(json!({"compression_group":[{"proof_bytes":[1],"input":{},"operations":[],"nested":{"$certificate":0}}]}),MAX_CERTIFICATE_BYTES).unwrap()).unwrap();
+        let mut current = Unpacker::new(&packer.certificates, true).unwrap();
+        current.grouped = true;
+        assert!(current
+            .expand(reference, &mut { MAX_BYTES }, MAX_DEPTH)
+            .is_err());
+    }
     #[test]
     fn checkpoint_dictionary_restores_exact_bytes_and_rejects_missing_or_unused_parts() {
         let value = json!({"version":1,"address_hash":{"proof_bytes":[1,2]},

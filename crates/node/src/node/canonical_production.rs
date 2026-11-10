@@ -2,7 +2,6 @@
 mod compressed;
 use super::*;
 use serde::{Deserialize, Serialize};
-use shell_crypto::SignatureType;
 use shell_primitives::blake3_hash;
 use shell_stark_prover::{
     canonical_producer::CanonicalProductionSource,
@@ -555,7 +554,7 @@ impl<S: KvStore> ProductionJob<S> {
                 let entries = index["components"]
                     .as_object()
                     .ok_or_else(|| error("production donor index shape"))?;
-                if !matches!(index["version"].as_u64(), Some(1..=3)) || entries.len() > 2048 {
+                if !matches!(index["version"].as_u64(), Some(1..=4)) || entries.len() > 2048 {
                     return Err(error("production donor index version/count"));
                 }
                 for (name, entry) in entries {
@@ -683,15 +682,7 @@ impl<S: KvStore + 'static> Node<S> {
         {
             return;
         }
-        if block.transactions.len()
-            > shell_stark_prover::canonical_batch::MAX_CANONICAL_SIGNATURE_BATCH
-            || block.transactions.iter().any(|t| {
-                !matches!(
-                    t.signature.sig_type,
-                    SignatureType::MlDsa65 | SignatureType::Dilithium3
-                )
-            })
-        {
+        if !shell_stark_prover::canonical_producer::supports_production_senders(block) {
             return;
         }
         let captured = (|| -> Result<(), String> {
@@ -855,9 +846,14 @@ impl<S: KvStore + 'static> Node<S> {
                 .map(|tx| tx.from.as_bytes().to_vec())
                 .collect::<std::collections::BTreeSet<_>>()
                 .len();
-            let mut job = if distinct_senders > 8 {
+            let mut job = if source.has_slh_senders() {
+                ProductionStore::open_slh(&mut kv, source.identity(), limit)
+            } else if distinct_senders > 8 {
                 ProductionStore::open_shared_matrix(&mut kv, source.identity(), limit)
-            } else if source.block().transactions.len() > 2 || source.has_unbound_senders() {
+            } else if source.block().transactions.len() > 2
+                || source.has_unbound_senders()
+                || source.has_slh_senders()
+            {
                 ProductionStore::open_compact(&mut kv, source.identity(), limit)
             } else {
                 ProductionStore::open(&mut kv, source.identity(), limit)
@@ -888,7 +884,7 @@ impl<S: KvStore + 'static> Node<S> {
             let payload = shell_stark_prover::compact_canonical::encode_payload(
                 &proof,
                 MAX_CANONICAL_PROOF_BYTES as usize,
-                source.block().transactions.len() > 2,
+                source.block().transactions.len() > 2 || source.has_slh_senders(),
             )?;
             let manifest = CanonicalProofManifest {
                 version: 1,

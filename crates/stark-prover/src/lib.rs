@@ -47,6 +47,8 @@ pub mod body_membership;
 pub mod canonical_batch;
 pub mod canonical_producer;
 pub mod canonical_signature;
+pub mod canonical_slh;
+mod canonical_slh_producer;
 pub mod compact_canonical;
 pub mod header_hash;
 pub mod keccak_permutation;

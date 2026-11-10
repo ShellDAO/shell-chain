@@ -616,12 +616,12 @@ pub(crate) fn compression_witness_output(
     route(algorithm, input, |op| native(algorithm, op))
 }
 
-/// Prove every compression's full schedule,64/80 rounds and eight-word feedforward.
-/// Inputs may have independently supplied chaining values for verified prefix reuse.
-pub fn prove_compression_batch(
+// Deterministic witness reconstruction for proving and lossless availability
+// decoding only. This function creates no proof or verification authority.
+pub(crate) fn compression_witness(
     algorithm: Sha2Algorithm,
     inputs: &[CompressionInput],
-) -> Result<Sha2CompressionProof, String> {
+) -> Result<(Vec<u64>, Vec<u8>), String> {
     validate_inputs(algorithm, inputs)?;
     let mut operations = Vec::new();
     let mut carries = Vec::new();
@@ -647,6 +647,16 @@ pub fn prove_compression_batch(
             value
         });
     }
+    Ok((operations, carries))
+}
+
+/// Prove every compression's full schedule,64/80 rounds and eight-word feedforward.
+/// Inputs may have independently supplied chaining values for verified prefix reuse.
+pub fn prove_compression_batch(
+    algorithm: Sha2Algorithm,
+    inputs: &[CompressionInput],
+) -> Result<Sha2CompressionProof, String> {
+    let (operations, carries) = compression_witness(algorithm, inputs)?;
     let statement = Statement {
         algorithm,
         inputs: inputs.to_vec(),

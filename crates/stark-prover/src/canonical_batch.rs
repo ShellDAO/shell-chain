@@ -1,6 +1,6 @@
-//! Complete sender cryptography for one retained trusted canonical block.
-//! Canonical storage and native body hashing select the sources independently;
-//! this is not an AIR proof of body membership, proposer consensus or execution.
+//! Complete canonical sender verification over trusted local context.
+//! Legacy profiles use native body selection; the SLH profile also verifies
+//! the large envelope/header relation. Consensus and execution remain native.
 use crate::{
     account_state::AccountStateProof,
     canonical_signature::{
@@ -55,13 +55,22 @@ pub struct CanonicalSignatureBatchProof {
     pub transactions: Vec<CanonicalTransactionProof>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposer: Option<ProposerSealProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slh_transactions: Option<Vec<crate::canonical_slh::CanonicalSlhTransactionProof>>,
 }
 impl CanonicalSignatureBatchProof {
     fn valid_profile(&self) -> bool {
-        matches!(
-            (self.version, self.proposer.is_some()),
-            (1, false) | (2, true)
-        )
+        match (
+            self.version,
+            self.proposer.is_some(),
+            &self.slh_transactions,
+        ) {
+            (1, false, None) | (2, true, None) => true,
+            // One large registered sender plus the mandatory existing proposer
+            // profile. This does not change the old sixteen-sender profiles.
+            (3, true, Some(slh)) => self.transactions.is_empty() && slh.len() == 1,
+            _ => false,
+        }
     }
 }
 
@@ -141,8 +150,9 @@ impl Verifier for VerifiedCanonicalSignatureBatch {
 /// three respectively; unbound MLDSA65 and PQClean Dilithium3 default accounts
 /// use versions two/four with a complete derived-address proof and the historical
 /// registry's Embedded/Reference rules. Bound Native tag-zero SDK FIPS uses profile five.
-/// AA, other algorithms and pruned witnesses
-/// remain outside this profile.
+/// Batch profile three separately verifies one registered SHA2-256f sender's
+/// complete signature/body relation and a mandatory existing proposer proof.
+/// AA, unsupported algorithms and pruned witnesses remain outside these profiles.
 pub fn verify_canonical_signature_batch<S: KvStore + 'static>(
     view: &CanonicalParentView<S>,
     block: &Block,
@@ -151,7 +161,11 @@ pub fn verify_canonical_signature_batch<S: KvStore + 'static>(
     if !proof.valid_profile()
         || block.transactions.is_empty()
         || block.transactions.len() > MAX_CANONICAL_SIGNATURE_BATCH
-        || proof.transactions.len() != block.transactions.len()
+        || (if proof.version == 3 {
+            proof.slh_transactions.as_ref().map_or(0, Vec::len)
+        } else {
+            proof.transactions.len()
+        }) != block.transactions.len()
     {
         return Err("canonical signature batch version/count/profile mismatch".into());
     }
@@ -205,7 +219,11 @@ fn verify_batch_at_parent<S: KvStore + 'static>(
     if !proof.valid_profile()
         || block.transactions.is_empty()
         || block.transactions.len() > MAX_CANONICAL_SIGNATURE_BATCH
-        || proof.transactions.len() != block.transactions.len()
+        || (if proof.version == 3 {
+            proof.slh_transactions.as_ref().map_or(0, Vec::len)
+        } else {
+            proof.transactions.len()
+        }) != block.transactions.len()
     {
         return Err("canonical signature batch version/count/profile mismatch".into());
     }
@@ -231,18 +249,32 @@ fn verify_batch_at_parent<S: KvStore + 'static>(
         .transpose()?;
     let mut seen = std::collections::HashSet::new();
     let mut signatures = Vec::with_capacity(block.transactions.len());
-    for (tx, item) in block.transactions.iter().zip(&proof.transactions) {
-        let entry = match item.signature.version {
-            1 | 3 | 5 => {
-                verify_canonical_registered_signature(view, tx, &item.account, &item.signature)?
-                    .signature()
-                    .entry()
-                    .clone()
+    for (index, tx) in block.transactions.iter().enumerate() {
+        let entry = if proof.version == 3 {
+            crate::canonical_slh::verify_at_parent(
+                view,
+                &block.header,
+                tx,
+                index as u64,
+                &proof
+                    .slh_transactions
+                    .as_ref()
+                    .ok_or("SLH sender proof absent")?[index],
+            )?
+        } else {
+            let item = &proof.transactions[index];
+            match item.signature.version {
+                1 | 3 | 5 => {
+                    verify_canonical_registered_signature(view, tx, &item.account, &item.signature)?
+                        .signature()
+                        .entry()
+                        .clone()
+                }
+                2 | 4 | 6 => {
+                    verify_canonical_unbound_signature(view, tx, &item.account, &item.signature)?
+                }
+                _ => return Err("unsupported canonical sender proof profile".into()),
             }
-            2 | 4 | 6 => {
-                verify_canonical_unbound_signature(view, tx, &item.account, &item.signature)?
-            }
-            _ => return Err("unsupported canonical sender proof profile".into()),
         };
         if !seen.insert(*entry.transaction_id()) {
             return Err("duplicate canonical signature batch source".into());
@@ -293,6 +325,16 @@ mod tests {
         .is_err());
     }
     #[test]
+    fn old_profiles_cannot_carry_new_sender_graphs() {
+        for version in [1, 2, 3] {
+            let proof: CanonicalSignatureBatchProof = serde_json::from_value(serde_json::json!({
+                "version":version,"transactions":[],"slh_transactions":[]
+            }))
+            .unwrap();
+            assert!(!proof.valid_profile());
+        }
+    }
+    #[test]
     fn candidate_batch_requires_active_current_parent_and_exact_body() {
         for activation in [None, Some(1), Some(2)] {
             let db = Arc::new(MemoryDb::new());
@@ -323,6 +365,7 @@ mod tests {
                 proposer_seal: None,
             };
             let proof = CanonicalSignatureBatchProof {
+                slh_transactions: None,
                 version: 1,
                 transactions: vec![],
                 proposer: None,

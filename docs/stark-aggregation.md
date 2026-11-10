@@ -1267,11 +1267,11 @@ ML-DSA proposer, Native quorum/finality, independent Native database import,
 wrong-owner/message refusals, signed wrong-root rollback and an ordinary
 successor. Existing output is refused before generating any new key.
 
-Canonical source capture currently rejects this fallback profile. This remains
-a missing full signature proving capability. Native execution and the SHA2
-compression primitives below do not establish full canonical SLH proof
-admission. The full mathematical signature backend below remains separate
-from the durable canonical production/peer/history chain, which needs integration.
+The unreleased registered-sender source profile below integrates this fallback
+with historical account authority, full signature/body proofs and durable
+production. Native execution and the standalone SHA2 primitives alone do not
+establish canonical proof admission. Network transport, automatic production,
+changed-state history and public release acceptance require separate evidence.
 Keep original outputs and signatures when investigating a failure. The explicit
 `recover-native` mode can checkpoint an already imported/finalized retained
 first block without any private key or re-signing; it cannot recreate an
@@ -1524,9 +1524,9 @@ Original input and proof artifacts remain immutable after every control.
 
 Only this full composition reports `full_signature_verified: true`. It proves
 the mathematical signature for the supplied signing message. Binding that
-message to a canonical transaction/header, large body identity, production
-source/jobs, node/peer import and historical replay still requires integration;
-`canonical_admission` remains false. This source entry is not a claim that a
+message to a canonical transaction/header and account authority requires the
+separate registered-sender composition below. The standalone mathematical
+command still reports `canonical_admission: false`; it does not execute a block. This source entry is not a claim that a
 published node binary or an activated network accepts full SLH proof sources.
 
 
@@ -1603,3 +1603,72 @@ an AIR-verification fallback. Successful body verification reports
 `signature_verified: false` and `canonical_admission: false`; complete canonical
 signature source/jobs, node/peer import, historical replay and public binary
 acceptance remain separate integration work.
+
+
+### Registered SLH canonical source and durable production
+
+This source-build entry continues exactly one retained, bound default-account
+SLH-DSA-SHA2-256f sender with a parent-registered key and an independent existing
+ML-DSA/Dilithium proposer seal. Use the RocksDB/C++ toolchain prerequisites above,
+Python 3 and the locked Rust dependencies (`fips205 0.4.1`). No private key is
+read, recreated or persisted by these commands.
+
+```bash
+tests/e2e/slh-canonical.sh capture slh-output canonical-output
+python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["senders"][0]["key"]))' canonical-output/source.json > slh-public-key.json
+tests/e2e/slh-fors.sh fors-original slh-output/signed-first.json slh-public-key.json
+tests/e2e/slh-signature.sh signature-original fors-original/input.json fors-original/proof/fors.cbor
+tests/e2e/large-body.sh body-original slh-output/candidate.json
+tests/e2e/slh-canonical.sh pause slh-output canonical-output signature-original/proof body-original/proof
+tests/e2e/slh-canonical.sh resume slh-output canonical-output signature-original/proof body-original/proof
+tests/e2e/slh-canonical.sh verify slh-output canonical-output signature-original/proof body-original/proof
+tests/e2e/slh-canonical.sh refusals slh-output canonical-output signature-original/proof body-original/proof
+```
+
+Create `slh-output` with the Native entry above, or keep an existing original
+Native output. Reuse matching existing FORS/full-signature/body directories;
+never regenerate them merely because proving paused. Capture uses an independent
+output, so an old failed Native capture receipt remains intact. The source fixes
+the original signed envelope, parent account/MPT witness, historical public key,
+chain/genesis and supported proposer. Explicit source format 6 and batch profile
+3 bind full signature mathematics to the proved signing message, unchanged
+80-byte identity preimage, complete large body and exact header. Older source
+formats 1–5 and batch profiles 1–2 retain their meanings.
+
+The job stores verified components in a separate database. `pause` requests one
+new component; `resume` rechecks retained components and imports matching original
+mathematical certificates. It proves missing account/key/batch-entry and proposer
+components, without re-signing. `proof.cbor` uses explicit availability frame 4.
+Checkpoint format 4/component format 2 reconstruct deterministic SHA2 witness
+words only after exact equality during encoding; decoding grants no authority.
+Every complete restored AIR, routing edge and original proof byte is still
+verified before an output can authorize Native execution. See
+[the encoding rationale](adr/canonical-slh-proofs.md).
+
+A raw compact intermediate can exceed the existing 256 MiB checkpoint quota.
+Its failed output is retained; it is never silently rewritten as format 4.
+Use a new owned canonical output for that encoding. An optional final
+`prior-job-output` argument imports already verified binding certificates from
+that exact-source job; the old database and index remain unchanged. The
+256 MiB store/payload,
+8 MiB full component and 2,048-certificate limits stay in force. The single large
+sender shares the existing 1 GiB expanded-pool ceiling with its proposer; old
+frames keep their prior per-transaction bounds. Body compression certificates
+are grouped in canonical runs of at most sixteen. Source/circuit defaults, gas,
+algorithm lifecycle and activation heights do not change.
+
+The regression replays through the actual Native Node in a read-only historical
+overlay and compares receipts/state with the original control. It also constructs
+a separate RocksDB receiver at the original authenticated genesis using only
+content-addressed trie nodes and historical registrations, imports the original
+child with full proofs, then cold-replays persisted receipts/state. This is an
+explicit test-parent reconstruction; no executed child or success flag seeds
+that receiver. Wrong source/proof profiles, altered keys, chain, signing message,
+signature witness and body/header root are refused without writing Native state.
+Unmatched signature tuples receive no native crypto fallback.
+
+This profile covers the first registered sender and direct offline import.
+Automatic Node.run production, actual peer transport/finality, history after a
+later original signed block, other account/role combinations and public
+package/binary/network activation remain separate acceptance work. A retained
+unsigned successor cannot be recreated after its private key has been dropped.

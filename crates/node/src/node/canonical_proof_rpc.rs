@@ -50,16 +50,7 @@ impl<S: KvStore + 'static> Node<S> {
             || block.transactions.is_empty()
             || block.transactions.len()
                 > shell_stark_prover::canonical_batch::MAX_CANONICAL_SIGNATURE_BATCH
-            || block.transactions.iter().any(|tx| {
-                tx.tx.tx_type > 3
-                    || tx.aa_bundle.is_some()
-                    || !matches!(
-                        tx.signature.sig_type,
-                        shell_crypto::SignatureType::MlDsa65
-                            | shell_crypto::SignatureType::Dilithium3
-                    )
-                    || tx.signature.data.len() != 3309
-            })
+            || !shell_stark_prover::canonical_producer::supports_production_senders(&block)
             || block
                 .system_transactions
                 .iter()

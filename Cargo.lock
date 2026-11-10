@@ -6404,6 +6404,7 @@ version = "0.27.14"
 dependencies = [
  "alloy-rlp",
  "async-trait",
+ "ciborium",
  "flate2",
  "hex",
  "http-body-util",

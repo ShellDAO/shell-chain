@@ -33,6 +33,7 @@ http-body-util.workspace = true
 flate2 = "1.1.9"
 
 [dev-dependencies]
+ciborium = "0.2.2"
 async-trait.workspace = true
 hyper = { workspace = true, features = ["client"] }
 libp2p.workspace = true
@@ -65,4 +66,8 @@ required-features = ["rocksdb"]
 
 [[example]]
 name = "mldsa-produce-proof"
+required-features = ["rocksdb"]
+
+[[example]]
+name = "slh-canonical"
 required-features = ["rocksdb"]

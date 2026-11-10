@@ -41,8 +41,10 @@ pub fn produce_block_proof(
         let block_bytes = bounded_json(source.block(), 2 * 1024 * 1024)?;
         let output = prepare_output(&database, &output)?;
         let mut db = RocksDbStore::open_all(output.join("db"), None)?.state;
-        let compact = source.block().transactions.len() > 2;
-        let mut job = if compact {
+        let compact = source.block().transactions.len() > 2 || source.has_slh_senders();
+        let mut job = if source.has_slh_senders() {
+            ProductionStore::open_slh(&mut db, source.identity(), component_limit)?
+        } else if compact {
             ProductionStore::open_compact(&mut db, source.identity(), component_limit)?
         } else {
             ProductionStore::open(&mut db, source.identity(), component_limit)?
@@ -115,7 +117,14 @@ fn prepare_output(
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_str().ok_or("invalid production output name")?;
-            if !["db", "proof.json", "manifest.json", "block.json"].contains(&name)
+            if ![
+                "db",
+                "proof.json",
+                "proof.cbor",
+                "manifest.json",
+                "block.json",
+            ]
+            .contains(&name)
                 || entry.file_type()?.is_symlink()
             {
                 return Err("refusing unowned or linked production output".into());
