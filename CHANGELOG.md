@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Prove complete large native signed-envelope body membership with a separate 64 KiB BLAKE3 hash v3 and body-membership v2 profile. Bind the unchanged small signing payload and canonical transaction ID through existing hash AIRs, persist verified compression checkpoints, and add cold/resume/refusal regression. Existing 4 KiB/16 KiB profiles, native identities, source formats and activation remain unchanged; canonical signature/source/job/peer integration is still pending.
+
 - Compose complete SHA2-256f signature certificates from verified H_msg/FORS and all seventeen WOTS+/XMSS layers, including every tree/leaf transition and the final public-key root. Add bounded streamed verification, retained-original proof import, shared-prefix reuse, immutable resume and independent full-signature/refusal regression. Canonical source/body/jobs, peer and historical admission remain unfinished.
 
 - Prove complete SHA2-256f WOTS+ chains/checksum and four-level XMSS layers with one authenticated seed-prefix compression and canonical F batches. Add retained-FORS layer export, immutable checkpoint recovery, cold verification and independent layer-root/refusal regression. Each standalone layer certificate remains an intermediate result; full signature composition is provided separately, and canonical SLH admission remains unfinished.

@@ -1528,3 +1528,78 @@ message to a canonical transaction/header, large body identity, production
 source/jobs, node/peer import and historical replay still requires integration;
 `canonical_admission` remains false. This source entry is not a claim that a
 published node binary or an activated network accepts full SLH proof sources.
+
+
+For a large native signed envelope such as SLH-DSA-SHA2-256f, the ordinary body
+leaf contains the complete encoded signature and can exceed the existing
+16 KiB body-leaf proof profile. `prove_large_body_hash_using` and
+`verify_large_body_hash` use an explicit BLAKE3 hash version 3 with a 65,536-byte
+bound. `prove_large_transaction_body_using` and
+`verify_large_transaction_body` use body-membership version 2, binding the exact
+ordinary envelope, index, sibling order, odd carry, total leaf count and expected
+header transaction root. Existing hash versions 1/2 retain their 4,096/16,384-byte
+bounds; legacy membership version 1 rejects the large profile. Native byte
+formats, transaction limits, gas, source formats and activation are unchanged.
+
+The canonical transaction ID remains the existing 80-byte preimage:
+`PQTX_IDENTITY_V1 || from || sender_signing_hash`. Authentication witnesses are
+excluded from that ID. `LargeTransactionEnvelopeProof` separately proves the
+ordinary signing payload, this small ID and the large body membership using
+actual compression AIRs. Its verifier takes the expected transaction ID and
+header independently. A changed signature can retain the same ID while failing
+body membership. This is body/identity evidence, not signature or consensus
+authorization. Header hashing labels the result; the caller must authenticate
+the selected header and link the mathematical signature/account/source context.
+
+Use the Rust stable/source-build prerequisites and Python 3 standard library:
+
+```bash
+tests/e2e/large-body.sh body-output
+```
+
+The default fixture generates a separate genuine, memory-only SLH signature and
+a mathematical block-body fixture; it is not a claim about Native execution.
+To prove the exact first ordinary envelope in an already retained Native block
+without generating a key or signature:
+
+```bash
+tests/e2e/large-body.sh body-original original-native-block.json
+```
+
+An optional third argument copies and rechecks an exact retained proof directory
+when continuing a failed regression. Its frozen public inputs must match the
+exported original block inputs byte-for-byte; it cannot substitute another
+target, signature or body. The original directory remains read-only and no
+proof is generated on the initial cache replay:
+
+```bash
+tests/e2e/large-body.sh body-rechecked original-native-block.json body-original/proof
+```
+
+The example exports public inputs without re-signing. Every BLAKE3 compression
+checkpoint is verified against independently routed byte/chaining/counter/flag
+operands before its output is used. Input snapshots, component hashes and final
+certificates are create-new and never replaced. The final envelope verifies in
+a separate process; full-cache resume creates no proof. A prepared partial
+boundary removes only the final leaf compression and the derived assemblies
+from a separate copy. Resume verifies retained steps, generates exactly the
+missing compression and reproduces the original final bytes. This tests a
+prepared checkpoint boundary, not actual process termination or power loss.
+
+```bash
+cargo run --locked --release -p shell-stark-prover --example large-body -- resume body-original/input.json body-original/proof
+cargo run --locked --release -p shell-stark-prover --example large-body -- verify body-original/input.json body-original/proof
+```
+
+The complete development reader has a separate 512 MiB bound for its component
+proof aggregate. Individual compression constraints/options and global
+proof-store quotas are unchanged. Wrong profiles, signatures, keys, sender,
+index, count, siblings, root, genuine reordered/foreign certificates,
+corrupt/trailing bytes and attempted input/output replacement fail nonzero.
+The regression checks independent Native hashing references, proves that a
+changed witness keeps the old ID but fails the body proof, and retains all
+original artifacts. `inspect` is explicitly a native reference command, never
+an AIR-verification fallback. Successful body verification reports
+`signature_verified: false` and `canonical_admission: false`; complete canonical
+signature source/jobs, node/peer import, historical replay and public binary
+acceptance remain separate integration work.

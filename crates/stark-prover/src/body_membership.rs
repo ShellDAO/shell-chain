@@ -1,8 +1,8 @@
 //! Complete BLAKE3 AIR membership of an exact public native signed envelope.
 //! A caller must authenticate the expected header; membership alone proves no consensus.
 use crate::blake3_hash::{
-    prove_body_hash, prove_hash, verify_body_hash, verify_hash, Blake3HashProof,
-    MAX_BODY_HASH_BYTES,
+    prove_body_hash, prove_hash, prove_large_body_hash, verify_body_hash, verify_hash,
+    verify_large_body_hash, Blake3HashProof, MAX_BODY_HASH_BYTES, MAX_LARGE_BODY_HASH_BYTES,
 };
 use alloy_rlp::Encodable;
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,42 @@ pub struct TransactionBodyProof {
     pub leaf: Blake3HashProof,
     pub parents: Vec<Blake3HashProof>,
     pub root: Blake3HashProof,
+}
+/// The signature witness is excluded from the canonical transaction ID, but
+/// included in the body leaf. Bind both relations without changing either.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LargeTransactionEnvelopeProof {
+    pub version: u8,
+    pub body: TransactionBodyProof,
+    pub signing_hash: Blake3HashProof,
+    pub transaction_id: Blake3HashProof,
+}
+
+pub fn verify_large_transaction_envelope(
+    proof: &LargeTransactionEnvelopeProof,
+    header: &BlockHeader,
+    transaction: &SignedTransaction,
+    expected_index: u64,
+    expected_id: &ShellHash,
+) -> Result<VerifiedBodyMembership, String> {
+    if proof.version != 1 || transaction.tx.tx_type > 3 || transaction.aa_bundle.is_some() {
+        return Err("unsupported large envelope version or signing profile".into());
+    }
+    let membership =
+        verify_large_transaction_body(&proof.body, header, transaction, expected_index)?;
+    verify_hash(
+        &proof.signing_hash,
+        &transaction
+            .tx
+            .signing_payload(transaction.signature.sig_type.as_u8()),
+        &proof.signing_hash.output,
+    )?;
+    let mut message = shell_core::PQTX_ID_DOMAIN.to_vec();
+    message.extend_from_slice(transaction.from.as_bytes());
+    message.extend_from_slice(&proof.signing_hash.output);
+    verify_hash(&proof.transaction_id, &message, expected_id.as_bytes())?;
+    Ok(membership)
 }
 /// Immutable verified membership, without a public constructor or Deserialize.
 #[derive(Clone, Debug)]
@@ -78,15 +114,53 @@ fn walk(
 /// Generate real compression certificates for the full envelope and every path hash.
 /// System siblings are included by the native body path; only ordinary leaves are targets.
 pub fn prove_transaction_body(block: &Block, index: usize) -> Result<TransactionBodyProof, String> {
+    prove_body_profile(block, index, 1, MAX_BODY_HASH_BYTES, |_, bytes, leaf| {
+        if leaf {
+            prove_body_hash(bytes)
+        } else {
+            prove_hash(bytes)
+        }
+    })
+}
+/// Explicit large-body membership v2, with leaf hash v3. The legacy entry
+/// retains its original 16KiB bound/version and refuses these certificates.
+pub fn prove_large_transaction_body(
+    block: &Block,
+    index: usize,
+) -> Result<TransactionBodyProof, String> {
+    prove_large_transaction_body_using(block, index, |_, bytes, leaf| {
+        if leaf {
+            prove_large_body_hash(bytes)
+        } else {
+            prove_hash(bytes)
+        }
+    })
+}
+/// Ordinal0 is the large leaf; later ordinals are ordered parent hashes and the
+/// count-wrapped root. Providers return concrete proofs, never trusted hashes.
+pub fn prove_large_transaction_body_using(
+    block: &Block,
+    index: usize,
+    certificate: impl FnMut(usize, &[u8], bool) -> Result<Blake3HashProof, String>,
+) -> Result<TransactionBodyProof, String> {
+    prove_body_profile(block, index, 2, MAX_LARGE_BODY_HASH_BYTES, certificate)
+}
+fn prove_body_profile(
+    block: &Block,
+    index: usize,
+    version: u8,
+    max: usize,
+    mut certificate: impl FnMut(usize, &[u8], bool) -> Result<Blake3HashProof, String>,
+) -> Result<TransactionBodyProof, String> {
     let transaction = block
         .transactions
         .get(index)
         .ok_or("ordinary body transaction absent")?;
-    if transaction.length() > MAX_BODY_HASH_BYTES {
+    if transaction.length() > max {
         return Err("native body leaf exceeds proof resource bound".into());
     }
     let message = block_body_leaf_message(transaction, index as u64);
-    if message.len() > MAX_BODY_HASH_BYTES {
+    if message.len() > max {
         return Err("native body leaf exceeds proof resource bound".into());
     }
     if block_body_root(&block.transactions, &block.system_transactions)
@@ -96,20 +170,28 @@ pub fn prove_transaction_body(block: &Block, index: usize) -> Result<Transaction
         return Err("native body/header root mismatch".into());
     }
     let path = block_body_membership_path(&block.transactions, &block.system_transactions, index)?;
-    let leaf = prove_body_hash(&message)?;
+    let leaf = certificate(0, &message, true)?;
+    if version == 1 {
+        verify_body_hash(&leaf, &message, &leaf.output)?;
+    } else {
+        verify_large_body_hash(&leaf, &message, &leaf.output)?;
+    }
     let mut parents = Vec::new();
     let top = walk(&path, ShellHash::from(leaf.output), |bytes| {
-        let proof = prove_hash(&bytes)?;
+        let proof = certificate(parents.len() + 1, &bytes, false)?;
+        verify_hash(&proof, &bytes, &proof.output)?;
         let output = ShellHash::from(proof.output);
         parents.push(proof);
         Ok(output)
     })?;
-    let root = prove_hash(&block_body_root_message(path.total, top))?;
+    let message = block_body_root_message(path.total, top);
+    let root = certificate(parents.len() + 1, &message, false)?;
+    verify_hash(&root, &message, &root.output)?;
     if root.output != *block.header.transactions_root.as_bytes() {
         return Err("proved native body root mismatch".into());
     }
     Ok(TransactionBodyProof {
-        version: 1,
+        version,
         path,
         leaf,
         parents,
@@ -125,19 +207,57 @@ pub fn verify_transaction_body(
     transaction: &SignedTransaction,
     expected_index: u64,
 ) -> Result<VerifiedBodyMembership, String> {
+    verify_body_profile(
+        proof,
+        header,
+        transaction,
+        expected_index,
+        1,
+        MAX_BODY_HASH_BYTES,
+    )
+}
+/// Prove only exact native body membership, without signature or consensus
+/// authorization. The expected header must be independently authenticated.
+pub fn verify_large_transaction_body(
+    proof: &TransactionBodyProof,
+    header: &BlockHeader,
+    transaction: &SignedTransaction,
+    expected_index: u64,
+) -> Result<VerifiedBodyMembership, String> {
+    verify_body_profile(
+        proof,
+        header,
+        transaction,
+        expected_index,
+        2,
+        MAX_LARGE_BODY_HASH_BYTES,
+    )
+}
+fn verify_body_profile(
+    proof: &TransactionBodyProof,
+    header: &BlockHeader,
+    transaction: &SignedTransaction,
+    expected_index: u64,
+    version: u8,
+    max: usize,
+) -> Result<VerifiedBodyMembership, String> {
     check_path(&proof.path)?;
-    if proof.version != 1
+    if proof.version != version
         || proof.path.index != expected_index
         || proof.parents.len() > 64
         || proof.root.output != *header.transactions_root.as_bytes()
     {
         return Err("native body proof version/index/header binding mismatch".into());
     }
-    if transaction.length() > MAX_BODY_HASH_BYTES {
+    if transaction.length() > max {
         return Err("native body leaf exceeds proof resource bound".into());
     }
     let message = block_body_leaf_message(transaction, expected_index);
-    verify_body_hash(&proof.leaf, &message, &proof.leaf.output)?;
+    if version == 1 {
+        verify_body_hash(&proof.leaf, &message, &proof.leaf.output)?;
+    } else {
+        verify_large_body_hash(&proof.leaf, &message, &proof.leaf.output)?;
+    }
     let mut index = 0;
     let top = walk(&proof.path, ShellHash::from(proof.leaf.output), |bytes| {
         let child = proof

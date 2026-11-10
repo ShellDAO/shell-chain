@@ -46,6 +46,8 @@ const MAX_PROOF_BYTES: usize = 1_048_576;
 pub const MAX_HASH_BYTES: usize = 4096;
 /// Separate body-leaf proof profile; not a native transaction size or gas limit.
 pub const MAX_BODY_HASH_BYTES: usize = 16_384;
+/// Explicit large-envelope development profile; old hash/body bounds stay fixed.
+pub const MAX_LARGE_BODY_HASH_BYTES: usize = 65_536;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -512,6 +514,42 @@ pub fn prove_hash(message: &[u8]) -> Result<Blake3HashProof, String> {
     prove_hash_profile(message, 1, MAX_HASH_BYTES)
 }
 
+/// Separate v3 profile for a complete large native body leaf. This changes no
+/// transaction identity, native transaction limit, gas or canonical source type.
+pub fn prove_large_body_hash(message: &[u8]) -> Result<Blake3HashProof, String> {
+    prove_large_body_hash_using(message, |_, input| prove_compression(input))
+}
+
+/// Supply new or retained concrete compression certificates. Every certificate
+/// is verified against its independently routed operands before output is used.
+pub fn prove_large_body_hash_using(
+    message: &[u8],
+    mut certificate: impl FnMut(usize, &CompressionInput) -> Result<CompressionProof, String>,
+) -> Result<Blake3HashProof, String> {
+    let mut compressions = Vec::new();
+    let output = hash_route(message, MAX_LARGE_BODY_HASH_BYTES, |input| {
+        let proof = certificate(compressions.len(), &input)?;
+        let output = proof.output().ok_or("missing BLAKE3 compression output")?;
+        verify_compression(&proof, &input, &output)?;
+        compressions.push(proof);
+        Ok(output)
+    })?;
+    Ok(Blake3HashProof {
+        version: 3,
+        message: message.to_vec(),
+        output,
+        compressions,
+    })
+}
+
+pub fn verify_large_body_hash(
+    p: &Blake3HashProof,
+    message: &[u8],
+    output: &[u8; 32],
+) -> Result<(), String> {
+    verify_hash_profile(p, message, output, 3, MAX_LARGE_BODY_HASH_BYTES)
+}
+
 /// A separately versioned bounded leaf profile. Compression certificates and
 /// standard BLAKE3 routing are identical; legacy v1 verification stays at 4096.
 pub(crate) fn prove_body_hash(message: &[u8]) -> Result<Blake3HashProof, String> {
@@ -901,5 +939,49 @@ mod body_profile_tests {
         let mut changed = body.clone();
         changed.compressions.push(changed.compressions[0].clone());
         assert!(verify_body_hash(&changed, message, &body.output).is_err());
+    }
+    #[test]
+    fn large_profile_routes_full_chunk_boundaries_and_rejects_oversize_before_provider() {
+        for len in [4097, 16_384, 16_385, 49_856, 65_535, 65_536] {
+            let bytes = (0..len).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+            let result = hash_route(&bytes, MAX_LARGE_BODY_HASH_BYTES, |input| {
+                Ok(route(&input, native))
+            })
+            .unwrap();
+            assert_eq!(&result, blake3::hash(&bytes).as_bytes());
+        }
+        let mut called = false;
+        assert!(
+            prove_large_body_hash_using(&vec![0; MAX_LARGE_BODY_HASH_BYTES + 1], |_, _| {
+                called = true;
+                Err("must not reach provider".into())
+            })
+            .is_err()
+        );
+        assert!(!called);
+    }
+    #[test]
+    fn large_hash_profile_is_explicit_and_legacy_bounds_are_unchanged() {
+        let bytes = b"separate large body profile";
+        let large = prove_large_body_hash(bytes).unwrap();
+        verify_large_body_hash(&large, bytes, &large.output).unwrap();
+        assert_eq!(large.version, 3);
+        assert!(verify_hash(&large, bytes, &large.output).is_err());
+        assert!(verify_body_hash(&large, bytes, &large.output).is_err());
+        for version in [0, 1, 2, 4] {
+            let mut wrong = large.clone();
+            wrong.version = version;
+            assert!(verify_large_body_hash(&wrong, bytes, &wrong.output).is_err());
+        }
+        assert_eq!(
+            (
+                MAX_HASH_BYTES,
+                MAX_BODY_HASH_BYTES,
+                MAX_LARGE_BODY_HASH_BYTES
+            ),
+            (4096, 16_384, 65_536)
+        );
+        assert!(prove_hash(&vec![0; 4097]).is_err());
+        assert!(prove_body_hash(&vec![0; 16_385]).is_err());
     }
 }
