@@ -78,3 +78,13 @@ A correct-hash payload with a genuine certificate in the wrong statement slot
 must fail even with genuine original signatures and a valid quorum certificate.
 This covers the original first child and single authority, not quorum AIR,
 later-original history or public release and activation.
+
+Fresh automatic generation has a separate standalone regression. It captures
+the original signed child through ordinary Native import with an empty
+mathematical job and no availability cache, without requiring or opening a
+completed reference checkpoint. The actual worker must generate nonzero new
+certificates, persist a graceful budget pause, cold-resume with full verification
+of retained progress, and generate the remaining graph within unchanged quotas.
+Authenticated RPC retrieval and cold read-only Native replay establish the
+generated output; a separate peer receiver checks execution and finality.
+Warm-checkpoint revalidation alone cannot satisfy these fresh-generation checks.

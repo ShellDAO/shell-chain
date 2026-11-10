@@ -1,4 +1,4 @@
-//! Actual background production from an explicitly transplanted same-source checkpoint.
+//! Actual background production from fresh sources or explicit warm checkpoints.
 use super::*;
 use shell_crypto::{CryptoError, MultiVerifier, PQSignature, SignatureType, Signer};
 use shell_network::{Libp2pNetwork, NetworkConfig};
@@ -86,11 +86,12 @@ impl Live {
         out: &Path,
         c: &fixture::Context,
         block: &shell_core::Block,
+        budget: Option<NonZeroUsize>,
     ) -> Result<Self, Error> {
         let db = Arc::new(RocksDbStore::open_all(out.join("provider/db"), None)?.state);
         let mut node = fixture::node(db, c.authority, &c.authority_key)?;
         node.config.canonical_proof_production = true;
-        node.config.canonical_proof_component_budget = NonZeroUsize::new(1);
+        node.config.canonical_proof_component_budget = budget;
         node.config.metrics.enabled = false;
         let socket = std::net::TcpListener::bind("127.0.0.1:0")?;
         let address = socket.local_addr()?;
@@ -177,12 +178,14 @@ fn context(native: &Path) -> Result<(fixture::Context, shell_core::Block, Value)
         json_read(&native.join("control.json"))?,
     ))
 }
-fn prepare(native: &Path, prior: &Path, out: &Path) -> Result<(), Error> {
+fn prepare(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Result<(), Error> {
     ensure(
         native.join("provider/db/CURRENT").is_file()
-            && prior.join("db/CURRENT").is_file()
-            && prior.join("proof.cbor").is_file(),
-        "initialized original Native source and completed checkpoint required",
+            && (fresh
+                || prior.is_some_and(|p| {
+                    p.join("db/CURRENT").is_file() && p.join("proof.cbor").is_file()
+                })),
+        "initialized Native input and required warm checkpoint missing",
     )?;
     ensure(
         !out.exists(),
@@ -197,25 +200,40 @@ fn prepare(native: &Path, prior: &Path, out: &Path) -> Result<(), Error> {
         source.has_slh_senders() && source.block() == &block,
         "original SLH source mismatch",
     )?;
-    let donor = RocksDbStore::open_all(prior.join("db"), None)?;
-    let donor_before = digest(&donor.state)?;
-    ensure(
-        donor.state.get(b"production/source")?.as_deref() == Some(source.identity()),
-        "checkpoint source is not the original source",
-    )?;
-    let index: Value = serde_json::from_slice(
-        &donor
-            .state
-            .get(b"production/index")?
-            .ok_or("checkpoint index absent")?,
-    )?;
-    ensure(
-        index["version"] == 4
-            && index["components"]
-                .as_object()
-                .is_some_and(|v| !v.is_empty()),
-        "complete format4 checkpoint required",
-    )?;
+    let donor = if fresh {
+        None
+    } else {
+        Some(RocksDbStore::open_all(
+            prior.ok_or("warm checkpoint absent")?.join("db"),
+            None,
+        )?)
+    };
+    let donor_before = donor.as_ref().map(|d| digest(&d.state)).transpose()?;
+    let component_count = if let Some(donor) = &donor {
+        ensure(
+            donor.state.get(b"production/source")?.as_deref() == Some(source.identity()),
+            "checkpoint source is not the original source",
+        )?;
+        let index: Value = serde_json::from_slice(
+            &donor
+                .state
+                .get(b"production/index")?
+                .ok_or("checkpoint index absent")?,
+        )?;
+        ensure(
+            index["version"] == 4
+                && index["components"]
+                    .as_object()
+                    .is_some_and(|v| !v.is_empty()),
+            "complete format4 checkpoint required",
+        )?;
+        index["components"]
+            .as_object()
+            .ok_or("component map absent")?
+            .len()
+    } else {
+        0
+    };
     std::fs::create_dir(out)?;
     std::fs::create_dir(out.join("provider"))?;
     let db = Arc::new(RocksDbStore::open_all(out.join("provider/db"), None)?.state);
@@ -290,33 +308,54 @@ fn prepare(native: &Path, prior: &Path, out: &Path) -> Result<(), Error> {
     )?;
     // Test-only transplant: preserve every exact mathematical component and index.
     // The actual worker must reverify them before it can publish any availability.
-    for (k, v) in donor.state.scan_prefix(b"production/")? {
+    if let Some(donor) = &donor {
+        for (k, v) in donor.state.scan_prefix(b"production/")? {
+            ensure(
+                rows.insert(job(c.block, &k), v).is_none(),
+                "native job already contains components",
+            )?;
+        }
+    } else {
         ensure(
-            rows.insert(job(c.block, &k), v).is_none(),
-            "native job already contains components",
+            db.scan_prefix(&job(c.block, b"production/"))?.is_empty()
+                && db.scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?.is_empty(),
+            "fresh source already contains mathematical checkpoints or availability",
         )?;
     }
     reaccount(db.as_ref(), rows)?;
     ensure(
-        before == digest(&original.state)? && donor_before == digest(&donor.state)?,
+        before == digest(&original.state)?
+            && donor_before == donor.as_ref().map(|d| digest(&d.state)).transpose()?,
         "retained original inputs changed",
     )?;
     save(
         &out.join("prepared.json"),
-        &json!({"ordinary_native_import_captured":queued,"genesis_only_parent":true,"child_root_not_preloaded":true,"checkpoint_transplant":"same-source test preparation; no complete flag","checkpoint_digest":donor_before,"component_count":index["components"].as_object().ok_or("component map absent")?.len(),"native_digest":native_digest(db.as_ref())?,"new_math":0,"new_signing":false,"original_digest":before}),
+        &json!({"ordinary_native_import_captured":queued,"genesis_only_parent":true,"child_root_not_preloaded":true,"checkpoint_transplant":if fresh {"none; empty mathematical job"}else{"same-source test preparation; no complete flag"},"fresh_generation":fresh,"donor_opened":donor.is_some(),"checkpoint_digest":donor_before,"component_count":component_count,"native_digest":native_digest(db.as_ref())?,"new_math":0,"new_signing":false,"original_digest":before}),
     )
 }
 async fn exercise(
     native: &Path,
-    prior: &Path,
+    prior: Option<&Path>,
     out: &Path,
     pause: bool,
     refuse: bool,
+    fresh: bool,
 ) -> Result<(), Error> {
     let (c, block, _) = context(native)?;
-    let live = Live::start(out, &c, &block).await?;
+    let live = Live::start(
+        out,
+        &c,
+        &block,
+        if fresh && !pause {
+            None
+        } else {
+            NonZeroUsize::new(1)
+        },
+    )
+    .await?;
     let result = async {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1800);
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(if fresh { 86400 } else { 1800 });
         let mut authenticated = false;
         let terminal = loop {
             ensure(
@@ -336,7 +375,16 @@ async fn exercise(
                     authenticated = true;
                 }
                 let state = value["status"]["state"].as_str();
-                if pause && state == Some("proving") {
+                if pause
+                    && if fresh {
+                        state == Some("paused")
+                            && value["status"]["components"]
+                                .as_u64()
+                                .is_some_and(|n| n > 0)
+                    } else {
+                        state == Some("proving")
+                    }
+                {
                     break value;
                 }
                 if !pause && state == Some(if refuse { "failed" } else { "complete" }) {
@@ -370,17 +418,29 @@ async fn exercise(
             )?;
             return Ok(terminal);
         }
-        ensure(
-            terminal["status"]["newlyProved"] == 0
-                && terminal["status"]["components"]
-                    == json_read::<Value>(&out.join("prepared.json"))?["component_count"]
-                && terminal["status"]["reused"].as_u64().is_some_and(|v| {
-                    terminal["status"]["components"]
+        if fresh {
+            ensure(
+                terminal["status"]["newlyProved"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0)
+                    && terminal["status"]["components"]
                         .as_u64()
-                        .is_some_and(|count| v >= count)
-                }),
-            "background worker regenerated or lost retained certificates",
-        )?;
+                        .is_some_and(|n| n > 0),
+                "fresh worker generated no new mathematical certificates",
+            )?;
+        } else {
+            ensure(
+                terminal["status"]["newlyProved"] == 0
+                    && terminal["status"]["components"]
+                        == json_read::<Value>(&out.join("prepared.json"))?["component_count"]
+                    && terminal["status"]["reused"].as_u64().is_some_and(|v| {
+                        terminal["status"]["components"]
+                            .as_u64()
+                            .is_some_and(|count| v >= count)
+                    }),
+                "background worker regenerated or lost retained certificates",
+            )?;
+        }
         let manifest: CanonicalProofManifest =
             serde_json::from_value(terminal["status"]["manifest"].clone())?;
         let cache: CanonicalProofUploadStatus = serde_json::from_value(
@@ -406,7 +466,10 @@ async fn exercise(
         ensure(
             payload.len() as u64 == manifest.total_bytes
                 && blake3_hash(&payload) == manifest.payload_hash
-                && payload == read(&prior.join("proof.cbor"), 256 * 1024 * 1024)?,
+                && prior
+                    .map(|p| read(&p.join("proof.cbor"), 256 * 1024 * 1024))
+                    .transpose()?
+                    .is_none_or(|expected| payload == expected),
             "authenticated RPC did not reproduce exact original proof bytes",
         )?;
         write(&out.join("proof.cbor"), &payload)?;
@@ -448,10 +511,10 @@ async fn exercise(
         } else {
             "runtime-complete.json"
         }),
-        &json!({"observed":terminal,"durable":saved,"native_unchanged":true,"new_signing":false,"graceful_Node_run_shutdown":true,"fresh_generation":false}),
+        &json!({"observed":terminal,"durable":saved,"native_unchanged":true,"new_signing":false,"graceful_Node_run_shutdown":true,"fresh_generation":fresh}),
     )
 }
-fn verify(native: &Path, prior: &Path, out: &Path) -> Result<(), Error> {
+fn verify(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Result<(), Error> {
     let (c, block, control) = context(native)?;
     let original = RocksDbStore::open_all(native.join("provider/db"), None)?;
     let before = digest(&original.state)?;
@@ -462,7 +525,10 @@ fn verify(native: &Path, prior: &Path, out: &Path) -> Result<(), Error> {
     )?;
     let bytes = read(&out.join("proof.cbor"), 256 * 1024 * 1024)?;
     ensure(
-        bytes == read(&prior.join("proof.cbor"), 256 * 1024 * 1024)?,
+        prior
+            .map(|p| read(&p.join("proof.cbor"), 256 * 1024 * 1024))
+            .transpose()?
+            .is_none_or(|expected| bytes == expected),
         "cold proof differs from original graph",
     )?;
     let proof = decode_payload(&bytes)?;
@@ -493,7 +559,7 @@ fn verify(native: &Path, prior: &Path, out: &Path) -> Result<(), Error> {
     )?;
     println!(
         "{}",
-        json!({"actual_Node_run_cold_proof_verified":true,"proof_bytes":bytes.len(),"byte_identical_original_graph":true,"receipts_state_accounts_match_original":true,"read_only":true,"new_signing":false,"fresh_generation":false,"peer_transport":false,"original_successor2_signed":false})
+        json!({"actual_Node_run_cold_proof_verified":true,"proof_bytes":bytes.len(),"byte_identical_original_graph":prior.map(|_|true),"receipts_state_accounts_match_original":true,"read_only":true,"new_signing":false,"fresh_generation":fresh,"peer_transport":false,"original_successor2_signed":false})
     );
     Ok(())
 }
@@ -544,19 +610,25 @@ fn corrupt(out: &Path, hash: ShellHash) -> Result<PathBuf, Error> {
     )?;
     Ok(bad)
 }
-pub(super) fn run(mode: &str, native: &Path, prior: &Path, out: &Path) -> Result<(), Error> {
+pub(super) fn run(
+    mode: &str,
+    native: &Path,
+    prior: Option<&Path>,
+    out: &Path,
+) -> Result<(), Error> {
+    let fresh = mode.starts_with("automatic-fresh-");
+    let mode = mode
+        .strip_prefix(if fresh {
+            "automatic-fresh-"
+        } else {
+            "automatic-"
+        })
+        .ok_or("unsupported automatic mode")?;
     ensure(
-        matches!(
-            mode,
-            "automatic-prepare"
-                | "automatic-pause"
-                | "automatic-resume"
-                | "automatic-verify"
-                | "automatic-refuse"
-        ),
+        matches!(mode, "prepare" | "pause" | "resume" | "verify" | "refuse"),
         "unsupported automatic mode",
     )?;
-    for input in [native, prior] {
+    for input in std::iter::once(native).chain(prior) {
         let input = input.canonicalize()?;
         let output = if out.exists() {
             out.canonicalize()?
@@ -571,30 +643,24 @@ pub(super) fn run(mode: &str, native: &Path, prior: &Path, out: &Path) -> Result
             "automatic output overlaps retained input",
         )?;
     }
-    if mode == "automatic-prepare" {
-        return prepare(native, prior, out);
+    if mode == "prepare" {
+        return prepare(native, prior, out, fresh);
     }
     ensure(
         out.is_dir() && !out.symlink_metadata()?.file_type().is_symlink(),
         "real owned automatic output required",
     )?;
-    if mode == "automatic-verify" {
-        return verify(native, prior, out);
+    if mode == "verify" {
+        return verify(native, prior, out, fresh);
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
-    if mode == "automatic-refuse" {
+    if mode == "refuse" {
         let (c, _, _) = context(native)?;
         let bad = corrupt(out, c.block)?;
-        return runtime.block_on(exercise(native, prior, &bad, false, true));
+        return runtime.block_on(exercise(native, prior, &bad, false, true, fresh));
     }
-    runtime.block_on(exercise(
-        native,
-        prior,
-        out,
-        mode == "automatic-pause",
-        false,
-    ))
+    runtime.block_on(exercise(native, prior, out, mode == "pause", false, fresh))
 }

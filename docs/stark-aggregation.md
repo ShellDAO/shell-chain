@@ -1712,6 +1712,49 @@ This covers warm-checkpoint background recovery and local RPC availability.
 Fresh automatic proof generation, later-original history, abrupt process
 termination and network activation retain their separate acceptance requirements.
 
+#### Fresh automatic SLH generation
+
+Use the retained Native `slh-output` from the earlier source-build setup and a
+new output directory. This flow needs no completed proof or mathematical cache:
+
+```bash
+tests/e2e/slh-canonical.sh automatic-fresh-prepare slh-output fresh-automatic-output
+tests/e2e/slh-canonical.sh automatic-fresh-pause slh-output fresh-automatic-output
+tests/e2e/slh-canonical.sh automatic-fresh-resume slh-output fresh-automatic-output
+tests/e2e/slh-canonical.sh automatic-fresh-verify slh-output fresh-automatic-output
+tests/e2e/slh-canonical.sh automatic-fresh-refuse slh-output fresh-automatic-output
+```
+
+The Rust/native dependencies and RocksDB feature are the same as above. Failed
+assertions produce a nonzero exit code. Preparation reconstructs only the
+authenticated genesis parent, ordinarily imports the original signed child and
+requires a queued source with zero mathematical components and no availability
+cache. It never opens or copies a donor checkpoint. Keep the original Native
+input; its existing test signature supplies public proving inputs without any
+new signing or private-key recovery.
+
+`pause` runs the real background worker with a one-component budget and requests
+graceful shutdown after nonzero new mathematical progress becomes durable.
+`resume` runs a separate process without a per-pass component ceiling, rechecks
+the retained component and generates the remaining graph. The existing job,
+component, cache and expanded-proof quotas still apply. Full generation is
+expensive; the regression allows up to 24 hours and retains each mathematical
+checkpoint. A stopped partial job is progress, not a complete proof.
+
+Completion requires the authenticated RPC to return the entire generated frame,
+with a ready cache that has no execution result. Cold verification checks all
+AIRs and replays the proof against the original persisted receipts, state,
+balances and nonces without writeback. The negative command uses a separate
+copy with damaged proof bytes and correct component hash/accounting; the worker
+must reject it even while an earlier ready payload is retained. Public-only
+actors reject every signing request.
+
+Use `fresh-automatic-output` as the provider input in the peer regression below
+to test its generated frame through independent receiver execution and signed
+certificate finality. This remains the original first child and single-authority
+profile. Later-original history, quorum AIR, broader roles, abrupt termination,
+public releases and network activation retain their separate requirements.
+
 #### Registered SLH admission over the proof channel
 
 Continue the same retained `slh-output` and completed `automatic-output`:

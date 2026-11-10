@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add standalone registered SLH automatic-generation regression modes that start from an empty mathematical job, without a completed donor proof. Exercise actual new background proving, durable nonzero progress, cold resume, authenticated output retrieval, read-only Native replay and corrupt-checkpoint refusal. Retain the original signature and unchanged quotas; broader history and public activation remain separate acceptance work.
+
 - Stage supported registered SLH children during opt-in peer proof admission and retain verified attached quorum certificates until proof-backed import. Add real TCP/Noise transfer, cold chunk-resume, Native execution/finality, read-only replay and wrong-statement refusal coverage using the original signature and proof graph. Fresh automatic generation, later-original history and public release/activation remain open.
 
 - Exercise registered SLH warm-checkpoint recovery through ordinary Native import capture, actual background-worker graceful shutdown/restart, full AIR revalidation, authenticated RPC chunk retrieval and cold Native replay. Preserve the original graph without new signing or proof generation, and reject a correct-hash damaged proof in a separate job copy. Fresh automatic generation, real peer transport and later-original history remain open.
