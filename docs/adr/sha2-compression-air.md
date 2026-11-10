@@ -121,3 +121,29 @@ original FORS proof before deriving layer zero's message and coordinates;
 no key or signature is regenerated. A layer root remains an intermediate
 result until all17 layers, transitions and final original public root are
 proved. Existing FORS and hash certificate formats retain their meanings.
+
+
+## Full signature composition and bounded streaming
+
+Compose the fixed H_msg/FORS relation with exactly seventeen complete XMSS
+layers. Bind every layer to the original public seed and signature slice,
+the previous verified root, its layer address and the derived tree/leaf index.
+Consume four low tree bits per transition and require the final tree index to
+be zero and the final proved root to match the original public key. Providers
+return concrete certificates, never trusted roots. Native hashing or signature
+verification is not an alternative admission path.
+
+Keep the existing component encodings and limits. A new versioned full-signature
+manifest binds the exact public-input envelope and fixed layer count; it is
+metadata whose acceptance requires all component proofs. Stream FORS plus one
+layer at a time instead of decoding a monolithic aggregate. Use canonical
+relative component filenames, immutable input snapshots, verified partial
+checkpoints and create-new final certificates. Reuse a seed-prefix proof only
+after checking it against each layer's derived public seed. Completed component
+certificates verify independently of their step caches. This permits retaining
+the exact original signature and prior mathematical proofs while completing
+higher layers, without signing or replacing earlier failures.
+
+The full mathematical relation does not establish canonical message/body
+identity or production, peer and historical source authority. Those integrations
+must preserve existing source-format meanings, quotas and activation decisions.

@@ -1270,8 +1270,8 @@ successor. Existing output is refused before generating any new key.
 Canonical source capture currently rejects this fallback profile. This remains
 a missing full signature proving capability. Native execution and the SHA2
 compression primitives below do not establish full canonical SLH proof
-admission. Complete WOTS+, hypertree verification and
-the complete durable production/peer/history chain still require integration.
+admission. The full mathematical signature backend below remains separate
+from the durable canonical production/peer/history chain, which needs integration.
 Keep original outputs and signatures when investigating a failure. The explicit
 `recover-native` mode can checkpoint an already imported/finalized retained
 first block without any private key or re-signing; it cannot recreate an
@@ -1455,9 +1455,76 @@ cargo run --locked --release -p shell-stark-prover --example slh-xmss -- verify 
 ```
 
 The complete layer certificate has a separate 64 MiB development reader bound;
-the compression batch bound and global limits are unchanged. Actual retained
-Native coverage is layer zero of seventeen. The remaining sixteen layers,
-their transitions and the final SLH public-root relation still need full proof
-integration. The independent Python full-hypertree check is an unproved oracle,
+the compression batch bound and global limits are unchanged. This standalone
+regression covers layer zero of seventeen. Full signature composition uses
+all seventeen independently verified layer certificates as described below.
+The standalone independent Python full-hypertree check is an unproved oracle,
 and every layer result reports `full_signature_verified: false`. This does not
 establish canonical source/job, node/peer or historical admission.
+
+
+The `slh_signature` API completes the mathematical SHA2-256f signature relation
+for a 32-byte signing message in pure mode with an empty context. It verifies
+the original H_msg/FORS certificate, then all seventeen complete WOTS+/XMSS
+certificates. Each layer uses the preceding **proved** root as its message;
+subsequent leaf indices consume the low four bits of the prior tree index,
+which then shifts right by four. Layer addresses and the exact original
+2,272-byte signature slices are derived independently of the supplied proofs.
+The final proved root must equal the root in the 64-byte public key. There is
+no native SHA or signature-verification fallback in this acceptance path.
+
+A versioned manifest freezes the original public seed, root, signing message
+and all 49,856 signature bytes. The manifest alone cannot authorize anything:
+verification reads the complete FORS certificate and every one of the seventeen
+bounded layer certificates. Streaming retains FORS and one layer in memory,
+with the existing separate 128 MiB FORS and 64 MiB layer development bounds.
+Existing source formats, global quotas, defaults and activation remain unchanged.
+
+Run the complete regression with Rust stable, the source-build dependencies,
+Python 3 standard library and enough disk for the retained component proofs:
+
+```bash
+tests/e2e/slh-signature.sh signature-output
+```
+
+This self-contained mode first creates a separate genuine, memory-only
+`fips205 0.4.1` test signature through the FORS entry. It requires no saved key
+or account and never uses those native verification checks as AIR acceptance.
+To continue exactly retained public inputs, without signing or regenerating
+FORS, supply them explicitly; an optional complete layer-zero certificate also
+avoids regenerating its proof:
+
+```bash
+tests/e2e/slh-signature.sh signature-original fors-original/input.json fors-original/proof/fors.cbor xmss-original/proof/xmss.cbor
+```
+
+The `init` command verifies imported components before creating a new owned
+output directory. Proving freezes exact inputs and persists only verified
+compression/hash steps, complete layer certificates and a final manifest. A
+single authenticated seed-prefix certificate can be reused across all layers;
+every use checks it against the independently derived seed. `resume` rechecks
+all available complete certificates, reuses verified partial steps only for
+missing layers, and refuses input replacement or corrupt consumed checkpoints.
+Full-cache resume produces no new proof. The same directory can cold-verify
+without the original checkpoint directories or private keys:
+
+```bash
+cargo run --locked --release -p shell-stark-prover --example slh-signature -- resume fors-original/input.json signature-original/proof
+cargo run --locked --release -p shell-stark-prover --example slh-signature -- verify fors-original/input.json signature-original/proof
+```
+
+The regression compares every proved layer root and the final public root with
+an independent Python hash oracle, cold-verifies in another process and checks
+version/count, original key/message/signature, foreign/rebound layer, corrupt
+AIR, missing-final-layer and authentication-order refusals. A separately prepared
+missing-last-hash checkpoint resumes by generating just that hash and reproduces
+the original certificate bytes. This does not test actual power loss. Invalid
+input, failed proof verification and attempted output replacement exit nonzero.
+Original input and proof artifacts remain immutable after every control.
+
+Only this full composition reports `full_signature_verified: true`. It proves
+the mathematical signature for the supplied signing message. Binding that
+message to a canonical transaction/header, large body identity, production
+source/jobs, node/peer import and historical replay still requires integration;
+`canonical_admission` remains false. This source entry is not a claim that a
+published node binary or an activated network accepts full SLH proof sources.

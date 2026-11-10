@@ -116,4 +116,5 @@ pub mod sha2_compression;
 pub mod sha2_digest;
 pub mod slh_fors;
 pub mod slh_sha2;
+pub mod slh_signature;
 pub mod slh_xmss;
