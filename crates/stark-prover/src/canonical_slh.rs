@@ -1,4 +1,4 @@
-//! Registered SHA2-256f sender authority for an exact canonical block envelope.
+//! SHA2-256f default-account authority for an exact canonical block envelope.
 //! The caller still authenticates consensus, activation and native execution.
 use crate::{
     account_state::{verify_account_state, AccountStateProof},
@@ -16,8 +16,9 @@ use shell_crypto::SignatureType;
 use shell_primitives::ShellHash;
 use shell_storage::{CanonicalParentView, KvStore};
 
-/// Explicit bound-account profile. All seventeen layer certificates are required;
-/// neither the manifest nor a persisted status is cryptographic authority.
+/// Version one binds a registered account; version two proves a funded unbound
+/// account's tagged address. Both require all seventeen layer certificates.
+/// Neither the manifest nor a persisted status is cryptographic authority.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalSlhTransactionProof {
@@ -66,7 +67,10 @@ pub(crate) fn verify_at_source(
     key: &[u8],
     account: &Account,
 ) -> Result<VerifiedSignatureEntry, String> {
-    if proof.version != 1 || proof.layers.len() != usize::from(SLH_HYPERTREE_LAYERS) {
+    let unbound = account.pq_pubkey_hash == ShellHash::ZERO;
+    if proof.version != if unbound { 2 } else { 1 }
+        || proof.layers.len() != usize::from(SLH_HYPERTREE_LAYERS)
+    {
         return Err("canonical SLH proof version/layer count mismatch".into());
     }
     let expected = inputs(signed, key, proof.envelope.signing_hash.output)?;
@@ -77,11 +81,22 @@ pub(crate) fn verify_at_source(
         Some(account),
     )?;
     let bound = state.account().ok_or("canonical SLH account absent")?;
-    if bound.validation_code_hash.is_some() || bound.pq_pubkey_hash == ShellHash::ZERO {
-        return Err("canonical SLH requires a bound default account".into());
+    if bound.validation_code_hash.is_some() {
+        return Err("canonical SLH requires a default account".into());
     }
     verify_hash(&proof.public_key_hash, key, &proof.public_key_hash.output)?;
-    if let Some(tagged) = &proof.tagged_key {
+    if unbound {
+        let mut bytes = vec![signed.signature.sig_type.as_u8()];
+        bytes.extend_from_slice(key);
+        verify_hash(
+            proof
+                .tagged_key
+                .as_ref()
+                .ok_or("canonical SLH unbound address proof absent")?,
+            &bytes,
+            signed.from.as_bytes(),
+        )?;
+    } else if let Some(tagged) = &proof.tagged_key {
         let mut bytes = vec![signed.signature.sig_type.as_u8()];
         bytes.extend_from_slice(key);
         verify_hash(tagged, &bytes, bound.pq_pubkey_hash.as_bytes())?;
@@ -110,7 +125,8 @@ pub(crate) fn verify_at_source(
 }
 
 /// Resolve authority only from the independently sealed historical parent.
-/// A future registration or an embedded replacement never supplies this key.
+/// A future registration never supplies this key. A funded unbound account can
+/// supply its first Embedded key, but still needs the complete address AIR.
 pub(crate) fn verify_at_parent<S: KvStore + 'static>(
     view: &CanonicalParentView<S>,
     header: &BlockHeader,
@@ -121,15 +137,24 @@ pub(crate) fn verify_at_parent<S: KvStore + 'static>(
     if signed.tx.chain_id != view.config().chain_id {
         return Err("canonical SLH chain identity mismatch".into());
     }
-    let key = view
-        .registered_key(&signed.from)
-        .map_err(|e| e.to_string())?
-        .ok_or("canonical SLH parent registry key absent")?;
     let account = view
         .world_state()
         .map_err(|e| e.to_string())?
         .get_account(&signed.from)
         .map_err(|e| e.to_string())?
         .ok_or("canonical SLH parent account absent")?;
-    verify_at_source(proof, view.parent(), header, signed, index, &key, &account)
+    let registered = view
+        .registered_key(&signed.from)
+        .map_err(|e| e.to_string())?;
+    let key = registered
+        .as_deref()
+        .or_else(|| {
+            if account.pq_pubkey_hash == ShellHash::ZERO {
+                signed.pubkey_mode.pubkey_bytes()
+            } else {
+                None
+            }
+        })
+        .ok_or("canonical SLH parent registry or first Embedded key absent")?;
+    verify_at_source(proof, view.parent(), header, signed, index, key, &account)
 }

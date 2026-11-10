@@ -693,6 +693,14 @@ fn corrupt_cache(out: &Path, role: &str) -> Result<(), Error> {
 }
 fn main() -> Result<(), Error> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.len() == 4 && args[0].starts_with("slh-first-use-") {
+        return admission_runtime::slh_first_use::command(
+            &args[0],
+            Path::new(&args[1]),
+            Path::new(&args[2]),
+            Path::new(&args[3]),
+        );
+    }
     if args.len() == 4 && args[0].starts_with("slh-peer-") {
         return admission_runtime::slh_peer::command(
             &args[0],

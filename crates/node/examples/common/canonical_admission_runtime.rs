@@ -5,6 +5,8 @@ pub(super) mod dilithium;
 pub(super) mod rotation;
 #[path = "slh_proof.rs"]
 pub(super) mod slh;
+#[path = "slh_first_use.rs"]
+pub(super) mod slh_first_use;
 #[path = "slh_peer.rs"]
 pub(super) mod slh_peer;
 use super::*;

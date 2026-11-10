@@ -137,7 +137,7 @@ struct CapturedInputs {
     senders: Vec<SenderSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proposer_key: Option<Vec<u8>>,
-    /// Native SDK FIPS proposer transcript marker in source formats five/six.
+    /// Native SDK FIPS proposer transcript marker in source formats five to seven.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proposer_sdk_fips: Option<u8>,
 }
@@ -219,11 +219,6 @@ impl CanonicalProductionSource {
                 || account.validation_code_hash.is_some()
             {
                 return Err("production parent key/default account binding mismatch".into());
-            }
-            if signed.signature.sig_type == SignatureType::SphincsSha2256f
-                && account.pq_pubkey_hash == ShellHash::ZERO
-            {
-                return Err("canonical SLH source requires a bound parent account".into());
             }
             if account.pq_pubkey_hash == ShellHash::ZERO {
                 if shell_primitives::Address::from_public_key(
@@ -316,7 +311,14 @@ impl CanonicalProductionSource {
                 if proposer_key.is_none() {
                     return Err("canonical SLH requires a supported registered proposer".into());
                 }
-                6
+                if senders
+                    .iter()
+                    .any(|s| s.account.pq_pubkey_hash == ShellHash::ZERO)
+                {
+                    7
+                } else {
+                    6
+                }
             } else if proposer_sdk_fips.is_some() {
                 5
             } else if senders
@@ -392,7 +394,7 @@ impl CanonicalProductionSource {
             .transactions
             .iter()
             .any(|t| t.signature.sig_type == SignatureType::SphincsSha2256f);
-        let profile_valid = (!has_slh || i.version == 6)
+        let profile_valid = (!has_slh || matches!(i.version, 6 | 7))
             && match i.version {
                 1 => i.proposer_key.is_none() && !has_sdk && !has_sdk_proposer,
                 2 => i.proposer_key.is_some() && !has_sdk && !has_sdk_proposer,
@@ -408,6 +410,16 @@ impl CanonicalProductionSource {
                         && i.senders
                             .iter()
                             .all(|s| s.account.pq_pubkey_hash != ShellHash::ZERO)
+                }
+                7 => {
+                    has_slh
+                        && matches!(i.proposer_sdk_fips, None | Some(1))
+                        && i.block.transactions.len() == 1
+                        && i.proposer_key.is_some()
+                        && !has_sdk
+                        && i.senders
+                            .iter()
+                            .all(|s| s.account.pq_pubkey_hash == ShellHash::ZERO)
                 }
                 _ => false,
             };
@@ -580,9 +592,9 @@ impl CanonicalProductionSource {
     pub fn block(&self) -> &Block {
         &self.input.block
     }
-    /// Explicit large registered-sender source; always requires compact checkpoints.
+    /// Explicit large bound or funded-unbound source; requires compact checkpoints.
     pub fn has_slh_senders(&self) -> bool {
-        self.input.version == 6
+        matches!(self.input.version, 6 | 7)
     }
     /// Unbound address certificates need compact checkpoints even in small batches.
     pub fn has_unbound_senders(&self) -> bool {
@@ -1649,10 +1661,21 @@ mod recovery_tests {
         legacy: bool,
         sdk: bool,
     ) -> (Arc<MemoryDb>, CanonicalProductionSource) {
+        fixture_transcript_slh(full, unbound, legacy, sdk, false)
+    }
+    fn fixture_transcript_slh(
+        full: bool,
+        unbound: bool,
+        legacy: bool,
+        sdk: bool,
+        slh: bool,
+    ) -> (Arc<MemoryDb>, CanonicalProductionSource) {
         // Storage-context fixture only; real native execution is exercised by the runtime regression.
         let db = Arc::new(MemoryDb::new());
         let chain = ChainStore::new(db.clone());
-        let signer: Box<dyn Signer> = if sdk {
+        let signer: Box<dyn Signer> = if slh {
+            Box::new(shell_crypto::SphincsSigner::generate())
+        } else if sdk {
             Box::new(SdkTaggedSigner(MlDsaSigner::generate()))
         } else if legacy {
             Box::new(shell_crypto::DilithiumSigner::generate())
@@ -1660,6 +1683,17 @@ mod recovery_tests {
             Box::new(MlDsaSigner::generate())
         };
         let address = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let independent = slh.then(MlDsaSigner::generate);
+        let proposer: &dyn Signer = independent
+            .as_ref()
+            .map_or(signer.as_ref(), |s| s as &dyn Signer);
+        let proposer_address =
+            Address::from_public_key(proposer.public_key(), proposer.sig_type().as_u8());
+        if slh {
+            chain
+                .put_pubkey(&proposer_address, proposer.public_key())
+                .unwrap();
+        }
         let mut world = shell_storage::WorldState::new(db.clone());
         world
             .set_account(
@@ -1736,8 +1770,8 @@ mod recovery_tests {
         block.header.transactions_root =
             shell_core::block_body_root(&block.transactions, &[]).unwrap();
         if full {
-            block.header.proposer = address;
-            block.proposer_seal = Some(signer.sign(block.hash().as_bytes()).unwrap());
+            block.header.proposer = proposer_address;
+            block.proposer_seal = Some(proposer.sign(block.hash().as_bytes()).unwrap());
         }
         let overlay = Arc::new(OverlayStore::new(db.clone()));
         let staged = ChainStore::new(overlay.clone());
@@ -1755,8 +1789,8 @@ mod recovery_tests {
                 .put_block_signers(
                     &block.hash(),
                     &[shell_core::BlockSignerEvidence {
-                        address,
-                        public_key: signer.public_key().to_vec(),
+                        address: proposer_address,
+                        public_key: proposer.public_key().to_vec(),
                         signature: block.proposer_seal.clone().unwrap(),
                     }],
                 )
@@ -1768,16 +1802,16 @@ mod recovery_tests {
         if full {
             // A later authenticated vote can carry another randomized signature
             // for the same authority/key/hash without changing the captured seal.
-            let vote = signer.sign(block.hash().as_bytes()).unwrap();
+            let vote = proposer.sign(block.hash().as_bytes()).unwrap();
             assert!(MlDsaVerifier
-                .verify(signer.public_key(), block.hash().as_bytes(), &vote)
+                .verify(proposer.public_key(), block.hash().as_bytes(), &vote)
                 .unwrap());
             chain
                 .put_block_signers(
                     &block.hash(),
                     &[shell_core::BlockSignerEvidence {
-                        address,
-                        public_key: signer.public_key().to_vec(),
+                        address: proposer_address,
+                        public_key: proposer.public_key().to_vec(),
                         signature: vote,
                     }],
                 )
@@ -1813,6 +1847,70 @@ mod recovery_tests {
             }
             Err(StorageError::State("live scan forbidden".into()))
         }
+    }
+    #[test]
+    fn funded_unbound_slh_source_freezes_address_and_rejects_profile_rebinding() {
+        let (db, source) = fixture_transcript_slh(true, true, false, false, true);
+        assert_eq!(source.input.version, 7);
+        assert!(source.has_slh_senders() && source.has_unbound_senders());
+        assert_eq!(source.input.senders[0].key.len(), 64);
+        assert!(source.block().transactions[0].pubkey_mode.is_embedded());
+        ChainStore::new(db.clone())
+            .put_pubkey(&source.block().transactions[0].from, &[9; 64])
+            .unwrap();
+        let before = db.scan_all().unwrap();
+        let frozen = ChainStore::new(Arc::new(NoTrieReads(db.clone())));
+        assert_eq!(
+            CanonicalProductionSource::restore(&frozen, source.identity())
+                .unwrap()
+                .identity(),
+            source.identity()
+        );
+        for mode in [
+            "bound-v6",
+            "old-v4",
+            "sdk-marker",
+            "foreign-key",
+            "bound-state",
+            "custom-validator",
+            "nonce",
+            "changed-envelope",
+        ] {
+            let mut input: CapturedInputs = serde_json::from_slice(source.identity()).unwrap();
+            match mode {
+                "bound-v6" => input.version = 6,
+                "old-v4" => input.version = 4,
+                "sdk-marker" => input.senders[0].sdk_fips = Some(1),
+                "foreign-key" => input.senders[0].key[0] ^= 1,
+                "bound-state" => {
+                    input.senders[0].account.pq_pubkey_hash = blake3_hash(&input.senders[0].key)
+                }
+                "custom-validator" => {
+                    input.senders[0].account.validation_code_hash = Some(ShellHash::from([8; 32]))
+                }
+                "nonce" => input.senders[0].account.nonce = 1,
+                _ => input.block.transactions[0].pubkey_mode = shell_core::PubkeyMode::Reference,
+            }
+            let bytes =
+                bounded_json(&serde_json::to_value(input).unwrap(), 4 * 1024 * 1024).unwrap();
+            assert!(
+                CanonicalProductionSource::restore(&frozen, &bytes).is_err(),
+                "{mode}"
+            );
+        }
+        assert_eq!(before, db.scan_all().unwrap());
+    }
+    #[test]
+    fn bound_slh_source_keeps_six_and_refuses_unbound_seven() {
+        let (db, source) = fixture_transcript_slh(true, false, false, false, true);
+        assert_eq!(source.input.version, 6);
+        assert!(!source.has_unbound_senders());
+        let mut input: CapturedInputs = serde_json::from_slice(source.identity()).unwrap();
+        input.version = 7;
+        let bytes = bounded_json(&serde_json::to_value(input).unwrap(), 4 * 1024 * 1024).unwrap();
+        let before = db.scan_all().unwrap();
+        assert!(CanonicalProductionSource::restore(&ChainStore::new(db.clone()), &bytes).is_err());
+        assert_eq!(before, db.scan_all().unwrap());
     }
     #[test]
     fn unbound_first_use_capture_recovers_frozen_inputs_and_rejects_key_or_account_rebinding() {

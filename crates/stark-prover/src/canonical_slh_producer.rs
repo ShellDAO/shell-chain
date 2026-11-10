@@ -50,7 +50,9 @@ pub(crate) fn produce<S: KvStore>(
         },
     )?;
     let public_key_hash = hash(job, "sender-0-key-hash", key)?;
-    let tagged_key = if account.pq_pubkey_hash == ShellHash::from(public_key_hash.output) {
+    let tagged_key = if account.pq_pubkey_hash != ShellHash::ZERO
+        && account.pq_pubkey_hash == ShellHash::from(public_key_hash.output)
+    {
         None
     } else {
         let mut bytes = vec![signed.signature.sig_type.as_u8()];
@@ -171,7 +173,11 @@ pub(crate) fn produce<S: KvStore>(
             })
         })?;
         let proof = CanonicalSlhTransactionProof {
-            version: 1,
+            version: if account.pq_pubkey_hash == ShellHash::ZERO {
+                2
+            } else {
+                1
+            },
             account: account_proof,
             public_key_hash,
             tagged_key,

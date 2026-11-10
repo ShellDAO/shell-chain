@@ -1,4 +1,4 @@
-# Registered SLH canonical proofs and bounded availability
+# SLH default-account proofs and bounded availability
 
 The complete SHA2-256f signature graph and its large native signed-envelope body
 must authorize the same historical sender. Standalone FORS/XMSS or body proofs
@@ -88,3 +88,25 @@ of retained progress, and generate the remaining graph within unchanged quotas.
 Authenticated RPC retrieval and cold read-only Native replay establish the
 generated output; a separate peer receiver checks execution and finality.
 Warm-checkpoint revalidation alone cannot satisfy these fresh-generation checks.
+
+Funded first use has a separate source format 7 and SLH transaction proof
+version 2. The historical parent must contain a default account with a zero
+key commitment. Its first Embedded public key must derive the sender address
+as BLAKE3 of the algorithm tag and all 64 key bytes; a complete address AIR
+certificate is mandatory alongside the unchanged full signature graph, account
+MPT, envelope, identity, body and proposer certificates. Source 6 and transaction
+proof version 1 retain bound-account authority and reject this substitution.
+A registered historical key takes precedence; a future key cache is never
+historical authority. Missing accounts and custom validators remain outside
+this profile.
+
+Native intake validates first-use signatures without registering the key.
+Proof-backed commit performs the ordinary key registration; rejection and
+historical replay cannot write that registration. Existing funded accounts can
+retain their zero account commitment after registration. First-use proofs must
+therefore follow the sealed parent account and registry, not infer a nonzero
+commitment from the current cache. The regression advances an independent
+Native control and proof receiver to a genuinely different second state and
+replays the first child against that historical parent without writeback.
+Its retained SLH signature is reused in an independent genesis with a new
+proposer; this does not create a missing successor in the original bound history.

@@ -509,9 +509,10 @@ fn hash_route(
     }
     Ok(bytes)
 }
-// Prover-only routing for bounded checkpoint groups. Acceptance still runs
-// prove_large_body_hash_using and verifies every certificate against its route.
-pub(crate) fn large_body_witness_inputs(message: &[u8]) -> Result<Vec<CompressionInput>, String> {
+/// Construct deterministic prover operands for bounded large-body checkpoints.
+/// These native witness hints grant no verification authority. The full digest
+/// prover and verifier independently route and verify every AIR certificate.
+pub fn large_body_witness_inputs(message: &[u8]) -> Result<Vec<CompressionInput>, String> {
     let mut inputs = Vec::new();
     hash_route(message, MAX_LARGE_BODY_HASH_BYTES, |input| {
         let output = route(&input, native);

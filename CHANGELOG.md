@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add funded default-account SLH first-use source 7 and transaction proof version 2. Prove the full tagged sender address with the complete signature graph, resolve authority from the sealed historical parent and register the Embedded key only through ordinary Native commit. Keep bound source 6/version 1 unchanged and provide durable recovery, historical replay and refusal regression entry points.
+
 - Add standalone registered SLH automatic-generation regression modes that start from an empty mathematical job, without a completed donor proof. Exercise actual new background proving, durable nonzero progress, cold resume, authenticated output retrieval, read-only Native replay and corrupt-checkpoint refusal. Retain the original signature and unchanged quotas; broader history and public activation remain separate acceptance work.
 
 - Stage supported registered SLH children during opt-in peer proof admission and retain verified attached quorum certificates until proof-backed import. Add real TCP/Noise transfer, cold chunk-resume, Native execution/finality, read-only replay and wrong-statement refusal coverage using the original signature and proof graph. Fresh automatic generation, later-original history and public release/activation remain open.

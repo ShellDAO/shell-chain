@@ -164,7 +164,7 @@ impl<S: KvStore + 'static> Node<S> {
         {
             return Ok(false);
         }
-        // The registered SLH profile has one sender and an independent supported
+        // The SLH profile has one sender and an independent supported
         // proposer. Other proposer algorithms retain their existing native path.
         if block
             .transactions
@@ -219,8 +219,16 @@ impl<S: KvStore + 'static> Node<S> {
                 return Ok(false);
             }
             if tx.signature.sig_type == shell_crypto::SignatureType::SphincsSha2256f
-                && (account.pq_pubkey_hash == ShellHash::ZERO
-                    || registered.as_deref().is_none_or(|key| key.len() != 64))
+                && registered
+                    .as_deref()
+                    .or_else(|| {
+                        if account.pq_pubkey_hash == ShellHash::ZERO {
+                            tx.pubkey_mode.pubkey_bytes()
+                        } else {
+                            None
+                        }
+                    })
+                    .is_none_or(|key| key.len() != 64)
             {
                 return Ok(false);
             }
@@ -254,7 +262,13 @@ impl<S: KvStore + 'static> Node<S> {
                 else {
                     return Ok(false);
                 };
-                if key.len() != 1952
+                let key_bytes =
+                    if tx.signature.sig_type == shell_crypto::SignatureType::SphincsSha2256f {
+                        64
+                    } else {
+                        1952
+                    };
+                if key.len() != key_bytes
                     || Address::from_public_key(key, tx.signature.sig_type.as_u8()) != tx.from
                 {
                     return Ok(false);

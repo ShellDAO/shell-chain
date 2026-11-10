@@ -1801,3 +1801,66 @@ proposer and the original first child. It does not establish fresh automatic
 generation, quorum AIR, later-original history, broader account/role
 combinations, public release or network activation. Admission remains opt-in;
 unsupported profiles keep their existing behavior.
+
+#### Funded SLH first use
+
+A funded default account can start without a registered key and with a zero
+key commitment. Its first transaction must supply the 64-byte public key in
+Embedded mode, derive the same algorithm-tagged sender address and pass the
+complete SHA2-256f signature graph. Source format 7 and SLH transaction proof
+version 2 add the mandatory address AIR; bound source 6 and proof version 1
+retain their existing meanings. An absent account or custom validator is not
+covered by this profile.
+
+Continue a retained Native SLH output and its complete bound canonical proof:
+
+```bash
+tests/e2e/slh-first-use.sh prepare slh-output canonical-output first-use-output
+tests/e2e/slh-first-use.sh capture slh-output canonical-output first-use-output
+tests/e2e/slh-first-use.sh pause slh-output canonical-output first-use-output
+tests/e2e/slh-first-use.sh resume slh-output canonical-output first-use-output
+tests/e2e/slh-first-use.sh verify slh-output canonical-output first-use-output
+tests/e2e/slh-first-use.sh refuse slh-output canonical-output first-use-output
+```
+
+Use the same locked Rust, RocksDB/C++ and Python prerequisites as the preceding
+SLH entries. `prepare` refuses an existing output. It uses the retained public
+SLH key and signature without signing again, creates an independent funded
+genesis with a memory-only ML-DSA proposer, and drops that proposer's keys after
+creating genuine Native controls. Switching Reference to Embedded preserves the
+signed transaction, signature, signing hash and canonical identity; the complete
+body and batch-entry proofs must bind the changed envelope. Matching retained
+signature and body compression certificates are fully reverified; changed
+account/address/envelope/proposer statements require their own certificates.
+`pause` durably stores one new component; `resume` continues that same job.
+These commands require the retained outputs, not personal keys or a preset
+account. Errors exit nonzero and preserve the failing output.
+
+Successful intake cannot register the sender key. The full proof receiver must
+start at the independently authenticated genesis without that registration,
+execute the first child through Native commit, and match the control receipts,
+accounts and key registration. The existing funded account can still have a
+zero commitment after registration. `verify` advances both the independent
+Native control and proof receiver to a different second state and checks the
+first child's historical replay without writing either current database.
+`refuse` rejects a bound-proof substitution, absent or foreign address proof,
+changed signature and changed envelope without registering a key or writing
+Native state. This independent second block does not replace an unavailable
+successor from the original bound history.
+
+The ready frame can also drive the same real peer regression:
+
+```bash
+tests/e2e/slh-peer-proof.sh prepare first-use-output first-use-output/published first-use-peer
+tests/e2e/slh-peer-proof.sh pause first-use-output first-use-output/published first-use-peer
+tests/e2e/slh-peer-proof.sh resume first-use-output first-use-output/published first-use-peer
+tests/e2e/slh-peer-proof.sh verify first-use-output first-use-output/published first-use-peer
+tests/e2e/slh-peer-proof.sh refuse first-use-output first-use-output/published first-use-peer
+```
+
+The first-use receiver must remain unregistered while the proof is partial or
+rejected and register only after complete verified Native import. The ordinary
+attached quorum certificate still requires independent verification before
+finality. Automatic first-use generation without a reference graph, other
+account/proposer combinations, quorum AIR, public binary/package acceptance
+and network activation require separate acceptance.

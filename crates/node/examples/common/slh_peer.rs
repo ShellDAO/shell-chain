@@ -118,12 +118,31 @@ fn prepare(native: &Path, cache: &Path, out: &Path) -> Result<(), Error> {
     )?;
     let view = chain.canonical_parent_view(c.tip, parent.hash())?;
     for address in [block.transactions[0].from, c.authority] {
-        target.put_pubkey(
-            &address,
-            &view
-                .registered_key(&address)?
-                .ok_or("historical key absent")?,
-        )?;
+        if let Some(key) = view.registered_key(&address)? {
+            target.put_pubkey(&address, &key)?;
+        } else {
+            ensure(
+                address == block.transactions[0].from
+                    && block.transactions[0]
+                        .pubkey_mode
+                        .pubkey_bytes()
+                        .is_some_and(|key| {
+                            key.len() == 64
+                                && Address::from_public_key(
+                                    key,
+                                    block.transactions[0].signature.sig_type.as_u8(),
+                                ) == address
+                        })
+                    && view
+                        .world_state()?
+                        .get_account(&address)?
+                        .is_some_and(|account| {
+                            account.validation_code_hash.is_none()
+                                && account.pq_pubkey_hash == ShellHash::ZERO
+                        }),
+                "historical key absent outside funded first-use profile",
+            )?;
+        }
     }
     receiver.flush()?;
     write(&out.join("manifest.json"), &manifest)?;
@@ -227,6 +246,9 @@ async fn run(native: &Path, out: &Path, pause: bool, negative: bool) -> Result<(
             if status["status"]["state"]=="complete" {
                 ensure(!negative,"genuine foreign key-hash proof was accepted")?;
                 ensure(status["nativeCanonical"]==true && receiver.node.chain_store.get_head_hash()?==Some(c.block) && receiver.node.chain_store.get_receipts(&c.block)?.is_some_and(|v|serde_json::to_value(v).is_ok_and(|v|v==control["receipts"])) && accounts(receiver.node.store.clone(),&block)?==control["accounts"],"peer native execution differs from original control")?;
+                if let Some(key) = block.transactions[0].pubkey_mode.pubkey_bytes() {
+                    ensure(receiver.node.chain_store.get_pubkey(&block.transactions[0].from)?.as_deref() == Some(key), "committed Embedded key registration absent")?;
+                }
                 if receiver.node.finality.read().last_finalized_number() < 1 {
                     ensure(tokio::time::Instant::now()<deadline,"imported SLH child did not finalize")?;
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -282,6 +304,15 @@ fn verify(native: &Path, out: &Path) -> Result<(), Error> {
             && node.finality.read().last_finalized_number() == 1,
         "cold peer head/finality missing",
     )?;
+    if let Some(key) = block.transactions[0].pubkey_mode.pubkey_bytes() {
+        ensure(
+            node.chain_store
+                .get_pubkey(&block.transactions[0].from)?
+                .as_deref()
+                == Some(key),
+            "cold Embedded key registration absent",
+        )?;
+    }
     let replay = node.replay_canonical_transactions_with_proof(c.block, c.block, &proof)?;
     ensure(
         replay.proved_sender_signatures == 1
