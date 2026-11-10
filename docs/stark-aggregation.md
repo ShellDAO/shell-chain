@@ -1109,3 +1109,36 @@ bad-block import. Keys remain memory-only; retained-role mismatches refuse befor
 signing. Other role/account combinations, consensus selector/quorum/penalty AIR
 and public release/network acceptance remain separate. Limits, Native transcript
 union, defaults and frozen source meanings are unchanged.
+
+
+### Genuine raw sender with a published SDK proposer
+
+```bash
+tests/e2e/dilithium-full-proof.sh raw-sdk-proposer raw-sdk-output
+tests/e2e/dilithium-full-proof.sh verify raw-sdk-output
+```
+
+Use the same published SDK candidate and prerequisites above. This is the
+opposite mixed transcript: a genuine locked PQClean raw Native tag-zero bound
+sender and an independent actual SDK Native tag-zero FIPS proposer. A disposable
+SDK process calls public `ShellSigner.sign` on exact raw 32-byte Native header
+and vote hashes, receives only public requests and never exports its secret.
+The ordinary Native block/quorum/finality, successor and separately signed
+wrong-root rollback precede supported full source capture.
+
+Existing source format 5 combines sender profile 3 and transaction profile 2
+with complete raw signature/challenge version 2 and a 32-byte seed. SDK proposer
+seal profile 3 independently requires full FIPS signature/challenge version 1
+and its 48-byte seed. The original graph must survive automatic durable
+pause/reopen/recovery, real peer Native import/finality, receipt/fee/account
+comparison and repeated read-only history after the ordinary successor.
+
+Genuine raw sender key/challenge/commitment certificates cannot authorize the
+SDK proposer. Raw/primary seal relabelling, a complete header certificate for
+the original independently SDK-signed successor and raw sender source/account
+relabelling must refuse without changing original proofs or KV bytes. SDK
+secrets are disposed cooperatively before proof production. Keep public outputs
+to resume; retained-role mismatches refuse before signing. Unbound mixed roles,
+other account arrangements, consensus selector/quorum/penalty AIR and public
+release/network acceptance remain separate. Limits, defaults, Native transcript
+union and prior frozen source meanings are unchanged.

@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Cover the opposite mixed proof flow: genuine raw sender with an actual public SDK proposer, strict raw/FIPS certificate separation and historical replay.
+
 - Add public SDK FIPS-sender/genuine-raw-proposer full-proof coverage with separate transcript domains, cross-role certificate refusals and historical replay.
 
 - Extend the public SDK sender/proposer proof entry to first-use registration and subsequent Reference transactions, preserving original signed bytes and adding address/profile refusal coverage.

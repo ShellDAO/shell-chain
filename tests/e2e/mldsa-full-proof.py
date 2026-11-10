@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 mode, raw_fixture, raw_output = sys.argv[1:]
-assert mode in ("dilithium-run", "dilithium-proposer", "dilithium-both", "dilithium-unbound", "dilithium-sdk", "dilithium-sdk-unbound", "dilithium-sdk-proposer", "dilithium-sdk-both", "dilithium-sdk-both-unbound", "dilithium-sdk-raw-proposer", "dilithium-verify", "run", "verify", "consecutive", "batch", "first-use", "wide", "mixed", "eight-keys", "sixteen-keys", "mixed-first-use", "rotation", "rotation-raw")
+assert mode in ("dilithium-run", "dilithium-proposer", "dilithium-both", "dilithium-unbound", "dilithium-sdk", "dilithium-sdk-unbound", "dilithium-sdk-proposer", "dilithium-sdk-both", "dilithium-sdk-both-unbound", "dilithium-sdk-raw-proposer", "dilithium-raw-sdk-proposer", "dilithium-verify", "run", "verify", "consecutive", "batch", "first-use", "wide", "mixed", "eight-keys", "sixteen-keys", "mixed-first-use", "rotation", "rotation-raw")
 fixture, out = map(lambda p: Path(p).resolve(), (raw_fixture, raw_output))
 
 def now():
@@ -64,19 +64,20 @@ def snapshot(label):
 def history_verify():
     run("full-history-verify", [fixture, "full-history-verify", out])
 
-if mode in ("dilithium-run", "dilithium-proposer", "dilithium-both", "dilithium-unbound", "dilithium-sdk", "dilithium-sdk-unbound", "dilithium-sdk-proposer", "dilithium-sdk-both", "dilithium-sdk-both-unbound", "dilithium-sdk-raw-proposer", "dilithium-verify"):
+if mode in ("dilithium-run", "dilithium-proposer", "dilithium-both", "dilithium-unbound", "dilithium-sdk", "dilithium-sdk-unbound", "dilithium-sdk-proposer", "dilithium-sdk-both", "dilithium-sdk-both-unbound", "dilithium-sdk-raw-proposer", "dilithium-raw-sdk-proposer", "dilithium-verify"):
     out.mkdir(exist_ok=True)
     network = out / "network-dilithium"
     if mode == "dilithium-verify":
         run("dilithium-cold-verify", [fixture, "dilithium-verify", out])
         sys.exit(0)
-    sdk_proposer=mode in ("dilithium-sdk-proposer", "dilithium-sdk-both", "dilithium-sdk-both-unbound")
+    sdk_proposer=mode in ("dilithium-sdk-proposer", "dilithium-sdk-both", "dilithium-sdk-both-unbound", "dilithium-raw-sdk-proposer")
+    raw_sdk_proposer=mode=="dilithium-raw-sdk-proposer"
     sdk_raw_proposer=mode=="dilithium-sdk-raw-proposer"
     sdk=mode in ("dilithium-sdk", "dilithium-sdk-unbound", "dilithium-sdk-both", "dilithium-sdk-both-unbound", "dilithium-sdk-raw-proposer")
     unbound = mode in ("dilithium-unbound", "dilithium-sdk-unbound", "dilithium-sdk-both-unbound")
     both = mode == "dilithium-both"
-    raw_proposer = mode in ("dilithium-proposer", "dilithium-both", "dilithium-sdk-proposer", "dilithium-sdk-both", "dilithium-sdk-both-unbound", "dilithium-sdk-raw-proposer")
-    raw_sender = mode in ("dilithium-run", "dilithium-both", "dilithium-unbound", "dilithium-sdk", "dilithium-sdk-unbound", "dilithium-sdk-both", "dilithium-sdk-both-unbound", "dilithium-sdk-raw-proposer")
+    raw_proposer = mode in ("dilithium-proposer", "dilithium-both", "dilithium-sdk-proposer", "dilithium-sdk-both", "dilithium-sdk-both-unbound", "dilithium-sdk-raw-proposer", "dilithium-raw-sdk-proposer")
+    raw_sender = mode in ("dilithium-run", "dilithium-both", "dilithium-unbound", "dilithium-sdk", "dilithium-sdk-unbound", "dilithium-sdk-both", "dilithium-sdk-both-unbound", "dilithium-sdk-raw-proposer", "dilithium-raw-sdk-proposer")
     def check_retained_profile(value):
         assert value["sender_algorithm"] == ("Dilithium3" if raw_sender else "MlDsa65") and value["proposer_algorithm"] == ("Dilithium3" if raw_proposer else "MlDsa65"), "retained algorithm roles differ; choose a new output directory"
         assert value.get("native_sdk_fips_proposer",False)==sdk_proposer, "retained proposer signing transcript differs; choose a new output directory"
@@ -90,7 +91,7 @@ if mode in ("dilithium-run", "dilithium-proposer", "dilithium-both", "dilithium-
     if sdk and not (out / "sdk-public.json").exists():
         run("public-sdk-sign", ["node", "tests/e2e/sdk-dilithium-inputs.mjs", "prepare-unbound-joint" if unbound and sdk_proposer else "prepare-unbound" if unbound else "prepare", str(out) + ".client", out / "sdk-public.json"])
     if not (out / "actors.json").exists():
-        prepare = "prepare-dilithium-sdk-raw-proposer" if sdk_raw_proposer else "prepare-dilithium-sdk-both-unbound" if sdk and sdk_proposer and unbound else "prepare-dilithium-sdk-both" if sdk and sdk_proposer else "prepare-dilithium-sdk-proposer" if sdk_proposer else "prepare-dilithium-sdk-unbound" if sdk and unbound else "prepare-dilithium-sdk" if sdk else "prepare-dilithium-unbound" if unbound else "prepare-dilithium-both" if both else "prepare-dilithium-proposer" if raw_proposer else "prepare-dilithium"
+        prepare = "prepare-dilithium-raw-sdk-proposer" if raw_sdk_proposer else "prepare-dilithium-sdk-raw-proposer" if sdk_raw_proposer else "prepare-dilithium-sdk-both-unbound" if sdk and sdk_proposer and unbound else "prepare-dilithium-sdk-both" if sdk and sdk_proposer else "prepare-dilithium-sdk-proposer" if sdk_proposer else "prepare-dilithium-sdk-unbound" if sdk and unbound else "prepare-dilithium-sdk" if sdk else "prepare-dilithium-unbound" if unbound else "prepare-dilithium-both" if both else "prepare-dilithium-proposer" if raw_proposer else "prepare-dilithium"
         run(prepare, [fixture, prepare, out])
     actors = json.loads((out / "actors.json").read_text())
     check_retained_profile(actors)
@@ -140,7 +141,7 @@ if mode in ("dilithium-run", "dilithium-proposer", "dilithium-both", "dilithium-
     run("dilithium-history-cold", [fixture, "dilithium-verify", out])
     run("dilithium-history-cold-again", [fixture, "dilithium-verify", out])
     complete = json.loads((network / "complete.json").read_text())
-    key = "genuine_sdk_sender_raw_proposer_full_proof_admitted" if sdk_raw_proposer else "genuine_sdk_both_roles_full_proof_admitted" if sdk and sdk_proposer else "genuine_sdk_tag0_fips_proposer_full_proof_admitted" if sdk_proposer else "genuine_unbound_sdk_tag0_fips_full_proof_admitted" if sdk and unbound else "genuine_sdk_tag0_fips_full_proof_admitted" if sdk else "genuine_unbound_dilithium_full_proof_admitted" if unbound else "genuine_dilithium_both_roles_full_proof_admitted" if both else "genuine_dilithium_proposer_primary_sender_full_proof_admitted" if raw_proposer else "genuine_dilithium_sender_primary_proposer_full_proof_admitted"
+    key = "genuine_raw_sender_sdk_proposer_full_proof_admitted" if raw_sdk_proposer else "genuine_sdk_sender_raw_proposer_full_proof_admitted" if sdk_raw_proposer else "genuine_sdk_both_roles_full_proof_admitted" if sdk and sdk_proposer else "genuine_sdk_tag0_fips_proposer_full_proof_admitted" if sdk_proposer else "genuine_unbound_sdk_tag0_fips_full_proof_admitted" if sdk and unbound else "genuine_sdk_tag0_fips_full_proof_admitted" if sdk else "genuine_unbound_dilithium_full_proof_admitted" if unbound else "genuine_dilithium_both_roles_full_proof_admitted" if both else "genuine_dilithium_proposer_primary_sender_full_proof_admitted" if raw_proposer else "genuine_dilithium_sender_primary_proposer_full_proof_admitted"
     assert complete[key] and complete["height"] == complete["finalized"] == 1
     assert complete["production"]["state"] == "complete" and complete["production"]["components"] > 0
     assert complete["admission"]["nativeCanonical"] and complete["admission"]["status"]["state"] == "complete"
@@ -156,7 +157,7 @@ if mode in ("dilithium-run", "dilithium-proposer", "dilithium-both", "dilithium-
     rollback = json.loads((out / "native-rollback.json").read_text())
     assert rollback["native_crypto_control_not_proof_admission"] and rollback["all_kv_unchanged"]
     refusals = json.loads((network / "refusals.json").read_text())
-    assert refusals["genuine_mixed_sdk_raw_certificates" if sdk_raw_proposer else "genuine_foreign_sdk_certificates" if sdk and sdk_proposer else "genuine_foreign_raw_certificates" if both else "genuine_primary_certificates"] and len(refusals["cases"]) == (10 if sdk_raw_proposer else 12 if sdk and sdk_proposer and unbound else 10 if sdk and sdk_proposer else 9 if unbound and sdk else 7 if unbound or sdk or sdk_proposer else 4)
+    assert refusals["genuine_mixed_raw_sdk_certificates" if raw_sdk_proposer else "genuine_mixed_sdk_raw_certificates" if sdk_raw_proposer else "genuine_foreign_sdk_certificates" if sdk and sdk_proposer else "genuine_foreign_raw_certificates" if both else "genuine_primary_certificates"] and len(refusals["cases"]) == (10 if raw_sdk_proposer or sdk_raw_proposer else 12 if sdk and sdk_proposer and unbound else 10 if sdk and sdk_proposer else 9 if unbound and sdk else 7 if unbound or sdk or sdk_proposer else 4)
     assert all(v["all_kv_unchanged"] and v["original_proof_unchanged"] and v["new_proofs_generated"] == 0 for v in refusals["cases"])
     result = {key: True, "legacy_proposer": raw_proposer, "legacy_sender": raw_sender, "unbound_sender": unbound, "native_sdk_fips_sender": sdk,"native_sdk_fips_proposer":sdk_proposer,
               "historical_replay_after_native_successor_no_writes": True,

@@ -178,6 +178,9 @@ pub(crate) fn prepare_sdk_unbound(out: &Path) -> Result<(), Error> {
 pub(crate) fn prepare_sdk_proposer(out: &Path) -> Result<(), Error> {
     prepare_profile(out, false, true, false, false, true)
 }
+pub(crate) fn prepare_raw_sdk_proposer(out: &Path) -> Result<(), Error> {
+    prepare_profile(out, true, true, false, false, true)
+}
 pub(crate) fn prepare_sdk_both(out: &Path) -> Result<(), Error> {
     prepare_profile(out, true, true, false, true, true)
 }
@@ -611,7 +614,7 @@ fn prepare_profile(
     }
     write(
         &out.join("actors.json"),
-        &json!({"sender":address,"sender_key":sender.public_key(),"sender_algorithm":sender.sig_type(),"proposer_algorithm":proposer.sig_type(),"private_keys_persisted":false,"unbound_sender":unbound,"native_sdk_fips_sender":sdk,"native_sdk_fips_proposer":sdk_proposer,"profile":if sdk && legacy_proposer && !sdk_proposer {"native-sdk-sender-raw-proposer"} else if sdk && sdk_proposer && unbound {"native-sdk-fips-both-unbound"} else if sdk && sdk_proposer {"native-sdk-fips-both"} else if sdk_proposer {"native-sdk-fips-proposer"} else if sdk && unbound {"native-sdk-fips-unbound"} else if sdk {"native-sdk-fips-bound"} else if unbound {"legacy-unbound"} else if legacy_sender && legacy_proposer {"legacy-both"} else if legacy_proposer {"legacy-proposer"} else {"legacy-sender"},"initial_automatic_capture_disabled_native_control":legacy_proposer || unbound || sdk,"native_transcript":"locked pqcrypto-dilithium0.5.0 raw roles; FIPS only where explicitly selected"}),
+        &json!({"sender":address,"sender_key":sender.public_key(),"sender_algorithm":sender.sig_type(),"proposer_algorithm":proposer.sig_type(),"private_keys_persisted":false,"unbound_sender":unbound,"native_sdk_fips_sender":sdk,"native_sdk_fips_proposer":sdk_proposer,"profile":if !sdk && sdk_proposer && legacy_sender {"native-raw-sender-sdk-proposer"} else if sdk && legacy_proposer && !sdk_proposer {"native-sdk-sender-raw-proposer"} else if sdk && sdk_proposer && unbound {"native-sdk-fips-both-unbound"} else if sdk && sdk_proposer {"native-sdk-fips-both"} else if sdk_proposer {"native-sdk-fips-proposer"} else if sdk && unbound {"native-sdk-fips-unbound"} else if sdk {"native-sdk-fips-bound"} else if unbound {"legacy-unbound"} else if legacy_sender && legacy_proposer {"legacy-both"} else if legacy_proposer {"legacy-proposer"} else {"legacy-sender"},"initial_automatic_capture_disabled_native_control":legacy_proposer || unbound || sdk,"native_transcript":"locked pqcrypto-dilithium0.5.0 raw roles; FIPS only where explicitly selected"}),
     )?;
     node.store.flush()?;
     drop(node);
@@ -908,7 +911,7 @@ pub(crate) async fn run(out: &Path, pause: bool, reference: bool) -> Result<(), 
                 let path = network.join(proof_name);
                 if path.exists() { ensure(std::fs::read(&path)? == bytes, "retained Dilithium proof changed")?; } else { std::fs::write(path, &bytes)?; }
                 write(&network.join(manifest_name), &manifest)?;
-                write(&network.join(complete_name), &json!({"production":production["status"],"admission":admission,"height":height,"finalized":finalized,"unbound_sender":unbound,"both_original_targets_proof_admitted":reference,"genuine_unbound_dilithium_full_proof_admitted":unbound && !sdk,"genuine_unbound_sdk_tag0_fips_full_proof_admitted":sdk && unbound,"native_sdk_fips_sender":sdk,"native_sdk_fips_proposer":sdk_proposer,"genuine_sdk_tag0_fips_proposer_full_proof_admitted":sdk_proposer,"genuine_sdk_tag0_fips_full_proof_admitted":sdk && !unbound && !legacy_proposer,"genuine_sdk_sender_raw_proposer_full_proof_admitted":sdk && legacy_proposer && !sdk_proposer,"genuine_dilithium_sender_primary_proposer_full_proof_admitted":legacy_sender && !legacy_proposer && !unbound && !sdk,"genuine_dilithium_proposer_primary_sender_full_proof_admitted":legacy_proposer && !legacy_sender && !sdk_proposer,"genuine_dilithium_both_roles_full_proof_admitted":legacy_sender && legacy_proposer && !sdk && !sdk_proposer,"genuine_sdk_both_roles_full_proof_admitted":sdk && sdk_proposer,"native_outputs_match":true,"served_chunks":faults.chunks.load(Ordering::SeqCst)}))?;
+                write(&network.join(complete_name), &json!({"production":production["status"],"admission":admission,"height":height,"finalized":finalized,"unbound_sender":unbound,"both_original_targets_proof_admitted":reference,"genuine_unbound_dilithium_full_proof_admitted":unbound && !sdk,"genuine_unbound_sdk_tag0_fips_full_proof_admitted":sdk && unbound,"native_sdk_fips_sender":sdk,"native_sdk_fips_proposer":sdk_proposer,"genuine_sdk_tag0_fips_proposer_full_proof_admitted":sdk_proposer,"genuine_sdk_tag0_fips_full_proof_admitted":sdk && !unbound && !legacy_proposer,"genuine_sdk_sender_raw_proposer_full_proof_admitted":sdk && legacy_proposer && !sdk_proposer,"genuine_raw_sender_sdk_proposer_full_proof_admitted":legacy_sender && sdk_proposer && !sdk,"genuine_dilithium_sender_primary_proposer_full_proof_admitted":legacy_sender && !legacy_proposer && !unbound && !sdk,"genuine_dilithium_proposer_primary_sender_full_proof_admitted":legacy_proposer && !legacy_sender && !sdk_proposer,"genuine_dilithium_both_roles_full_proof_admitted":legacy_sender && legacy_proposer && !sdk && !sdk_proposer,"genuine_sdk_both_roles_full_proof_admitted":sdk && sdk_proposer,"native_outputs_match":true,"served_chunks":faults.chunks.load(Ordering::SeqCst)}))?;
                 break;
             }
             ensure(tokio::time::Instant::now() < deadline && last_progress.elapsed() < Duration::from_secs(1800), "Dilithium progress bound exceeded")?;
@@ -1111,6 +1114,7 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
     let sdk = actors["native_sdk_fips_sender"] == true;
     let sdk_proposer = actors["native_sdk_fips_proposer"] == true;
     let mixed_sdk_raw = sdk && legacy_proposer && !sdk_proposer;
+    let mixed_raw_sdk = !sdk && sdk_proposer && legacy_sender;
     let both = legacy_sender && legacy_proposer;
     let cases = if both {
         [
@@ -1180,6 +1184,13 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
                     "framing"
                 },
             ),
+        ]);
+    }
+    if mixed_raw_sdk {
+        cases.extend([
+            ("raw-sender-as-sdk-source", "Dilithium3 shape"),
+            ("raw-sender-as-sdk-account", "SDK transaction"),
+            ("raw-sender-as-primary-account", "framing"),
         ]);
     }
     if mixed_sdk_raw {
@@ -1266,6 +1277,9 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
             4 if sdk => proof.transactions[0].signature.transaction.version = 1,
             5 if sdk => proof.transactions[0].signature.version = if unbound { 4 } else { 3 },
             6 if sdk => proof.transactions[0].signature.version = if unbound { 2 } else { 1 },
+            7 if mixed_raw_sdk => proof.transactions[0].signature.transaction.version = 3,
+            8 if mixed_raw_sdk => proof.transactions[0].signature.version = 5,
+            9 if mixed_raw_sdk => proof.transactions[0].signature.version = 1,
             7 if mixed_sdk_raw => {
                 proof
                     .proposer
@@ -1328,7 +1342,7 @@ pub(crate) fn negative(out: &Path) -> Result<(), Error> {
     }
     write(
         &network.join("refusals.json"),
-        &json!({"genuine_primary_certificates":!both,"genuine_foreign_raw_certificates":both && !sdk && !sdk_proposer,"genuine_foreign_sdk_certificates":both && sdk && sdk_proposer,"genuine_mixed_sdk_raw_certificates":mixed_sdk_raw,"genuine_foreign_raw_header":mixed_sdk_raw,"genuine_unbound_address_certificate":unbound,"native_sdk_fips_sender":sdk,"native_sdk_fips_proposer":sdk_proposer,"genuine_foreign_sdk_header":sdk_proposer,"cases":results,"scope":"full historical predicate refusals, not new native block imports"}),
+        &json!({"genuine_primary_certificates":!both,"genuine_foreign_raw_certificates":both && !sdk && !sdk_proposer,"genuine_foreign_sdk_certificates":both && sdk && sdk_proposer,"genuine_mixed_sdk_raw_certificates":mixed_sdk_raw,"genuine_mixed_raw_sdk_certificates":mixed_raw_sdk,"genuine_foreign_raw_header":mixed_sdk_raw,"genuine_unbound_address_certificate":unbound,"native_sdk_fips_sender":sdk,"native_sdk_fips_proposer":sdk_proposer,"genuine_foreign_sdk_header":sdk_proposer,"cases":results,"scope":"full historical predicate refusals, not new native block imports"}),
     )?;
     Ok(())
 }
