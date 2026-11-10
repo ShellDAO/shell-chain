@@ -1270,7 +1270,7 @@ successor. Existing output is refused before generating any new key.
 Canonical source capture currently rejects this fallback profile. This remains
 a missing full signature proving capability. Native execution and the SHA2
 compression primitives below do not establish full canonical SLH proof
-admission. FIPS 205 message expansion, FORS, WOTS+, hypertree verification and
+admission. Complete FORS, WOTS+, hypertree verification and
 the complete durable production/peer/history chain still require integration.
 Keep original outputs and signatures when investigating a failure. The explicit
 `recover-native` mode can checkpoint an already imported/finalized retained
@@ -1308,3 +1308,58 @@ inputs. An existing proof is never overwritten; wrong inputs, malformed proofs
 and trailing certificate data return a failure exit code. Use `Sha512` with
 64-bit words for SHA-512 compression. Complete digest and signature framing
 remain the caller's responsibility.
+
+The `sha2_digest` API adds complete FIPS 180-4 byte-message hashing: the standard
+initial state, exact padding and bit length, every chained block and canonical
+groups of up to sixteen compressions. The message profile is bounded to 4,096
+bytes. It verifies the compression AIR and all input edges; verification never
+computes a native SHA digest. This is a proving profile, not a change to Native
+transaction limits or the global proof-store quota.
+
+The `slh_sha2` API builds on those digests for the **SHA2-256f** verification hash
+functions. `Message` uses the Native 32-byte signing hash in pure mode with an
+empty context, SHA-512 and the fixed 49-byte MGF1 output. `F` uses SHA-256;
+`H`, `WotsPublicKey` and `ForsRoots` use SHA-512 truncated to 32 bytes. The public
+seed padding, 22-byte address, domain and fixed 67/35-node counts are bound to
+the independently supplied request. The address fields are `layer`, `tree`,
+`kind`, `key_pair`, `chain_or_height` and `hash_or_index`; their byte order follows
+FIPS 205. The full signature verifier still needs to establish the correct
+tree positions and node relationships.
+
+To prove H_msg from the retained Native test output above, export the public
+key and request without generating another key or signature:
+
+```bash
+python3 - <<'PY'
+import json
+with open("slh-output/actors.json") as source:
+    public_key = json.load(source)["sender_key"]
+with open("slh-public-key.json", "x") as output:
+    json.dump(public_key, output)
+PY
+cargo run --locked --release -p shell-stark-prover --example slh-sha2 -- native-hmsg slh-output/signed-first.json slh-public-key.json slh-hmsg.json
+cargo run --locked --release -p shell-stark-prover --example slh-sha2 -- prove slh-hmsg.json slh-hmsg.cbor
+cargo run --locked --release -p shell-stark-prover --example slh-sha2 -- verify slh-hmsg.json slh-hmsg.cbor
+```
+
+The exporter first checks the retained Native signature and exact algorithm,
+key and signature lengths. This native check validates export inputs; it is
+separate from mathematical hash-proof acceptance. Verification starts in a new
+process with independently supplied JSON. Output is exclusive and flushed to
+disk; changed request bytes, malformed or trailing certificate bytes and
+attempted output replacement fail with a nonzero exit code. Keep all original
+inputs and certificates after a failure. The output explicitly identifies a
+hash-only proof, with no signature-admission authority.
+
+Run the focused digest, compression and SLH hash regressions with:
+
+```bash
+cargo test --locked --release -p shell-stark-prover --lib sha2 -- --test-threads=1
+```
+
+These tests cover independent RustCrypto digests, padding and block boundaries,
+the bounded maximum message and multiple chunks, genuine compression proofs
+with false IV/padding/chaining/order, FIPS 205 routing and public-input refusals.
+They do not establish full FORS/WOTS+/hypertree or canonical node/peer/history
+acceptance. Existing source formats, activation and consensus policy remain
+unchanged.

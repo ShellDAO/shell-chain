@@ -608,6 +608,14 @@ impl Prover for CompressionProver {
     }
 }
 
+// Native witness generation only. Verification always uses the compression AIR.
+pub(crate) fn compression_witness_output(
+    algorithm: Sha2Algorithm,
+    input: &CompressionInput,
+) -> [u64; 8] {
+    route(algorithm, input, |op| native(algorithm, op))
+}
+
 /// Prove every compression's full schedule,64/80 rounds and eight-word feedforward.
 /// Inputs may have independently supplied chaining values for verified prefix reuse.
 pub fn prove_compression_batch(

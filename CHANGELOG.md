@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Prove complete byte-message SHA-256/SHA-512 digests and SLH-DSA-SHA2-256f H_msg/MGF1/F/H/T verification hashes, with exact padding, IV, chaining and address domains. Add persistent hash certificates and read-only export from retained Native signatures. These remain hash primitives; complete SLH signature and canonical production admission are unfinished.
+
 - Add complete batched SHA-256/SHA-512 compression AIRs with constrained schedules, rounds, limb carries and feedforward, as a foundation for SLH-DSA proof production. Native SLH controls and immutable source-capture reproduction are available; full canonical SLH signature proof admission remains unfinished.
 
 - Cover raw first-use registration with an independent raw proposer, retaining the original signature through refusal/Embedded acceptance, both full proof targets and cross-role/header/profile refusals.
