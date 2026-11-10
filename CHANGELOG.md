@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Prove the complete SHA2-256f FORS forest: H_msg indices, all 35 trees and nine authentication levels, and the final 35-root compression. Persist and reverify immutable hash steps on resume, independently cold-verify the full certificate, and provide an executable regression with an independent Python hash reference. WOTS+/hypertree and full canonical SLH admission remain unfinished.
+
 - Prove complete byte-message SHA-256/SHA-512 digests and SLH-DSA-SHA2-256f H_msg/MGF1/F/H/T verification hashes, with exact padding, IV, chaining and address domains. Add persistent hash certificates and read-only export from retained Native signatures. These remain hash primitives; complete SLH signature and canonical production admission are unfinished.
 
 - Add complete batched SHA-256/SHA-512 compression AIRs with constrained schedules, rounds, limb carries and feedforward, as a foundation for SLH-DSA proof production. Native SLH controls and immutable source-capture reproduction are available; full canonical SLH signature proof admission remains unfinished.

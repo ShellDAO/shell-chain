@@ -1270,7 +1270,7 @@ successor. Existing output is refused before generating any new key.
 Canonical source capture currently rejects this fallback profile. This remains
 a missing full signature proving capability. Native execution and the SHA2
 compression primitives below do not establish full canonical SLH proof
-admission. Complete FORS, WOTS+, hypertree verification and
+admission. Complete WOTS+, hypertree verification and
 the complete durable production/peer/history chain still require integration.
 Keep original outputs and signatures when investigating a failure. The explicit
 `recover-native` mode can checkpoint an already imported/finalized retained
@@ -1360,6 +1360,59 @@ cargo test --locked --release -p shell-stark-prover --lib sha2 -- --test-threads
 These tests cover independent RustCrypto digests, padding and block boundaries,
 the bounded maximum message and multiple chunks, genuine compression proofs
 with false IV/padding/chaining/order, FIPS 205 routing and public-input refusals.
-They do not establish full FORS/WOTS+/hypertree or canonical node/peer/history
+They do not establish WOTS+/hypertree or canonical node/peer/history
 acceptance. Existing source formats, activation and consensus policy remain
 unchanged.
+
+The `slh_fors` API composes these hashes into the complete fixed SHA2-256f FORS
+forest. It derives all 35 nine-bit indices from H_msg's first 315 bits, the
+64-bit tree index and four-bit leaf index. Each tree constrains its secret-leaf
+hash, all nine authentication hashes, their left/right ordering and global
+tree indices. The final T hash combines all 35 ordered roots. Every hash uses
+the complete SHA2 AIR. No native hash or native signature verifier participates
+in FORS proof acceptance.
+
+Run the self-contained full-forest regression with Rust stable, the source-build
+and RocksDB prerequisites above, and Python 3 (standard library only):
+
+```bash
+tests/e2e/slh-fors.sh fors-output
+```
+
+The default fixture generates a genuine memory-only SLH signature and drops the
+private key after exporting public inputs. It exercises standalone cryptographic
+verification; it does not execute a Native transaction. To continue from the
+same retained Native signature and public key exported above instead:
+
+```bash
+tests/e2e/slh-fors.sh fors-original slh-output/signed-first.json slh-public-key.json
+```
+
+Both modes prove all 35 trees at the real nine-level parameter, independently
+reconstruct the entire forest with Python `hashlib`, cold-verify the certificate
+in a separate process and check genuine foreign-tree/branch, message/key/node,
+proof and serialization refusals. A wrong input, corrupt checkpoint or attempted
+output replacement fails with a nonzero exit code. Keep the original inputs,
+steps and full certificate; the command refuses an existing regression output.
+The independent Python oracle also hashes the remaining hypertree to check that
+the FORS output reaches the original public root. Those oracle operations are
+unproved and never participate in proof acceptance.
+
+The `slh-fors` example stores each of its 352 verified hash steps with exclusive
+creation and file synchronization. Recovery rechecks every retained step against
+the independently derived request before using its result. It never replaces a
+bad step or changes frozen inputs. The assembled `fors.cbor` can be verified
+without the step directory:
+
+```bash
+cargo run --locked --release -p shell-stark-prover --example slh-fors -- resume fors-output/input.json fors-output/proof
+cargo run --locked --release -p shell-stark-prover --example slh-fors -- verify fors-output/input.json fors-output/proof/fors.cbor
+```
+
+This development certificate reader has a separate 128 MiB bound; Native and
+global proof-store limits are unchanged. The result is a FORS public key. The
+full original signature envelope is compared to caller-supplied bytes, while
+the WOTS+/hypertree tail's mathematical relation to the SLH public root remains
+unproved. The output explicitly reports `full_signature_verified: false`.
+Complete signature authorization, canonical sources/jobs, node import and
+historical acceptance still require integration.

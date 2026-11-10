@@ -73,3 +73,27 @@ public signature before emitting H_msg inputs, with no signing or private-key
 generation. Native export validation never substitutes for a proof. This
 composition does not create a verified signature token or change canonical
 source formats.
+
+## FORS composition and retained checkpoints
+
+Compose the verification hashes into the fixed SHA2-256f FORS relation, without
+reducing tree count or depth. Derive 35 nine-bit indices MSB first from H_msg,
+then the separate 64-bit tree and low four-bit leaf coordinates. Bind all 35
+secret-leaf hashes, 315 authentication hashes and the final ordered-root T hash.
+Global tree indices include the tree number; authentication ordering follows
+the corresponding message-index bit. Reset the final address to FORS_ROOTS,
+retaining the independently derived key-pair address.
+
+One fixed ordered list contains 352 full hash certificates, including H_msg.
+The prover accepts a retained-step provider, but verifies every returned
+certificate before its output participates in subsequent routing. The public
+example exclusively persists verified steps, compares frozen inputs on resume,
+and refuses corrupt steps instead of replacing them. Its full certificate
+also verifies independently of the checkpoint directory. A bounded 128 MiB
+development reader does not change the global proof-store quota.
+
+FORS produces an intermediate public key. Compare the complete original
+signature envelope to independently expected input bytes, while keeping the
+hypertree tail explicitly outside the mathematical claim. Native verification
+is confined to optional public-input fixture/export checks. WOTS+/hypertree,
+canonical authority and node/peer/history admission remain separate work.

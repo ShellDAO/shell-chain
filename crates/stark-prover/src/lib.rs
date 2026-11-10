@@ -114,4 +114,5 @@ pub const PROTOCOL_VERSION: u8 = 1;
 
 pub mod sha2_compression;
 pub mod sha2_digest;
+pub mod slh_fors;
 pub mod slh_sha2;
