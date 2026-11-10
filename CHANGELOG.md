@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Cover genuine raw first-use registration with an actual SDK proposer, retaining one original first-use signature across refusal/Embedded acceptance and both full proof targets.
+
 - Extend SDK first-use proof coverage to a genuine raw proposer, including unchanged-signature key registration, both proof targets and mixed/address/profile refusals.
 
 - Cover the opposite mixed proof flow: genuine raw sender with an actual public SDK proposer, strict raw/FIPS certificate separation and historical replay.

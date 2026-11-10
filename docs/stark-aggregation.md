@@ -1178,3 +1178,41 @@ key registration; they are distinct from proof-backed bad-block imports. Keep
 public outputs to resume. Other unbound raw/account combinations, consensus
 selector/quorum/penalty AIR and public release/network acceptance remain separate;
 limits, defaults, Native transcript union and frozen source meanings are unchanged.
+
+
+### Genuine raw first use with a published SDK proposer
+
+```bash
+tests/e2e/dilithium-full-proof.sh raw-unbound-sdk-proposer raw-first-sdk-output
+tests/e2e/dilithium-full-proof.sh verify raw-first-sdk-output
+```
+
+Use the exact published SDK candidate and prerequisites above. The funded raw
+Native tag-zero sender begins with zero key commitment and no registered key;
+the independent SDK Native tag-zero FIPS proposer signs exact raw 32-byte Native
+header/vote hashes through public `ShellSigner.sign` in a disposable process.
+The first genuine raw Reference transaction is signed once and retained for the
+expected refusal. Embedded first use adds only that original public key to a
+clone of the same transaction/signature; signed bytes and signing hash must match.
+
+Native block 1 registers the key and reaches quorum/finality, then Reference
+transfers execute in blocks 2 and 3. Both original Embedded1 and Reference2 full
+graphs must complete automatic durable recovery and real peer Native import/
+finality2 with equal receipts, fees, accounts and nonce. Ordinary block 3 precedes
+repeated read-only history for both targets. Existing source format 5 retains
+sender profile 4, tag-zero address AIR and transaction profile 2 with complete
+raw signature/challenge version 2 and a 32-byte seed. Registration adds a key
+lookup while the account commitment stays zero for both targets. SDK proposer
+seal profile 3 separately requires full FIPS signature/challenge version 1 and
+a 48-byte seed.
+
+Genuine mixed certificates, Raw/primary seal relabelling, the original independently
+SDK-signed successor's full header certificate, Raw sender source/account,
+untagged address and bound-at-first-use substitutions must refuse without changing
+original proofs or KV bytes. Genuine Reference/wrong-address/tamper intake controls
+and an independently SDK-signed wrong-root ordinary import must preserve state
+and registration; they are distinct from proof-backed bad-block import. The SDK
+key is disposed cooperatively before proving. Keep public outputs to resume.
+Other unbound raw/account combinations, consensus selector/quorum/penalty AIR
+and public release/network acceptance remain separate; limits, defaults, Native
+transcript union and prior frozen source meanings are unchanged.
