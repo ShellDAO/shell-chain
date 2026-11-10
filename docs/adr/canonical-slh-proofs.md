@@ -46,3 +46,14 @@ not evidence of peer transport, quorum/finality AIR or history after an original
 signed successor. Automatic production, broader combinations and public release
 and activation require separate acceptance. No power-loss claim follows from a
 clean component-budget pause.
+
+The warm-checkpoint automatic regression separately exercises ordinary Native
+import capture, actual background-worker cancellation/restart, complete AIR
+revalidation and authenticated loopback chunk retrieval. Its isolated fixture
+transplants a completed same-source checkpoint and retains the queued status;
+the worker supplies the verified result and ready payload. It requires zero new
+mathematical certificates and no signing capability. A separate corrupt copy
+updates the component hash and accounting around damaged proof bytes, so a
+failed background verification cannot be mistaken for a storage-hash mismatch
+or accepted through an existing ready payload. This experiment leaves fresh
+automatic generation, real peer transport and later-original history open.

@@ -1668,7 +1668,47 @@ signature witness and body/header root are refused without writing Native state.
 Unmatched signature tuples receive no native crypto fallback.
 
 This profile covers the first registered sender and direct offline import.
-Automatic Node.run production, actual peer transport/finality, history after a
+Fresh automatic generation, actual peer transport/finality, history after a
 later original signed block, other account/role combinations and public
 package/binary/network activation remain separate acceptance work. A retained
 unsigned successor cannot be recreated after its private key has been dropped.
+
+#### Automatic recovery from a retained SLH checkpoint
+
+Continue the same `slh-output` and completed `canonical-output` above:
+
+```bash
+tests/e2e/slh-canonical.sh automatic-prepare slh-output canonical-output automatic-output
+tests/e2e/slh-canonical.sh automatic-pause slh-output canonical-output automatic-output
+tests/e2e/slh-canonical.sh automatic-resume slh-output canonical-output automatic-output
+tests/e2e/slh-canonical.sh automatic-verify slh-output canonical-output automatic-output
+tests/e2e/slh-canonical.sh automatic-refuse slh-output canonical-output automatic-output
+```
+
+Preparation creates an isolated receiver from authenticated genesis-reachable
+trie nodes and parent registrations, executes the original signed child through
+ordinary Native import, and checks the normal hook captured a queued source.
+It explicitly transplants the completed same-source mathematical checkpoint into
+that job as a test fixture. A queued record and retained component count grant no
+verification authority. Keep both original input directories.
+
+`pause` starts real `Node.run` production and requests graceful shutdown after
+`proving` becomes observable. Cancellation can take effect before the first
+certificate is rechecked. A separate `resume` process must reverify the entire
+graph, generate zero new certificates, publish the ready byte cache and download
+every chunk through authenticated loopback RPC. The downloaded frame must equal
+the original complete proof byte for byte. The prover actor holds only its public
+key and refuses every signing request; no original private key is recovered.
+
+The regression refuses unauthenticated RPC, checks that ready availability has no
+execution result, and cold-replays the downloaded proof against persisted Native
+receipts, state, balances and nonces. The negative case keeps the valid output
+and mutates AIR proof bytes only in a separate checkpoint copy, updating its
+component hash and quota accounting. The actual background worker must reject
+it even when the earlier ready payload remains available. Canonical Native data
+must remain unchanged throughout.
+
+This covers warm-checkpoint background recovery and local RPC availability.
+Fresh automatic proof generation, actual peer transfer/finality, later-original
+history, abrupt process termination and network activation retain their separate
+acceptance requirements.

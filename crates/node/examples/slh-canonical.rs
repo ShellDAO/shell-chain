@@ -1,4 +1,6 @@
 //! Reuse genuine retained signatures/certificates through actual canonical production.
+#[path = "common/slh_automatic.rs"]
+mod automatic;
 #[allow(dead_code)]
 #[path = "common/canonical_proof_fixture.rs"]
 mod fixture;
@@ -307,6 +309,14 @@ fn peer_import(
 
 fn main() -> Result<(), Error> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.len() == 4 && args[0].starts_with("automatic-") {
+        return automatic::run(
+            &args[0],
+            Path::new(&args[1]),
+            Path::new(&args[2]),
+            Path::new(&args[3]),
+        );
+    }
     ensure(matches!(args.len(),5|6) || (args.len()==3 && args[0]=="capture"),"usage: slh-canonical capture native-output proof-output; pause|prove|resume|verify|refusals native-output proof-output signature-cache body-cache [prior-job-output]")?;
     let mode = &args[0];
     let native = Path::new(&args[1]);
