@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Stage supported registered SLH children during opt-in peer proof admission and retain verified attached quorum certificates until proof-backed import. Add real TCP/Noise transfer, cold chunk-resume, Native execution/finality, read-only replay and wrong-statement refusal coverage using the original signature and proof graph. Fresh automatic generation, later-original history and public release/activation remain open.
+
 - Exercise registered SLH warm-checkpoint recovery through ordinary Native import capture, actual background-worker graceful shutdown/restart, full AIR revalidation, authenticated RPC chunk retrieval and cold Native replay. Preserve the original graph without new signing or proof generation, and reject a correct-hash damaged proof in a separate job copy. Fresh automatic generation, real peer transport and later-original history remain open.
 
 - Connect one registered SHA2-256f sender to historical account/key authority, its complete signature and large body/header/identity proofs, an independent proposer and durable canonical production. Add explicit source 6, batch 3, checkpoint 4/component 2 and streamed availability frame 4, with exact deterministic witness reconstruction followed by full AIR verification. Preserve existing formats/quotas and failed jobs; add original-certificate pause/resume, Native replay and reconstructed-parent RocksDB import coverage. Network transport, fresh automatic generation, changed-state history and public release acceptance remain open.

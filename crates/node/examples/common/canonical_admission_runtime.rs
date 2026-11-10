@@ -5,6 +5,8 @@ pub(super) mod dilithium;
 pub(super) mod rotation;
 #[path = "slh_proof.rs"]
 pub(super) mod slh;
+#[path = "slh_peer.rs"]
+pub(super) mod slh_peer;
 use super::*;
 use async_trait::async_trait;
 use shell_network::{
@@ -36,9 +38,23 @@ struct Faults {
     gossip_block: RwLock<Option<Block>>,
     gossip_attempts: AtomicUsize,
     suppressed_direct_bodies: AtomicUsize,
+    attached_certificates_only: AtomicBool,
+    certificate_responses: AtomicUsize,
 }
 impl Faults {
     fn withhold(&self, message: &mut NetworkMessage) -> bool {
+        if self.attached_certificates_only.load(Ordering::SeqCst) {
+            match message {
+                NetworkMessage::CommitCertificate { .. } => return true,
+                NetworkMessage::BlockResponse {
+                    commit_certificates,
+                    ..
+                } if !commit_certificates.is_empty() => {
+                    self.certificate_responses.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        }
         // Deliver the Byzantine child only after the valid parent has finalized.
         // Empty responses still reach the ordinary sync/certificate handlers.
         let Some(hash) = *self.withheld_block.read().unwrap() else {
@@ -173,6 +189,17 @@ impl Live {
         production: bool,
         faults: Option<Arc<Faults>>,
     ) -> Result<Self, Error> {
+        Self::start_with_actor(db, c, boot, admission, production, faults, None).await
+    }
+    async fn start_with_actor(
+        db: &Path,
+        c: &fixture::Context,
+        boot: Vec<String>,
+        admission: bool,
+        production: bool,
+        faults: Option<Arc<Faults>>,
+        actor: Option<Arc<dyn Signer>>,
+    ) -> Result<Self, Error> {
         let stores = RocksDbStore::open_all(db, None)?;
         let mut node = fixture::node(Arc::new(stores.state), c.authority, &c.authority_key)?;
         let socket = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -207,11 +234,17 @@ impl Live {
         node.config.network = cfg.clone();
         let mut network = Libp2pNetwork::new(&cfg).await?;
         let info = network.local_node_info_handle();
-        let signer = Arc::new(DilithiumSigner::generate());
-        ensure(
-            Address::from_public_key(signer.public_key(), signer.sig_type().as_u8()) != c.authority,
-            "duplicate canonical signer",
-        )?;
+        let signer: Arc<dyn Signer> = if let Some(actor) = actor {
+            actor
+        } else {
+            let signer = Arc::new(DilithiumSigner::generate());
+            ensure(
+                Address::from_public_key(signer.public_key(), signer.sig_type().as_u8())
+                    != c.authority,
+                "duplicate canonical signer",
+            )?;
+            signer
+        };
         let node = Arc::new(node);
         let run = node.clone();
         let task = tokio::spawn(async move {

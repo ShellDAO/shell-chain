@@ -693,6 +693,14 @@ fn corrupt_cache(out: &Path, role: &str) -> Result<(), Error> {
 }
 fn main() -> Result<(), Error> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.len() == 4 && args[0].starts_with("slh-peer-") {
+        return admission_runtime::slh_peer::command(
+            &args[0],
+            Path::new(&args[1]),
+            Path::new(&args[2]),
+            Path::new(&args[3]),
+        );
+    }
     if args.first().is_some_and(|mode| mode == "compact-roundtrip") && args.len() == 3 {
         return admission_runtime::compact_roundtrip(Path::new(&args[1]), Path::new(&args[2]));
     }

@@ -1672,7 +1672,15 @@ impl<S: KvStore + 'static> Node<S> {
                                         commit_certificates.into_iter().collect();
                                     for block in blocks {
                                         match if self.config.canonical_proof_admission { proof_admission_work(||self.stage_live_candidate(&peer,&block)) } else { Ok(false) }{
-                                            Ok(true)=>{break;},Ok(false)=>{},Err(error)=>{warn!(%error,"fresh sync proof candidate refused; no native fallback");break;}
+                                            Ok(true)=>{
+                                                // Proof verification defers native import. Keep the
+                                                // independently verified next-height certificate for
+                                                // finalization after that import, just as for gossip.
+                                                if let Some(certificate)=certs.get(&block.hash()) {
+                                                    early_commit_certificate.retain(&self,block.number(),block.hash(),certificate.clone());
+                                                }
+                                                break;
+                                            },Ok(false)=>{},Err(error)=>{warn!(%error,"fresh sync proof candidate refused; no native fallback");break;}
                                         }
                                         let num = block.number();
                                         let hdr = block.header.clone();

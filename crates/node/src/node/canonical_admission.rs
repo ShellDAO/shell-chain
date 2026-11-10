@@ -152,24 +152,30 @@ impl<S: KvStore + 'static> Node<S> {
         block: &Block,
     ) -> Result<bool, String> {
         if !self.config.canonical_proof_admission
-            || block.transactions.is_empty()
-            || block.transactions.len()
-                > shell_stark_prover::canonical_batch::MAX_CANONICAL_SIGNATURE_BATCH
-            || block.transactions.iter().any(|tx| {
-                tx.tx.tx_type > 3
-                    || tx.aa_bundle.is_some()
-                    || !matches!(
-                        tx.signature.sig_type,
-                        shell_crypto::SignatureType::MlDsa65
-                            | shell_crypto::SignatureType::Dilithium3
-                    )
-                    || tx.signature.data.len() != 3309
-                    || tx.tx.signing_payload(tx.signature.sig_type.as_u8()).len() > 4096
-            })
+            || !shell_stark_prover::canonical_producer::supports_production_senders(block)
+            || block
+                .transactions
+                .iter()
+                .any(|tx| tx.tx.signing_payload(tx.signature.sig_type.as_u8()).len() > 4096)
             || block
                 .system_transactions
                 .iter()
                 .any(|tx| tx.kind != SystemTxKind::BlockGasReward)
+        {
+            return Ok(false);
+        }
+        // The registered SLH profile has one sender and an independent supported
+        // proposer. Other proposer algorithms retain their existing native path.
+        if block
+            .transactions
+            .iter()
+            .any(|tx| tx.signature.sig_type == shell_crypto::SignatureType::SphincsSha2256f)
+            && block.proposer_seal.as_ref().is_none_or(|seal| {
+                !matches!(
+                    seal.sig_type,
+                    shell_crypto::SignatureType::MlDsa65 | shell_crypto::SignatureType::Dilithium3
+                ) || seal.data.len() != 3309
+            })
         {
             return Ok(false);
         }
@@ -210,6 +216,12 @@ impl<S: KvStore + 'static> Node<S> {
                 return Ok(false);
             };
             if account.validation_code_hash.is_some() {
+                return Ok(false);
+            }
+            if tx.signature.sig_type == shell_crypto::SignatureType::SphincsSha2256f
+                && (account.pq_pubkey_hash == ShellHash::ZERO
+                    || registered.as_deref().is_none_or(|key| key.len() != 64))
+            {
                 return Ok(false);
             }
             // Tag zero also permits an SDK MLDSA adapter in native execution.

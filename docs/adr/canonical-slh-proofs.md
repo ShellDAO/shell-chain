@@ -56,4 +56,25 @@ mathematical certificates and no signing capability. A separate corrupt copy
 updates the component hash and accounting around damaged proof bytes, so a
 failed background verification cannot be mistaken for a storage-hash mismatch
 or accepted through an existing ready payload. This experiment leaves fresh
-automatic generation, real peer transport and later-original history open.
+automatic generation and later-original history open.
+
+Live proof admission uses the same bounded sender-shape preflight as production
+for the registered SLH profile, with its supported independent proposer and
+historical 64-byte key. Ordinary block responses stage that child before Native
+import. An attached next-height quorum certificate is independently verified
+and retained while the proof is pending, then reverified against the canonical
+target after successful import. A pending or rejected proof cannot finalize
+the child through that certificate.
+
+The real TCP/Noise regression transfers the original ready frame to a separate
+genesis-only receiver, pauses after three chunks, resumes in another process
+at the missing chunk with a fresh nonce, and checks Native execution and
+certificate-backed finality. Its provider restores the original signed quorum
+certificate through the normal verification API; the receiver receives no child
+state or finality. Cold replay checks the received graph without writeback.
+Standalone certificate messages are withheld so this regression specifically
+requires the ordinary block response's attached certificate to survive staging.
+A correct-hash payload with a genuine certificate in the wrong statement slot
+must fail even with genuine original signatures and a valid quorum certificate.
+This covers the original first child and single authority, not quorum AIR,
+later-original history or public release and activation.

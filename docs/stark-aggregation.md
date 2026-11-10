@@ -1709,6 +1709,52 @@ it even when the earlier ready payload remains available. Canonical Native data
 must remain unchanged throughout.
 
 This covers warm-checkpoint background recovery and local RPC availability.
-Fresh automatic proof generation, actual peer transfer/finality, later-original
-history, abrupt process termination and network activation retain their separate
-acceptance requirements.
+Fresh automatic proof generation, later-original history, abrupt process
+termination and network activation retain their separate acceptance requirements.
+
+#### Registered SLH admission over the proof channel
+
+Continue the same retained `slh-output` and completed `automatic-output`:
+
+```bash
+tests/e2e/slh-peer-proof.sh prepare slh-output automatic-output peer-output
+tests/e2e/slh-peer-proof.sh pause slh-output automatic-output peer-output
+tests/e2e/slh-peer-proof.sh resume slh-output automatic-output peer-output
+tests/e2e/slh-peer-proof.sh verify slh-output automatic-output peer-output
+tests/e2e/slh-peer-proof.sh refuse slh-output automatic-output peer-output
+```
+
+Use the Rust toolchain, native build dependencies and RocksDB feature required
+by the earlier source-build regressions. Each command exits unsuccessfully on
+a failed assertion. Preparation requires a new output directory, keeps both
+inputs, and uses their original test signature and complete proof graph. It
+copies the ready availability cache to an isolated provider and restores the
+original signed quorum certificate through normal certificate verification.
+The independent receiver gets only authenticated genesis trie nodes and parent
+key registrations, without the child state, receipts or finality.
+
+Ordinary block discovery must stage the supported registered SLH child when
+canonical proof admission is enabled. Real TCP/Noise peers then transfer the
+proof through the dedicated channel; there is no operator fetch or import.
+`pause` holds chunk three after the first three chunks arrive and requires
+unchanged canonical genesis data. A separate `resume` process requests chunk
+three first with a fresh nonce, verifies the complete graph, executes the
+original child and finalizes it using the retained signed quorum certificate.
+The attached certificate is independently verified when retained and again
+against the canonical target after proof-backed import. It cannot authorize
+an unverified proof. The fixture suppresses standalone certificate messages,
+so finality must use the certificate attached to the ordinary block response.
+Public-only prover actors reject every signing request.
+
+`verify` cold-replays the actually received frame and compares persisted
+receipts, root, balances and nonces without writing back. `refuse` uses a
+separate fresh receiver and a correct-hash payload containing a genuine
+signing-hash certificate in the key-hash slot. The original signatures and
+quorum certificate remain genuine, but the wrong mathematical statement must
+fail and leave genesis unchanged, without a native signature fallback.
+
+This regression covers one registered sender, its independent supported
+proposer and the original first child. It does not establish fresh automatic
+generation, quorum AIR, later-original history, broader account/role
+combinations, public release or network activation. Admission remains opt-in;
+unsupported profiles keep their existing behavior.
