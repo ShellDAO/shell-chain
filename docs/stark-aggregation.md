@@ -1142,3 +1142,39 @@ to resume; retained-role mismatches refuse before signing. Unbound mixed roles,
 other account arrangements, consensus selector/quorum/penalty AIR and public
 release/network acceptance remain separate. Limits, defaults, Native transcript
 union and prior frozen source meanings are unchanged.
+
+
+### Published SDK first use with a genuine raw proposer
+
+```bash
+tests/e2e/dilithium-full-proof.sh sdk-unbound-raw-proposer sdk-first-raw-output
+tests/e2e/dilithium-full-proof.sh verify sdk-first-raw-output
+```
+
+Use the same exact published SDK candidate and prerequisites above. This combines
+a funded zero-commitment SDK Native tag-zero FIPS sender with an independent
+genuine locked PQClean raw Native tag-zero proposer. The original SDK default
+Reference first-use envelope must be refused. The public transaction builder
+adds only the original public key for Embedded first use, keeping original
+transaction and signature bytes unchanged without re-signing.
+
+Actual SDK provider/RPC execution registers the key in block 1, then executes
+Reference transfers in blocks 2 and 3. Both original Embedded1 and Reference2 full
+mixed-transcript graphs must complete automatic durable recovery and real peer
+Native import/finality2 with matching receipts, fees, accounts and nonce. Ordinary
+block 3 precedes repeated read-only history for both targets. Existing source
+format 4 retains sender profile 6 and tag-zero address AIR for both targets:
+registration adds a key lookup while the account commitment stays zero. Sender
+transaction profile 3 requires FIPS signature/challenge version 1 and a 48-byte
+seed; proposer seal profile 2 separately requires raw signature/challenge version
+2 and a 32-byte seed.
+
+Genuine mixed certificates, FIPS/SDK/primary seal relabelling, a complete header
+proof for the original independently raw-signed successor, sender source/account,
+untagged address and bound-at-first-use substitutions must fail without changing
+original proofs or KV bytes. Separate genuine SDK Reference/wrong-address/tamper
+intake refusals and a signed wrong-root ordinary import must preserve state and
+key registration; they are distinct from proof-backed bad-block imports. Keep
+public outputs to resume. Other unbound raw/account combinations, consensus
+selector/quorum/penalty AIR and public release/network acceptance remain separate;
+limits, defaults, Native transcript union and frozen source meanings are unchanged.

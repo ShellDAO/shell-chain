@@ -717,6 +717,9 @@ fn main() -> Result<(), Error> {
         "prepare-dilithium-sdk-raw-proposer" => {
             admission_runtime::dilithium::prepare_sdk_raw_proposer(out)
         }
+        "prepare-dilithium-sdk-unbound-raw-proposer" => {
+            admission_runtime::dilithium::prepare_sdk_unbound_raw_proposer(out)
+        }
         "prepare-dilithium-sdk-both-unbound" => {
             admission_runtime::dilithium::prepare_sdk_both_unbound(out)
         }
