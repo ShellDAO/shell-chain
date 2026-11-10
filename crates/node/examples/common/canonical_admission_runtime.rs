@@ -3,6 +3,8 @@
 pub(super) mod dilithium;
 #[path = "rotation_proof.rs"]
 pub(super) mod rotation;
+#[path = "slh_proof.rs"]
+pub(super) mod slh;
 use super::*;
 use async_trait::async_trait;
 use shell_network::{

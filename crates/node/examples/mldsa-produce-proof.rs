@@ -706,6 +706,10 @@ fn main() -> Result<(), Error> {
         "prepare-dilithium-proposer" => {
             admission_runtime::dilithium::prepare(out, false, true, false)
         }
+        "prepare-slh" => admission_runtime::slh::prepare(out),
+        "slh-recover-native" => admission_runtime::slh::recover_native(out),
+        "slh-capture" => admission_runtime::slh::capture(out, false),
+        "slh-capture-recovered" => admission_runtime::slh::capture(out, true),
         "prepare-dilithium-both" => admission_runtime::dilithium::prepare(out, true, true, false),
         "prepare-dilithium-both-unbound" => admission_runtime::dilithium::prepare_both_unbound(out),
         "sdk-intake-refusal" => admission_runtime::dilithium::sdk_intake_refusal(out),

@@ -1251,3 +1251,60 @@ remain distinct from proof-backed bad-block imports. Keep public outputs to
 resume. Account abstraction/custom validators, same-block key sequencing,
 selector/quorum/penalty AIR and public release/network acceptance remain
 separate; frozen source meanings, limits, defaults and activation are unchanged.
+
+### Native SLH-DSA fallback and canonical proof reproduction
+
+```bash
+tests/e2e/slh-full-proof.sh native slh-output
+tests/e2e/slh-full-proof.sh capture slh-output
+```
+
+Use the source-build and RocksDB prerequisites above. Native mode generates
+memory-only `fips205 0.4.1` SLH-DSA-SHA2-256f keys and genuine signatures with
+the empty pure-signature context: Native algorithm 2, 64-byte public keys and
+49,856-byte signatures. It exercises a bound Reference transfer, an independent
+ML-DSA proposer, Native quorum/finality, independent Native database import,
+wrong-owner/message refusals, signed wrong-root rollback and an ordinary
+successor. Existing output is refused before generating any new key.
+
+Canonical source capture currently rejects this fallback profile. This remains
+a missing full signature proving capability. Native execution and the SHA2
+compression primitives below do not establish full canonical SLH proof
+admission. FIPS 205 message expansion, FORS, WOTS+, hypertree verification and
+the complete durable production/peer/history chain still require integration.
+Keep original outputs and signatures when investigating a failure. The explicit
+`recover-native` mode can checkpoint an already imported/finalized retained
+first block without any private key or re-signing; it cannot recreate an
+unsigned successor or supply missing later acceptance evidence.
+
+The `sha2_compression` API proves complete SHA-256/SHA-512 compression schedules,
+64/80 rounds and feedforward, including all Boolean operations and 32-bit limb
+carries. Its caller must independently bind every expected chaining value and
+block. All 64-bit public values are split into limbs, avoiding reduction aliases
+in the Goldilocks base field. The separate quadratic-extension proof profile
+preserves query, blowup, grinding and FRI settings; global options are unchanged.
+Its 16-block batch bound is a development proof resource profile, not a Native
+transaction limit. Compression certificates alone do not prove digest padding,
+chaining, transaction authority or an SLH signature.
+
+```bash
+cargo test --locked --release -p shell-stark-prover --lib sha2_compression -- --test-threads=1
+```
+
+For a persistent SHA-256 compression certificate, save the following padded
+`abc` block as `sha2-input.json`:
+
+```json
+{"algorithm":"Sha256","inputs":[{"chaining_value":[1779033703,3144134277,1013904242,2773480762,1359893119,2600822924,528734635,1541459225],"block":[1633837952,0,0,0,0,0,0,0,0,0,0,0,0,0,0,24]}]}
+```
+
+```bash
+cargo run --locked --release -p shell-stark-prover --example sha2-compression -- prove sha2-input.json sha2-proof.cbor
+cargo run --locked --release -p shell-stark-prover --example sha2-compression -- verify sha2-input.json sha2-proof.cbor
+```
+
+The verifier starts separately and checks the certificate against the supplied
+inputs. An existing proof is never overwritten; wrong inputs, malformed proofs
+and trailing certificate data return a failure exit code. Use `Sha512` with
+64-bit words for SHA-512 compression. Complete digest and signature framing
+remain the caller's responsibility.

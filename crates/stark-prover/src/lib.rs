@@ -111,3 +111,5 @@ pub use state_machine::{BlockProofState, BlockStateMachine, InvalidTransition};
 
 /// Current protocol version for [`SigBatchProof`] serialization.
 pub const PROTOCOL_VERSION: u8 = 1;
+
+pub mod sha2_compression;

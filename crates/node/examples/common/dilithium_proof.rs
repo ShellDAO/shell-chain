@@ -3,7 +3,7 @@ use super::*;
 use shell_crypto::{DilithiumSigner, MlDsaSigner, Verifier};
 use shell_storage::RocksDbStores;
 
-fn genesis(
+pub(super) fn genesis(
     path: &Path,
     sender: &dyn Signer,
     proposer: &dyn Signer,
@@ -50,7 +50,7 @@ fn genesis(
     stores.state.flush()?;
     Ok(stores)
 }
-fn signed(sender: &dyn Signer, nonce: u64) -> Result<SignedTransaction, Error> {
+pub(super) fn signed(sender: &dyn Signer, nonce: u64) -> Result<SignedTransaction, Error> {
     let tx = Transaction {
         chain_id: 10,
         nonce,
@@ -71,7 +71,7 @@ fn signed(sender: &dyn Signer, nonce: u64) -> Result<SignedTransaction, Error> {
         sender.sign(tx.signing_hash(sender.sig_type().as_u8()).as_bytes())?,
     ))
 }
-fn control(node: &Node<RocksDbStore>, block: &Block) -> Result<Value, Error> {
+pub(super) fn control(node: &Node<RocksDbStore>, block: &Block) -> Result<Value, Error> {
     let receipts = node
         .chain_store
         .get_receipts(&block.hash())?

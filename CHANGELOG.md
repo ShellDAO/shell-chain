@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add complete batched SHA-256/SHA-512 compression AIRs with constrained schedules, rounds, limb carries and feedforward, as a foundation for SLH-DSA proof production. Native SLH controls and immutable source-capture reproduction are available; full canonical SLH signature proof admission remains unfinished.
+
 - Cover raw first-use registration with an independent raw proposer, retaining the original signature through refusal/Embedded acceptance, both full proof targets and cross-role/header/profile refusals.
 
 - Cover genuine raw first-use registration with an actual SDK proposer, retaining one original first-use signature across refusal/Embedded acceptance and both full proof targets.
