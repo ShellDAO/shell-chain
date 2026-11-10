@@ -43,40 +43,50 @@ def reference(value):
             "indices": indices, "fors_public_key": list(key)}
 
 
+def reference_xmss(value):
+    """Independent complete WOTS+/XMSS hash oracle, never proof acceptance."""
+    seed, sig = bytes(value["public_seed"]), bytes(value["signature"])
+    layer, tree, leaf = value["layer"], value["tree"], value["leaf"]
+    message = bytes(value["message"])
+
+    def address(kind, key_pair, height, index):
+        return (bytes([layer]) + tree.to_bytes(8, "big") + bytes([kind])
+                + key_pair.to_bytes(4, "big") + height.to_bytes(4, "big")
+                + index.to_bytes(4, "big"))
+
+    digits = [n for b in message for n in (b >> 4, b & 15)]
+    checksum = sum(15 - x for x in digits)
+    digits.extend([checksum >> 8, (checksum >> 4) & 15, checksum & 15])
+    nodes = []
+    for chain, first in enumerate(digits):
+        node = sig[chain * 32:(chain + 1) * 32]
+        for step in range(first, 15):
+            node = hashlib.sha256(seed + b"\0" * 32
+                                  + address(0, leaf, chain, step) + node).digest()
+        nodes.append(node)
+    current = hashlib.sha512(seed + b"\0" * 96 + address(1, leaf, 0, 0)
+                             + b"".join(nodes)).digest()[:32]
+    for level in range(4):
+        auth = sig[(67 + level) * 32:(68 + level) * 32]
+        pair = auth + current if (leaf >> level) & 1 else current + auth
+        current = hashlib.sha512(seed + b"\0" * 96
+                                 + address(2, 0, level + 1, leaf >> (level + 1))
+                                 + pair).digest()[:32]
+    return current
+
+
 def reference_hypertree(value, forest):
     """Independent native-hash oracle only; this is never proof acceptance."""
-    seed = bytes(value["public_seed"])
-    sig = bytes(value["signature"])
     current = bytes(forest["fors_public_key"])
     tree, leaf = forest["tree"], forest["leaf"]
     for layer in range(17):
         if layer:
             leaf, tree = tree & 15, tree >> 4
         start = 11_232 + layer * 2272
-
-        def address(kind, key_pair, height, index):
-            return (bytes([layer]) + tree.to_bytes(8, "big") + bytes([kind])
-                    + key_pair.to_bytes(4, "big") + height.to_bytes(4, "big")
-                    + index.to_bytes(4, "big"))
-
-        digits = [n for b in current for n in (b >> 4, b & 15)]
-        checksum = sum(15 - x for x in digits)
-        digits.extend([checksum >> 8, (checksum >> 4) & 15, checksum & 15])
-        nodes = []
-        for chain, first in enumerate(digits):
-            node = sig[start + chain * 32:start + (chain + 1) * 32]
-            for step in range(first, 15):
-                node = hashlib.sha256(seed + b"\0" * 32
-                                      + address(0, leaf, chain, step) + node).digest()
-            nodes.append(node)
-        current = hashlib.sha512(seed + b"\0" * 96 + address(1, leaf, 0, 0)
-                                 + b"".join(nodes)).digest()[:32]
-        for level in range(4):
-            auth = sig[start + (67 + level) * 32:start + (68 + level) * 32]
-            pair = auth + current if (leaf >> level) & 1 else current + auth
-            current = hashlib.sha512(seed + b"\0" * 96
-                                     + address(2, 0, level + 1, leaf >> (level + 1))
-                                     + pair).digest()[:32]
+        current = reference_xmss({"public_seed": value["public_seed"],
+                                 "message": list(current), "layer": layer,
+                                 "tree": tree, "leaf": leaf,
+                                 "signature": value["signature"][start:start + 2272]})
     return current
 
 

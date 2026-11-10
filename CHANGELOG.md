@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Prove complete SHA2-256f WOTS+ chains/checksum and four-level XMSS layers with one authenticated seed-prefix compression and canonical F batches. Add retained-FORS layer export, immutable checkpoint recovery, cold verification and independent layer-root/refusal regression. The original first layer is covered; the remaining hypertree layers and full canonical SLH admission remain unfinished.
+
 - Prove the complete SHA2-256f FORS forest: H_msg indices, all 35 trees and nine authentication levels, and the final 35-root compression. Persist and reverify immutable hash steps on resume, independently cold-verify the full certificate, and provide an executable regression with an independent Python hash reference. WOTS+/hypertree and full canonical SLH admission remain unfinished.
 
 - Prove complete byte-message SHA-256/SHA-512 digests and SLH-DSA-SHA2-256f H_msg/MGF1/F/H/T verification hashes, with exact padding, IV, chaining and address domains. Add persistent hash certificates and read-only export from retained Native signatures. These remain hash primitives; complete SLH signature and canonical production admission are unfinished.

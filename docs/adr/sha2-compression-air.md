@@ -97,3 +97,27 @@ signature envelope to independently expected input bytes, while keeping the
 hypertree tail explicitly outside the mathematical claim. Native verification
 is confined to optional public-input fixture/export checks. WOTS+/hypertree,
 canonical authority and node/peer/history admission remain separate work.
+
+## WOTS+/XMSS prefix and batch composition
+
+Prove a complete fixed67-chain WOTS+ relation and four-level XMSS layer. Derive
+the 64 message nibbles and three checksum digits from the independently expected
+32-byte message. At hash steps zero through fourteen, select exactly the
+chains whose start digit has been reached, in ascending chain order. Partition
+each wave into canonical groups of at most sixteen; consume every compression
+output at its corresponding chain before the next wave.
+
+Authenticate the seed/zero prefix as one raw SHA-256 compression from the
+standard IV. F suffix blocks bind the 22-byte address, 32-byte current node,
+padding and absolute 118-byte length. The authenticated prefix output is the
+expected chaining value of every suffix. This avoids proving the identical
+prefix repeatedly without trusting a native midstate or changing existing
+compression options. The final T hash binds all67 ordered chain endpoints;
+the four H hashes bind authentication order and reset TREE-domain coordinates.
+
+Persist independently verified compression/hash steps and a separately
+verifiable bounded layer certificate. Retained FORS export verifies the full
+original FORS proof before deriving layer zero's message and coordinates;
+no key or signature is regenerated. A layer root remains an intermediate
+result until all17 layers, transitions and final original public root are
+proved. Existing FORS and hash certificate formats retain their meanings.

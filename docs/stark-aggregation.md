@@ -1416,3 +1416,48 @@ the WOTS+/hypertree tail's mathematical relation to the SLH public root remains
 unproved. The output explicitly reports `full_signature_verified: false`.
 Complete signature authorization, canonical sources/jobs, node import and
 historical acceptance still require integration.
+
+The `slh_xmss` API proves one complete SHA2-256f XMSS layer: all 64 message
+nibbles, three checksum digits, 67 WOTS+ chain start positions and lengths,
+the ordered chain endpoints and their T hash, and all four XMSS authentication
+hashes. It binds the independently expected layer/tree/leaf coordinates and
+signature bytes. A single proved SHA-256 compression authenticates the public
+seed plus zero padding. Canonical groups of at most sixteen F suffix
+compressions reuse that state, with the exact address, node, SHA padding and
+absolute 118-byte message length. Verification never computes a native SHA.
+
+Use the same build prerequisites and Python 3 to run a self-contained genuine
+signature, full FORS and first-layer XMSS regression:
+
+```bash
+tests/e2e/slh-xmss.sh xmss-output
+```
+
+To reuse the exact retained FORS input and certificate instead of generating
+another signature or regenerating FORS:
+
+```bash
+tests/e2e/slh-xmss.sh xmss-original fors-original/input.json fors-original/proof/fors.cbor
+```
+
+The `from-fors` example command first mathematically verifies the retained FORS
+certificate, then exports layer zero's message, coordinates and original
+2,272-byte XMSS signature. The regression proves all 67 chains and four actual
+authentication levels, compares the root to the independent Python hash
+oracle, cold-verifies in a separate process and resumes from immutable verified
+compression/hash checkpoints. Wrong chain batches, prefixes, addresses, input
+bytes, authentication order and corrupt/trailing proofs are refused. Existing
+outputs and frozen inputs are never replaced.
+
+```bash
+cargo run --locked --release -p shell-stark-prover --example slh-xmss -- resume xmss-output/layer.json xmss-output/proof
+cargo run --locked --release -p shell-stark-prover --example slh-xmss -- verify xmss-output/layer.json xmss-output/proof/xmss.cbor
+```
+
+The complete layer certificate has a separate 64 MiB development reader bound;
+the compression batch bound and global limits are unchanged. Actual retained
+Native coverage is layer zero of seventeen. The remaining sixteen layers,
+their transitions and the final SLH public-root relation still need full proof
+integration. The independent Python full-hypertree check is an unproved oracle,
+and every layer result reports `full_signature_verified: false`. This does not
+establish canonical source/job, node/peer or historical admission.
