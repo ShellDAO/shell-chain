@@ -707,6 +707,7 @@ fn main() -> Result<(), Error> {
             admission_runtime::dilithium::prepare(out, false, true, false)
         }
         "prepare-dilithium-both" => admission_runtime::dilithium::prepare(out, true, true, false),
+        "prepare-dilithium-both-unbound" => admission_runtime::dilithium::prepare_both_unbound(out),
         "sdk-intake-refusal" => admission_runtime::dilithium::sdk_intake_refusal(out),
         "prepare-dilithium-sdk" => admission_runtime::dilithium::prepare_sdk(out),
         "prepare-dilithium-sdk-proposer" => admission_runtime::dilithium::prepare_sdk_proposer(out),

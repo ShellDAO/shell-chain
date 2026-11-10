@@ -1216,3 +1216,38 @@ key is disposed cooperatively before proving. Keep public outputs to resume.
 Other unbound raw/account combinations, consensus selector/quorum/penalty AIR
 and public release/network acceptance remain separate; limits, defaults, Native
 transcript union and prior frozen source meanings are unchanged.
+
+### Genuine raw sender first use with a genuine raw proposer
+
+```bash
+tests/e2e/dilithium-full-proof.sh both-unbound raw-first-both-output
+tests/e2e/dilithium-full-proof.sh verify raw-first-both-output
+```
+
+This mode uses independent memory-only keys from locked
+`pqcrypto-dilithium 0.5.0` for both Native tag-zero roles. The funded sender
+starts with zero account commitment and no registered key. Its original signed
+Reference transaction must refuse; Embedded first use adds only the original
+public key, keeping the transaction, signature and signing hash unchanged.
+Native block 1 registers the key and reaches quorum/finality. Reference
+transfers execute in blocks 2 and 3, including an ordinary successor before
+repeated read-only historical verification.
+
+Both original Embedded1 and Reference2 complete automatic durable full proof
+recovery and real peer Native import/finality2 with equal receipts, fees,
+accounts and nonces. Existing source format 2 requires sender profile 4,
+tag-zero address AIR, transaction profile 2 and full raw signature/challenge
+version 2 with a 32-byte seed. The separate proposer seal profile 2 also requires
+full raw signature/challenge version 2 and a 32-byte seed. Registration creates
+a key lookup while the account commitment remains zero, so sender profile 4
+and address AIR remain mandatory for both targets.
+
+Genuine cross-role key/challenge/commitment certificates, FIPS/primary seal
+relabelling, the original independently raw-signed successor's complete header,
+SDK sender source/account profiles, untagged address and bound-at-first-use
+substitutions must refuse with original proofs and KV bytes unchanged. Native
+Reference/wrong-address/tamper intake and signed wrong-root registration rollback
+remain distinct from proof-backed bad-block imports. Keep public outputs to
+resume. Account abstraction/custom validators, same-block key sequencing,
+selector/quorum/penalty AIR and public release/network acceptance remain
+separate; frozen source meanings, limits, defaults and activation are unchanged.

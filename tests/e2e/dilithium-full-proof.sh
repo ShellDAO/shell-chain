@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ $# != 2 || ( $1 != run && $1 != proposer && $1 != both && $1 != unbound && $1 != sdk && $1 != sdk-unbound && $1 != sdk-proposer && $1 != sdk-both && $1 != sdk-both-unbound && $1 != sdk-raw-proposer && $1 != raw-sdk-proposer && $1 != sdk-unbound-raw-proposer && $1 != raw-unbound-sdk-proposer && $1 != verify ) ]]; then
-  echo "usage: $0 run|proposer|both|unbound|sdk|sdk-unbound|sdk-proposer|sdk-both|sdk-both-unbound|sdk-raw-proposer|raw-sdk-proposer|sdk-unbound-raw-proposer|raw-unbound-sdk-proposer|verify output" >&2
+if [[ $# != 2 || ( $1 != run && $1 != proposer && $1 != both && $1 != both-unbound && $1 != unbound && $1 != sdk && $1 != sdk-unbound && $1 != sdk-proposer && $1 != sdk-both && $1 != sdk-both-unbound && $1 != sdk-raw-proposer && $1 != raw-sdk-proposer && $1 != sdk-unbound-raw-proposer && $1 != raw-unbound-sdk-proposer && $1 != verify ) ]]; then
+  echo "usage: $0 run|proposer|both|both-unbound|unbound|sdk|sdk-unbound|sdk-proposer|sdk-both|sdk-both-unbound|sdk-raw-proposer|raw-sdk-proposer|sdk-unbound-raw-proposer|raw-unbound-sdk-proposer|verify output" >&2
   exit 2
 fi
 cd "$(dirname "$0")/../.."
