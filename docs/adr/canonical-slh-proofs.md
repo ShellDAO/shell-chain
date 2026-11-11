@@ -121,3 +121,27 @@ checkpoint is a different experiment. The cold first-use check advances an
 independent copy to the retained later state, then verifies the generated graph
 against both that copy and the ordinary Native later control without writeback.
 The original worker output and signed inputs are preserved.
+
+Registered SLH proposer seals use a separate source format 8 and batch profile 4
+with one bound primary ML-DSA-65 sender. The sender's existing complete graph is
+unchanged. The proposer graph binds the exact canonical header hash to its raw
+32-byte message and the historical registered 64-byte key, and verifies the
+49,856-byte SHA2-256f signature through FORS and all seventeen hypertree layers.
+Only full verification constructs the existing private exact-tuple proposer
+token. Native selection, lifecycle, execution, rollback, quorum and activation
+remain external requirements. Legacy source 1 can retain sender-only proofs;
+it must not be promoted to a full proposer claim by version relabeling.
+
+New availability frame 5 streams this proposer graph through the existing
+bounded certificate dictionary and deterministic witness reconstruction. Its
+sender and proposer share the existing expanded-pool budget. Checkpoint 4 and
+component 2 remain unchanged; no component, pool, dictionary, job or payload
+limit increases. Old frames reject the new role rather than silently decoding
+it as an optional extension. The independent Native regression creates and
+retains actual signed first/later controls once, cold-resumes fresh mathematical
+generation, imports with full proofs, and checks historical replay and refusal
+without state writeback. The peer regression reuses that ready frame and checks
+three-chunk pause/cold resume, proof-backed import, separately verified attached
+certificate finality, cold replay and genuine wrong-statement refusal. Both SLH
+roles together, broader account profiles, fresh automatic-worker generation,
+quorum AIR, public artifacts and activation require separate acceptance.

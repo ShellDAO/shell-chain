@@ -1,6 +1,7 @@
 //! Complete canonical sender verification over trusted local context.
-//! Legacy profiles use native body selection; the SLH profile also verifies
-//! the large envelope/header relation. Consensus and execution remain native.
+//! Legacy profiles use native body selection; SLH sender proofs verify the
+//! large envelope/header relation. A separate profile proves raw SLH proposer
+//! seals with one bound primary sender. Consensus and execution remain native.
 use crate::{
     account_state::AccountStateProof,
     canonical_signature::{
@@ -57,9 +58,17 @@ pub struct CanonicalSignatureBatchProof {
     pub proposer: Option<ProposerSealProof>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slh_transactions: Option<Vec<crate::canonical_slh::CanonicalSlhTransactionProof>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slh_proposer: Option<crate::slh_proposer::SlhProposerSealProof>,
 }
 impl CanonicalSignatureBatchProof {
     fn valid_profile(&self) -> bool {
+        if self.slh_proposer.is_some() {
+            return self.version == 4
+                && self.proposer.is_none()
+                && self.slh_transactions.is_none()
+                && self.transactions.len() == 1;
+        }
         match (
             self.version,
             self.proposer.is_some(),
@@ -229,7 +238,7 @@ fn verify_batch_at_parent<S: KvStore + 'static>(
     }
     // The independent native caller still selects and authorizes the proposer.
     // Refuse an invalid mandatory seal before spending work on sender graphs.
-    let proposer = proof
+    let mut proposer = proof
         .proposer
         .as_ref()
         .map(|seal| {
@@ -247,6 +256,33 @@ fn verify_batch_at_parent<S: KvStore + 'static>(
             )
         })
         .transpose()?;
+    if let Some(seal) = &proof.slh_proposer {
+        let sender = &block.transactions[0];
+        let account = view
+            .world_state()
+            .map_err(|e| e.to_string())?
+            .get_account(&sender.from)
+            .map_err(|e| e.to_string())?
+            .ok_or("SLH proposer profile sender account absent")?;
+        if sender.signature.sig_type != SignatureType::MlDsa65
+            || account.pq_pubkey_hash == ShellHash::ZERO
+            || account.validation_code_hash.is_some()
+        {
+            return Err("SLH proposer profile requires one bound primary sender".into());
+        }
+        proposer = Some(crate::proposer_seal::verify_slh_seal_at_parent(
+            view,
+            &block.header,
+            &hash,
+            &block.header.proposer,
+            view.config().chain_id,
+            block
+                .proposer_seal
+                .as_ref()
+                .ok_or("SLH proposer seal absent")?,
+            seal,
+        )?);
+    }
     let mut seen = std::collections::HashSet::new();
     let mut signatures = Vec::with_capacity(block.transactions.len());
     for (index, tx) in block.transactions.iter().enumerate() {
@@ -314,7 +350,7 @@ mod tests {
         let legacy: CanonicalSignatureBatchProof = serde_json::from_slice(bytes).unwrap();
         assert!(legacy.valid_profile());
         assert_eq!(serde_json::to_vec(&legacy).unwrap(), bytes);
-        for version in [0, 2, 3] {
+        for version in [0, 2, 3, 4] {
             let value = serde_json::json!({"version":version,"transactions":[]});
             let proof: CanonicalSignatureBatchProof = serde_json::from_value(value).unwrap();
             assert!(!proof.valid_profile());
@@ -365,6 +401,7 @@ mod tests {
                 proposer_seal: None,
             };
             let proof = CanonicalSignatureBatchProof {
+                slh_proposer: None,
                 slh_transactions: None,
                 version: 1,
                 transactions: vec![],

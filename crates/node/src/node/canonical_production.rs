@@ -846,13 +846,13 @@ impl<S: KvStore + 'static> Node<S> {
                 .map(|tx| tx.from.as_bytes().to_vec())
                 .collect::<std::collections::BTreeSet<_>>()
                 .len();
-            let mut job = if source.has_slh_senders() {
+            let mut job = if source.needs_slh_encoding() {
                 ProductionStore::open_slh(&mut kv, source.identity(), limit)
             } else if distinct_senders > 8 {
                 ProductionStore::open_shared_matrix(&mut kv, source.identity(), limit)
             } else if source.block().transactions.len() > 2
                 || source.has_unbound_senders()
-                || source.has_slh_senders()
+                || source.needs_slh_encoding()
             {
                 ProductionStore::open_compact(&mut kv, source.identity(), limit)
             } else {
@@ -884,7 +884,7 @@ impl<S: KvStore + 'static> Node<S> {
             let payload = shell_stark_prover::compact_canonical::encode_payload(
                 &proof,
                 MAX_CANONICAL_PROOF_BYTES as usize,
-                source.block().transactions.len() > 2 || source.has_slh_senders(),
+                source.block().transactions.len() > 2 || source.needs_slh_encoding(),
             )?;
             let manifest = CanonicalProofManifest {
                 version: 1,

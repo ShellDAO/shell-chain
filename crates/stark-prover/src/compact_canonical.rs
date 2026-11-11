@@ -14,6 +14,7 @@ use std::{
 
 const PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v2/";
 const HASH_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v3/";
+const SLH_PROPOSER_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v5/";
 const SLH_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v4/";
 const WITNESS_COMPONENT: &[u8] = b"\0canonical-component/cbor/v2/";
 const COMPONENT: &[u8] = b"\0canonical-component/cbor/v1/";
@@ -222,6 +223,8 @@ struct Frame {
     #[serde(deserialize_with = "bounded_transactions")]
     transactions: Vec<Bytes>,
     proposer: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slh_proposer: Option<Bytes>,
     #[serde(deserialize_with = "bounded_certificates")]
     certificates: Vec<Certificate>,
 }
@@ -495,6 +498,57 @@ pub fn encode_payload(
     limit: usize,
     compact: bool,
 ) -> Result<Vec<u8>, String> {
+    if proof.version == 4 {
+        if proof.proposer.is_some()
+            || proof.slh_transactions.is_some()
+            || proof.transactions.len() != 1
+        {
+            return Err("SLH proposer compact profile/count mismatch".into());
+        }
+        let mut packer = Packer {
+            witnesses: true,
+            ..Default::default()
+        };
+        let transactions = proof
+            .transactions
+            .iter()
+            .map(|p| {
+                packer
+                    .pack(
+                        serde_json::to_value(p).map_err(|e| e.to_string())?,
+                        MAX_DEPTH,
+                    )
+                    .and_then(|v| template(&v))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let proposer = slh::encode_proposer(
+            &mut packer,
+            proof
+                .slh_proposer
+                .as_ref()
+                .ok_or("SLH proposer proof absent")?,
+        )?;
+        let frame = Frame {
+            format_version: 5,
+            proof_version: 4,
+            transactions,
+            proposer: None,
+            slh_proposer: Some(proposer),
+            certificates: packer.certificates,
+        };
+        template_bound(&frame)?;
+        let body = cbor(
+            &frame,
+            limit
+                .min(MAX_BYTES)
+                .checked_sub(SLH_PROPOSER_PAYLOAD.len())
+                .ok_or("compact payload byte limit")?,
+        )?;
+        return Ok([SLH_PROPOSER_PAYLOAD, body.as_slice()].concat());
+    }
+    if proof.slh_proposer.is_some() {
+        return Err("legacy compact profile cannot contain SLH proposer".into());
+    }
     if proof.version == 3 {
         if !proof.transactions.is_empty()
             || proof.proposer.is_none()
@@ -516,6 +570,7 @@ pub fn encode_payload(
             MAX_DEPTH,
         )?;
         let frame = Frame {
+            slh_proposer: None,
             format_version: 4,
             proof_version: 3,
             transactions: vec![sender],
@@ -574,6 +629,7 @@ pub fn encode_payload(
         })
         .transpose()?;
     let frame = Frame {
+        slh_proposer: None,
         format_version: 3,
         proof_version: proof.version,
         transactions,
@@ -652,6 +708,7 @@ fn template_bound(frame: &Frame) -> Result<(), String> {
         .transactions
         .iter()
         .chain(frame.proposer.iter())
+        .chain(frame.slh_proposer.iter())
         .try_fold(0usize, |n, v| {
             n.checked_add(v.0.len())
                 .ok_or("compact template size overflow")
@@ -666,7 +723,9 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
     if bytes.len() > MAX_BYTES {
         return Err("canonical payload byte limit".into());
     }
-    let (bytes, version) = if let Some(bytes) = bytes.strip_prefix(SLH_PAYLOAD) {
+    let (bytes, version) = if let Some(bytes) = bytes.strip_prefix(SLH_PROPOSER_PAYLOAD) {
+        (bytes, 5)
+    } else if let Some(bytes) = bytes.strip_prefix(SLH_PAYLOAD) {
         (bytes, 4)
     } else if let Some(bytes) = bytes.strip_prefix(HASH_PAYLOAD) {
         (bytes, 3)
@@ -679,7 +738,13 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
     if frame.format_version != version
         || frame.transactions.is_empty()
         || frame.transactions.len() > MAX_CANONICAL_SIGNATURE_BATCH
-        || (if version == 4 {
+        || (version != 5 && frame.slh_proposer.is_some())
+        || (if version == 5 {
+            frame.proof_version != 4
+                || frame.transactions.len() != 1
+                || frame.proposer.is_some()
+                || frame.slh_proposer.is_none()
+        } else if version == 4 {
             frame.proof_version != 3 || frame.transactions.len() != 1 || frame.proposer.is_none()
         } else {
             !matches!(
@@ -695,7 +760,7 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
         return Err("noncanonical compact frame".into());
     }
     let mut unpacker = Unpacker::new(&frame.certificates, version >= 3)?;
-    unpacker.grouped = version == 4;
+    unpacker.grouped = version >= 4;
     let mut slh_transactions = (version == 4).then(Vec::new);
     let mut slh_budget = MAX_POOL_JSON;
     let mut transactions = Vec::with_capacity(frame.transactions.len());
@@ -703,9 +768,22 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
         if let Some(slh) = &mut slh_transactions {
             slh.push(slh::decode(&mut unpacker, bytes, &mut slh_budget)?);
         } else {
+            if version == 5 {
+                slh_budget = slh_budget
+                    .checked_sub(bytes.0.len())
+                    .ok_or("SLH proposer sender template expansion limit")?;
+            }
             let value: Value = serde_json::from_slice(&bytes.0).map_err(|e| e.to_string())?;
             let mut budget = MAX_BYTES - bytes.0.len();
-            let value = unpacker.expand(value, &mut budget, MAX_DEPTH)?;
+            let value = unpacker.expand(
+                value,
+                if version == 5 {
+                    &mut slh_budget
+                } else {
+                    &mut budget
+                },
+                MAX_DEPTH,
+            )?;
             transactions.push(serde_json::from_value(value).map_err(|e| e.to_string())?);
         }
     }
@@ -726,8 +804,13 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
             .map_err(|e| e.to_string())
         })
         .transpose()?;
+    let slh_proposer = frame
+        .slh_proposer
+        .map(|bytes| slh::decode_proposer(&mut unpacker, bytes, &mut slh_budget))
+        .transpose()?;
     unpacker.finish()?;
     Ok(CanonicalSignatureBatchProof {
+        slh_proposer,
         slh_transactions,
         version: frame.proof_version,
         transactions,
@@ -857,6 +940,7 @@ mod tests {
     fn template_bytes_and_list_limits_precede_untrusted_tree_expansion() {
         let frames = [
             Frame {
+                slh_proposer: None,
                 format_version: 2,
                 proof_version: 1,
                 transactions: (0..17).map(|_| Bytes(b"null".to_vec())).collect(),
@@ -864,6 +948,7 @@ mod tests {
                 certificates: vec![],
             },
             Frame {
+                slh_proposer: None,
                 format_version: 2,
                 proof_version: 1,
                 transactions: vec![Bytes(vec![b' '; MAX_TEMPLATE_BYTES + 1])],
@@ -877,6 +962,33 @@ mod tests {
         {
             let bytes = [PAYLOAD, cbor(&frame, MAX_BYTES).unwrap().as_slice()].concat();
             assert!(decode_payload(&bytes).unwrap_err().contains(message));
+        }
+    }
+    #[test]
+    fn slh_proposer_frame_relabeling_cannot_hide_or_add_a_mandatory_role() {
+        for (prefix, format, proof, small, slh, count) in [
+            (SLH_PROPOSER_PAYLOAD, 5, 4, false, false, 1),
+            (SLH_PROPOSER_PAYLOAD, 5, 4, true, true, 1),
+            (SLH_PROPOSER_PAYLOAD, 5, 4, false, true, 2),
+            (SLH_PROPOSER_PAYLOAD, 5, 3, false, true, 1),
+            (SLH_PAYLOAD, 4, 3, true, true, 1),
+            (HASH_PAYLOAD, 3, 2, true, true, 1),
+            (PAYLOAD, 2, 2, true, true, 1),
+        ] {
+            // Deliberately invalid templates must never be expanded when the
+            // declared role/count/version is already incompatible.
+            let frame = Frame {
+                format_version: format,
+                proof_version: proof,
+                transactions: (0..count).map(|_| Bytes(vec![0xff])).collect(),
+                proposer: small.then(|| Bytes(vec![0xff])),
+                slh_proposer: slh.then(|| Bytes(vec![0xff])),
+                certificates: vec![],
+            };
+            let bytes = [prefix, cbor(&frame, MAX_BYTES).unwrap().as_slice()].concat();
+            assert!(decode_payload(&bytes)
+                .unwrap_err()
+                .contains("profile/count mismatch"));
         }
     }
     #[test]
@@ -907,6 +1019,7 @@ mod tests {
         assert_eq!(u.expand(a, &mut budget, MAX_DEPTH).unwrap(), v);
         u.finish().unwrap();
         let frame = Frame {
+            slh_proposer: None,
             format_version: 2,
             proof_version: 2,
             transactions: vec![template(&b).unwrap()],

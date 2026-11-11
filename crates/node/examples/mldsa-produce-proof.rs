@@ -722,6 +722,13 @@ fn main() -> Result<(), Error> {
         "prepare-dilithium-proposer" => {
             admission_runtime::dilithium::prepare(out, false, true, false)
         }
+        "prepare-slh-proposer" => admission_runtime::slh_proposer::prepare(out),
+        "capture-slh-proposer" => admission_runtime::slh_proposer::capture(out),
+        "pause-slh-proposer" => admission_runtime::slh_proposer::prove(out, true),
+        "resume-slh-proposer" => admission_runtime::slh_proposer::prove(out, false),
+        "verify-slh-proposer" => admission_runtime::slh_proposer::verify(out, false),
+        "refuse-slh-proposer" => admission_runtime::slh_proposer::verify(out, true),
+        "publish-slh-proposer" => admission_runtime::slh_proposer::publish(out),
         "prepare-slh" => admission_runtime::slh::prepare(out),
         "slh-recover-native" => admission_runtime::slh::recover_native(out),
         "slh-capture" => admission_runtime::slh::capture(out, false),

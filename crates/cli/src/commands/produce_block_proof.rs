@@ -41,8 +41,8 @@ pub fn produce_block_proof(
         let block_bytes = bounded_json(source.block(), 2 * 1024 * 1024)?;
         let output = prepare_output(&database, &output)?;
         let mut db = RocksDbStore::open_all(output.join("db"), None)?.state;
-        let compact = source.block().transactions.len() > 2 || source.has_slh_senders();
-        let mut job = if source.has_slh_senders() {
+        let compact = source.block().transactions.len() > 2 || source.needs_slh_encoding();
+        let mut job = if source.needs_slh_encoding() {
             ProductionStore::open_slh(&mut db, source.identity(), component_limit)?
         } else if compact {
             ProductionStore::open_compact(&mut db, source.identity(), component_limit)?

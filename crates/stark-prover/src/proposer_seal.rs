@@ -1,4 +1,4 @@
-//! Exact primary65, genuine PQClean or Native SDK FIPS proposer seal at a trusted parent.
+//! Exact primary65, PQClean, SDK FIPS or full SLH proposer seal at a trusted parent.
 //! Selector and registry provenance remain caller/trusted-store inputs; this
 //! does not prove validator weights, penalty history, quorum or consensus.
 use crate::{
@@ -137,6 +137,38 @@ pub(crate) fn verify_seal_at_parent<S: KvStore + 'static>(
     })
 }
 
+/// Full raw SHA2-256f header seal at the independently frozen parent. Selection,
+/// lifecycle and consensus are still enforced by the native caller.
+pub(crate) fn verify_slh_seal_at_parent<S: KvStore + 'static>(
+    view: &CanonicalParentView<S>,
+    header: &BlockHeader,
+    hash: &ShellHash,
+    expected_proposer: &Address,
+    chain_id: u64,
+    seal: &PQSignature,
+    proof: &crate::slh_proposer::SlhProposerSealProof,
+) -> Result<VerifiedProposerSeal, String> {
+    if header.proposer != *expected_proposer
+        || view.config().chain_id != chain_id
+        || view.parent().number.checked_add(1) != Some(header.number)
+        || header.parent_hash != view.parent().hash()
+    {
+        return Err("SLH proposer selected authority/parent/chain mismatch".into());
+    }
+    let key = view
+        .registered_key(expected_proposer)
+        .map_err(|e| e.to_string())?
+        .ok_or("SLH proposer parent key absent")?;
+    crate::slh_proposer::verify_graph(proof, &key, header, hash, seal)?;
+    Ok(VerifiedProposerSeal {
+        hash: *hash,
+        proposer: *expected_proposer,
+        chain_id,
+        key,
+        seal: seal.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +180,7 @@ mod tests {
         for signer in [
             Box::new(MlDsaSigner::generate()) as Box<dyn Signer>,
             Box::new(DilithiumSigner::generate()) as Box<dyn Signer>,
+            Box::new(shell_crypto::SphincsSigner::generate()) as Box<dyn Signer>,
         ] {
             let hash = ShellHash::from([17; 32]);
             let seal = signer.sign(hash.as_bytes()).unwrap();

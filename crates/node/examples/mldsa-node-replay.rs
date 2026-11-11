@@ -253,6 +253,7 @@ fn block_proof(
         });
     }
     Ok(CanonicalSignatureBatchProof {
+        slh_proposer: None,
         slh_transactions: None,
         version: 1,
         proposer: None,

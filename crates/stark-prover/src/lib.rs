@@ -72,6 +72,7 @@ pub mod recursive_air;
 pub mod registered_signature;
 pub mod scheduler;
 pub mod shake_sponge;
+pub mod slh_proposer;
 pub mod state_machine;
 
 pub use amendment::{

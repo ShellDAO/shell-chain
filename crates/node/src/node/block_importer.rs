@@ -2765,6 +2765,7 @@ mod tests {
             .commit_genesis_block(&parent, &config)
             .unwrap();
         let proof = CanonicalSignatureBatchProof {
+            slh_proposer: None,
             slh_transactions: None,
             version: 1,
             proposer: None,

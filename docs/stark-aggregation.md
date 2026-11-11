@@ -1912,5 +1912,91 @@ tests/e2e/slh-peer-proof.sh refuse first-use-output first-use-automatic-output f
 The transport checks partial-proof rejection, cold missing-chunk resume,
 complete Native execution/key registration/finality and a genuine certificate
 in the wrong statement slot. Public binaries, packages and network activation,
-SLH proposer seals, other account combinations and quorum AIR remain separate
-acceptance work.
+other account combinations and quorum AIR remain separate acceptance work.
+
+### Complete SLH proposer seal with a bound primary sender
+
+This separate profile supports a registered SLH-DSA-SHA2-256f proposer and one
+independent, bound default-account ML-DSA-65 sender. The proposer signs the raw
+32-byte Native header hash. Its 64-byte public key and 49,856-byte signature
+must pass H_msg, FORS and all seventeen WOTS+/XMSS layers, including the final
+public-key root. A sender proof or Native signature check cannot stand in for
+these proposer certificates.
+
+With the Rust, RocksDB/C++ toolchain and locked dependencies described above:
+
+```bash
+tests/e2e/slh-proposer.sh prepare slh-proposer-output
+tests/e2e/slh-proposer.sh capture slh-proposer-output
+tests/e2e/slh-proposer.sh pause slh-proposer-output
+tests/e2e/slh-proposer.sh resume slh-proposer-output
+tests/e2e/slh-proposer.sh verify slh-proposer-output
+tests/e2e/slh-proposer.sh refuse slh-proposer-output
+tests/e2e/slh-proposer.sh publish slh-proposer-output
+```
+
+Use a new output directory. `prepare` creates memory-only sender/proposer keys,
+two independent Native database controls, genuine first and later signed
+blocks, and verified quorum certificates. It drops private keys and refuses to
+replace existing data. Preserve that output and resume the same job; proving
+all layers can take substantial time. No saved private key, reference graph or
+completed proof donor is required. A process failure exits nonzero and leaves
+its evidence and durable progress in place.
+
+The ordinary offline CLI can reuse that exact durable job and emit the same
+frame without generating the signature again. Stop any node using the Native
+database and use the captured block hash for both arguments:
+
+```bash
+cargo build --locked --release -p shell-cli
+BLOCK_HASH=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["block"])' slh-proposer-output/context.json)
+target/release/shell-node --datadir slh-proposer-output/provider produce-block-proof \
+  --block-hash "$BLOCK_HASH" --expected-tip "$BLOCK_HASH" \
+  --output slh-proposer-output/proof
+```
+
+The CLI rechecks every retained component and reports zero newly proved
+components for a complete matching job. Keep its manifest and frame alongside
+the Native controls; an incompatible source cannot reuse that job.
+
+Capture uses source format 8, batch profile 4 and streamed availability frame 5.
+The sender retains its existing complete account/signature/identity/body proof;
+the proposer has a separate complete header/signature graph. Authority comes
+from the sealed parent registration and Native-selected proposer. Only complete
+verification creates the private exact-tuple proposer token. Native lifecycle,
+selection, execution, fees, rollback, activation and quorum verification remain
+in force. Legacy sender-only source 1 remains explicitly partial; it cannot be
+relabeled as source 8. Sources 1–7 and existing frame encodings retain their
+previous behavior and limits.
+
+`pause` persists one actual mathematical component. `resume` cold-revalidates
+retained progress, completes the full graph and round-trips frame 5 without
+raising the 256 MiB checkpoint/payload, 2,048-certificate or shared 1 GiB expanded
+pool limits. `verify` imports the first child through proof-backed Native
+execution, compares receipts/accounts with ordinary Native controls, advances
+to a genuinely changed second state, and replays the first proof against both
+historical controls without writing current state. `refuse` rejects missing or
+relabeled roles, changed signature data, missing layers and a genuine hash
+certificate placed in the wrong header slot; every refusal preserves genesis.
+
+`publish` makes the completed frame available in a separate provider checkpoint;
+readiness alone grants no execution authority. Exercise the ordinary peer path:
+
+```bash
+tests/e2e/slh-peer-proof.sh prepare slh-proposer-output slh-proposer-output/published slh-proposer-peer
+tests/e2e/slh-peer-proof.sh pause slh-proposer-output slh-proposer-output/published slh-proposer-peer
+tests/e2e/slh-peer-proof.sh resume slh-proposer-output slh-proposer-output/published slh-proposer-peer
+tests/e2e/slh-peer-proof.sh verify slh-proposer-output slh-proposer-output/published slh-proposer-peer
+tests/e2e/slh-peer-proof.sh refuse slh-proposer-output slh-proposer-output/published slh-proposer-peer
+```
+
+The receiver starts from authenticated genesis state, receives no child receipts
+or execution state, pauses after three proof chunks and resumes the missing
+chunk in a new process. Complete graph verification must precede Native import
+and finality from the separately verified attached quorum certificate. A payload
+with a correct outer hash and genuine certificate in the wrong statement slot
+must fail without Native fallback. Cold replay checks the received graph with
+no writeback. This bounded profile does not establish two simultaneous SLH
+roles, other sender/account combinations, quorum AIR, power-loss recovery,
+fresh automatic-worker generation, public release acceptance or network
+activation.

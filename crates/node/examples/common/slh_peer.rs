@@ -1,4 +1,4 @@
-//! Same-original SLH child through ordinary discovery and the dedicated proof channel.
+//! Retained SLH sender or proposer through discovery and the dedicated proof channel.
 use super::*;
 use shell_crypto::{CryptoError, PQSignature, SignatureType};
 use shell_storage::{CanonicalProofUploadState, CanonicalProofUploadStore};
@@ -30,8 +30,13 @@ fn source(native: &Path) -> Result<(fixture::Context, Block, Value), Error> {
         block.hash() == c.block
             && block.number() == 1
             && block.transactions == vec![original]
-            && block.transactions[0].signature.sig_type == SignatureType::SphincsSha2256f,
-        "same original first SLH child required",
+            && (block.transactions[0].signature.sig_type == SignatureType::SphincsSha2256f
+                || (block.transactions[0].signature.sig_type == SignatureType::MlDsa65
+                    && block.proposer_seal.as_ref().is_some_and(|seal| {
+                        seal.sig_type == SignatureType::SphincsSha2256f
+                            && c.authority_key.len() == 64
+                    }))),
+        "retained first SLH sender or primary-sender/SLH-proposer child required",
     )?;
     Ok((c, block, read(&native.join("control.json"))?))
 }
@@ -349,18 +354,28 @@ fn negative(native: &Path, cache: &Path, out: &Path) -> Result<std::path::PathBu
     let mut proof = shell_stark_prover::compact_canonical::decode_payload(&std::fs::read(
         cache.join("proof.cbor"),
     )?)?;
-    let sender = proof
-        .slh_transactions
-        .as_mut()
-        .and_then(|v| v.first_mut())
-        .ok_or("SLH proof absent")?;
-    let foreign = sender.envelope.signing_hash.clone();
-    shell_stark_prover::blake3_hash::verify_hash(&foreign, &foreign.message, &foreign.output)?;
-    ensure(
-        foreign.message != sender.public_key_hash.message,
-        "foreign certificate not distinct",
-    )?;
-    sender.public_key_hash = foreign;
+    if let Some(proposer) = &mut proof.slh_proposer {
+        let foreign = proof.transactions[0].signature.transaction_id.clone();
+        shell_stark_prover::blake3_hash::verify_hash(&foreign, &foreign.message, &foreign.output)?;
+        ensure(
+            foreign.message != proposer.header.canonical.message,
+            "foreign header certificate not distinct",
+        )?;
+        proposer.header.canonical = foreign;
+    } else {
+        let sender = proof
+            .slh_transactions
+            .as_mut()
+            .and_then(|v| v.first_mut())
+            .ok_or("SLH proof absent")?;
+        let foreign = sender.envelope.signing_hash.clone();
+        shell_stark_prover::blake3_hash::verify_hash(&foreign, &foreign.message, &foreign.output)?;
+        ensure(
+            foreign.message != sender.public_key_hash.message,
+            "foreign certificate not distinct",
+        )?;
+        sender.public_key_hash = foreign;
+    }
     let payload =
         shell_stark_prover::compact_canonical::encode_payload(&proof, 256 * 1024 * 1024, true)?;
     let mut manifest: CanonicalProofManifest = read(&bad.join("manifest.json"))?;

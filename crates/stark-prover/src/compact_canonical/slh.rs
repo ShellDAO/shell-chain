@@ -251,3 +251,82 @@ pub(super) fn decode(
         layers,
     })
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposerParts {
+    version: u8,
+    header: Value,
+    manifest: SlhSignatureManifest,
+    fors: Fors,
+    #[serde(deserialize_with = "layers")]
+    layers: Vec<Xmss>,
+}
+pub(super) fn encode_proposer(
+    packer: &mut Packer,
+    proof: &crate::slh_proposer::SlhProposerSealProof,
+) -> Result<Bytes, String> {
+    let mut layers = Vec::new();
+    for layer in &proof.layers {
+        layers.push(Xmss {
+            version: layer.version,
+            inputs: layer.inputs.clone(),
+            prefix: pack(packer, &layer.prefix)?,
+            chains: pack_many(packer, &layer.chains)?,
+            wots_public_key: pack(packer, &layer.wots_public_key)?,
+            authentication: pack_many(packer, &layer.authentication)?,
+        });
+    }
+    template(
+        &serde_json::to_value(ProposerParts {
+            version: proof.version,
+            header: pack(packer, &proof.header)?,
+            manifest: proof.manifest.clone(),
+            fors: Fors {
+                version: proof.fors.version,
+                inputs: proof.fors.inputs.clone(),
+                hashes: pack_many(packer, &proof.fors.hashes)?,
+            },
+            layers,
+        })
+        .map_err(|e| e.to_string())?,
+    )
+}
+pub(super) fn decode_proposer(
+    unpacker: &mut Unpacker<'_>,
+    bytes: Bytes,
+    budget: &mut usize,
+) -> Result<crate::slh_proposer::SlhProposerSealProof, String> {
+    *budget = budget
+        .checked_sub(bytes.0.len())
+        .ok_or("SLH proposer template expansion limit")?;
+    let p: ProposerParts = serde_json::from_slice(&bytes.0).map_err(|e| e.to_string())?;
+    if p.layers.len() != 17 || p.fors.hashes.len() != crate::slh_fors::SLH_FORS_HASHES {
+        return Err("SLH proposer graph count mismatch".into());
+    }
+    let mut layers = Vec::new();
+    for layer in p.layers {
+        if layer.chains.len() > 64 || layer.authentication.len() != 4 {
+            return Err("SLH proposer layer resource/profile mismatch".into());
+        }
+        layers.push(SlhXmssProof {
+            version: layer.version,
+            inputs: layer.inputs,
+            prefix: expand(unpacker, layer.prefix, budget)?,
+            chains: many(unpacker, layer.chains, budget)?,
+            wots_public_key: expand(unpacker, layer.wots_public_key, budget)?,
+            authentication: many(unpacker, layer.authentication, budget)?,
+        });
+    }
+    Ok(crate::slh_proposer::SlhProposerSealProof {
+        version: p.version,
+        header: expand(unpacker, p.header, budget)?,
+        manifest: p.manifest,
+        fors: SlhForsProof {
+            version: p.fors.version,
+            inputs: p.fors.inputs,
+            hashes: many(unpacker, p.fors.hashes, budget)?,
+        },
+        layers,
+    })
+}

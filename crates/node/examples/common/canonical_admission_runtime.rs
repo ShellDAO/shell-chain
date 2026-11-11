@@ -9,6 +9,8 @@ pub(super) mod slh;
 pub(super) mod slh_first_use;
 #[path = "slh_peer.rs"]
 pub(super) mod slh_peer;
+#[path = "slh_proposer.rs"]
+pub(super) mod slh_proposer;
 use super::*;
 use async_trait::async_trait;
 use shell_network::{
