@@ -206,5 +206,13 @@ no-writeback history, durable recovery, real peer import/finality and genuine
 wrong-header-certificate refusal are required. Frame 7 uses the existing bounded
 dictionary and shared expansion pool. Sources 1–9, frames 1–6, default-off
 production, Native compatibility and all quotas remain unchanged. SDK first-use
-accounts with SLH proposers, raw Native tag-zero senders with SLH proposers and
-fresh automatic Source 10 generation require separate acceptance.
+accounts with SLH proposers and raw Native tag-zero senders with SLH proposers
+require separate acceptance.
+
+The Source 10 automatic entry consumes the same retained Native control through
+ordinary import, starting with zero mathematical components and no donor. Its
+public-only worker must generate durable progress and cold-resume the full
+frame 7 graph. Authenticated RPC retrieval, unchanged Native state, registered
+sealed-parent sender/proposer keys after genuine state 2, damaged-checkpoint
+refusal and real peer admission/finality remain independent checks. Standalone
+proof completion cannot substitute for this empty-job worker flow.

@@ -2224,7 +2224,38 @@ tests/e2e/slh-peer-proof.sh refuse sdk-slh-output sdk-slh-output/published sdk-s
 Partial or rejected transfer must preserve receiver genesis. Complete verified
 import must match the independent Native receipts/accounts; finality separately
 requires the genuine attached quorum certificate. Cold replay and a genuine
-wrong-header certificate remain required checks. Fresh automatic Source 10,
+wrong-header certificate remain required checks.
+
+To produce Source 10 through the background worker, keep the same
+`sdk-slh-output` and choose a new output directory. This entry starts with an
+empty mathematical job and never opens the completed standalone proof as a
+donor:
+
+```sh
+tests/e2e/slh-canonical.sh automatic-fresh-prepare sdk-slh-output sdk-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-pause sdk-slh-output sdk-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-resume sdk-slh-output sdk-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-verify sdk-slh-output sdk-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-refuse sdk-slh-output sdk-slh-automatic
+tests/e2e/slh-peer-proof.sh prepare sdk-slh-output sdk-slh-automatic sdk-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh pause sdk-slh-output sdk-slh-automatic sdk-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh resume sdk-slh-output sdk-slh-automatic sdk-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh verify sdk-slh-output sdk-slh-automatic sdk-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh refuse sdk-slh-output sdk-slh-automatic sdk-slh-automatic-peer
+```
+
+Ordinary Native import must capture a queued Source 10 job with zero components.
+The actual worker generates durable progress, stops gracefully and continues
+from disk in a new process. Its authenticated RPC must return the complete
+frame 7 graph without claiming Native execution merely from availability.
+Cold verification advances to the retained second Native block and replays the
+first graph against the exact registered sender and proposer keys in its sealed
+parent, without writing either current database. A damaged mathematical
+checkpoint with a corrected outer hash must fail without retries or Native
+state changes. The generated frame then follows the same real peer admission
+and independent finality checks above. No sender or proposer signing keys are
+needed, and proof production remains disabled by default.
+
 SDK first use or raw Native tag-zero senders with an SLH proposer, two SLH roles,
 other accounts, quorum AIR, power-loss recovery, public artifacts and network
 activation remain separate acceptance work.
