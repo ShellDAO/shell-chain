@@ -276,16 +276,19 @@ fn prepare(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resu
         } else {
             ensure(
                 address == block.transactions[0].from
-                    && block.transactions[0].signature.sig_type == SignatureType::SphincsSha2256f
+                    && source.has_unbound_senders()
                     && block.transactions[0]
                         .pubkey_mode
                         .pubkey_bytes()
                         .is_some_and(|key| {
-                            key.len() == 64
-                                && shell_primitives::Address::from_public_key(
-                                    key,
-                                    block.transactions[0].signature.sig_type.as_u8(),
-                                ) == address
+                            matches!(
+                                (block.transactions[0].signature.sig_type, key.len()),
+                                (SignatureType::SphincsSha2256f, 64)
+                                    | (SignatureType::MlDsa65, 1952)
+                            ) && shell_primitives::Address::from_public_key(
+                                key,
+                                block.transactions[0].signature.sig_type.as_u8(),
+                            ) == address
                         })
                     && view
                         .world_state()?
@@ -294,7 +297,7 @@ fn prepare(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resu
                             account.validation_code_hash.is_none()
                                 && account.pq_pubkey_hash == ShellHash::ZERO
                         }),
-                "historical key absent outside funded SLH first-use profile",
+                "historical key absent outside funded first-use profile",
             )?;
         }
     }

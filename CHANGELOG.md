@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Restore primary first-use parents for Source 9 automatic proof generation without preloading their future key. Cover the empty-job worker, durable pause and cold continuation, authenticated proof retrieval, changed-state historical replay, damaged checkpoints and real peer admission with the retained Native input and signatures.
+
 - Add funded primary ML-DSA first-use proofs with a registered SLH proposer: Source 9, batch 5 and frame 6 bind the complete tagged sender address, zero-commitment parent account and full raw-header proposer signature. Preserve bound Source 8, Native key-registration timing and existing limits; add retained-signature Native controls, durable proof recovery, historical replay, peer import and refusal coverage.
 
 - Enable the automatic proof regression for the registered SLH proposer/one bound primary sender profile. Capture an empty Source 8 job through ordinary Native import, generate through the actual background worker, and verify changed-state historical replay against sealed sender/proposer registrations. Preserve existing SLH sender profiles and separate fresh generation from warm checkpoint reuse.

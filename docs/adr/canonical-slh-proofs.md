@@ -177,5 +177,13 @@ the original public primary signatures through Reference-to-Embedded intake,
 first import/registration and a genuine second state, with a new memory-only
 proposer for the new headers. Full proof import, no-writeback historical replay,
 partial/cold peer recovery and genuine wrong-statement refusal are required.
-No existing sender or proposer key is recreated after it is dropped. Fresh
-automatic first-use generation and broader combinations remain separate checks.
+No existing sender or proposer key is recreated after it is dropped. The fresh
+automatic entry restores an absent sender registration only for the validated
+funded first-use source and its exact tagged key shape: source 7 has a 64-byte
+SLH sender; source 9 has a 1952-byte primary sender and a registered SLH proposer.
+Ordinary Native import must capture a zero-component source 9 job and perform
+first-use registration. The public-only worker must generate the full frame 6
+graph after a durable pause and cold continuation, with no proof donor or new
+signatures. Authenticated RPC retrieval, sealed-parent historical replay after
+state 2, correct-hash damaged-checkpoint refusal and actual peer import remain
+part of this entry's acceptance. Broader combinations require separate checks.

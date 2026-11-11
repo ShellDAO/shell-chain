@@ -2113,6 +2113,55 @@ tests/e2e/slh-peer-proof.sh refuse primary-first-use primary-first-use/published
 The receiver must remain unregistered during partial or rejected proof transfer
 and register only after complete verified Native import. Finality separately
 requires the genuine attached certificate. Fresh automatic-worker generation
-for this first-use profile, other sender/account combinations, quorum AIR,
-power-loss recovery, public artifacts and network activation require separate
-acceptance.
+for this first-use profile uses the entry below. Other sender/account
+combinations, quorum AIR, power-loss recovery, public artifacts and network
+activation require separate acceptance.
+
+#### Fresh automatic generation for primary first use with an SLH proposer
+
+Reuse the existing `primary-first-use` Native output and its retained first and
+later signed blocks. The automatic entry restores only historical parent keys:
+the sender has no key at genesis, while the SLH proposer is already registered.
+It checks the funded zero-commitment default account and the complete 1952-byte
+primary key's tagged address before ordinary Native import. Only that import
+registers the Embedded sender key and captures the source 9 job.
+
+```sh
+tests/e2e/slh-canonical.sh automatic-fresh-prepare primary-first-use primary-first-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-pause primary-first-use primary-first-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-resume primary-first-use primary-first-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-verify primary-first-use primary-first-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-refuse primary-first-use primary-first-automatic
+```
+
+Preparation must report source 9, an empty mathematical job and no proof donor.
+The actual public-only `Node.run` worker generates a nonzero durable pause and
+cold-resumes the complete primary signature/address and seventeen-layer SLH
+proposer graph under the existing quotas. It publishes frame 6 through the
+authenticated RPC only after verification, without signing again. A checkpoint
+with a correct outer hash but damaged mathematical proof must fail without
+Native state changes or automatic retries.
+
+Verification imports the retained genuine second block, then replays the first
+proof against its sealed parent. The sender key must remain absent there even
+though it exists in the current registry. Both sender and proposer proofs,
+receipts and state must match the independent Native controls without writeback.
+
+The generated frame also serves the existing peer regression:
+
+```sh
+tests/e2e/slh-peer-proof.sh prepare primary-first-use primary-first-automatic primary-first-automatic-peer
+tests/e2e/slh-peer-proof.sh pause primary-first-use primary-first-automatic primary-first-automatic-peer
+tests/e2e/slh-peer-proof.sh resume primary-first-use primary-first-automatic primary-first-automatic-peer
+tests/e2e/slh-peer-proof.sh verify primary-first-use primary-first-automatic primary-first-automatic-peer
+tests/e2e/slh-peer-proof.sh refuse primary-first-use primary-first-automatic primary-first-automatic-peer
+```
+
+Partial or rejected transfer must leave the receiver's genesis and missing
+sender registration unchanged. Complete verified Native import registers the
+key, and the genuine attached certificate supplies finality. Cold replay and a
+genuine certificate for the wrong header remain separate checks. Source 8 bound
+proposers and source 7 first-use senders retain their existing profiles and
+encodings; the worker still defaults off. Other role/account combinations,
+quorum AIR, power-loss recovery, public release and network activation remain
+separate acceptance work.
