@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Restore funded SLH first-use parents without preloading their future key in the automatic proof regression. Capture source 7 through ordinary Native import, generate from an empty job without a proof donor, and verify the generated graph against changed-state historical controls and real peer admission.
+
 - Add funded default-account SLH first-use source 7 and transaction proof version 2. Prove the full tagged sender address with the complete signature graph, resolve authority from the sealed historical parent and register the Embedded key only through ordinary Native commit. Keep bound source 6/version 1 unchanged and provide durable recovery, historical replay and refusal regression entry points.
 
 - Add standalone registered SLH automatic-generation regression modes that start from an empty mathematical job, without a completed donor proof. Exercise actual new background proving, durable nonzero progress, cold resume, authenticated output retrieval, read-only Native replay and corrupt-checkpoint refusal. Retain the original signature and unchanged quotas; broader history and public activation remain separate acceptance work.

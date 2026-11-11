@@ -1864,3 +1864,53 @@ attached quorum certificate still requires independent verification before
 finality. Automatic first-use generation without a reference graph, other
 account/proposer combinations, quorum AIR, public binary/package acceptance
 and network activation require separate acceptance.
+
+#### Fresh automatic generation for funded SLH first use
+
+The same automatic entry accepts the `first-use-output` Native input above.
+It restores only historical parent registrations: the first-use sender key must
+remain absent until ordinary Embedded Native import commits it. The proposer
+still needs its registered historical key. This avoids treating a future sender
+registration as authority at genesis.
+
+```bash
+tests/e2e/slh-canonical.sh automatic-fresh-prepare first-use-output first-use-automatic-output
+tests/e2e/slh-canonical.sh automatic-fresh-pause first-use-output first-use-automatic-output
+tests/e2e/slh-canonical.sh automatic-fresh-resume first-use-output first-use-automatic-output
+tests/e2e/slh-canonical.sh automatic-fresh-verify first-use-output first-use-automatic-output
+tests/e2e/slh-canonical.sh automatic-fresh-refuse first-use-output first-use-automatic-output
+```
+
+Use a new automatic output. Keep the Native input, signatures and failed outputs;
+`prepare` refuses replacement. These three-argument commands require no completed
+canonical proof, checkpoint transplant or saved private key. Ordinary import
+must capture source 7 as a queued job with zero mathematical components and no
+availability cache. The actual background worker generates a nonzero durable
+pause, cold-resumes and produces the full address/signature/body/proposer graph
+within the existing quotas. A warmed checkpoint cannot satisfy this check.
+The existing authenticated chunk retrieval, readiness-versus-execution check and
+correct-hash damaged-checkpoint refusal remain part of the entry.
+
+For a first-use Native input carrying the retained independent later control,
+`verify` also creates a separate history checkpoint, imports that genuine second
+block and cold-replays the generated first-use proof against its sealed parent.
+It checks the ordinary Native later control too: the current key is present,
+the historical parent key is absent, receipts and roots match, and neither
+historical query writes current state. This separate control does not create
+an unavailable successor in the original bound history.
+
+Use the generated frame for actual peer import and certificate-backed finality:
+
+```bash
+tests/e2e/slh-peer-proof.sh prepare first-use-output first-use-automatic-output first-use-automatic-peer
+tests/e2e/slh-peer-proof.sh pause first-use-output first-use-automatic-output first-use-automatic-peer
+tests/e2e/slh-peer-proof.sh resume first-use-output first-use-automatic-output first-use-automatic-peer
+tests/e2e/slh-peer-proof.sh verify first-use-output first-use-automatic-output first-use-automatic-peer
+tests/e2e/slh-peer-proof.sh refuse first-use-output first-use-automatic-output first-use-automatic-peer
+```
+
+The transport checks partial-proof rejection, cold missing-chunk resume,
+complete Native execution/key registration/finality and a genuine certificate
+in the wrong statement slot. Public binaries, packages and network activation,
+SLH proposer seals, other account combinations and quorum AIR remain separate
+acceptance work.

@@ -110,3 +110,14 @@ Native control and proof receiver to a genuinely different second state and
 replays the first child against that historical parent without writeback.
 Its retained SLH signature is reused in an independent genesis with a new
 proposer; this does not create a missing successor in the original bound history.
+
+The automatic regression reconstructs registrations from the sealed parent.
+A missing sender key is valid only for the funded default-account first-use
+profile with a matching Embedded key and derived address; a missing proposer
+key remains an error. The ordinary Native import must register that sender and
+capture source 7 with zero mathematical components. Fresh mode opens no proof
+donor and the background worker must generate the graph itself. A valid warm
+checkpoint is a different experiment. The cold first-use check advances an
+independent copy to the retained later state, then verifies the generated graph
+against both that copy and the ordinary Native later control without writeback.
+The original worker output and signed inputs are preserved.

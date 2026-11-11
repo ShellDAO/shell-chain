@@ -269,14 +269,39 @@ fn prepare(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resu
         &chain.get_chain_config()?.ok_or("configuration absent")?,
     )?;
     let view = chain.canonical_parent_view(c.tip, parent.hash())?;
+    let parent_sender_registered = view.registered_key(&block.transactions[0].from)?.is_some();
     for address in [block.transactions[0].from, c.authority] {
-        target.put_pubkey(
-            &address,
-            &view
-                .registered_key(&address)?
-                .ok_or("parent registration absent")?,
-        )?;
+        if let Some(key) = view.registered_key(&address)? {
+            target.put_pubkey(&address, &key)?;
+        } else {
+            ensure(
+                address == block.transactions[0].from
+                    && block.transactions[0].signature.sig_type == SignatureType::SphincsSha2256f
+                    && block.transactions[0]
+                        .pubkey_mode
+                        .pubkey_bytes()
+                        .is_some_and(|key| {
+                            key.len() == 64
+                                && shell_primitives::Address::from_public_key(
+                                    key,
+                                    block.transactions[0].signature.sig_type.as_u8(),
+                                ) == address
+                        })
+                    && view
+                        .world_state()?
+                        .get_account(&address)?
+                        .is_some_and(|account| {
+                            account.validation_code_hash.is_none()
+                                && account.pq_pubkey_hash == ShellHash::ZERO
+                        }),
+                "historical key absent outside funded SLH first-use profile",
+            )?;
+        }
     }
+    ensure(
+        target.get_pubkey(&block.transactions[0].from)?.is_some() == parent_sender_registered,
+        "genesis restoration changed historical sender registration",
+    )?;
     let mut node = fixture::node(db.clone(), c.authority, &c.authority_key)?;
     ensure(
         !node.config.canonical_proof_production && db.scan_prefix(PREFIX)?.is_empty(),
@@ -299,6 +324,13 @@ fn prepare(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resu
             .is_some_and(|v| serde_json::to_value(v).is_ok_and(|v| v == control["receipts"])),
         "fresh native receipts differ",
     )?;
+    if !parent_sender_registered {
+        ensure(
+            target.get_pubkey(&block.transactions[0].from)?.as_deref()
+                == block.transactions[0].pubkey_mode.pubkey_bytes(),
+            "ordinary first-use import did not register its Embedded key",
+        )?;
+    }
     drop(node);
     let mut rows: BTreeMap<_, _> = db.scan_prefix(PREFIX)?.into_iter().collect();
     ensure(
@@ -330,7 +362,7 @@ fn prepare(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resu
     )?;
     save(
         &out.join("prepared.json"),
-        &json!({"ordinary_native_import_captured":queued,"genesis_only_parent":true,"child_root_not_preloaded":true,"checkpoint_transplant":if fresh {"none; empty mathematical job"}else{"same-source test preparation; no complete flag"},"fresh_generation":fresh,"donor_opened":donor.is_some(),"checkpoint_digest":donor_before,"component_count":component_count,"native_digest":native_digest(db.as_ref())?,"new_math":0,"new_signing":false,"original_digest":before}),
+        &json!({"ordinary_native_import_captured":queued,"parent_sender_registered":parent_sender_registered,"sender_registered_after_native_import":target.get_pubkey(&block.transactions[0].from)?.is_some(),"source_version":serde_json::from_slice::<Value>(source.identity())?["version"],"genesis_only_parent":true,"child_root_not_preloaded":true,"checkpoint_transplant":if fresh {"none; empty mathematical job"}else{"same-source test preparation; no complete flag"},"fresh_generation":fresh,"donor_opened":donor.is_some(),"checkpoint_digest":donor_before,"component_count":component_count,"native_digest":native_digest(db.as_ref())?,"new_math":0,"new_signing":false,"original_digest":before}),
     )
 }
 async fn exercise(
@@ -533,7 +565,8 @@ fn verify(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resul
     )?;
     let proof = decode_payload(&bytes)?;
     source.verify(&proof)?;
-    let db = Arc::new(RocksDbStore::open_all(out.join("provider/db"), None)?.state);
+    let stores = RocksDbStore::open_all(out.join("provider/db"), None)?;
+    let db = Arc::new(stores.state.clone());
     let native_before = native_digest(db.as_ref())?;
     let node = fixture::node(db.clone(), c.authority, &c.authority_key)?;
     let replay = node.replay_canonical_transactions_with_proof(c.block, c.block, &proof)?;
@@ -557,9 +590,80 @@ fn verify(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resul
             && before == digest(&original.state)?,
         "cold replay altered canonical state or accounts differ",
     )?;
+    let first_use_history = if source.has_unbound_senders() && native.join("later.json").is_file() {
+        let later: shell_core::Block = json_read(&native.join("later.json"))?;
+        ensure(
+            later.header.parent_hash == c.block
+                && later.number() == 2
+                && later.header.state_root != block.header.state_root,
+            "first-use later control is not a changed child",
+        )?;
+        std::fs::create_dir_all(out.join("history"))?;
+        if !out.join("history/db/CURRENT").is_file() {
+            stores.create_checkpoint(out.join("history/db"))?;
+        }
+        let history = Arc::new(RocksDbStore::open_all(out.join("history/db"), None)?.state);
+        let history_node = fixture::node(history.clone(), c.authority, &c.authority_key)?;
+        ensure(
+            !history_node.config.canonical_proof_production,
+            "cold history enabled new jobs",
+        )?;
+        if history_node.chain_store.get_head_hash()? == Some(c.block) {
+            history_node.import_block(later.clone(), &MultiVerifier)?;
+        }
+        ensure(
+            history_node.chain_store.get_head_hash()? == Some(later.hash())
+                && history_node.world_state.write().state_root()? == later.header.state_root
+                && history_node
+                    .chain_store
+                    .get_pubkey(&block.transactions[0].from)?
+                    .is_some(),
+            "first-use history did not advance with registered key",
+        )?;
+        let sealed = history_node
+            .chain_store
+            .canonical_parent_view(later.hash(), block.header.parent_hash)?;
+        ensure(
+            sealed
+                .registered_key(&block.transactions[0].from)?
+                .is_none(),
+            "current key supplied historical first-use authority",
+        )?;
+        let history_before = digest(history.as_ref())?;
+        let replay =
+            history_node.replay_canonical_transactions_with_proof(later.hash(), c.block, &proof)?;
+        let ordinary =
+            Arc::new(RocksDbStore::open_all(native.join("native-later/db"), None)?.state);
+        let ordinary_before = digest(ordinary.as_ref())?;
+        let ordinary_node = fixture::node(ordinary.clone(), c.authority, &c.authority_key)?;
+        ensure(
+            ordinary_node.chain_store.get_head_hash()? == Some(later.hash()),
+            "independent Native later control absent",
+        )?;
+        let ordinary_replay = ordinary_node.replay_canonical_transactions_with_proof(
+            later.hash(),
+            c.block,
+            &proof,
+        )?;
+        ensure(
+            replay.state_root == block.header.state_root
+                && ordinary_replay.state_root == block.header.state_root
+                && serde_json::to_value(&replay.receipts)? == control["receipts"]
+                && serde_json::to_value(&ordinary_replay.receipts)? == control["receipts"]
+                && history_before == digest(history.as_ref())?
+                && ordinary_before == digest(ordinary.as_ref())?
+                && native_before == native_digest(db.as_ref())?,
+            "generated first-use proof historical replay differs or writes current state",
+        )?;
+        Some(
+            json!({"current_height":2,"current_state_changed":true,"current_key_present":true,"sealed_parent_key_absent":true,"generated_proof_replay_matches_independent_Native":true,"both_databases_unchanged":true,"original_bound_successor2_not_replaced":true}),
+        )
+    } else {
+        None
+    };
     println!(
         "{}",
-        json!({"actual_Node_run_cold_proof_verified":true,"proof_bytes":bytes.len(),"byte_identical_original_graph":prior.map(|_|true),"receipts_state_accounts_match_original":true,"read_only":true,"new_signing":false,"fresh_generation":fresh,"peer_transport":false,"original_successor2_signed":false})
+        json!({"actual_Node_run_cold_proof_verified":true,"proof_bytes":bytes.len(),"byte_identical_original_graph":prior.map(|_|true),"receipts_state_accounts_match_original":true,"read_only":true,"new_signing":false,"fresh_generation":fresh,"peer_transport":false,"first_use_history":first_use_history,"original_successor2_signed":false})
     );
     Ok(())
 }
