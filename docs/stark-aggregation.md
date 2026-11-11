@@ -2049,3 +2049,70 @@ proof-backed Native import and attached-certificate finality, cold replay and a
 genuine hash certificate placed in the wrong header slot. These are local
 source-build checks; public artifacts, network activation, quorum AIR and other
 role/account combinations require separate acceptance.
+
+#### Funded primary sender first use with an SLH proposer
+
+A separate profile supports a funded default primary ML-DSA-65 account whose
+parent key commitment is zero, together with a registered SLH-DSA-SHA2-256f
+proposer. First use must carry its Embedded 1,952-byte sender key. Reference
+mode is refused until the ordinary Native commit registers that key. Intake
+and failed proofs cannot perform registration.
+
+Use the preceding Native proposer control as a public signature source, or
+create it once with `tests/e2e/slh-proposer.sh prepare slh-proposer-output`.
+The first-use preparation retains its genuine primary first/later signatures;
+switching the first envelope from Reference to Embedded preserves the signing
+hash and transaction identity. A new independent proposer signs the new
+headers while its key is in memory, then drops it. No sender private key or
+new sender signature is needed:
+
+```bash
+tests/e2e/slh-proposer-first-use.sh prepare slh-proposer-output primary-first-use
+tests/e2e/slh-proposer-first-use.sh capture primary-first-use
+tests/e2e/slh-proposer-first-use.sh pause primary-first-use
+tests/e2e/slh-proposer-first-use.sh resume primary-first-use
+tests/e2e/slh-proposer-first-use.sh verify primary-first-use
+tests/e2e/slh-proposer-first-use.sh refuse primary-first-use
+tests/e2e/slh-proposer-first-use.sh publish primary-first-use
+```
+
+Use new output directories and retain signatures, controls, failed outputs and
+durable progress. Preparation verifies Reference-without-key, changed address,
+message and Embedded-key refusals, then compares two independent Native imports
+and genuine later state changes. Never repeat preparation to replace dropped
+keys or existing data. The Rust/RocksDB/C++ dependencies above apply, and every
+failed command exits nonzero.
+
+Source 9, batch 5 and frame 6 explicitly distinguish this profile from bound
+Source 8/batch 4/frame 5. The complete tagged-address AIR binds the algorithm
+tag and all 1,952 sender-key bytes to the account address; account, signature,
+identity/body and full seventeen-layer raw-header proposer proofs remain
+mandatory. Neither a nonzero commitment nor a future key cache can replace
+the sealed zero-commitment parent. Old profiles reject relabeling. Existing
+checkpoint/component encodings, quotas and Native lifecycle, economics,
+selection, quorum and activation rules remain unchanged.
+
+Proof-backed Native commit registers the Embedded key. Cold replay after the
+retained second state must keep the current key present, resolve the first
+block's absent sealed-parent sender key, prove both signature roles, match
+ordinary Native receipts/root and write no current state. Refusal includes a
+missing address certificate, bound-profile substitution and a genuine hash
+certificate in the wrong header slot; rejected graphs leave genesis and the
+sender registration unchanged.
+
+The ready frame also uses the ordinary peer entry:
+
+```bash
+tests/e2e/slh-peer-proof.sh prepare primary-first-use primary-first-use/published primary-first-use-peer
+tests/e2e/slh-peer-proof.sh pause primary-first-use primary-first-use/published primary-first-use-peer
+tests/e2e/slh-peer-proof.sh resume primary-first-use primary-first-use/published primary-first-use-peer
+tests/e2e/slh-peer-proof.sh verify primary-first-use primary-first-use/published primary-first-use-peer
+tests/e2e/slh-peer-proof.sh refuse primary-first-use primary-first-use/published primary-first-use-peer
+```
+
+The receiver must remain unregistered during partial or rejected proof transfer
+and register only after complete verified Native import. Finality separately
+requires the genuine attached certificate. Fresh automatic-worker generation
+for this first-use profile, other sender/account combinations, quorum AIR,
+power-loss recovery, public artifacts and network activation require separate
+acceptance.

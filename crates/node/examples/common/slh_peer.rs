@@ -132,7 +132,15 @@ fn prepare(native: &Path, cache: &Path, out: &Path) -> Result<(), Error> {
                         .pubkey_mode
                         .pubkey_bytes()
                         .is_some_and(|key| {
-                            key.len() == 64
+                            (key.len() == 64
+                                && block.transactions[0].signature.sig_type
+                                    == SignatureType::SphincsSha2256f
+                                || key.len() == 1952
+                                    && block.transactions[0].signature.sig_type
+                                        == SignatureType::MlDsa65
+                                    && block.proposer_seal.as_ref().is_some_and(|s| {
+                                        s.sig_type == SignatureType::SphincsSha2256f
+                                    }))
                                 && Address::from_public_key(
                                     key,
                                     block.transactions[0].signature.sig_type.as_u8(),

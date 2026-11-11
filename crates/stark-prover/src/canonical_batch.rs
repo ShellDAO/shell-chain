@@ -64,7 +64,7 @@ pub struct CanonicalSignatureBatchProof {
 impl CanonicalSignatureBatchProof {
     fn valid_profile(&self) -> bool {
         if self.slh_proposer.is_some() {
-            return self.version == 4
+            return matches!(self.version, 4 | 5)
                 && self.proposer.is_none()
                 && self.slh_transactions.is_none()
                 && self.transactions.len() == 1;
@@ -265,10 +265,12 @@ fn verify_batch_at_parent<S: KvStore + 'static>(
             .map_err(|e| e.to_string())?
             .ok_or("SLH proposer profile sender account absent")?;
         if sender.signature.sig_type != SignatureType::MlDsa65
-            || account.pq_pubkey_hash == ShellHash::ZERO
+            || (account.pq_pubkey_hash == ShellHash::ZERO) != (proof.version == 5)
             || account.validation_code_hash.is_some()
         {
-            return Err("SLH proposer profile requires one bound primary sender".into());
+            return Err(
+                "SLH proposer profile requires its bound or first-use primary account".into(),
+            );
         }
         proposer = Some(crate::proposer_seal::verify_slh_seal_at_parent(
             view,
@@ -350,7 +352,7 @@ mod tests {
         let legacy: CanonicalSignatureBatchProof = serde_json::from_slice(bytes).unwrap();
         assert!(legacy.valid_profile());
         assert_eq!(serde_json::to_vec(&legacy).unwrap(), bytes);
-        for version in [0, 2, 3, 4] {
+        for version in [0, 2, 3, 4, 5] {
             let value = serde_json::json!({"version":version,"transactions":[]});
             let proof: CanonicalSignatureBatchProof = serde_json::from_value(value).unwrap();
             assert!(!proof.valid_profile());

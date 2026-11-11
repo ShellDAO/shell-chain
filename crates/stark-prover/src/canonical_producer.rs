@@ -303,8 +303,7 @@ impl CanonicalProductionSource {
             Some(seal)
                 if seal.sig_type == SignatureType::SphincsSha2256f
                     && block.transactions.len() == 1
-                    && block.transactions[0].signature.sig_type == SignatureType::MlDsa65
-                    && senders[0].account.pq_pubkey_hash != ShellHash::ZERO =>
+                    && block.transactions[0].signature.sig_type == SignatureType::MlDsa65 =>
             {
                 Some(
                     view.registered_key(&block.header.proposer)
@@ -321,7 +320,11 @@ impl CanonicalProductionSource {
                     .as_ref()
                     .is_some_and(|seal| seal.sig_type == SignatureType::SphincsSha2256f)
             {
-                8
+                if senders[0].account.pq_pubkey_hash == ShellHash::ZERO {
+                    9
+                } else {
+                    8
+                }
             } else if block
                 .transactions
                 .iter()
@@ -440,7 +443,7 @@ impl CanonicalProductionSource {
                             .iter()
                             .all(|s| s.account.pq_pubkey_hash == ShellHash::ZERO)
                 }
-                8 => {
+                8 | 9 => {
                     i.proposer_key.is_some()
                         && i.proposer_sdk_fips.is_none()
                         && i.block
@@ -450,9 +453,9 @@ impl CanonicalProductionSource {
                         && i.block.transactions.len() == 1
                         && i.block.transactions[0].signature.sig_type == SignatureType::MlDsa65
                         && !has_sdk
-                        && i.senders
-                            .iter()
-                            .all(|sender| sender.account.pq_pubkey_hash != ShellHash::ZERO)
+                        && i.senders.iter().all(|sender| {
+                            (sender.account.pq_pubkey_hash == ShellHash::ZERO) == (i.version == 9)
+                        })
                 }
                 _ => false,
             };
@@ -525,7 +528,7 @@ impl CanonicalProductionSource {
             } else {
                 verify_production_signature(key, i.block.hash().as_bytes(), seal)?
             };
-            let shape = if i.version == 8 {
+            let shape = if matches!(i.version, 8 | 9) {
                 key.len() == 64
                     && seal.sig_type == SignatureType::SphincsSha2256f
                     && seal.data.len() == 49856
@@ -633,9 +636,9 @@ impl CanonicalProductionSource {
     pub fn has_slh_senders(&self) -> bool {
         matches!(self.input.version, 6 | 7)
     }
-    /// Full raw-header SLH proposer profile with one bound primary sender.
+    /// Full raw-header SLH proposer with one bound or explicit first-use primary sender.
     pub fn has_slh_proposer(&self) -> bool {
-        self.input.version == 8
+        matches!(self.input.version, 8 | 9)
     }
     /// Shared bounded witness encoding for either supported large signature role.
     pub fn needs_slh_encoding(&self) -> bool {
@@ -659,7 +662,11 @@ impl CanonicalProductionSource {
     pub fn verify(&self, proof: &CanonicalSignatureBatchProof) -> Result<(), String> {
         if proof.version
             != (if self.has_slh_proposer() {
-                4
+                if self.has_unbound_senders() {
+                    5
+                } else {
+                    4
+                }
             } else if self.has_slh_senders() {
                 3
             } else if self.input.proposer_key.is_some() {
@@ -1058,7 +1065,11 @@ impl CanonicalProductionSource {
             },
             slh_transactions,
             version: if self.has_slh_proposer() {
-                4
+                if self.has_unbound_senders() {
+                    5
+                } else {
+                    4
+                }
             } else if self.has_slh_senders() {
                 3
             } else if self.input.proposer_key.is_some() {
@@ -1977,6 +1988,7 @@ mod recovery_tests {
         for case in [
             "small-profile",
             "sender-profile",
+            "unbound-profile",
             "wrong-key",
             "missing-key",
             "sdk-proposer",
@@ -1987,10 +1999,67 @@ mod recovery_tests {
             match case {
                 "small-profile" => input.version = 2,
                 "sender-profile" => input.version = 6,
+                "unbound-profile" => input.version = 9,
                 "wrong-key" => input.proposer_key.as_mut().unwrap()[0] ^= 1,
                 "missing-key" => input.proposer_key = None,
                 "sdk-proposer" => input.proposer_sdk_fips = Some(1),
                 "unbound-sender" => input.senders[0].account.pq_pubkey_hash = ShellHash::ZERO,
+                _ => input.block.header.timestamp += 1,
+            }
+            let bytes =
+                bounded_json(&serde_json::to_value(input).unwrap(), 4 * 1024 * 1024).unwrap();
+            assert!(
+                CanonicalProductionSource::restore(&frozen, &bytes).is_err(),
+                "{case}"
+            );
+        }
+        assert_eq!(before, db.scan_all().unwrap());
+    }
+    #[test]
+    fn primary_first_use_slh_proposer_source_nine_freezes_both_roles_and_refuses_rebinding() {
+        let (db, source) = fixture_transcript_roles(true, true, false, false, false, true);
+        assert_eq!(source.input.version, 9);
+        assert!(
+            source.has_slh_proposer()
+                && source.has_unbound_senders()
+                && source.needs_slh_encoding()
+        );
+        let chain = ChainStore::new(db.clone());
+        chain
+            .put_pubkey(&source.block().transactions[0].from, &[7; 1952])
+            .unwrap();
+        chain
+            .put_pubkey(&source.block().header.proposer, &[7; 64])
+            .unwrap();
+        let before = db.scan_all().unwrap();
+        let frozen = ChainStore::new(Arc::new(NoTrieReads(db.clone())));
+        assert_eq!(
+            CanonicalProductionSource::restore(&frozen, source.identity())
+                .unwrap()
+                .identity(),
+            source.identity()
+        );
+        for case in [
+            "bound-profile",
+            "small-profile",
+            "missing-proposer-key",
+            "wrong-proposer-key",
+            "bound-account",
+            "reference-without-parent-key",
+            "changed-header",
+        ] {
+            let mut input: CapturedInputs = serde_json::from_slice(source.identity()).unwrap();
+            match case {
+                "bound-profile" => input.version = 8,
+                "small-profile" => input.version = 4,
+                "missing-proposer-key" => input.proposer_key = None,
+                "wrong-proposer-key" => input.proposer_key.as_mut().unwrap()[0] ^= 1,
+                "bound-account" => {
+                    input.senders[0].account.pq_pubkey_hash = blake3_hash(&input.senders[0].key)
+                }
+                "reference-without-parent-key" => {
+                    input.block.transactions[0].pubkey_mode = shell_core::PubkeyMode::Reference
+                }
                 _ => input.block.header.timestamp += 1,
             }
             let bytes =

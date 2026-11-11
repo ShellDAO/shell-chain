@@ -15,6 +15,7 @@ use std::{
 const PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v2/";
 const HASH_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v3/";
 const SLH_PROPOSER_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v5/";
+const SLH_FIRST_USE_PROPOSER_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v6/";
 const SLH_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v4/";
 const WITNESS_COMPONENT: &[u8] = b"\0canonical-component/cbor/v2/";
 const COMPONENT: &[u8] = b"\0canonical-component/cbor/v1/";
@@ -498,7 +499,7 @@ pub fn encode_payload(
     limit: usize,
     compact: bool,
 ) -> Result<Vec<u8>, String> {
-    if proof.version == 4 {
+    if matches!(proof.version, 4 | 5) {
         if proof.proposer.is_some()
             || proof.slh_transactions.is_some()
             || proof.transactions.len() != 1
@@ -528,9 +529,14 @@ pub fn encode_payload(
                 .as_ref()
                 .ok_or("SLH proposer proof absent")?,
         )?;
+        let (format_version, prefix) = if proof.version == 5 {
+            (6, SLH_FIRST_USE_PROPOSER_PAYLOAD)
+        } else {
+            (5, SLH_PROPOSER_PAYLOAD)
+        };
         let frame = Frame {
-            format_version: 5,
-            proof_version: 4,
+            format_version,
+            proof_version: proof.version,
             transactions,
             proposer: None,
             slh_proposer: Some(proposer),
@@ -541,10 +547,10 @@ pub fn encode_payload(
             &frame,
             limit
                 .min(MAX_BYTES)
-                .checked_sub(SLH_PROPOSER_PAYLOAD.len())
+                .checked_sub(prefix.len())
                 .ok_or("compact payload byte limit")?,
         )?;
-        return Ok([SLH_PROPOSER_PAYLOAD, body.as_slice()].concat());
+        return Ok([prefix, body.as_slice()].concat());
     }
     if proof.slh_proposer.is_some() {
         return Err("legacy compact profile cannot contain SLH proposer".into());
@@ -723,7 +729,9 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
     if bytes.len() > MAX_BYTES {
         return Err("canonical payload byte limit".into());
     }
-    let (bytes, version) = if let Some(bytes) = bytes.strip_prefix(SLH_PROPOSER_PAYLOAD) {
+    let (bytes, version) = if let Some(bytes) = bytes.strip_prefix(SLH_FIRST_USE_PROPOSER_PAYLOAD) {
+        (bytes, 6)
+    } else if let Some(bytes) = bytes.strip_prefix(SLH_PROPOSER_PAYLOAD) {
         (bytes, 5)
     } else if let Some(bytes) = bytes.strip_prefix(SLH_PAYLOAD) {
         (bytes, 4)
@@ -738,9 +746,9 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
     if frame.format_version != version
         || frame.transactions.is_empty()
         || frame.transactions.len() > MAX_CANONICAL_SIGNATURE_BATCH
-        || (version != 5 && frame.slh_proposer.is_some())
-        || (if version == 5 {
-            frame.proof_version != 4
+        || (!matches!(version, 5 | 6) && frame.slh_proposer.is_some())
+        || (if matches!(version, 5 | 6) {
+            frame.proof_version != if version == 6 { 5 } else { 4 }
                 || frame.transactions.len() != 1
                 || frame.proposer.is_some()
                 || frame.slh_proposer.is_none()
@@ -768,7 +776,7 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
         if let Some(slh) = &mut slh_transactions {
             slh.push(slh::decode(&mut unpacker, bytes, &mut slh_budget)?);
         } else {
-            if version == 5 {
+            if version >= 5 {
                 slh_budget = slh_budget
                     .checked_sub(bytes.0.len())
                     .ok_or("SLH proposer sender template expansion limit")?;
@@ -777,7 +785,7 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
             let mut budget = MAX_BYTES - bytes.0.len();
             let value = unpacker.expand(
                 value,
-                if version == 5 {
+                if version >= 5 {
                     &mut slh_budget
                 } else {
                     &mut budget
@@ -967,6 +975,10 @@ mod tests {
     #[test]
     fn slh_proposer_frame_relabeling_cannot_hide_or_add_a_mandatory_role() {
         for (prefix, format, proof, small, slh, count) in [
+            (SLH_FIRST_USE_PROPOSER_PAYLOAD, 6, 5, false, false, 1),
+            (SLH_FIRST_USE_PROPOSER_PAYLOAD, 6, 4, false, true, 1),
+            (SLH_FIRST_USE_PROPOSER_PAYLOAD, 6, 5, false, true, 2),
+            (SLH_PROPOSER_PAYLOAD, 5, 5, false, true, 1),
             (SLH_PROPOSER_PAYLOAD, 5, 4, false, false, 1),
             (SLH_PROPOSER_PAYLOAD, 5, 4, true, true, 1),
             (SLH_PROPOSER_PAYLOAD, 5, 4, false, true, 2),

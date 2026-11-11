@@ -158,3 +158,24 @@ bound primary sender in Source 8 requires its original registered key. Neither
 can acquire authority from a future current cache. Independent Native later
 controls, full-role replay, no-writeback checks and generated-output peer
 admission remain necessary; warm revalidation alone proves no fresh generation.
+
+Primary sender first use with an SLH proposer has explicit source format 9,
+batch profile 5 and availability frame 6. Its historical default account has a
+zero commitment. The existing complete primary first-use signature profile
+proves BLAKE3 of the algorithm tag and all 1,952 public-key bytes as the sender
+address, alongside account authority and unchanged signed identity/body. The
+full raw-header SLH proposer graph remains mandatory. Bound Source 8 and batch
+4 retain their nonzero-commitment requirement; neither profile may be relabeled
+to substitute the other's parent authority or omit an address certificate.
+
+Frame 6 streams the same bounded proposer dictionary and shared expansion pool,
+with the explicit first-use batch version. Frame 5 remains bound-profile only;
+older frames retain their encodings and bounds. Native intake does not register
+the sender; successful Native commit does. A later current cache must not supply
+authority at the first block's sealed parent. Independent Native controls retain
+the original public primary signatures through Reference-to-Embedded intake,
+first import/registration and a genuine second state, with a new memory-only
+proposer for the new headers. Full proof import, no-writeback historical replay,
+partial/cold peer recovery and genuine wrong-statement refusal are required.
+No existing sender or proposer key is recreated after it is dropped. Fresh
+automatic first-use generation and broader combinations remain separate checks.

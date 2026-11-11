@@ -1,6 +1,6 @@
 //! Genuine SLH proposer controls and complete canonical seal acceptance.
 use super::*;
-use shell_crypto::{MlDsaSigner, SphincsSigner};
+use shell_crypto::{CryptoError, MlDsaSigner, PQSignature, SignatureType, SphincsSigner, Verifier};
 
 fn finalize(node: &Node<RocksDbStore>, signer: &dyn Signer, block: &Block) -> Result<(), Error> {
     let authority = block.header.proposer;
@@ -137,6 +137,206 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
         &json!({"independent_new_native_control":true,"primary_MLDSA_sender":true,"SLH_proposer_key_bytes":64,"SLH_seal_bytes":49856,"first_native_import_and_finality":true,"later_native_state_changed":true,"private_keys_memory_only_dropped":true}),
     )
 }
+struct PublicPrimary {
+    key: Vec<u8>,
+    calls: AtomicUsize,
+}
+impl Signer for PublicPrimary {
+    fn public_key(&self) -> &[u8] {
+        &self.key
+    }
+    fn sig_type(&self) -> SignatureType {
+        SignatureType::MlDsa65
+    }
+    fn sign(&self, _: &[u8]) -> Result<PQSignature, CryptoError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(CryptoError::SigningFailed(
+            "public-only primary sender".into(),
+        ))
+    }
+}
+pub(crate) fn prepare_first_use(original: &Path, out: &Path) -> Result<(), Error> {
+    ensure(
+        !out.exists(),
+        "first-use proposer output exists; refusing replacement",
+    )?;
+    let old_context: fixture::Context = read(&original.join("context.json"))?;
+    let old_block: Block = read(&original.join("candidate.json"))?;
+    let reference: SignedTransaction = read(&original.join("signed-first.json"))?;
+    let next: SignedTransaction = read(&original.join("later-signed.json"))?;
+    let old = RocksDbStore::open_all(original.join("provider/db"), None)?;
+    let old_before = digest(&old.state)?;
+    let key = ChainStore::new(Arc::new(old.state.clone()))
+        .canonical_parent_view(old_context.tip, old_block.header.parent_hash)?
+        .registered_key(&reference.from)?
+        .ok_or("retained primary parent key absent")?;
+    ensure(
+        key.len() == 1952
+            && reference.signature.sig_type == SignatureType::MlDsa65
+            && next.signature.sig_type == SignatureType::MlDsa65
+            && next.from == reference.from
+            && reference.tx.nonce == 0
+            && next.tx.nonce == 1
+            && Address::from_public_key(&key, SignatureType::MlDsa65.as_u8()) == reference.from
+            && MultiVerifier.verify(
+                &key,
+                reference.sender_signing_hash().as_bytes(),
+                &reference.signature,
+            )?
+            && MultiVerifier.verify(
+                &key,
+                next.sender_signing_hash().as_bytes(),
+                &next.signature,
+            )?,
+        "retained genuine primary first/later signatures differ",
+    )?;
+    let sender = PublicPrimary {
+        key,
+        calls: AtomicUsize::new(0),
+    };
+    let proposer = SphincsSigner::generate();
+    let authority = Address::from_public_key(proposer.public_key(), proposer.sig_type().as_u8());
+    std::fs::create_dir(out)?;
+    let native = dilithium::genesis(&out.join("native/db"), &sender, &proposer, true)?;
+    let receiver = dilithium::genesis(&out.join("receiver/db"), &sender, &proposer, true)?;
+    let mut node = fixture::node(
+        Arc::new(native.state.clone()),
+        authority,
+        proposer.public_key(),
+    )?;
+    node.config.proposer_address = Some(authority);
+    node.config.node_role = shell_node::NodeRole::ValidatorProver;
+    ensure(
+        node.chain_store.get_pubkey(&reference.from)?.is_none()
+            && node
+                .world_state
+                .read()
+                .get_account(&reference.from)?
+                .is_some_and(|a| a.pq_pubkey_hash == ShellHash::ZERO),
+        "first-use parent was bound or registered",
+    )?;
+    let mut first = reference.clone();
+    first.pubkey_mode = shell_core::PubkeyMode::Embedded(sender.key.clone());
+    ensure(
+        first.tx == reference.tx
+            && first.signature == reference.signature
+            && first.sender_signing_hash() == reference.sender_signing_hash()
+            && first.uncached_hash() == reference.uncached_hash(),
+        "first-use changed signed primary identity",
+    )?;
+    let mut refused = Vec::new();
+    for case in [
+        "reference-without-key",
+        "wrong-derived-address",
+        "changed-message",
+        "wrong-embedded-key",
+    ] {
+        let mut bad = first.clone();
+        match case {
+            "reference-without-key" => bad.pubkey_mode = shell_core::PubkeyMode::Reference,
+            "wrong-derived-address" => bad.from = Address::from([0x12; 32]),
+            "changed-message" => bad.tx.value = U256::from(2),
+            _ => {
+                let mut key = sender.key.clone();
+                key[0] ^= 1;
+                bad.pubkey_mode = shell_core::PubkeyMode::Embedded(key);
+            }
+        }
+        let before = digest(node.store.as_ref())?;
+        let error = node
+            .handle_incoming_tx(bad, &MultiVerifier)
+            .err()
+            .ok_or("invalid primary first-use accepted")?
+            .to_string();
+        ensure(
+            before == digest(node.store.as_ref())?
+                && node.chain_store.get_pubkey(&first.from)?.is_none(),
+            "refusal wrote Native state or registration",
+        )?;
+        refused.push(
+            json!({"case":case,"error":error,"native_unchanged":true,"key_registered":false}),
+        );
+    }
+    write(&out.join("native-refusals.json"), &refused)?;
+    node.handle_incoming_tx(first.clone(), &MultiVerifier)?;
+    ensure(
+        node.chain_store.get_pubkey(&first.from)?.is_none(),
+        "mempool registered first-use key",
+    )?;
+    let block = node.produce_block(&proposer, 100)?;
+    ensure(
+        block.transactions == vec![first.clone()]
+            && node.chain_store.get_pubkey(&first.from)?.as_deref() == Some(sender.public_key()),
+        "first-use commit or key registration failed",
+    )?;
+    let peer = fixture::node(
+        Arc::new(receiver.state.clone()),
+        authority,
+        proposer.public_key(),
+    )?;
+    peer.import_block(block.clone(), &MultiVerifier)?;
+    finalize(&node, &proposer, &block)?;
+    finalize(&peer, &proposer, &block)?;
+    let mut control = dilithium::control(&node, &block)?;
+    ensure(
+        dilithium::control(&peer, &block)? == control,
+        "independent first-use Native controls differ",
+    )?;
+    control["first_use_parent_unregistered"] = json!(true);
+    std::fs::create_dir(out.join("provider"))?;
+    native.create_checkpoint(out.join("provider/db"))?;
+    write(
+        &out.join("context.json"),
+        &fixture::Context {
+            version: 1,
+            authority,
+            authority_key: proposer.public_key().to_vec(),
+            genesis_root: node
+                .chain_store
+                .get_header_by_hash(&block.header.parent_hash)?
+                .ok_or("genesis absent")?
+                .state_root,
+            block: block.hash(),
+            tip: block.hash(),
+        },
+    )?;
+    write(&out.join("candidate.json"), &block)?;
+    write(&out.join("signed-first.json"), &first)?;
+    write(&out.join("original-signed-first.json"), &reference)?;
+    write(&out.join("control.json"), &control)?;
+    node.handle_incoming_tx(next.clone(), &MultiVerifier)?;
+    let later = node.produce_block(&proposer, 100)?;
+    ensure(
+        later.number() == 2
+            && later.transactions == vec![next.clone()]
+            && later.header.state_root != block.header.state_root,
+        "genuine later primary state did not change",
+    )?;
+    peer.import_block(later.clone(), &MultiVerifier)?;
+    finalize(&node, &proposer, &later)?;
+    finalize(&peer, &proposer, &later)?;
+    ensure(
+        dilithium::control(&node, &later)? == dilithium::control(&peer, &later)?,
+        "later Native controls differ",
+    )?;
+    std::fs::create_dir(out.join("native-later"))?;
+    native.create_checkpoint(out.join("native-later/db"))?;
+    write(&out.join("later.json"), &later)?;
+    write(&out.join("later-signed.json"), &next)?;
+    write(
+        &out.join("later-control.json"),
+        &dilithium::control(&node, &later)?,
+    )?;
+    ensure(
+        sender.calls.load(Ordering::SeqCst) == 0 && old_before == digest(&old.state)?,
+        "sender signing or original Native mutation",
+    )?;
+    drop(proposer);
+    write(
+        &out.join("prepared.json"),
+        &json!({"funded_zero_commitment_primary_sender":true,"same_retained_first_and_later_signatures":true,"first_reference_to_embedded_identity_unchanged":true,"native_first_use_and_registration":true,"native_later_state_changed":true,"new_sender_signing":false,"new_proposer_keys_memory_only_dropped":true,"original_native_unchanged":true}),
+    )
+}
 pub(crate) fn capture(out: &Path) -> Result<(), Error> {
     let c: fixture::Context = read(&out.join("context.json"))?;
     let db = RocksDbStore::open_all(out.join("provider/db"), None)?;
@@ -151,7 +351,7 @@ pub(crate) fn capture(out: &Path) -> Result<(), Error> {
         before == digest(&db.state)?,
         "proposer capture wrote Native state",
     )?;
-    if value["version"] != 8
+    if !matches!(value["version"].as_u64(), Some(8 | 9))
         || value["proposer_key"]
             .as_array()
             .is_none_or(|v| v.len() != 64)
@@ -244,7 +444,7 @@ pub(crate) fn prove(out: &Path, pause: bool) -> Result<(), Error> {
     )?;
     write(
         &out.join("proof-complete.json"),
-        &json!({"source_version":8,"batch_version":4,"frame_version":5,"proposer_full17_layers":true,"source_native_unchanged":true,"new_signing":false,"proof_bytes":payload.len()}),
+        &json!({"source_version":serde_json::from_slice::<Value>(source.identity())?["version"],"batch_version":proof.version,"frame_version":if proof.version==5{6}else{5},"proposer_full17_layers":true,"source_native_unchanged":true,"new_signing":false,"proof_bytes":payload.len()}),
     )
 }
 pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
@@ -288,17 +488,23 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
         )?;
         let before = digest(fresh.as_ref())?;
         let mut results = Vec::new();
-        for case in [
+        let mut cases = vec![
             "missing-proposer",
             "wrong-profile",
             "missing-layer",
             "changed-signature",
             "foreign-header-certificate",
-        ] {
+        ];
+        if source.has_unbound_senders() {
+            cases.extend(["bound-account-profile", "missing-address-certificate"]);
+        }
+        for case in cases {
             let mut bad = proof.clone();
             match case {
                 "missing-proposer" => bad.slh_proposer = None,
                 "wrong-profile" => bad.version = 2,
+                "bound-account-profile" => bad.version = 4,
+                "missing-address-certificate" => bad.transactions[0].signature.tagged_key = None,
                 "missing-layer" => {
                     bad.slh_proposer.as_mut().ok_or("SLH absent")?.layers.pop();
                 }
@@ -383,9 +589,22 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
             && ordinary_before == digest(ordinary.as_ref())?,
         "SLH proposer historical replay differs or writes back",
     )?;
+    let parent_sender_absent = node
+        .chain_store
+        .canonical_parent_view(later.hash(), block.header.parent_hash)?
+        .registered_key(&block.transactions[0].from)?
+        .is_none();
+    ensure(
+        parent_sender_absent == source.has_unbound_senders()
+            && node
+                .chain_store
+                .get_pubkey(&block.transactions[0].from)?
+                .is_some(),
+        "current registration replaced sealed parent authority",
+    )?;
     write(
         &out.join("verified.json"),
-        &json!({"full_SLH_proposer_AIR":true,"actual_proof_import":true,"changed_current_height":2,"read_only_historical_replay":replay,"ordinary_Native_history_matches":true,"both_Native_databases_unchanged":true,"new_signing":false}),
+        &json!({"full_SLH_proposer_AIR":true,"actual_proof_import":true,"changed_current_height":2,"sealed_parent_sender_key_absent":parent_sender_absent,"current_sender_key_present":true,"read_only_historical_replay":replay,"ordinary_Native_history_matches":true,"both_Native_databases_unchanged":true,"new_signing":false}),
     )
 }
 
