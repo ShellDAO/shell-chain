@@ -197,7 +197,7 @@ fn prepare(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resu
     let chain = ChainStore::new(Arc::new(original.state.clone()));
     let source = CanonicalProductionSource::capture(&chain, c.tip, c.block)?;
     ensure(
-        source.has_slh_senders() && source.block() == &block,
+        source.needs_slh_encoding() && source.block() == &block,
         "original SLH source mismatch",
     )?;
     let donor = if fresh {
@@ -571,7 +571,9 @@ fn verify(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resul
     let node = fixture::node(db.clone(), c.authority, &c.authority_key)?;
     let replay = node.replay_canonical_transactions_with_proof(c.block, c.block, &proof)?;
     ensure(
-        replay.state_root == block.header.state_root
+        replay.proved_sender_signatures == 1
+            && replay.proved_proposer_signature
+            && replay.state_root == block.header.state_root
             && serde_json::to_value(&replay.receipts)? == control["receipts"]
             && node.chain_store.get_receipts(&c.block)?.as_ref() == Some(&replay.receipts),
         "cold background proof replay differs from original native execution",
@@ -590,13 +592,15 @@ fn verify(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resul
             && before == digest(&original.state)?,
         "cold replay altered canonical state or accounts differ",
     )?;
-    let first_use_history = if source.has_unbound_senders() && native.join("later.json").is_file() {
+    let changed_history = if (source.has_unbound_senders() || source.has_slh_proposer())
+        && native.join("later.json").is_file()
+    {
         let later: shell_core::Block = json_read(&native.join("later.json"))?;
         ensure(
             later.header.parent_hash == c.block
                 && later.number() == 2
                 && later.header.state_root != block.header.state_root,
-            "first-use later control is not a changed child",
+            "later control is not a changed child",
         )?;
         std::fs::create_dir_all(out.join("history"))?;
         if !out.join("history/db/CURRENT").is_file() {
@@ -618,16 +622,19 @@ fn verify(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resul
                     .chain_store
                     .get_pubkey(&block.transactions[0].from)?
                     .is_some(),
-            "first-use history did not advance with registered key",
+            "history did not advance with registered key",
         )?;
+        let original_parent = ChainStore::new(Arc::new(original.state.clone()))
+            .canonical_parent_view(c.tip, block.header.parent_hash)?;
+        let parent_sender_key = original_parent.registered_key(&block.transactions[0].from)?;
+        let parent_proposer_key = original_parent.registered_key(&c.authority)?;
         let sealed = history_node
             .chain_store
             .canonical_parent_view(later.hash(), block.header.parent_hash)?;
         ensure(
-            sealed
-                .registered_key(&block.transactions[0].from)?
-                .is_none(),
-            "current key supplied historical first-use authority",
+            sealed.registered_key(&block.transactions[0].from)? == parent_sender_key
+                && sealed.registered_key(&c.authority)? == parent_proposer_key,
+            "current key supplied different historical authority",
         )?;
         let history_before = digest(history.as_ref())?;
         let replay =
@@ -646,24 +653,28 @@ fn verify(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resul
             &proof,
         )?;
         ensure(
-            replay.state_root == block.header.state_root
+            replay.proved_sender_signatures == 1
+                && replay.proved_proposer_signature
+                && ordinary_replay.proved_sender_signatures == 1
+                && ordinary_replay.proved_proposer_signature
+                && replay.state_root == block.header.state_root
                 && ordinary_replay.state_root == block.header.state_root
                 && serde_json::to_value(&replay.receipts)? == control["receipts"]
                 && serde_json::to_value(&ordinary_replay.receipts)? == control["receipts"]
                 && history_before == digest(history.as_ref())?
                 && ordinary_before == digest(ordinary.as_ref())?
                 && native_before == native_digest(db.as_ref())?,
-            "generated first-use proof historical replay differs or writes current state",
+            "generated proof historical replay differs or writes current state",
         )?;
         Some(
-            json!({"current_height":2,"current_state_changed":true,"current_key_present":true,"sealed_parent_key_absent":true,"generated_proof_replay_matches_independent_Native":true,"both_databases_unchanged":true,"original_bound_successor2_not_replaced":true}),
+            json!({"current_height":2,"current_state_changed":true,"current_key_present":true,"sealed_parent_key_absent":parent_sender_key.is_none(),"sealed_parent_keys_match_original":true,"proved_sender_signatures":replay.proved_sender_signatures,"proved_proposer_signature":replay.proved_proposer_signature,"generated_proof_replay_matches_independent_Native":true,"both_databases_unchanged":true}),
         )
     } else {
         None
     };
     println!(
         "{}",
-        json!({"actual_Node_run_cold_proof_verified":true,"proof_bytes":bytes.len(),"byte_identical_original_graph":prior.map(|_|true),"receipts_state_accounts_match_original":true,"read_only":true,"new_signing":false,"fresh_generation":fresh,"peer_transport":false,"first_use_history":first_use_history,"original_successor2_signed":false})
+        json!({"actual_Node_run_cold_proof_verified":true,"proof_bytes":bytes.len(),"byte_identical_original_graph":prior.map(|_|true),"receipts_state_accounts_match_original":true,"read_only":true,"new_signing":false,"fresh_generation":fresh,"peer_transport":false,"first_use_history":if source.has_unbound_senders(){changed_history.as_ref()}else{None},"slh_proposer_history":if source.has_slh_proposer(){changed_history.as_ref()}else{None},"original_successor2_signed":false})
     );
     Ok(())
 }

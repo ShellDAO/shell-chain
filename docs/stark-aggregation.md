@@ -1998,5 +1998,54 @@ with a correct outer hash and genuine certificate in the wrong statement slot
 must fail without Native fallback. Cold replay checks the received graph with
 no writeback. This bounded profile does not establish two simultaneous SLH
 roles, other sender/account combinations, quorum AIR, power-loss recovery,
-fresh automatic-worker generation, public release acceptance or network
-activation.
+public release acceptance or network activation.
+
+#### Fresh automatic SLH proposer generation
+
+The same bounded proposer profile can start through ordinary Native import and
+the actual automatic worker. Prepare the independent Native controls once with
+`tests/e2e/slh-proposer.sh prepare slh-proposer-output`, or keep the existing
+output from the preceding entry. These commands need no completed standalone
+proof, published cache, checkpoint donor or private key:
+
+```bash
+tests/e2e/slh-canonical.sh automatic-fresh-prepare slh-proposer-output slh-proposer-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-pause slh-proposer-output slh-proposer-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-resume slh-proposer-output slh-proposer-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-verify slh-proposer-output slh-proposer-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-refuse slh-proposer-output slh-proposer-automatic
+```
+
+Use a new automatic output and retain failed outputs. Both the bound sender and
+proposer require their sealed parent registrations. Ordinary Native import must
+capture Source 8 with zero mathematical components and no availability cache;
+production remains disabled unless explicitly enabled. The public-only worker
+must generate nonzero new progress, persist a graceful pause, cold-revalidate
+that progress, and finish the full sender/header/SLH signature graph. A complete
+warm checkpoint cannot satisfy this fresh-generation check. Limits and Native
+activation, execution and quorum rules are unchanged.
+
+Authenticated chunk retrieval must reproduce the ready frame without claiming
+execution authority. Cold verification checks the generated graph and Native
+receipts/accounts, then advances a separate history checkpoint to the retained
+genuine second block. Replay against that checkpoint and the ordinary Native
+later control must prove both signature roles, match first-block receipts and
+root, resolve the original sealed parent keys and leave both current databases
+unchanged. A separate correct-hash damaged checkpoint must fail without Native
+changes, retrying or using a prior ready result.
+
+Use the generated frame for the existing actual peer regression:
+
+```bash
+tests/e2e/slh-peer-proof.sh prepare slh-proposer-output slh-proposer-automatic slh-proposer-automatic-peer
+tests/e2e/slh-peer-proof.sh pause slh-proposer-output slh-proposer-automatic slh-proposer-automatic-peer
+tests/e2e/slh-peer-proof.sh resume slh-proposer-output slh-proposer-automatic slh-proposer-automatic-peer
+tests/e2e/slh-peer-proof.sh verify slh-proposer-output slh-proposer-automatic slh-proposer-automatic-peer
+tests/e2e/slh-peer-proof.sh refuse slh-proposer-output slh-proposer-automatic slh-proposer-automatic-peer
+```
+
+This checks ordinary discovery, three-chunk pause/cold resume, complete
+proof-backed Native import and attached-certificate finality, cold replay and a
+genuine hash certificate placed in the wrong header slot. These are local
+source-build checks; public artifacts, network activation, quorum AIR and other
+role/account combinations require separate acceptance.

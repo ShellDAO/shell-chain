@@ -143,5 +143,18 @@ generation, imports with full proofs, and checks historical replay and refusal
 without state writeback. The peer regression reuses that ready frame and checks
 three-chunk pause/cold resume, proof-backed import, separately verified attached
 certificate finality, cold replay and genuine wrong-statement refusal. Both SLH
-roles together, broader account profiles, fresh automatic-worker generation,
-quorum AIR, public artifacts and activation require separate acceptance.
+roles together, broader account profiles, quorum AIR, public artifacts and
+activation require separate acceptance.
+
+The automatic entry selects the existing bounded witness encoding for either
+supported large-signature role. A valid Source 8 proposer must not be excluded
+merely because its sender uses ML-DSA rather than SLH. Ordinary import captures
+an empty job; fresh mode opens no donor, and the actual public-only worker
+generates, checkpoints and cold-resumes the full graph before publishing
+availability. Cold changed-state replay compares sealed sender and proposer
+registrations with the original Native parent for both supported history
+profiles. First-use history still requires an absent parent sender key; the
+bound primary sender in Source 8 requires its original registered key. Neither
+can acquire authority from a future current cache. Independent Native later
+controls, full-role replay, no-writeback checks and generated-output peer
+admission remain necessary; warm revalidation alone proves no fresh generation.

@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Enable the automatic proof regression for the registered SLH proposer/one bound primary sender profile. Capture an empty Source 8 job through ordinary Native import, generate through the actual background worker, and verify changed-state historical replay against sealed sender/proposer registrations. Preserve existing SLH sender profiles and separate fresh generation from warm checkpoint reuse.
+
 - Add complete raw-header SLH proposer seal proofs for one bound primary ML-DSA sender. Source 8, batch 4 and availability frame 5 bind the historical registered key, full seventeen-layer signature and exact header; retain existing limits and formats. Add durable generation/recovery, Native import, changed-state historical replay, peer transfer/finality and wrong-statement refusal entry points.
 
 - Restore funded SLH first-use parents without preloading their future key in the automatic proof regression. Capture source 7 through ordinary Native import, generate from an empty job without a proof donor, and verify the generated graph against changed-state historical controls and real peer admission.
