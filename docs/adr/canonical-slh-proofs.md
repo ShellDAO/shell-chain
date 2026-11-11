@@ -187,3 +187,24 @@ graph after a durable pause and cold continuation, with no proof donor or new
 signatures. Authenticated RPC retrieval, sealed-parent historical replay after
 state 2, correct-hash damaged-checkpoint refusal and actual peer import remain
 part of this entry's acceptance. Broader combinations require separate checks.
+
+Source format 10, batch profile 6 and streamed frame 7 cover one bound
+published-SDK Native tag-zero FIPS sender with a registered SLH proposer. The
+captured sender must select SDK transcript marker 1, use `Dilithium3` as its
+Native tag and have a nonzero default-account parent commitment. Its existing
+account/signature profile 5 requires SDK transaction source 3, complete FIPS
+signature/challenge profile 1 and the 48-byte challenge seed. Raw PQClean
+transcripts and primary-tag transactions cannot be relabeled into this profile.
+The proposer retains the complete raw-header SHA2-256f graph and sealed-parent
+64-byte key; no Native verification fallback supplies a missing AIR role.
+
+The Native preparation consumes an existing published-SDK control's first and
+later signed transactions, without creating another sender key or signature.
+Only the independent SLH proposer keys are created in memory for the new
+headers and quorum controls, then dropped. Complete proof import, changed-state
+no-writeback history, durable recovery, real peer import/finality and genuine
+wrong-header-certificate refusal are required. Frame 7 uses the existing bounded
+dictionary and shared expansion pool. Sources 1–9, frames 1–6, default-off
+production, Native compatibility and all quotas remain unchanged. SDK first-use
+accounts with SLH proposers, raw Native tag-zero senders with SLH proposers and
+fresh automatic Source 10 generation require separate acceptance.

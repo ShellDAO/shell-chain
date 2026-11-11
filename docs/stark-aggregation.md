@@ -2165,3 +2165,66 @@ proposers and source 7 first-use senders retain their existing profiles and
 encodings; the worker still defaults off. Other role/account combinations,
 quorum AIR, power-loss recovery, public release and network activation remain
 separate acceptance work.
+
+#### Bound published SDK sender with an SLH proposer
+
+Use the existing `sdk-output` from the published SDK bound-sender entry above.
+If no such control exists, create it once with
+`tests/e2e/dilithium-full-proof.sh sdk sdk-output`, which installs the pinned
+public `shell-sdk@0.14.0-rc.3` consumer. Keep that control and its signed first
+and later transactions; do not rerun preparation to replace dropped keys.
+
+```sh
+tests/e2e/slh-proposer-sdk.sh prepare sdk-output sdk-slh-output
+tests/e2e/slh-proposer-sdk.sh capture sdk-slh-output
+tests/e2e/slh-proposer-sdk.sh pause sdk-slh-output
+tests/e2e/slh-proposer-sdk.sh resume sdk-slh-output
+tests/e2e/slh-proposer-sdk.sh verify sdk-slh-output
+tests/e2e/slh-proposer-sdk.sh refuse sdk-slh-output
+tests/e2e/slh-proposer-sdk.sh publish sdk-slh-output
+```
+
+Preparation retains the original SDK transaction and signature bytes and checks
+the public package version/key plus the actual Native SDK transcript. The sender
+already has its bound default-account parent registration. A distinct SLH
+proposer signs the new first and later Native headers and quorum controls with
+memory-only keys, then drops them. Both independent Native nodes must agree on
+receipts, accounts and the genuinely changed second state. No sender signing or
+replacement is needed.
+
+Capture reports source 10, batch 6 and frame 7. The Native sender tag remains
+zero: account/signature profile 5 and SDK transaction source 3 require the
+complete FIPS signature/challenge profile 1 with a 48-byte challenge seed.
+This preserves the SDK domain rather than accepting a raw PQClean or primary-tag
+certificate in its place. The proposer proves its full raw header and all
+seventeen SHA2-256f signature layers against the sealed parent key. Earlier
+primary sender source 8/9 profiles retain their distinct account requirements.
+
+`pause` and `resume` preserve durable progress within the existing 256 MiB
+checkpoint/payload, 2,048-certificate and shared 1 GiB expansion limits. `verify`
+imports the first complete graph through Native execution, advances to the
+retained genuine second block and checks historical replay on both independent
+controls without writing current state. `refuse` covers missing/changed proposer
+roles and layers, SDK/raw/primary account and transaction substitutions, raw
+challenge relabeling and a genuine certificate in the wrong header slot.
+
+For the ordinary CLI, use `sdk-slh-output` in the complete-job command above;
+it must reverify the retained components and report zero newly proved components.
+`publish` provides availability only. Check actual peer transport and Native
+admission with the published frame:
+
+```sh
+tests/e2e/slh-peer-proof.sh prepare sdk-slh-output sdk-slh-output/published sdk-slh-peer
+tests/e2e/slh-peer-proof.sh pause sdk-slh-output sdk-slh-output/published sdk-slh-peer
+tests/e2e/slh-peer-proof.sh resume sdk-slh-output sdk-slh-output/published sdk-slh-peer
+tests/e2e/slh-peer-proof.sh verify sdk-slh-output sdk-slh-output/published sdk-slh-peer
+tests/e2e/slh-peer-proof.sh refuse sdk-slh-output sdk-slh-output/published sdk-slh-peer
+```
+
+Partial or rejected transfer must preserve receiver genesis. Complete verified
+import must match the independent Native receipts/accounts; finality separately
+requires the genuine attached quorum certificate. Cold replay and a genuine
+wrong-header certificate remain required checks. Fresh automatic Source 10,
+SDK first use or raw Native tag-zero senders with an SLH proposer, two SLH roles,
+other accounts, quorum AIR, power-loss recovery, public artifacts and network
+activation remain separate acceptance work.

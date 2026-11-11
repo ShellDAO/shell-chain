@@ -31,12 +31,13 @@ fn source(native: &Path) -> Result<(fixture::Context, Block, Value), Error> {
             && block.number() == 1
             && block.transactions == vec![original]
             && (block.transactions[0].signature.sig_type == SignatureType::SphincsSha2256f
-                || (block.transactions[0].signature.sig_type == SignatureType::MlDsa65
-                    && block.proposer_seal.as_ref().is_some_and(|seal| {
-                        seal.sig_type == SignatureType::SphincsSha2256f
-                            && c.authority_key.len() == 64
-                    }))),
-        "retained first SLH sender or primary-sender/SLH-proposer child required",
+                || (matches!(
+                    block.transactions[0].signature.sig_type,
+                    SignatureType::MlDsa65 | SignatureType::Dilithium3
+                ) && block.proposer_seal.as_ref().is_some_and(|seal| {
+                    seal.sig_type == SignatureType::SphincsSha2256f && c.authority_key.len() == 64
+                }))),
+        "retained first SLH sender or supported-sender/SLH-proposer child required",
     )?;
     Ok((c, block, read(&native.join("control.json"))?))
 }
