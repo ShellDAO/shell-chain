@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add a public raw Reference/SLH control-reuse entry: replay the existing three genuine headers and quorums with public-only actors, preserve finalized parent 1 and target 2 checkpoints, and prove Source 13/batch 9/frame 10 without new signing or a completed donor. Cover cold recovery, CLI, target-2 finality, third-state history, refusals and real peer admission.
+
 - Add fresh Source 13 background-proof coverage for the retained funded raw first-use sender and SLH proposer. Generate from an empty job through durable pause and cold worker recovery, verify authenticated frame 10 availability and historical replay after both ordinary successors, and exercise checkpoint/status refusals plus generated-frame peer admission without new keys, signing or a completed donor.
 
 - Add funded raw Native tag-zero first use with a registered SLH proposer: Source 13, batch 9 and frame 10 bind the full tagged sender address, zero-commitment parent, raw signature domain and complete seventeen-layer proposer graph. Retain three genuine sender transactions and freeze every independent Native header/quorum control before dropping the proposer; cover durable recovery, CLI, registration/finality, historical replay after block 3, peer admission and domain/address/role refusals.

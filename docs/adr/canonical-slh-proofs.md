@@ -376,3 +376,25 @@ correct-hash damaged-component refusal, status-provenance RPC failure with
 graceful shutdown, and generated-frame real peer admission/registration/finality,
 cold replay and foreign-header refusal are separate checks. Core proof formats,
 Native policy, defaults and quotas do not change.
+
+A raw Reference target uses the same Source 13/profile 4/batch 9/frame 10
+predicate even though its sealed parent now has the sender's registered key.
+A zero account commitment still requires the complete tagged-address AIR and
+raw transcript. Reuse the existing frozen three-block control with public-only
+actors: replay its exact Embedded first block and genuine quorum from the same
+funded genesis, save finalized parent 1 before importing Reference target 2,
+and preserve target 2 with its own quorum before ordinary block 3. Match both
+isolated replays to the original Native receipts, roots, accounts and finality.
+Generate no new keys, signatures, headers or quorum certificates, and open no
+completed mathematical donor. Refuse an existing destination.
+
+The full Reference graph must pass durable pause/cold recovery, same-target CLI
+zero-new validation, proof-backed target-2 import/finality, and read-only
+historical replay after block 3 on independent controls. Only first-block batch
+9 verification consumes two successors; a Reference target consumes its ordinary
+third-block child. Native intake, domain/address/profile/layer and foreign-header
+refusals preserve the parent. Published availability must also pass actual
+peer cold continuation, attached-certificate finality 2 and cold replay.
+Fresh Reference background generation, other roles, public artifacts and
+activation remain separate checks; core formats, policy, defaults and quotas
+are unchanged.

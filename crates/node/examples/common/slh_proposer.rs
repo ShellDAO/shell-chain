@@ -180,6 +180,197 @@ pub(crate) fn prepare_raw_bound(original: &Path, out: &Path) -> Result<(), Error
 pub(crate) fn prepare_raw_first_use(original: &Path, out: &Path) -> Result<(), Error> {
     prepare_retained(original, out, RetainedKind::Raw, true, 1)
 }
+pub(crate) fn reuse_raw_reference(original: &Path, out: &Path) -> Result<(), Error> {
+    ensure(
+        !out.exists(),
+        "Reference output exists; refusing replacement",
+    )?;
+    let c: fixture::Context = read(&original.join("context.json"))?;
+    let prepared: Value = read(&original.join("prepared.json"))?;
+    let first: Block = read(&original.join("candidate.json"))?;
+    let target: Block = read(&original.join("later.json"))?;
+    let later: Block = read(&original.join("advance.json"))?;
+    ensure(
+        prepared["funded_zero_commitment_raw_sender"] == true
+            && prepared["all_three_genuine_headers_and_quorum_controls_frozen"] == true
+            && c.block == first.hash()
+            && c.tip == first.hash()
+            && first.number() == 1
+            && target.number() == 2
+            && later.number() == 3
+            && target.header.parent_hash == first.hash()
+            && later.header.parent_hash == target.hash()
+            && target.header.state_root != first.header.state_root
+            && later.header.state_root != target.header.state_root
+            && first.transactions.len() == 1
+            && target.transactions.len() == 1
+            && later.transactions.len() == 1,
+        "retained funded raw first/Reference/third controls required",
+    )?;
+    let key = first.transactions[0]
+        .pubkey_mode
+        .pubkey_bytes()
+        .ok_or("retained raw Embedded public key absent")?;
+    let sender = PublicRetainedSender {
+        key: key.to_vec(),
+        kind: SignatureType::Dilithium3,
+        calls: AtomicUsize::new(0),
+    };
+    let proposer = PublicRetainedSender {
+        key: c.authority_key.clone(),
+        kind: SignatureType::SphincsSha2256f,
+        calls: AtomicUsize::new(0),
+    };
+    ensure(
+        key.len() == 1952
+            && c.authority_key.len() == 64
+            && Address::from_public_key(&c.authority_key, proposer.kind.as_u8()) == c.authority
+            && [&first, &target, &later]
+                .into_iter()
+                .enumerate()
+                .all(|(nonce, block)| {
+                    let signed = &block.transactions[0];
+                    signed.from == Address::from_public_key(key, sender.kind.as_u8())
+                        && signed.tx.nonce == nonce as u64
+                        && signed.signature.sig_type == sender.kind
+                        && signed.pubkey_mode.is_embedded() == (nonce == 0)
+                        && block.header.proposer == c.authority
+                        && DilithiumVerifier.verify_legacy_transcript(
+                            key,
+                            signed.sender_signing_hash().as_bytes(),
+                            &signed.signature,
+                        )
+                        && !DilithiumVerifier.verify_sdk_transcript(
+                            key,
+                            signed.sender_signing_hash().as_bytes(),
+                            &signed.signature,
+                        )
+                }),
+        "retained raw identities, signature domain or public proposer differ",
+    )?;
+    let source = RocksDbStore::open_all(original.join("native-third/db"), None)?;
+    let before = digest(&source.state)?;
+    let chain = ChainStore::new(Arc::new(source.state.clone()));
+    ensure(
+        chain.get_head_hash()? == Some(later.hash())
+            && chain.get_pubkey(&c.authority)?.as_deref() == Some(c.authority_key.as_slice()),
+        "retained ordinary third checkpoint differs",
+    )?;
+    for prefix in [
+        b"production/".as_slice(),
+        b"local/canonical-production/v1/".as_slice(),
+        shell_storage::CANONICAL_PROOF_CACHE_PREFIX,
+    ] {
+        ensure(
+            source.state.scan_prefix(prefix)?.is_empty(),
+            "retained ordinary control contains mathematical job or availability rows",
+        )?;
+    }
+    std::fs::create_dir(out)?;
+    let native = dilithium::genesis(&out.join("native/db"), &sender, &proposer, true)?;
+    let receiver = dilithium::genesis(&out.join("receiver/db"), &sender, &proposer, true)?;
+    let node = fixture::node(
+        Arc::new(native.state.clone()),
+        c.authority,
+        &c.authority_key,
+    )?;
+    let peer = fixture::node(
+        Arc::new(receiver.state.clone()),
+        c.authority,
+        &c.authority_key,
+    )?;
+    ensure(
+        node.chain_store.get_chain_config()? == chain.get_chain_config()?
+            && node.chain_store.get_head_hash()? == Some(first.header.parent_hash)
+            && node.world_state.write().state_root()? == c.genesis_root
+            && node
+                .chain_store
+                .get_pubkey(&first.transactions[0].from)?
+                .is_none(),
+        "replayed funded genesis differs from retained control",
+    )?;
+    for (block, name) in [
+        (&first, "control.json"),
+        (&target, "later-control.json"),
+        (&later, "advance-control.json"),
+    ] {
+        ensure(
+            chain.get_block_by_hash(&block.hash())?.as_ref() == Some(block),
+            "retained signed header differs from canonical checkpoint",
+        )?;
+        let certificate = chain
+            .get_commit_certificate(&block.hash())?
+            .ok_or("retained genuine quorum certificate absent")?;
+        let expected: Value = read(&original.join(name))?;
+        for control in [&node, &peer] {
+            control.import_block(block.clone(), &MultiVerifier)?;
+            ensure(
+                control.fast_finalize_with_certificate(block.number(), block.hash(), &certificate)
+                    && control.finality.read().last_finalized_number() == block.number()
+                    && control
+                        .chain_store
+                        .get_commit_certificate(&block.hash())?
+                        .as_ref()
+                        == Some(&certificate),
+                "retained quorum did not authenticate replayed Native finality",
+            )?;
+            let mut observed = dilithium::control(control, block)?;
+            if let Some(flag) = expected.get("first_use_parent_unregistered") {
+                observed["first_use_parent_unregistered"] = flag.clone();
+            }
+            ensure(
+                observed == expected,
+                "replayed frozen Native control differs",
+            )?;
+        }
+        let checkpoint = match block.number() {
+            1 => "native-parent/db",
+            2 => "provider/db",
+            _ => "native-later/db",
+        };
+        let path = out.join(checkpoint);
+        std::fs::create_dir_all(path.parent().ok_or("checkpoint parent absent")?)?;
+        native.create_checkpoint(path)?;
+    }
+    let mut control: Value = read(&original.join("later-control.json"))?;
+    control["first_use_parent_unregistered"] = json!(false);
+    write(
+        &out.join("parent-control.json"),
+        &read::<Value>(&original.join("control.json"))?,
+    )?;
+    write(&out.join("retained-embedded.json"), &first.transactions[0])?;
+    write(
+        &out.join("original-signed-first.json"),
+        &first.transactions[0],
+    )?;
+    write(&out.join("signed-first.json"), &target.transactions[0])?;
+    write(&out.join("later-signed.json"), &later.transactions[0])?;
+    write(&out.join("candidate.json"), &target)?;
+    write(&out.join("control.json"), &control)?;
+    write(&out.join("later.json"), &later)?;
+    write(
+        &out.join("later-control.json"),
+        &read::<Value>(&original.join("advance-control.json"))?,
+    )?;
+    write(
+        &out.join("context.json"),
+        &fixture::Context {
+            block: target.hash(),
+            tip: target.hash(),
+            ..c
+        },
+    )?;
+    ensure(
+        before == digest(&source.state)?
+            && sender.calls.load(Ordering::SeqCst) == 0
+            && proposer.calls.load(Ordering::SeqCst) == 0,
+        "retained Native input changed or public-only actor attempted signing",
+    )?;
+    write(
+        &out.join("prepared.json"),
+        &json!({"funded_zero_commitment_raw_sender":true,"reference_target":true,"target_height":2,"parent_height":1,"later_height":3,"retained_headers_and_quorums_reused":true,"all_three_genuine_sender_signatures_unchanged":true,"new_keys":false,"new_signing":false,"new_headers_or_quorums":false,"completed_math_donor_opened":false,"original_native_unchanged":true,"genuine_parent1_and_target2_quorums_persisted":true,"independent_native_replays_match_frozen_controls":true}),
+    )
+}
 pub(crate) fn prepare_first_use(original: &Path, out: &Path) -> Result<(), Error> {
     prepare_retained(original, out, RetainedKind::Primary, true, 1)
 }
@@ -968,7 +1159,7 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
     if node.chain_store.get_head_hash()? == Some(c.block) {
         node.import_block(later.clone(), &MultiVerifier)?;
     }
-    let ordinary_path = if proof.version == 9 {
+    let ordinary_path = if proof.version == 9 && block.number() == 1 {
         let advance: Block = read(&out.join("advance.json"))?;
         ensure(
             advance.number() == 3

@@ -2469,6 +2469,56 @@ foreign-header refusal. This does not establish a later Reference-target proof,
 power-loss recovery, broader account/role combinations, public release or
 activation.
 
+#### Funded raw Reference with retained SLH controls
+
+Retain the `raw-first-slh` three-block control above. To prove its genuine
+Reference transaction at height 2, reuse those exact signed headers, quorum
+certificates and sender inputs in a new output. This entry has public-only
+actors: it generates no keys, signatures, headers or quorum certificates and
+opens no completed mathematical donor. It replays the retained first block
+from the same funded genesis, saves the finalized parent at height 1 before
+importing target 2, and saves target 2 before replaying the ordinary third block.
+Both isolated Native replays must match the original receipts, accounts, roots
+and genuine finality. Existing output directories are refused.
+
+```sh
+tests/e2e/slh-proposer-raw.sh reuse-reference raw-first-slh raw-reference-slh
+tests/e2e/slh-proposer-raw.sh capture raw-reference-slh
+tests/e2e/slh-proposer-raw.sh pause raw-reference-slh
+tests/e2e/slh-proposer-raw.sh resume raw-reference-slh
+tests/e2e/slh-proposer-raw.sh verify raw-reference-slh
+tests/e2e/slh-proposer-raw.sh refuse raw-reference-slh
+tests/e2e/slh-proposer-raw.sh publish raw-reference-slh
+tests/e2e/slh-peer-proof.sh prepare raw-reference-slh raw-reference-slh/published raw-reference-slh-peer
+tests/e2e/slh-peer-proof.sh pause raw-reference-slh raw-reference-slh/published raw-reference-slh-peer
+tests/e2e/slh-peer-proof.sh resume raw-reference-slh raw-reference-slh/published raw-reference-slh-peer
+tests/e2e/slh-peer-proof.sh verify raw-reference-slh raw-reference-slh/published raw-reference-slh-peer
+tests/e2e/slh-peer-proof.sh refuse raw-reference-slh raw-reference-slh/published raw-reference-slh-peer
+```
+
+Capture still requires Source 13, account/signature profile 4, batch 9 and
+frame 10. The parent now has the original registered sender key while its
+funded default account retains the zero key commitment; neither registry
+presence nor Reference mode permits a bound, SDK or primary profile shortcut.
+The raw signature domain, full tagged address and complete seventeen-layer
+SLH proposer graph remain mandatory. Use `raw-reference-slh` in the complete-job
+CLI command above; it must revalidate the same target with zero new components.
+
+Proof-backed import starts at the authentic finalized parent 1 and must match
+Native target-2 execution and genuine certificate finality. Historical target-2
+replay after ordinary block 3 must resolve both keys from the sealed parent and
+write neither the proof receiver nor independent Native third-state control.
+Native signature/message/key refusals, proof domain/address/profile/layer
+refusals and genuine foreign-header refusal preserve the parent. Publication
+is availability only. Real peer transfer must cold-resume at the retained chunk
+with a fresh request nonce, import against parent 1, finalize target 2 using its
+attached original certificate, and cold-replay without signing or state writes.
+
+This standalone Reference target is separate from fresh background-worker
+acceptance, broader accounts/roles, power-loss recovery, public release and
+network activation. Keep the earlier first-use graph and all retained Native
+controls; never rerun preparation to replace dropped keys or completed work.
+
 #### Funded SDK first use with an SLH proposer
 
 Keep the existing `sdk-first-use-output` from the funded unbound SDK entry.
