@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add bound raw PQClean Native tag-zero senders with a registered SLH proposer: Source 12, batch 8 and frame 9 bind the existing raw transaction/challenge domains and the complete seventeen-layer proposer graph. Retain original sender signatures through durable proof recovery, CLI, Native finality, historical replay and peer admission; refuse SDK, primary and unbound relabeling without changing earlier formats or limits.
+
 - Extend the Source 11 empty-job automatic regression to SDK Reference target block 2. Reuse the genuine registered parent checkpoint, retain all existing signatures, generate through the actual cold-resumed worker, and verify history after block 3, damaged-checkpoint refusal and generated-frame peer admission/finality.
 
 - Add retained public SDK Reference proof coverage with an independent three-block SLH proposer control. Preserve original SDK signatures, restore the genuine registered parent for target block 2, verify history after block 3 without writeback, and exercise durable recovery, Native finality and peer admission with Source 11/frame 8.

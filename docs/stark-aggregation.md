@@ -2256,9 +2256,68 @@ state changes. The generated frame then follows the same real peer admission
 and independent finality checks above. No sender or proposer signing keys are
 needed, and proof production remains disabled by default.
 
-Raw Native tag-zero senders with an SLH proposer, two SLH roles,
-other accounts, quorum AIR, power-loss recovery, public artifacts and network
-activation remain separate acceptance work.
+Two SLH roles, other accounts, quorum AIR, power-loss recovery, public artifacts
+and network activation remain separate acceptance work.
+
+#### Bound raw PQClean sender with an SLH proposer
+
+Keep the `dilithium-output` from the genuine PQClean sender entry above. If it
+does not exist, create it once with
+`tests/e2e/dilithium-full-proof.sh run dilithium-output`. Use the same Python 3,
+stable Rust and RocksDB C/C++/libclang prerequisites. This source regression is
+expensive; retain its public signatures and Native checkpoints to continue it.
+Preparation refuses an existing destination and never recreates dropped keys.
+
+```sh
+tests/e2e/slh-proposer-raw.sh prepare dilithium-output raw-slh-output
+tests/e2e/slh-proposer-raw.sh capture raw-slh-output
+tests/e2e/slh-proposer-raw.sh pause raw-slh-output
+tests/e2e/slh-proposer-raw.sh resume raw-slh-output
+tests/e2e/slh-proposer-raw.sh verify raw-slh-output
+tests/e2e/slh-proposer-raw.sh refuse raw-slh-output
+tests/e2e/slh-proposer-raw.sh publish raw-slh-output
+```
+
+Preparation checks both original Native tag-zero raw transcripts and their
+bound default-account parent registration. A distinct memory-only SLH proposer
+signs first-block and successor headers and genuine quorum controls, then drops
+its keys. The sender signs nothing new. Independent Native controls must agree
+on receipts, accounts, fees and changed successor state before proof production.
+
+Capture selects Source 12, batch 8 and frame 9. The sender keeps registered
+account/signature profile 3, transaction source 2 and full raw signature/challenge
+version 2: all 48 c-tilde bytes bind the commitment, while SampleInBall uses the
+first 32 bytes. SDK FIPS framing, primary tags and unbound account profiles are
+refused. The proposer graph proves its exact raw header against the sealed
+registered key, including all seventeen SHA2-256f layers.
+
+`pause` persists one actual component; a separate `resume` process verifies that
+checkpoint and generates the remaining graph. `verify` imports the complete
+proof through Native execution and genuine finality, advances to the retained
+second block, then replays historical verification on both independent controls
+without writing current state. `refuse` rejects domain/profile substitutions,
+missing or changed proposer layers and genuine certificates for foreign headers
+without Native mutation. Assertions exit nonzero on failure. Existing payload,
+checkpoint, certificate, expansion and transport limits remain in force.
+
+Use `raw-slh-output` in the complete-job CLI command above; it must report zero
+newly proved components and preserve the accepted graph. Check real transport
+and Native admission separately from availability:
+
+```sh
+tests/e2e/slh-peer-proof.sh prepare raw-slh-output raw-slh-output/published raw-slh-peer
+tests/e2e/slh-peer-proof.sh pause raw-slh-output raw-slh-output/published raw-slh-peer
+tests/e2e/slh-peer-proof.sh resume raw-slh-output raw-slh-output/published raw-slh-peer
+tests/e2e/slh-peer-proof.sh verify raw-slh-output raw-slh-output/published raw-slh-peer
+tests/e2e/slh-peer-proof.sh refuse raw-slh-output raw-slh-output/published raw-slh-peer
+```
+
+The receiver must preserve genesis after partial or rejected transfer. Complete
+verified import must match the Native control and finalize with its genuine
+quorum certificate. Cold replay and foreign-header refusal remain independent
+checks. Raw first use, a later Reference target, fresh background generation,
+other account/role combinations, public release and activation remain separate
+acceptance work. Proof production still defaults off.
 
 #### Funded SDK first use with an SLH proposer
 

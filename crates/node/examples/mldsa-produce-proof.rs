@@ -693,6 +693,12 @@ fn corrupt_cache(out: &Path, role: &str) -> Result<(), Error> {
 }
 fn main() -> Result<(), Error> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.len() == 3 && args[0] == "prepare-slh-proposer-raw-bound" {
+        return admission_runtime::slh_proposer::prepare_raw_bound(
+            Path::new(&args[1]),
+            Path::new(&args[2]),
+        );
+    }
     if args.len() == 3 && args[0] == "prepare-slh-proposer-sdk-reference" {
         return admission_runtime::slh_proposer::prepare_sdk_reference(
             Path::new(&args[1]),

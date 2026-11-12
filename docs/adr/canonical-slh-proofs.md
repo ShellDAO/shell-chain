@@ -205,8 +205,8 @@ headers and quorum controls, then dropped. Complete proof import, changed-state
 no-writeback history, durable recovery, real peer import/finality and genuine
 wrong-header-certificate refusal are required. Frame 7 uses the existing bounded
 dictionary and shared expansion pool. Sources 1–9, frames 1–6, default-off
-production, Native compatibility and all quotas remain unchanged. Raw Native
-tag-zero senders with SLH proposers require separate acceptance.
+production, Native compatibility and all quotas remain unchanged. Bound raw
+Native tag-zero senders use the distinct Source 12 profile below.
 
 The Source 10 automatic entry consumes the same retained Native control through
 ordinary import, starting with zero mathematical components and no donor. Its
@@ -240,7 +240,7 @@ from its existing job; never replace it with another preparation. Actual
 public-only worker generation, authenticated frame 8 retrieval, sealed-parent
 SDK key absence after state 2, no-writeback replay on both controls,
 correct-hash damaged-checkpoint refusal and generated-frame real peer admission
-are independent checks from standalone proof completion. Raw Native tag-zero
+are independent checks from standalone proof completion. Raw first-use
 SLH proposer combinations remain open.
 
 
@@ -293,3 +293,29 @@ failure to surface and the Node to shut down gracefully. Neither original job
 nor Native data may change, and no new signing or mathematical generation may
 supply the refusal. This differs from a corrupt inner AIR component whose outer
 hash was repaired.
+
+Source format 12, batch profile 8 and availability frame 9 add one bound raw
+PQClean Native tag-zero sender with a registered SLH proposer. A nonzero
+default-account parent commitment and absent SDK transcript marker are mandatory.
+The existing raw account/signature profile 3 and transaction source 2 must prove
+full signature and challenge version 2, preserving the first-32-byte sampler
+domain and the complete 48-byte commitment. Neither SDK FIPS nor primary-tag
+proofs can substitute. Raw unbound senders remain outside this new profile.
+
+Freeze both historical public keys, the exact sender bytes and the genuine raw
+SLH header seal. The proposer uses the same full seventeen-layer SHA2 graph as
+earlier proposer profiles; no Native fallback fills either role. Frame 9 keeps
+the shared dictionary and all existing byte, expansion and certificate limits.
+Sources 1–11 and earlier frames retain their meanings, including historical
+sender-only source 1. A new explicit format prevents that partial source from
+being relabeled as a complete proposer proof.
+
+Preparation consumes two retained genuine raw sender transactions and creates
+only the independent memory-only proposer, freezing first/later headers and
+quorum controls before dropping its keys. Require durable pause/cold generation,
+CLI revalidation without new proofs, complete Native import and finality,
+changed-state historical replay without writeback, and actual peer transfer,
+cold replay and genuine foreign-header refusal. Raw first use, later Reference
+targets, fresh automatic generation, broader accounts/roles and public release
+or activation require separate acceptance; defaults and Native admission policy
+do not change.

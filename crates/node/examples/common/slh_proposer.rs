@@ -160,25 +160,43 @@ impl Signer for PublicRetainedSender {
         ))
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetainedKind {
+    Primary,
+    Sdk,
+    Raw,
+}
+impl RetainedKind {
+    fn signature_type(self) -> SignatureType {
+        match self {
+            Self::Primary => SignatureType::MlDsa65,
+            Self::Sdk | Self::Raw => SignatureType::Dilithium3,
+        }
+    }
+}
+pub(crate) fn prepare_raw_bound(original: &Path, out: &Path) -> Result<(), Error> {
+    prepare_retained(original, out, RetainedKind::Raw, false, 1)
+}
 pub(crate) fn prepare_first_use(original: &Path, out: &Path) -> Result<(), Error> {
-    prepare_retained(original, out, SignatureType::MlDsa65, true, 1)
+    prepare_retained(original, out, RetainedKind::Primary, true, 1)
 }
 pub(crate) fn prepare_sdk_bound(original: &Path, out: &Path) -> Result<(), Error> {
-    prepare_retained(original, out, SignatureType::Dilithium3, false, 1)
+    prepare_retained(original, out, RetainedKind::Sdk, false, 1)
 }
 pub(crate) fn prepare_sdk_first_use(original: &Path, out: &Path) -> Result<(), Error> {
-    prepare_retained(original, out, SignatureType::Dilithium3, true, 1)
+    prepare_retained(original, out, RetainedKind::Sdk, true, 1)
 }
 pub(crate) fn prepare_sdk_reference(original: &Path, out: &Path) -> Result<(), Error> {
-    prepare_retained(original, out, SignatureType::Dilithium3, true, 2)
+    prepare_retained(original, out, RetainedKind::Sdk, true, 2)
 }
 fn prepare_retained(
     original: &Path,
     out: &Path,
-    kind: SignatureType,
+    profile: RetainedKind,
     first_use: bool,
     target_number: u64,
 ) -> Result<(), Error> {
+    let kind = profile.signature_type();
     ensure(
         !out.exists(),
         "retained-sender proposer output exists; refusing replacement",
@@ -186,7 +204,7 @@ fn prepare_retained(
     let old_context: fixture::Context = read(&original.join("context.json"))?;
     let old_block: Block = read(&original.join("candidate.json"))?;
     let (reference, next, original_db): (SignedTransaction, SignedTransaction, PathBuf) =
-        if kind == SignatureType::MlDsa65 {
+        if profile == RetainedKind::Primary {
             (
                 read(&original.join("signed-first.json"))?,
                 read(&original.join("later-signed.json"))?,
@@ -197,7 +215,7 @@ fn prepare_retained(
             let later: Block = read(&original.join("successor.json"))?;
             ensure(
                 first.transactions.len() == 1 && later.transactions.len() == 1,
-                "retained SDK transaction count differs",
+                "retained Native tag-zero transaction count differs",
             )?;
             (
                 first.transactions[0].clone(),
@@ -234,7 +252,7 @@ fn prepare_retained(
             && reference.tx.nonce == 0
             && next.tx.nonce == 1
             && Address::from_public_key(&key, kind.as_u8()) == reference.from
-            && if kind == SignatureType::MlDsa65 {
+            && if profile == RetainedKind::Primary {
                 MultiVerifier.verify(
                     &key,
                     reference.sender_signing_hash().as_bytes(),
@@ -244,6 +262,30 @@ fn prepare_retained(
                     next.sender_signing_hash().as_bytes(),
                     &next.signature,
                 )?
+            } else if profile == RetainedKind::Raw {
+                ensure(
+                    !first_use
+                        && registered.is_some()
+                        && old_parent
+                            .world_state()?
+                            .get_account(&reference.from)?
+                            .is_some_and(|a| {
+                                a.validation_code_hash.is_none()
+                                    && a.pq_pubkey_hash != ShellHash::ZERO
+                            }),
+                    "raw retained bound parent differs",
+                )?;
+                [&reference, &next].into_iter().all(|signed| {
+                    DilithiumVerifier.verify_legacy_transcript(
+                        &key,
+                        signed.sender_signing_hash().as_bytes(),
+                        &signed.signature,
+                    ) && !DilithiumVerifier.verify_sdk_transcript(
+                        &key,
+                        signed.sender_signing_hash().as_bytes(),
+                        &signed.signature,
+                    )
+                })
             } else {
                 let public: Value = read(&original.join("sdk-public.json"))?;
                 ensure(
@@ -285,7 +327,7 @@ fn prepare_retained(
     )?;
     let advance = if target_number == 2 {
         ensure(
-            kind == SignatureType::Dilithium3 && first_use,
+            profile == RetainedKind::Sdk && first_use,
             "unsupported retained target",
         )?;
         let block: Block = read(&original.join("advance.json"))?;
@@ -503,7 +545,7 @@ fn prepare_retained(
     drop(proposer);
     write(
         &out.join("prepared.json"),
-        &json!({"funded_zero_commitment_primary_sender":first_use && kind==SignatureType::MlDsa65,"funded_zero_commitment_sdk_sender":first_use && kind==SignatureType::Dilithium3,"native_bound_sdk_sender":!first_use,"same_retained_first_and_later_signatures":true,"first_reference_to_embedded_identity_unchanged":first_use && kind==SignatureType::MlDsa65,"sdk_embedded_input_unchanged":first_use && kind==SignatureType::Dilithium3,"retained_signed_identity_unchanged":true,"target_height":target_number,"later_height":later.number(),"reference_target":target_number==2,"native_first_use_and_registration":first_use,"native_bound_sdk_first_and_later":!first_use,"native_later_state_changed":true,"new_sender_signing":false,"new_proposer_keys_memory_only_dropped":true,"original_native_unchanged":true}),
+        &json!({"funded_zero_commitment_primary_sender":first_use && kind==SignatureType::MlDsa65,"funded_zero_commitment_sdk_sender":first_use && kind==SignatureType::Dilithium3,"native_bound_raw_sender":profile==RetainedKind::Raw,"native_bound_sdk_sender":profile==RetainedKind::Sdk && !first_use,"same_retained_first_and_later_signatures":true,"first_reference_to_embedded_identity_unchanged":first_use && kind==SignatureType::MlDsa65,"sdk_embedded_input_unchanged":first_use && kind==SignatureType::Dilithium3,"retained_signed_identity_unchanged":true,"target_height":target_number,"later_height":later.number(),"reference_target":target_number==2,"native_first_use_and_registration":first_use,"native_bound_sdk_first_and_later":profile==RetainedKind::Sdk && !first_use,"native_later_state_changed":true,"new_sender_signing":false,"new_proposer_keys_memory_only_dropped":true,"original_native_unchanged":true}),
     )
 }
 pub(crate) fn capture(out: &Path) -> Result<(), Error> {
@@ -520,7 +562,7 @@ pub(crate) fn capture(out: &Path) -> Result<(), Error> {
         before == digest(&db.state)?,
         "proposer capture wrote Native state",
     )?;
-    if !matches!(value["version"].as_u64(), Some(8..=11))
+    if !matches!(value["version"].as_u64(), Some(8..=12))
         || value["proposer_key"]
             .as_array()
             .is_none_or(|v| v.len() != 64)
@@ -726,10 +768,42 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
         if proof.version == 7 {
             cases.push("wrong-address-tag");
         }
+        if proof.version == 8 {
+            cases.extend([
+                "raw-as-sdk-account",
+                "raw-as-primary-account",
+                "raw-as-unbound-account",
+                "raw-as-sdk-transaction",
+                "raw-as-primary-transaction",
+                "raw-as-sdk-signature",
+                "raw-as-sdk-challenge",
+                "raw-as-sdk-profile",
+            ]);
+        }
         for case in cases {
             let mut bad = proof.clone();
             match case {
                 "missing-proposer" => bad.slh_proposer = None,
+                "raw-as-sdk-account" => bad.transactions[0].signature.version = 5,
+                "raw-as-primary-account" => bad.transactions[0].signature.version = 1,
+                "raw-as-unbound-account" => bad.transactions[0].signature.version = 4,
+                "raw-as-sdk-transaction" => bad.transactions[0].signature.transaction.version = 3,
+                "raw-as-primary-transaction" => {
+                    bad.transactions[0].signature.transaction.version = 1
+                }
+                "raw-as-sdk-signature" => {
+                    bad.transactions[0].signature.transaction.signature.version = 1
+                }
+                "raw-as-sdk-challenge" => {
+                    bad.transactions[0]
+                        .signature
+                        .transaction
+                        .signature
+                        .equation
+                        .challenge
+                        .version = 1
+                }
+                "raw-as-sdk-profile" => bad.version = 6,
                 "sdk-as-raw-account" => {
                     bad.transactions[0].signature.version = if proof.version == 7 { 4 } else { 3 }
                 }
