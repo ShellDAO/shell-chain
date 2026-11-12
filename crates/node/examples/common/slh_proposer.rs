@@ -161,12 +161,20 @@ impl Signer for PublicRetainedSender {
     }
 }
 pub(crate) fn prepare_first_use(original: &Path, out: &Path) -> Result<(), Error> {
-    prepare_retained(original, out, true)
+    prepare_retained(original, out, SignatureType::MlDsa65, true)
 }
 pub(crate) fn prepare_sdk_bound(original: &Path, out: &Path) -> Result<(), Error> {
-    prepare_retained(original, out, false)
+    prepare_retained(original, out, SignatureType::Dilithium3, false)
 }
-fn prepare_retained(original: &Path, out: &Path, first_use: bool) -> Result<(), Error> {
+pub(crate) fn prepare_sdk_first_use(original: &Path, out: &Path) -> Result<(), Error> {
+    prepare_retained(original, out, SignatureType::Dilithium3, true)
+}
+fn prepare_retained(
+    original: &Path,
+    out: &Path,
+    kind: SignatureType,
+    first_use: bool,
+) -> Result<(), Error> {
     ensure(
         !out.exists(),
         "retained-sender proposer output exists; refusing replacement",
@@ -174,7 +182,7 @@ fn prepare_retained(original: &Path, out: &Path, first_use: bool) -> Result<(), 
     let old_context: fixture::Context = read(&original.join("context.json"))?;
     let old_block: Block = read(&original.join("candidate.json"))?;
     let (reference, next, original_db): (SignedTransaction, SignedTransaction, PathBuf) =
-        if first_use {
+        if kind == SignatureType::MlDsa65 {
             (
                 read(&original.join("signed-first.json"))?,
                 read(&original.join("later-signed.json"))?,
@@ -193,17 +201,27 @@ fn prepare_retained(original: &Path, out: &Path, first_use: bool) -> Result<(), 
                 original.join("network-dilithium/provider/db"),
             )
         };
-    let kind = if first_use {
-        SignatureType::MlDsa65
-    } else {
-        SignatureType::Dilithium3
-    };
     let old = RocksDbStore::open_all(original_db, None)?;
     let old_before = digest(&old.state)?;
-    let key = ChainStore::new(Arc::new(old.state.clone()))
-        .canonical_parent_view(old_context.tip, old_block.header.parent_hash)?
-        .registered_key(&reference.from)?
-        .ok_or("retained primary parent key absent")?;
+    let old_chain = ChainStore::new(Arc::new(old.state.clone()));
+    ensure(
+        old_context.block == old_block.hash()
+            && old_chain.get_block_hash_by_number(old_block.number())? == Some(old_block.hash()),
+        "retained sender control is not canonical",
+    )?;
+    let current_tip = old_chain
+        .get_head_hash()?
+        .ok_or("retained sender current tip absent")?;
+    let old_parent = old_chain.canonical_parent_view(current_tip, old_block.header.parent_hash)?;
+    let registered = old_parent.registered_key(&reference.from)?;
+    let key = registered
+        .clone()
+        .or_else(|| {
+            first_use
+                .then(|| reference.pubkey_mode.pubkey_bytes().map(<[u8]>::to_vec))
+                .flatten()
+        })
+        .ok_or("retained sender parent or first-use Embedded key absent")?;
     ensure(
         key.len() == 1952
             && reference.signature.sig_type == kind
@@ -212,7 +230,7 @@ fn prepare_retained(original: &Path, out: &Path, first_use: bool) -> Result<(), 
             && reference.tx.nonce == 0
             && next.tx.nonce == 1
             && Address::from_public_key(&key, kind.as_u8()) == reference.from
-            && if first_use {
+            && if kind == SignatureType::MlDsa65 {
                 MultiVerifier.verify(
                     &key,
                     reference.sender_signing_hash().as_bytes(),
@@ -232,6 +250,21 @@ fn prepare_retained(original: &Path, out: &Path, first_use: bool) -> Result<(), 
                         && serde_json::from_value::<Vec<u8>>(public["public_key"].clone())? == key,
                     "retained public SDK provenance differs",
                 )?;
+                if first_use {
+                    ensure(
+                        public["unbound_sender"] == true
+                            && registered.is_none()
+                            && reference.pubkey_mode.pubkey_bytes() == Some(key.as_slice())
+                            && old_parent
+                                .world_state()?
+                                .get_account(&reference.from)?
+                                .is_some_and(|a| {
+                                    a.validation_code_hash.is_none()
+                                        && a.pq_pubkey_hash == ShellHash::ZERO
+                                }),
+                        "retained SDK first-use parent or Embedded provenance differs",
+                    )?;
+                }
                 [&reference, &next].into_iter().all(|signed| {
                     !DilithiumVerifier.verify_legacy_transcript(
                         &key,
@@ -282,6 +315,10 @@ fn prepare_retained(original: &Path, out: &Path, first_use: bool) -> Result<(), 
             && first.sender_signing_hash() == reference.sender_signing_hash()
             && first.uncached_hash() == reference.uncached_hash(),
         "retained signed sender identity changed",
+    )?;
+    ensure(
+        kind != SignatureType::Dilithium3 || !first_use || first == reference,
+        "original SDK first-use Embedded input changed",
     )?;
     let mut refused = Vec::new();
     for case in [
@@ -398,7 +435,7 @@ fn prepare_retained(original: &Path, out: &Path, first_use: bool) -> Result<(), 
     drop(proposer);
     write(
         &out.join("prepared.json"),
-        &json!({"funded_zero_commitment_primary_sender":first_use,"native_bound_sdk_sender":!first_use,"same_retained_first_and_later_signatures":true,"first_reference_to_embedded_identity_unchanged":first_use,"retained_signed_identity_unchanged":true,"native_first_use_and_registration":first_use,"native_bound_sdk_first_and_later":!first_use,"native_later_state_changed":true,"new_sender_signing":false,"new_proposer_keys_memory_only_dropped":true,"original_native_unchanged":true}),
+        &json!({"funded_zero_commitment_primary_sender":first_use && kind==SignatureType::MlDsa65,"funded_zero_commitment_sdk_sender":first_use && kind==SignatureType::Dilithium3,"native_bound_sdk_sender":!first_use,"same_retained_first_and_later_signatures":true,"first_reference_to_embedded_identity_unchanged":first_use && kind==SignatureType::MlDsa65,"sdk_embedded_input_unchanged":first_use && kind==SignatureType::Dilithium3,"retained_signed_identity_unchanged":true,"native_first_use_and_registration":first_use,"native_bound_sdk_first_and_later":!first_use,"native_later_state_changed":true,"new_sender_signing":false,"new_proposer_keys_memory_only_dropped":true,"original_native_unchanged":true}),
     )
 }
 pub(crate) fn capture(out: &Path) -> Result<(), Error> {
@@ -415,7 +452,7 @@ pub(crate) fn capture(out: &Path) -> Result<(), Error> {
         before == digest(&db.state)?,
         "proposer capture wrote Native state",
     )?;
-    if !matches!(value["version"].as_u64(), Some(8..=10))
+    if !matches!(value["version"].as_u64(), Some(8..=11))
         || value["proposer_key"]
             .as_array()
             .is_none_or(|v| v.len() != 64)
@@ -508,7 +545,7 @@ pub(crate) fn prove(out: &Path, pause: bool) -> Result<(), Error> {
     )?;
     write(
         &out.join("proof-complete.json"),
-        &json!({"source_version":serde_json::from_slice::<Value>(source.identity())?["version"],"batch_version":proof.version,"frame_version":if proof.version==6{7}else if proof.version==5{6}else{5},"proposer_full17_layers":true,"source_native_unchanged":true,"new_signing":false,"proof_bytes":payload.len()}),
+        &json!({"source_version":serde_json::from_slice::<Value>(source.identity())?["version"],"batch_version":proof.version,"frame_version":proof.version+1,"proposer_full17_layers":true,"source_native_unchanged":true,"new_signing":false,"proof_bytes":payload.len()}),
     )
 }
 pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
@@ -562,7 +599,7 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
         if source.has_unbound_senders() {
             cases.extend(["bound-account-profile", "missing-address-certificate"]);
         }
-        if proof.version == 6 {
+        if matches!(proof.version, 6 | 7) {
             cases.extend([
                 "sdk-as-raw-account",
                 "sdk-as-primary-account",
@@ -571,12 +608,19 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
                 "sdk-as-raw-challenge",
             ]);
         }
+        if proof.version == 7 {
+            cases.push("wrong-address-tag");
+        }
         for case in cases {
             let mut bad = proof.clone();
             match case {
                 "missing-proposer" => bad.slh_proposer = None,
-                "sdk-as-raw-account" => bad.transactions[0].signature.version = 3,
-                "sdk-as-primary-account" => bad.transactions[0].signature.version = 1,
+                "sdk-as-raw-account" => {
+                    bad.transactions[0].signature.version = if proof.version == 7 { 4 } else { 3 }
+                }
+                "sdk-as-primary-account" => {
+                    bad.transactions[0].signature.version = if proof.version == 7 { 2 } else { 1 }
+                }
                 "sdk-as-raw-transaction" => bad.transactions[0].signature.transaction.version = 2,
                 "sdk-as-primary-transaction" => {
                     bad.transactions[0].signature.transaction.version = 1
@@ -591,8 +635,16 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
                         .version = 2
                 }
                 "wrong-profile" => bad.version = 2,
-                "bound-account-profile" => bad.version = 4,
+                "bound-account-profile" => bad.version = if proof.version == 7 { 6 } else { 4 },
                 "missing-address-certificate" => bad.transactions[0].signature.tagged_key = None,
+                "wrong-address-tag" => {
+                    bad.transactions[0]
+                        .signature
+                        .tagged_key
+                        .as_mut()
+                        .ok_or("address certificate absent")?
+                        .message[0] ^= 1
+                }
                 "missing-layer" => {
                     bad.slh_proposer.as_mut().ok_or("SLH absent")?.layers.pop();
                 }

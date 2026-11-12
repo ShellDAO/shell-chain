@@ -2256,6 +2256,58 @@ state changes. The generated frame then follows the same real peer admission
 and independent finality checks above. No sender or proposer signing keys are
 needed, and proof production remains disabled by default.
 
-SDK first use or raw Native tag-zero senders with an SLH proposer, two SLH roles,
+Raw Native tag-zero senders with an SLH proposer, two SLH roles,
 other accounts, quorum AIR, power-loss recovery, public artifacts and network
 activation remain separate acceptance work.
+
+#### Funded SDK first use with an SLH proposer
+
+Keep the existing `sdk-first-use-output` from the funded unbound SDK entry.
+If needed, create it once with
+`tests/e2e/dilithium-full-proof.sh sdk-unbound sdk-first-use-output`, using the
+same pinned public `shell-sdk@0.14.0-rc.3` prerequisites. Preserve its original
+Embedded first transaction and later Reference transaction after the SDK keys
+are dropped. Preparation supports a retained SDK node that has already advanced
+by authenticating its first block against the current canonical chain.
+
+```sh
+tests/e2e/slh-proposer-sdk.sh prepare-first-use sdk-first-use-output sdk-first-use-slh
+tests/e2e/slh-proposer-sdk.sh capture sdk-first-use-slh
+tests/e2e/slh-proposer-sdk.sh pause sdk-first-use-slh
+tests/e2e/slh-proposer-sdk.sh resume sdk-first-use-slh
+tests/e2e/slh-proposer-sdk.sh verify sdk-first-use-slh
+tests/e2e/slh-proposer-sdk.sh refuse sdk-first-use-slh
+tests/e2e/slh-proposer-sdk.sh publish sdk-first-use-slh
+tests/e2e/slh-peer-proof.sh prepare sdk-first-use-slh sdk-first-use-slh/published sdk-first-use-slh-peer
+tests/e2e/slh-peer-proof.sh pause sdk-first-use-slh sdk-first-use-slh/published sdk-first-use-slh-peer
+tests/e2e/slh-peer-proof.sh resume sdk-first-use-slh sdk-first-use-slh/published sdk-first-use-slh-peer
+tests/e2e/slh-peer-proof.sh verify sdk-first-use-slh sdk-first-use-slh/published sdk-first-use-slh-peer
+tests/e2e/slh-peer-proof.sh refuse sdk-first-use-slh sdk-first-use-slh/published sdk-first-use-slh-peer
+```
+
+This entry creates one independent SLH proposer in memory, signs the new first
+and later headers/quorum controls, then drops its keys. Sender signatures and
+transactions remain unchanged. The funded genesis account has zero key
+commitment and no registered sender key. Intake must preserve that absence;
+only Native commit of the original Embedded transaction registers its key.
+The later original Reference transaction must then succeed on both independent
+Native controls.
+
+Capture selects Source 11, batch 7 and frame 8. Account/signature profile 6
+requires the full `BLAKE3(0 || pubkey)` address proof for the 1,952-byte SDK key.
+It also requires SDK transaction source 3 and full FIPS signature/challenge
+profile 1 with the 48-byte seed. The registered 64-byte SLH proposer key binds
+the exact raw header and all seventeen SHA2-256f signature layers. Bound SDK
+Source 10 and primary first-use Source 9 keep their distinct formats.
+
+Durable pause/cold continuation, ordinary CLI zero-new-component completion,
+full Native import/key registration, genuine changed-state history and actual
+peer admission/finality follow the checks above. Historical replay must see the
+absent sealed-parent sender key despite its current registration, and must not
+write either current database. Refusals cover missing/tag-changed address AIR,
+bound/raw/primary account and SDK transaction/challenge substitutions, missing
+proposer layers and genuine wrong-header certificates. Existing size/count/
+expansion limits and default-off production remain unchanged. Full fresh
+automatic Source 11 generation, raw Native tag-zero SLH proposer combinations,
+two SLH roles, other accounts, quorum AIR, power-loss recovery, public artifacts
+and network activation remain separate acceptance work.

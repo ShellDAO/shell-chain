@@ -137,8 +137,10 @@ fn prepare(native: &Path, cache: &Path, out: &Path) -> Result<(), Error> {
                                 && block.transactions[0].signature.sig_type
                                     == SignatureType::SphincsSha2256f
                                 || key.len() == 1952
-                                    && block.transactions[0].signature.sig_type
-                                        == SignatureType::MlDsa65
+                                    && matches!(
+                                        block.transactions[0].signature.sig_type,
+                                        SignatureType::MlDsa65 | SignatureType::Dilithium3
+                                    )
                                     && block.proposer_seal.as_ref().is_some_and(|s| {
                                         s.sig_type == SignatureType::SphincsSha2256f
                                     }))

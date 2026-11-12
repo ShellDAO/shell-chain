@@ -17,6 +17,7 @@ const HASH_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v3/";
 const SLH_PROPOSER_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v5/";
 const SLH_FIRST_USE_PROPOSER_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v6/";
 const SLH_SDK_PROPOSER_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v7/";
+const SLH_SDK_FIRST_USE_PROPOSER_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v8/";
 const SLH_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v4/";
 const WITNESS_COMPONENT: &[u8] = b"\0canonical-component/cbor/v2/";
 const COMPONENT: &[u8] = b"\0canonical-component/cbor/v1/";
@@ -500,7 +501,7 @@ pub fn encode_payload(
     limit: usize,
     compact: bool,
 ) -> Result<Vec<u8>, String> {
-    if matches!(proof.version, 4..=6) {
+    if matches!(proof.version, 4..=7) {
         if proof.proposer.is_some()
             || proof.slh_transactions.is_some()
             || proof.transactions.len() != 1
@@ -531,6 +532,7 @@ pub fn encode_payload(
                 .ok_or("SLH proposer proof absent")?,
         )?;
         let (format_version, prefix) = match proof.version {
+            7 => (8, SLH_SDK_FIRST_USE_PROPOSER_PAYLOAD),
             6 => (7, SLH_SDK_PROPOSER_PAYLOAD),
             5 => (6, SLH_FIRST_USE_PROPOSER_PAYLOAD),
             _ => (5, SLH_PROPOSER_PAYLOAD),
@@ -730,27 +732,30 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
     if bytes.len() > MAX_BYTES {
         return Err("canonical payload byte limit".into());
     }
-    let (bytes, version) = if let Some(bytes) = bytes.strip_prefix(SLH_SDK_PROPOSER_PAYLOAD) {
-        (bytes, 7)
-    } else if let Some(bytes) = bytes.strip_prefix(SLH_FIRST_USE_PROPOSER_PAYLOAD) {
-        (bytes, 6)
-    } else if let Some(bytes) = bytes.strip_prefix(SLH_PROPOSER_PAYLOAD) {
-        (bytes, 5)
-    } else if let Some(bytes) = bytes.strip_prefix(SLH_PAYLOAD) {
-        (bytes, 4)
-    } else if let Some(bytes) = bytes.strip_prefix(HASH_PAYLOAD) {
-        (bytes, 3)
-    } else if let Some(bytes) = bytes.strip_prefix(PAYLOAD) {
-        (bytes, 2)
-    } else {
-        return serde_json::from_slice(bytes).map_err(|e| e.to_string());
-    };
+    let (bytes, version) =
+        if let Some(bytes) = bytes.strip_prefix(SLH_SDK_FIRST_USE_PROPOSER_PAYLOAD) {
+            (bytes, 8)
+        } else if let Some(bytes) = bytes.strip_prefix(SLH_SDK_PROPOSER_PAYLOAD) {
+            (bytes, 7)
+        } else if let Some(bytes) = bytes.strip_prefix(SLH_FIRST_USE_PROPOSER_PAYLOAD) {
+            (bytes, 6)
+        } else if let Some(bytes) = bytes.strip_prefix(SLH_PROPOSER_PAYLOAD) {
+            (bytes, 5)
+        } else if let Some(bytes) = bytes.strip_prefix(SLH_PAYLOAD) {
+            (bytes, 4)
+        } else if let Some(bytes) = bytes.strip_prefix(HASH_PAYLOAD) {
+            (bytes, 3)
+        } else if let Some(bytes) = bytes.strip_prefix(PAYLOAD) {
+            (bytes, 2)
+        } else {
+            return serde_json::from_slice(bytes).map_err(|e| e.to_string());
+        };
     let frame: Frame = uncbor(bytes)?;
     if frame.format_version != version
         || frame.transactions.is_empty()
         || frame.transactions.len() > MAX_CANONICAL_SIGNATURE_BATCH
-        || (!matches!(version, 5..=7) && frame.slh_proposer.is_some())
-        || (if matches!(version, 5..=7) {
+        || (!matches!(version, 5..=8) && frame.slh_proposer.is_some())
+        || (if matches!(version, 5..=8) {
             frame.proof_version != version - 1
                 || frame.transactions.len() != 1
                 || frame.proposer.is_some()
@@ -978,6 +983,10 @@ mod tests {
     #[test]
     fn slh_proposer_frame_relabeling_cannot_hide_or_add_a_mandatory_role() {
         for (prefix, format, proof, small, slh, count) in [
+            (SLH_SDK_FIRST_USE_PROPOSER_PAYLOAD, 8, 7, false, false, 1),
+            (SLH_SDK_FIRST_USE_PROPOSER_PAYLOAD, 8, 6, false, true, 1),
+            (SLH_SDK_FIRST_USE_PROPOSER_PAYLOAD, 8, 7, false, true, 2),
+            (SLH_SDK_PROPOSER_PAYLOAD, 7, 7, false, true, 1),
             (SLH_SDK_PROPOSER_PAYLOAD, 7, 6, false, false, 1),
             (SLH_SDK_PROPOSER_PAYLOAD, 7, 5, false, true, 1),
             (SLH_SDK_PROPOSER_PAYLOAD, 7, 6, false, true, 2),

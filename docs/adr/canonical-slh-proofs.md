@@ -205,9 +205,8 @@ headers and quorum controls, then dropped. Complete proof import, changed-state
 no-writeback history, durable recovery, real peer import/finality and genuine
 wrong-header-certificate refusal are required. Frame 7 uses the existing bounded
 dictionary and shared expansion pool. Sources 1–9, frames 1–6, default-off
-production, Native compatibility and all quotas remain unchanged. SDK first-use
-accounts with SLH proposers and raw Native tag-zero senders with SLH proposers
-require separate acceptance.
+production, Native compatibility and all quotas remain unchanged. Raw Native
+tag-zero senders with SLH proposers require separate acceptance.
 
 The Source 10 automatic entry consumes the same retained Native control through
 ordinary import, starting with zero mathematical components and no donor. Its
@@ -216,3 +215,24 @@ frame 7 graph. Authenticated RPC retrieval, unchanged Native state, registered
 sealed-parent sender/proposer keys after genuine state 2, damaged-checkpoint
 refusal and real peer admission/finality remain independent checks. Standalone
 proof completion cannot substitute for this empty-job worker flow.
+
+Source format 11, batch profile 7 and streamed frame 8 extend the SLH proposer
+case to one funded SDK first-use default account. The Native sender tag stays
+zero and the captured SDK transcript marker stays one. Parent commitment zero
+requires unbound account/signature profile 6, complete `BLAKE3(0 || pubkey)`
+address AIR, SDK transaction source 3 and full FIPS signature/challenge profile 1
+with its 48-byte seed. Bound Source 10/batch 6/frame 7 and primary first-use
+Source 9/batch 5/frame 6 retain their separate predicates.
+
+Preparation retains the actual public SDK Embedded first transaction and later
+Reference transaction byte for byte. Its original node may have advanced;
+authenticate the original block in the current canonical chain before restoring
+the sealed parent. The new independent SLH proposer signs genuine first/later
+headers and quorum controls once in memory, then drops its keys. No future
+sender registration is preloaded into genesis. Full Native import must register
+the key, and historical replay after state 2 must still see the absent parent
+key without writing either current database. Missing/tag-changed address AIR,
+SDK/raw/primary relabeling and wrong-slot proposer certificates must refuse.
+Frame 8 retains the shared dictionary, expansion pool and existing quotas.
+Full empty-job automatic generation remains a separate acceptance from the
+standalone graph; raw Native tag-zero SLH proposer combinations remain open.

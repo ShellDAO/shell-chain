@@ -285,6 +285,7 @@ fn prepare(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resu
                                 (block.transactions[0].signature.sig_type, key.len()),
                                 (SignatureType::SphincsSha2256f, 64)
                                     | (SignatureType::MlDsa65, 1952)
+                                    | (SignatureType::Dilithium3, 1952)
                             ) && shell_primitives::Address::from_public_key(
                                 key,
                                 block.transactions[0].signature.sig_type.as_u8(),

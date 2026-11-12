@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add funded SDK first-use senders with a registered SLH proposer: Source 11, batch 7 and frame 8 bind the full tagged address, SDK FIPS sender and seventeen-layer proposer graph. Retain original signed inputs across Native registration, durable recovery, CLI/history/peer and refusal checks; restore historical controls against their current canonical tip without changing earlier profiles or limits.
+
 - Document the bound SDK sender/SLH proposer Source 10 empty-job automatic entry, including durable worker recovery, authenticated frame retrieval, changed-state historical replay, damaged-checkpoint refusal and real peer admission without new signing or a completed proof donor.
 
 - Add bound published-SDK Native tag-zero FIPS senders with a registered SLH proposer: Source 10, batch 6 and frame 7 preserve the SDK transaction/challenge domains and bind the complete raw-header proposer graph. Add retained-signature Native controls, durable recovery, CLI/history/peer verification and transcript/role refusal coverage without changing earlier profiles or limits.

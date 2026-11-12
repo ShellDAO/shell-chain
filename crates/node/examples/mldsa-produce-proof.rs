@@ -699,6 +699,12 @@ fn main() -> Result<(), Error> {
             Path::new(&args[2]),
         );
     }
+    if args.len() == 3 && args[0] == "prepare-slh-proposer-sdk-first-use" {
+        return admission_runtime::slh_proposer::prepare_sdk_first_use(
+            Path::new(&args[1]),
+            Path::new(&args[2]),
+        );
+    }
     if args.len() == 3 && args[0] == "prepare-slh-proposer-first-use" {
         return admission_runtime::slh_proposer::prepare_first_use(
             Path::new(&args[1]),
