@@ -2315,9 +2315,47 @@ tests/e2e/slh-peer-proof.sh refuse raw-slh-output raw-slh-output/published raw-s
 The receiver must preserve genesis after partial or rejected transfer. Complete
 verified import must match the Native control and finalize with its genuine
 quorum certificate. Cold replay and foreign-header refusal remain independent
-checks. Raw first use, a later Reference target, fresh background generation,
-other account/role combinations, public release and activation remain separate
-acceptance work. Proof production still defaults off.
+checks. Raw first use, a later Reference target, other account/role combinations,
+public release and activation remain separate acceptance work. Proof production
+still defaults off.
+
+To generate Source 12 through the background worker, keep the same
+`raw-slh-output` and choose a new automatic output. This entry does not open
+the completed standalone graph as a mathematical donor:
+
+```sh
+tests/e2e/slh-canonical.sh automatic-fresh-prepare raw-slh-output raw-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-pause raw-slh-output raw-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-resume raw-slh-output raw-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-verify raw-slh-output raw-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-refuse raw-slh-output raw-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-rpc-refuse raw-slh-output raw-slh-automatic
+tests/e2e/slh-peer-proof.sh prepare raw-slh-output raw-slh-automatic raw-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh pause raw-slh-output raw-slh-automatic raw-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh resume raw-slh-output raw-slh-automatic raw-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh verify raw-slh-output raw-slh-automatic raw-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh refuse raw-slh-output raw-slh-automatic raw-slh-automatic-peer
+```
+
+Ordinary Native import must capture a queued Source 12 job with zero
+mathematical components and no availability cache. Both sender and proposer
+keys come from the sealed registered parent. The actual public-only `Node.run`
+worker must persist a component-budget pause, stop gracefully and continue that
+same job from disk in a new process. Never repeat successful preparation to
+replace a paused output or dropped keys. Authenticated RPC retrieval must return
+the full frame 9 graph while reporting availability separately from execution.
+
+Cold verification advances to the retained second Native state and replays the
+first graph against the original parent on both independent controls without
+writing either current database. A damaged inner component with a corrected
+outer hash must fail without Native mutation or retries. A separate status
+source-hash refusal must surface through the authenticated RPC and shut the
+Node down gracefully, preserving the original job. Finally, the generated frame
+must pass real peer transfer, cold continuation, proof-backed Native import,
+genuine certificate finality and foreign-header refusal. Warm checkpoint reuse
+does not establish fresh generation; broader accounts, raw first use, later
+Reference targets, power-loss recovery, public artifacts and activation remain
+separate checks.
 
 #### Funded SDK first use with an SLH proposer
 

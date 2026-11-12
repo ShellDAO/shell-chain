@@ -316,6 +316,19 @@ quorum controls before dropping its keys. Require durable pause/cold generation,
 CLI revalidation without new proofs, complete Native import and finality,
 changed-state historical replay without writeback, and actual peer transfer,
 cold replay and genuine foreign-header refusal. Raw first use, later Reference
-targets, fresh automatic generation, broader accounts/roles and public release
-or activation require separate acceptance; defaults and Native admission policy
-do not change.
+targets, broader accounts/roles and public release or activation require separate
+acceptance; defaults and Native admission policy do not change.
+
+The Source 12 fresh automatic entry reuses the same retained Native control and
+raw sender/SLH header signatures. Ordinary import must capture an empty queued
+job, restoring both historical registered keys without preloading child state.
+The actual public-only worker generates nonzero progress, durably pauses and
+cold-resumes that same job without opening a completed graph donor. Require
+authenticated frame 9 retrieval with no execution-authority claim, Native-state
+stability, historical replay after the genuine second block on both controls,
+correct-hash damaged-component refusal, and an independent status-provenance
+RPC failure with graceful shutdown. The generated graph must then pass real
+peer admission, attached-certificate finality, cold replay and foreign-header
+refusal. Existing standalone and earlier automatic qualifications remain distinct;
+no key creation, Native policy, production default or quota changes follow from
+this entry.
