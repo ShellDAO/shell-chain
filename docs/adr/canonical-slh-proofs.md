@@ -258,5 +258,38 @@ expected key from the sealed parent instead of inferring registration absence
 from the unbound account profile. Import and finalize the full Reference graph
 at height 2, then replay it read-only after the genuine third block on both
 proof-imported and ordinary Native controls. No SDK signatures or existing
-proposer identities are recreated. Full fresh automatic Reference-target
-production, public artifacts and activation remain separate acceptance work.
+proposer identities are recreated. Full fresh automatic Reference-target production has its own empty-job
+acceptance entry; standalone completion cannot substitute for it. Public
+artifacts and activation remain separate acceptance work.
+
+
+The Reference-target automatic entry reuses the same independently finalized
+Native parent checkpoint as proof import and peer admission. Share its canonical
+header/configuration, state-root, finality, key and absent-target validation.
+Keep genesis restoration for earlier profiles. Ordinary Native import of target
+height 2 must capture an empty Source 11 job, with no mathematical donor or
+preloaded target data. The public-only worker must generate durable progress and
+cold-resume the complete frame 8 graph. Authenticated retrieval remains
+availability only. Validate generated-proof historical replay after the genuine
+third block against both current Native controls without writeback, reject a
+correct-hash damaged component without retry, and exercise generated-frame real
+peer import/finality2/cold/refusal. No Native control or signing input is replaced.
+
+
+A restored finalized parent requires the genuine target quorum sidecar before
+starting the cold worker: ordinary startup deliberately rewinds an uncertified
+suffix. Complete that Native consensus step using the original verified quorum
+certificate. Existing stopped jobs may reimport the retained target after the
+expected rewind and complete its finality without replacing any source or
+mathematical progress. Record the completed Native baseline separately and
+assert that proving never changes it. Preserve earlier failed attempts. Status
+RPC failures after service startup must surface immediately and trigger graceful
+Node shutdown; they must not become an unobservable polling timeout.
+
+
+Keep a distinct status-provenance refusal entry: copy the completed local job,
+damage its recorded source hash, then require the real authenticated status RPC
+failure to surface and the Node to shut down gracefully. Neither original job
+nor Native data may change, and no new signing or mathematical generation may
+supply the refusal. This differs from a corrupt inner AIR component whose outer
+hash was repaired.

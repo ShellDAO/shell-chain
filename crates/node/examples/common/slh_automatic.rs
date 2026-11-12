@@ -152,7 +152,7 @@ impl Live {
         let (status, v) = fixture::request(self.address, Some(&self.token), method, params).await?;
         ensure(
             status == 200 && v.get("error").is_none(),
-            "authenticated RPC refused request",
+            &format!("authenticated RPC refused request: HTTP {status}, {v}"),
         )?;
         v.get("result")
             .cloned()
@@ -177,6 +177,79 @@ fn context(native: &Path) -> Result<(fixture::Context, shell_core::Block, Value)
         json_read(&native.join("candidate.json"))?,
         json_read(&native.join("control.json"))?,
     ))
+}
+fn finalize_reference(
+    node: &shell_node::Node<RocksDbStore>,
+    original: &ChainStore<RocksDbStore>,
+    block: &shell_core::Block,
+) -> Result<(), Error> {
+    if block.number() == 1 {
+        return Ok(());
+    }
+    let certificate = original
+        .get_commit_certificate(&block.hash())?
+        .ok_or("genuine Reference quorum certificate absent")?;
+    if node.finality.read().last_finalized_number() < block.number() {
+        ensure(
+            node.fast_finalize_with_certificate(block.number(), block.hash(), &certificate),
+            "genuine Reference quorum did not finalize",
+        )?;
+    }
+    ensure(
+        node.finality.read().last_finalized_number() == block.number()
+            && node
+                .chain_store
+                .get_commit_certificate(&block.hash())?
+                .as_ref()
+                == Some(&certificate),
+        "Reference finality/certificate differs from retained Native control",
+    )
+}
+fn complete_reference_native(native: &Path, out: &Path) -> Result<Value, Error> {
+    let (c, block, control) = context(native)?;
+    let original = RocksDbStore::open_all(native.join("provider/db"), None)?;
+    let before = digest(&original.state)?;
+    let chain = ChainStore::new(Arc::new(original.state.clone()));
+    let source = CanonicalProductionSource::capture(&chain, c.tip, c.block)?;
+    let stores = RocksDbStore::open_all(out.join("provider/db"), None)?;
+    let db = Arc::new(stores.state.clone());
+    let progress = db.scan_prefix(PREFIX)?;
+    let node = fixture::node(db.clone(), c.authority, &c.authority_key)?;
+    ensure(
+        !node.config.canonical_proof_production,
+        "Native finality completion enabled proving",
+    )?;
+    let old_head = node.chain_store.get_head_hash()?;
+    if old_head == Some(block.header.parent_hash) {
+        node.import_block(block.clone(), &MultiVerifier)?;
+    }
+    ensure(
+        node.chain_store.get_head_hash()? == Some(c.block)
+            && node.world_state.write().state_root()? == block.header.state_root
+            && node
+                .chain_store
+                .get_receipts(&c.block)?
+                .is_some_and(|v| serde_json::to_value(v).is_ok_and(|v| v == control["receipts"]))
+            && CanonicalProductionSource::capture(&node.chain_store, c.tip, c.block)?.identity()
+                == source.identity(),
+        "Native Reference completion differs from retained control",
+    )?;
+    finalize_reference(&node, &chain, &block)?;
+    ensure(
+        progress == db.scan_prefix(PREFIX)? && before == digest(&original.state)?,
+        "Native completion changed retained jobs or original control",
+    )?;
+    let result = json!({"native_digest":native_digest(db.as_ref())?,"target_height":block.number(),"finalized_height":block.number(),"genuine_original_certificate":true,"original_control_unchanged":true,"all_production_jobs_and_components_unchanged":true,"no_signing":true});
+    let path = out.join("native-finality-complete.json");
+    if path.exists() {
+        ensure(
+            json_read::<Value>(&path)? == result,
+            "completed Reference baseline changed",
+        )?;
+    } else {
+        save(&path, &result)?;
+    }
+    Ok(result["native_digest"].clone())
 }
 fn prepare(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Result<(), Error> {
     ensure(
@@ -234,45 +307,67 @@ fn prepare(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resu
     } else {
         0
     };
-    std::fs::create_dir(out)?;
-    std::fs::create_dir(out.join("provider"))?;
-    let db = Arc::new(RocksDbStore::open_all(out.join("provider/db"), None)?.state);
-    let target = ChainStore::new(db.clone());
     let parent = chain
         .get_block_by_hash(&block.header.parent_hash)?
         .ok_or("original parent absent")?;
-    ensure(
-        parent.number() == 0 && db.scan_all()?.is_empty(),
-        "fresh original genesis receiver required",
-    )?;
-    shell_storage::WorldState::validate_snapshot_nodes(&original.state, parent.header.state_root)?;
-    for hash in shell_storage::WorldState::collect_snapshot_node_hashes(
-        &original.state,
-        parent.header.state_root,
-    )? {
-        let value = original
-            .state
-            .get(hash.as_bytes())?
-            .ok_or("genesis trie node absent")?;
+    std::fs::create_dir(out)?;
+    std::fs::create_dir(out.join("provider"))?;
+    if parent.number() > 0 {
+        fixture::restore_parent(native, &out.join("provider/db"), &original.state)?;
+    }
+    let db = Arc::new(RocksDbStore::open_all(out.join("provider/db"), None)?.state);
+    let target = ChainStore::new(db.clone());
+    if parent.number() == 0 {
         ensure(
-            shell_primitives::keccak256(&value) == hash,
-            "genesis node mismatch",
+            db.scan_all()?.is_empty(),
+            "fresh original genesis receiver required",
         )?;
-        db.put(hash.as_bytes(), &value)?;
+        shell_storage::WorldState::validate_snapshot_nodes(
+            &original.state,
+            parent.header.state_root,
+        )?;
+        for hash in shell_storage::WorldState::collect_snapshot_node_hashes(
+            &original.state,
+            parent.header.state_root,
+        )? {
+            let value = original
+                .state
+                .get(hash.as_bytes())?
+                .ok_or("genesis trie node absent")?;
+            ensure(
+                shell_primitives::keccak256(&value) == hash,
+                "genesis node mismatch",
+            )?;
+            db.put(hash.as_bytes(), &value)?;
+        }
+        ensure(
+            db.get(block.header.state_root.as_bytes())?.is_none(),
+            "child state was preloaded",
+        )?;
+        target.commit_genesis_block(
+            &parent,
+            &chain.get_chain_config()?.ok_or("configuration absent")?,
+        )?;
     }
     ensure(
-        db.get(block.header.state_root.as_bytes())?.is_none(),
-        "child state was preloaded",
-    )?;
-    target.commit_genesis_block(
-        &parent,
-        &chain.get_chain_config()?.ok_or("configuration absent")?,
+        target.get_head_hash()? == Some(parent.hash())
+            && target.get_block_by_hash(&c.block)?.is_none()
+            && target.get_receipts(&c.block)?.is_none()
+            && db.get(block.header.state_root.as_bytes())?.is_none(),
+        "automatic target state preloaded",
     )?;
     let view = chain.canonical_parent_view(c.tip, parent.hash())?;
     let parent_sender_registered = view.registered_key(&block.transactions[0].from)?.is_some();
     for address in [block.transactions[0].from, c.authority] {
         if let Some(key) = view.registered_key(&address)? {
-            target.put_pubkey(&address, &key)?;
+            if parent.number() == 0 {
+                target.put_pubkey(&address, &key)?;
+            } else {
+                ensure(
+                    target.get_pubkey(&address)?.as_ref() == Some(&key),
+                    "restored parent key differs",
+                )?;
+            }
         } else {
             ensure(
                 address == block.transactions[0].from
@@ -304,7 +399,7 @@ fn prepare(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resu
     }
     ensure(
         target.get_pubkey(&block.transactions[0].from)?.is_some() == parent_sender_registered,
-        "genesis restoration changed historical sender registration",
+        "parent restoration changed historical sender registration",
     )?;
     let mut node = fixture::node(db.clone(), c.authority, &c.authority_key)?;
     ensure(
@@ -335,6 +430,7 @@ fn prepare(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resu
             "ordinary first-use import did not register its Embedded key",
         )?;
     }
+    finalize_reference(&node, &chain, &block)?;
     drop(node);
     let mut rows: BTreeMap<_, _> = db.scan_prefix(PREFIX)?.into_iter().collect();
     ensure(
@@ -366,7 +462,7 @@ fn prepare(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resu
     )?;
     save(
         &out.join("prepared.json"),
-        &json!({"ordinary_native_import_captured":queued,"parent_sender_registered":parent_sender_registered,"sender_registered_after_native_import":target.get_pubkey(&block.transactions[0].from)?.is_some(),"source_version":serde_json::from_slice::<Value>(source.identity())?["version"],"genesis_only_parent":true,"child_root_not_preloaded":true,"checkpoint_transplant":if fresh {"none; empty mathematical job"}else{"same-source test preparation; no complete flag"},"fresh_generation":fresh,"donor_opened":donor.is_some(),"checkpoint_digest":donor_before,"component_count":component_count,"native_digest":native_digest(db.as_ref())?,"new_math":0,"new_signing":false,"original_digest":before}),
+        &json!({"ordinary_native_import_captured":queued,"parent_sender_registered":parent_sender_registered,"sender_registered_after_native_import":target.get_pubkey(&block.transactions[0].from)?.is_some(),"source_version":serde_json::from_slice::<Value>(source.identity())?["version"],"genesis_only_parent":parent.number()==0,"parent_height":parent.number(),"target_height":block.number(),"genuine_native_parent_checkpoint":parent.number()>0,"child_root_not_preloaded":true,"checkpoint_transplant":if fresh {"none; empty mathematical job"}else{"same-source test preparation; no complete flag"},"fresh_generation":fresh,"donor_opened":donor.is_some(),"checkpoint_digest":donor_before,"component_count":component_count,"native_digest":native_digest(db.as_ref())?,"new_math":0,"new_signing":false,"original_digest":before}),
     )
 }
 async fn exercise(
@@ -378,6 +474,11 @@ async fn exercise(
     fresh: bool,
 ) -> Result<(), Error> {
     let (c, block, _) = context(native)?;
+    let expected_native = if block.number() > 1 {
+        complete_reference_native(native, out)?
+    } else {
+        json_read::<Value>(&out.join("prepared.json"))?["native_digest"].clone()
+    };
     let live = Live::start(
         out,
         &c,
@@ -393,12 +494,24 @@ async fn exercise(
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(if fresh { 86400 } else { 1800 });
         let mut authenticated = false;
+        let rpc_start_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let terminal = loop {
             ensure(
                 !live.task.is_finished(),
                 "Node.run exited before producer result",
             )?;
-            if let Ok(value) = live.status(c.block).await {
+            let observed = live.status(c.block).await;
+            if let Err(error) = &observed {
+                ensure(
+                    !authenticated
+                        && tokio::time::Instant::now() < rpc_start_deadline
+                        && !error
+                            .to_string()
+                            .starts_with("authenticated RPC refused request"),
+                    &format!("automatic status RPC failed: {error}"),
+                )?;
+            }
+            if let Ok(value) = observed {
                 if !authenticated {
                     let (status, _) = fixture::request(
                         live.address,
@@ -515,8 +628,8 @@ async fn exercise(
     }
     .await;
     let stopped = live.stop().await;
-    let terminal = result?;
     stopped?;
+    let terminal = result?;
     let db = RocksDbStore::open_all(out.join("provider/db"), None)?;
     let saved: Value = serde_json::from_slice(
         &db.state
@@ -534,9 +647,8 @@ async fn exercise(
             },
         "graceful shutdown did not retain expected state",
     )?;
-    let prepared: Value = json_read(&out.join("prepared.json"))?;
     ensure(
-        json!(native_digest(&db.state)?) == prepared["native_digest"],
+        json!(native_digest(&db.state)?) == expected_native,
         "automatic production changed native canonical data",
     )?;
     save(
@@ -602,7 +714,7 @@ fn verify(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resul
         let later: shell_core::Block = json_read(&native.join("later.json"))?;
         ensure(
             later.header.parent_hash == c.block
-                && later.number() == 2
+                && later.number() == block.number() + 1
                 && later.header.state_root != block.header.state_root,
             "later control is not a changed child",
         )?;
@@ -671,7 +783,7 @@ fn verify(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resul
             "generated proof historical replay differs or writes current state",
         )?;
         Some(
-            json!({"current_height":2,"current_state_changed":true,"current_key_present":true,"sealed_parent_key_absent":parent_sender_key.is_none(),"sealed_parent_keys_match_original":true,"proved_sender_signatures":replay.proved_sender_signatures,"proved_proposer_signature":replay.proved_proposer_signature,"generated_proof_replay_matches_independent_Native":true,"both_databases_unchanged":true}),
+            json!({"current_height":later.number(),"target_height":block.number(),"current_state_changed":true,"current_key_present":true,"sealed_parent_key_absent":parent_sender_key.is_none(),"sealed_parent_keys_match_original":true,"proved_sender_signatures":replay.proved_sender_signatures,"proved_proposer_signature":replay.proved_proposer_signature,"generated_proof_replay_matches_independent_Native":true,"both_databases_unchanged":true}),
         )
     } else {
         None
@@ -729,6 +841,68 @@ fn corrupt(out: &Path, hash: ShellHash) -> Result<PathBuf, Error> {
     )?;
     Ok(bad)
 }
+fn refuse_status_rpc(
+    native: &Path,
+    prior: Option<&Path>,
+    out: &Path,
+    fresh: bool,
+) -> Result<(), Error> {
+    let (c, _, _) = context(native)?;
+    let bad = out.join("bad-rpc-status");
+    ensure(
+        !bad.exists(),
+        "RPC refusal output exists; refusing replacement",
+    )?;
+    std::fs::create_dir(&bad)?;
+    std::fs::create_dir(bad.join("provider"))?;
+    let original = RocksDbStore::open_all(out.join("provider/db"), None)?;
+    let original_before = digest(&original.state)?;
+    original.create_checkpoint(bad.join("provider/db"))?;
+    let copy = RocksDbStore::open_all(bad.join("provider/db"), None)?;
+    let native_before = native_digest(&copy.state)?;
+    let math_before = copy.state.scan_prefix(&job(c.block, b"production/"))?;
+    let mut rows: BTreeMap<_, _> = copy.state.scan_prefix(PREFIX)?.into_iter().collect();
+    let rk = key(&[b"record/".as_slice(), c.block.as_bytes()].concat());
+    let mut record: Value = serde_json::from_slice(rows.get(&rk).ok_or("original status absent")?)?;
+    record["sourceHash"] = json!(ShellHash::ZERO);
+    record["state"] = json!("paused");
+    record["manifest"] = Value::Null;
+    record["newlyProved"] = json!(0);
+    rows.insert(rk, serde_json::to_vec(&record)?);
+    reaccount(&copy.state, rows)?;
+    save(
+        &bad.join("prepared.json"),
+        &json!({"native_digest":native_before,"only_status_source_hash_damaged":true}),
+    )?;
+    drop(copy);
+    drop(original);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let started = tokio::time::Instant::now();
+    let failure = runtime
+        .block_on(exercise(native, prior, &bad, false, false, fresh))
+        .err()
+        .ok_or("invalid status source hash accepted by RPC")?
+        .to_string();
+    ensure(
+        failure.starts_with("automatic status RPC failed: authenticated RPC refused request"),
+        &format!("unexpected RPC refusal: {failure}"),
+    )?;
+    let copy = RocksDbStore::open_all(bad.join("provider/db"), None)?;
+    let original = RocksDbStore::open_all(out.join("provider/db"), None)?;
+    ensure(
+        native_before == native_digest(&copy.state)?
+            && math_before == copy.state.scan_prefix(&job(c.block, b"production/"))?
+            && original_before == digest(&original.state)?,
+        "RPC refusal changed Native data or valid job",
+    )?;
+    save(
+        &bad.join("runtime-rpc-refused.json"),
+        &json!({"error":failure,"elapsed_ms":started.elapsed().as_millis(),"status_error_surfaced":true,"graceful_Node_run_shutdown":true,"native_unchanged":true,"original_job_unchanged":true,"no_signing":true,"no_new_math":true,"mathematical_rows_unchanged":true}),
+    )
+}
 pub(super) fn run(
     mode: &str,
     native: &Path,
@@ -744,7 +918,10 @@ pub(super) fn run(
         })
         .ok_or("unsupported automatic mode")?;
     ensure(
-        matches!(mode, "prepare" | "pause" | "resume" | "verify" | "refuse"),
+        matches!(
+            mode,
+            "prepare" | "pause" | "resume" | "verify" | "refuse" | "rpc-refuse"
+        ),
         "unsupported automatic mode",
     )?;
     for input in std::iter::once(native).chain(prior) {
@@ -771,6 +948,9 @@ pub(super) fn run(
     )?;
     if mode == "verify" {
         return verify(native, prior, out, fresh);
+    }
+    if mode == "rpc-refuse" {
+        return refuse_status_rpc(native, prior, out, fresh);
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

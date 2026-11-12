@@ -2381,6 +2381,62 @@ accounts and state root and finalize block 2 with its genuine certificate.
 Cold historical replay after genuine block 3 must reproduce block 2 without
 writing either current database. Durable continuation, ordinary CLI completion
 without new mathematical components, real peer chunk recovery/finality and
-wrong-statement refusals remain required. Full fresh automatic generation for
-this Reference target is separate acceptance work; this entry does not change
-production defaults, quotas or network activation.
+wrong-statement refusals remain required. Fresh automatic generation for this Reference target uses the separate
+empty-job entry below; standalone completion does not qualify that worker.
+Production defaults, quotas and network activation remain unchanged.
+
+
+For fresh background production of the Reference target, retain the same
+three-block `sdk-reference-slh` control and choose a new automatic output.
+Preparation restores its genuine independent parent at height 1. Ordinary Native
+import of target block 2 must capture a Source 11 job with zero mathematical
+components, without opening the standalone graph as a donor. The sender key is
+already registered in this sealed parent; its account commitment remains zero.
+
+```sh
+tests/e2e/slh-canonical.sh automatic-fresh-prepare sdk-reference-slh sdk-reference-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-pause sdk-reference-slh sdk-reference-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-resume sdk-reference-slh sdk-reference-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-verify sdk-reference-slh sdk-reference-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-refuse sdk-reference-slh sdk-reference-slh-automatic
+tests/e2e/slh-peer-proof.sh prepare sdk-reference-slh sdk-reference-slh-automatic sdk-reference-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh pause sdk-reference-slh sdk-reference-slh-automatic sdk-reference-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh resume sdk-reference-slh sdk-reference-slh-automatic sdk-reference-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh verify sdk-reference-slh sdk-reference-slh-automatic sdk-reference-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh refuse sdk-reference-slh sdk-reference-slh-automatic sdk-reference-slh-automatic-peer
+```
+
+If the automatic job already has a durable initial pause, continue from that
+job with `automatic-fresh-resume`. Preserve the original Native control, signed
+SDK transactions, signed SLH headers and quorum controls; all signing keys have
+already been dropped. The actual worker must generate the complete frame 8
+graph after cold continuation. Authenticated RPC retrieval supplies availability
+only. Cold replay after genuine block 3 must match both current Native stores,
+use the registered sealed-parent keys and write neither database. A damaged
+component with a corrected outer hash must fail without retries or Native
+changes. The generated frame must also pass real peer chunk recovery, Native
+import, attached-certificate finality at height 2 and cold replay/refusal.
+Production defaults, quotas, public release and network activation are unchanged.
+
+
+A Reference worker starts only after the original target quorum certificate has
+been verified and persisted. With an already finalized parent, normal startup
+rewinds an unfinalized suffix. Retaining that genuine certificate completes the
+Native consensus stage; do not disable startup recovery or change finality
+parameters to keep an uncertified target. For an existing stopped automatic job,
+the entry can reimport the same retained target after this expected rewind and
+complete its genuine finality before resuming. It preserves all existing jobs
+and components and records the completed Native baseline separately. Production
+must leave that baseline unchanged. Authenticated status errors must fail the
+regression and shut down its Node gracefully, rather than being hidden by a
+long polling loop.
+
+
+Exercise the status-error shutdown regression separately on a copy of the
+completed job. It changes only local status provenance in that copy, preserving
+the original graph and Native data. An authenticated status error must surface
+and the Node must stop gracefully without new signing or proving:
+
+```sh
+tests/e2e/slh-canonical.sh automatic-fresh-rpc-refuse sdk-reference-slh sdk-reference-slh-automatic
+```

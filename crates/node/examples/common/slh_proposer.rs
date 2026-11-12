@@ -652,7 +652,7 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
             super::prepare_from(out, directory, &out.join("provider/db"))?;
         } else {
             let source = RocksDbStore::open_all(out.join("provider/db"), None)?;
-            restore_parent(out, &out.join(directory).join("receiver/db"), &source.state)?;
+            fixture::restore_parent(out, &out.join(directory).join("receiver/db"), &source.state)?;
         }
     }
     let fresh =
@@ -904,74 +904,5 @@ pub(crate) fn publish(out: &Path) -> Result<(), Error> {
     write(
         &published.join("published.json"),
         &json!({"availability_only":true,"outer_hash_checked":true,"native_original_unchanged":true,"payload_bytes":payload.len(),"new_math":0,"new_signing":false}),
-    )
-}
-
-/// Restore the genuine independent Native parent without importing the proof target.
-pub(super) fn restore_parent(
-    native: &Path,
-    receiver_path: &Path,
-    source: &RocksDbStore,
-) -> Result<(), Error> {
-    ensure(
-        !receiver_path.exists(),
-        "parent receiver exists; refusing replacement",
-    )?;
-    let c: fixture::Context = read(&native.join("context.json"))?;
-    let block: Block = read(&native.join("candidate.json"))?;
-    ensure(
-        native.join("provider/db/CURRENT").is_file()
-            && native.join("native-parent/db/CURRENT").is_file(),
-        "initialized Native parent controls required",
-    )?;
-    let parent = RocksDbStore::open_all(native.join("native-parent/db"), None)?;
-    let source_before = digest(source)?;
-    let parent_before = digest(&parent.state)?;
-    let chain = ChainStore::new(Arc::new(source.clone()));
-    let prior = ChainStore::new(Arc::new(parent.state.clone()));
-    let header = prior
-        .get_header_by_hash(&block.header.parent_hash)?
-        .ok_or("saved parent absent")?;
-    let view = chain.canonical_parent_view(c.tip, block.header.parent_hash)?;
-    ensure(
-        block.hash() == c.block
-            && block.number() == 2
-            && prior.get_head_hash()? == Some(block.header.parent_hash)
-            && header.number + 1 == block.number()
-            && chain.get_header_by_hash(&block.header.parent_hash)? == Some(header.clone())
-            && prior.get_chain_config()? == chain.get_chain_config()?
-            && prior.get_block_by_hash(&c.block)?.is_none()
-            && prior.get_receipts(&c.block)?.is_none()
-            && parent
-                .state
-                .get(block.header.state_root.as_bytes())?
-                .is_none(),
-        "saved Native parent is not the canonical target predecessor",
-    )?;
-    let node = fixture::node(
-        Arc::new(parent.state.clone()),
-        c.authority,
-        &c.authority_key,
-    )?;
-    ensure(
-        node.world_state.write().state_root()? == header.state_root
-            && node.finality.read().last_finalized_number() == header.number,
-        "saved parent state or finality differs",
-    )?;
-    for address in [block.transactions[0].from, c.authority] {
-        ensure(
-            prior.get_pubkey(&address)? == view.registered_key(&address)?,
-            "saved parent authority differs",
-        )?;
-    }
-    std::fs::create_dir_all(
-        receiver_path
-            .parent()
-            .ok_or("receiver parent path absent")?,
-    )?;
-    parent.create_checkpoint(receiver_path)?;
-    ensure(
-        source_before == digest(source)? && parent_before == digest(&parent.state)?,
-        "parent restore changed retained Native controls",
     )
 }

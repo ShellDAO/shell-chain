@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Extend the Source 11 empty-job automatic regression to SDK Reference target block 2. Reuse the genuine registered parent checkpoint, retain all existing signatures, generate through the actual cold-resumed worker, and verify history after block 3, damaged-checkpoint refusal and generated-frame peer admission/finality.
+
 - Add retained public SDK Reference proof coverage with an independent three-block SLH proposer control. Preserve original SDK signatures, restore the genuine registered parent for target block 2, verify history after block 3 without writeback, and exercise durable recovery, Native finality and peer admission with Source 11/frame 8.
 
 - Document full Source 11 background proof generation from an empty job, including continuation of an existing durable pause, authenticated frame retrieval, sealed-parent SDK key absence, historical replay and real peer admission without new signing or a completed proof donor.

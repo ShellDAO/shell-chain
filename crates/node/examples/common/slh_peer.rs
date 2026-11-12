@@ -98,7 +98,7 @@ fn prepare(native: &Path, cache: &Path, out: &Path) -> Result<(), Error> {
         .get_block_by_hash(&block.header.parent_hash)?
         .ok_or("original genesis absent")?;
     if parent.number() > 0 {
-        slh_proposer::restore_parent(native, &out.join("receiver/db"), &original.state)?;
+        fixture::restore_parent(native, &out.join("receiver/db"), &original.state)?;
     }
     let receiver = Arc::new(RocksDbStore::open_all(out.join("receiver/db"), None)?.state);
     if parent.number() == 0 {
