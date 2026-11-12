@@ -1,7 +1,7 @@
 //! Complete canonical sender verification over trusted local context.
 //! Legacy profiles use native body selection; SLH sender proofs verify the
 //! large envelope/header relation. A separate profile proves raw SLH proposer
-//! seals with one supported primary, SDK or bound raw sender. Consensus and execution remain native.
+//! seals with one supported primary, SDK or raw sender. Consensus and execution remain native.
 use crate::{
     account_state::AccountStateProof,
     canonical_signature::{
@@ -64,7 +64,7 @@ pub struct CanonicalSignatureBatchProof {
 impl CanonicalSignatureBatchProof {
     fn valid_profile(&self) -> bool {
         if self.slh_proposer.is_some() {
-            return matches!(self.version, 4..=8)
+            return matches!(self.version, 4..=9)
                 && self.proposer.is_none()
                 && self.slh_transactions.is_none()
                 && self.transactions.len() == 1;
@@ -278,17 +278,21 @@ fn verify_batch_at_parent<S: KvStore + 'static>(
                     )
                     && proof.transactions[0].signature.transaction.version == 3
             }
-            8 => {
+            8 | 9 => {
                 sender.signature.sig_type == SignatureType::Dilithium3
-                    && account.pq_pubkey_hash != ShellHash::ZERO
-                    && proof.transactions[0].signature.version == 3
+                    && (account.pq_pubkey_hash == ShellHash::ZERO) == (proof.version == 9)
+                    && matches!(
+                        (proof.version, proof.transactions[0].signature.version),
+                        (8, 3) | (9, 4)
+                    )
                     && proof.transactions[0].signature.transaction.version == 2
             }
             _ => false,
         };
         if !valid_sender || account.validation_code_hash.is_some() {
             return Err(
-                "SLH proposer profile requires its explicit primary, SDK or bound raw default account".into(),
+                "SLH proposer profile requires its explicit primary, SDK or raw default account"
+                    .into(),
             );
         }
         proposer = Some(crate::proposer_seal::verify_slh_seal_at_parent(
@@ -371,7 +375,7 @@ mod tests {
         let legacy: CanonicalSignatureBatchProof = serde_json::from_slice(bytes).unwrap();
         assert!(legacy.valid_profile());
         assert_eq!(serde_json::to_vec(&legacy).unwrap(), bytes);
-        for version in [0, 2, 3, 4, 5, 6, 7, 8] {
+        for version in [0, 2, 3, 4, 5, 6, 7, 8, 9] {
             let value = serde_json::json!({"version":version,"transactions":[]});
             let proof: CanonicalSignatureBatchProof = serde_json::from_value(value).unwrap();
             assert!(!proof.valid_profile());

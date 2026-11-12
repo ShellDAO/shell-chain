@@ -315,8 +315,8 @@ only the independent memory-only proposer, freezing first/later headers and
 quorum controls before dropping its keys. Require durable pause/cold generation,
 CLI revalidation without new proofs, complete Native import and finality,
 changed-state historical replay without writeback, and actual peer transfer,
-cold replay and genuine foreign-header refusal. Raw first use, later Reference
-targets, broader accounts/roles and public release or activation require separate
+cold replay and genuine foreign-header refusal. Raw first-use background
+generation, later Reference targets, broader accounts/roles and public release or activation require separate
 acceptance; defaults and Native admission policy do not change.
 
 The Source 12 fresh automatic entry reuses the same retained Native control and
@@ -332,3 +332,29 @@ peer admission, attached-certificate finality, cold replay and foreign-header
 refusal. Existing standalone and earlier automatic qualifications remain distinct;
 no key creation, Native policy, production default or quota changes follow from
 this entry.
+
+Source format 13, batch profile 9 and availability frame 10 extend the registered
+SLH proposer to one funded zero-commitment raw Native tag-zero sender. The exact
+unbound account/signature profile 4 binds the complete `BLAKE3(0 || key1952)`
+address, raw transaction source 2 and signature/challenge version 2. Both the
+first-32-byte sampler domain and the full 48-byte commitment remain mandatory.
+Bound Source 12, SDK FIPS and primary profiles cannot be relabeled into this
+predicate. Native policy still decides account lifecycle and registry authority.
+
+Preparation consumes all three retained genuine raw sender transactions. Only
+one independent memory-only SLH proposer is created; freeze matching Native
+headers, quorum controls and checkpoints 1, 2 and 3 on independent stores before
+dropping it. The first proof must register its sender and finalize through the
+genuine certificate. Both later ordinary blocks change current state before
+read-only first-block verification on the proof receiver and independent Native
+third-state control. The sealed parent still has no sender key, regardless of
+the current registry. Address/domain/role substitutions must refuse without
+Native mutation or a verification fallback.
+
+The full raw-header seventeen-layer proposer graph and bounded dictionary,
+checkpoint, expansion and transport limits remain unchanged. Require durable
+pause/cold generation, CLI zero-new revalidation and real peer admission,
+registration, genuine finality, cold replay and foreign-header refusal. Earlier
+source/frame meanings remain strict. Reference-target proofs, fresh automatic
+generation for this unbound profile, other account/role combinations and public
+release or activation require separate acceptance.

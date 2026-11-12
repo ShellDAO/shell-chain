@@ -2315,7 +2315,8 @@ tests/e2e/slh-peer-proof.sh refuse raw-slh-output raw-slh-output/published raw-s
 The receiver must preserve genesis after partial or rejected transfer. Complete
 verified import must match the Native control and finalize with its genuine
 quorum certificate. Cold replay and foreign-header refusal remain independent
-checks. Raw first use, a later Reference target, other account/role combinations,
+checks. Raw first-use background generation, a later Reference target, other
+account/role combinations,
 public release and activation remain separate acceptance work. Proof production
 still defaults off.
 
@@ -2353,9 +2354,80 @@ source-hash refusal must surface through the authenticated RPC and shut the
 Node down gracefully, preserving the original job. Finally, the generated frame
 must pass real peer transfer, cold continuation, proof-backed Native import,
 genuine certificate finality and foreign-header refusal. Warm checkpoint reuse
-does not establish fresh generation; broader accounts, raw first use, later
-Reference targets, power-loss recovery, public artifacts and activation remain
+does not establish fresh generation; broader accounts, first-use raw background
+generation, later Reference targets, power-loss recovery, public artifacts and activation remain
 separate checks.
+
+#### Funded raw first use with an SLH proposer
+
+Keep `raw-first-output` from the genuine funded unbound raw sender entry above.
+If needed, create it once with
+`tests/e2e/dilithium-full-proof.sh unbound raw-first-output`, using Python 3,
+stable Rust and the RocksDB C/C++/libclang prerequisites. Retain all three
+original signed inputs: Embedded first use, the Reference successor and the
+ordinary third transaction. Preparation refuses an existing destination; never
+rerun it to replace dropped keys or a paused proof job.
+
+```sh
+tests/e2e/slh-proposer-raw.sh prepare-first-use raw-first-output raw-first-slh
+tests/e2e/slh-proposer-raw.sh capture raw-first-slh
+tests/e2e/slh-proposer-raw.sh pause raw-first-slh
+tests/e2e/slh-proposer-raw.sh resume raw-first-slh
+tests/e2e/slh-proposer-raw.sh verify raw-first-slh
+tests/e2e/slh-proposer-raw.sh refuse raw-first-slh
+tests/e2e/slh-proposer-raw.sh publish raw-first-slh
+```
+
+The original sender signs nothing new. Its sealed parent must contain a funded
+default account with a zero key commitment, no registered sender key and a
+matching Embedded 1,952-byte key. Preparation checks the actual raw Native
+tag-zero transcript of every retained signature. One new independent SLH
+proposer signs genuine headers and quorum controls for all three transactions,
+then drops its memory-only keys. Both independent Native controls must agree on
+receipts, accounts, state changes and finality at heights 1, 2 and 3. Separate
+checkpoints preserve every available header and quorum certificate before key
+disposal; neither old sender nor proposer identities are regenerated.
+
+Capture selects Source 13, batch 9 and frame 10. Account/signature profile 4
+requires the full `BLAKE3(0 || pubkey)` address AIR, zero-commitment parent MPT
+and raw transaction source 2. Complete raw signature/challenge version 2 keeps
+the first-32-byte sampler domain and all 48 commitment bytes. SDK FIPS framing,
+primary tags and bound Source 12 cannot substitute. The registered SLH proposer
+proves the exact raw header and all seventeen SHA2-256f layers against its sealed
+historical key. Earlier profiles retain their original predicates and formats.
+
+`pause` stores one real component. A separate `resume` process verifies that
+checkpoint and generates the remaining graph within the existing quotas.
+`verify` imports the complete first-block proof, registers its sender and
+finalizes with the genuine original certificate. The retained second and third
+blocks then change current state. Cold first-block replay against both the proof
+receiver and ordinary Native third-state control must still use the absent
+parent key and write neither database, even though the current key is present.
+`refuse` covers Native Reference-without-parent-key rejection, missing or
+tag-changed address AIR, raw/SDK/primary/bound profile and transcript swaps,
+missing or changed proposer layers, and genuine foreign-header certificates.
+Every assertion exits nonzero on failure.
+
+Use `raw-first-slh` in the complete-job CLI command above: revalidation must
+report zero newly proved components and preserve the accepted graph. Publication
+provides availability only; exercise actual transport and Native admission:
+
+```sh
+tests/e2e/slh-peer-proof.sh prepare raw-first-slh raw-first-slh/published raw-first-slh-peer
+tests/e2e/slh-peer-proof.sh pause raw-first-slh raw-first-slh/published raw-first-slh-peer
+tests/e2e/slh-peer-proof.sh resume raw-first-slh raw-first-slh/published raw-first-slh-peer
+tests/e2e/slh-peer-proof.sh verify raw-first-slh raw-first-slh/published raw-first-slh-peer
+tests/e2e/slh-peer-proof.sh refuse raw-first-slh raw-first-slh/published raw-first-slh-peer
+```
+
+The receiver starts with the genuine funded genesis and no sender registration.
+Partial or rejected transfer must preserve it. Successful proof-backed import
+must register the original key and match Native receipts/accounts; finality
+separately requires the attached genuine quorum certificate. Cold replay and
+foreign-header refusal remain independent checks. This first-use target does
+not qualify a later Reference proof or fresh background generation. Other
+accounts/roles, quorum AIR, power-loss recovery, public artifacts and activation
+remain separate acceptance work; production defaults and limits do not change.
 
 #### Funded SDK first use with an SLH proposer
 

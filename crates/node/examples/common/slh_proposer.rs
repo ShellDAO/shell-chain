@@ -177,6 +177,9 @@ impl RetainedKind {
 pub(crate) fn prepare_raw_bound(original: &Path, out: &Path) -> Result<(), Error> {
     prepare_retained(original, out, RetainedKind::Raw, false, 1)
 }
+pub(crate) fn prepare_raw_first_use(original: &Path, out: &Path) -> Result<(), Error> {
+    prepare_retained(original, out, RetainedKind::Raw, true, 1)
+}
 pub(crate) fn prepare_first_use(original: &Path, out: &Path) -> Result<(), Error> {
     prepare_retained(original, out, RetainedKind::Primary, true, 1)
 }
@@ -264,16 +267,17 @@ fn prepare_retained(
                 )?
             } else if profile == RetainedKind::Raw {
                 ensure(
-                    !first_use
-                        && registered.is_some()
+                    registered.is_none() == first_use
+                        && (!first_use
+                            || reference.pubkey_mode.pubkey_bytes() == Some(key.as_slice()))
                         && old_parent
                             .world_state()?
                             .get_account(&reference.from)?
                             .is_some_and(|a| {
                                 a.validation_code_hash.is_none()
-                                    && a.pq_pubkey_hash != ShellHash::ZERO
+                                    && (a.pq_pubkey_hash == ShellHash::ZERO) == first_use
                             }),
-                    "raw retained bound parent differs",
+                    "raw retained parent commitment or Embedded provenance differs",
                 )?;
                 [&reference, &next].into_iter().all(|signed| {
                     DilithiumVerifier.verify_legacy_transcript(
@@ -359,6 +363,36 @@ fn prepare_retained(
         ensure(target_number == 1, "unsupported retained target")?;
         None
     };
+    let third = if profile == RetainedKind::Raw && first_use {
+        let block: Block = read(&original.join("advance.json"))?;
+        ensure(
+            block.transactions.len() == 1,
+            "raw third transaction count differs",
+        )?;
+        let signed = block.transactions[0].clone();
+        ensure(
+            target_number == 1
+                && !next.pubkey_mode.is_embedded()
+                && !signed.pubkey_mode.is_embedded()
+                && signed.from == reference.from
+                && signed.tx.nonce == 2
+                && signed.signature.sig_type == kind
+                && DilithiumVerifier.verify_legacy_transcript(
+                    &key,
+                    signed.sender_signing_hash().as_bytes(),
+                    &signed.signature,
+                )
+                && !DilithiumVerifier.verify_sdk_transcript(
+                    &key,
+                    signed.sender_signing_hash().as_bytes(),
+                    &signed.signature,
+                ),
+            "retained genuine raw Reference third input differs",
+        )?;
+        Some(signed)
+    } else {
+        None
+    };
     let sender = PublicRetainedSender {
         key,
         kind,
@@ -398,7 +432,7 @@ fn prepare_retained(
     )?;
     ensure(
         kind != SignatureType::Dilithium3 || !first_use || first == reference,
-        "original SDK first-use Embedded input changed",
+        "original Native tag-zero first-use Embedded input changed",
     )?;
     let mut refused = Vec::new();
     for case in [
@@ -538,6 +572,31 @@ fn prepare_retained(
         &out.join("later-control.json"),
         &dilithium::control(&node, &later)?,
     )?;
+    if let Some(signed) = &third {
+        node.handle_incoming_tx(signed.clone(), &MultiVerifier)?;
+        let advance = node.produce_block(&proposer, 100)?;
+        ensure(
+            advance.number() == 3
+                && advance.transactions == vec![signed.clone()]
+                && advance.header.state_root != later.header.state_root,
+            "genuine raw third state differs",
+        )?;
+        peer.import_block(advance.clone(), &MultiVerifier)?;
+        finalize(&node, &proposer, &advance)?;
+        finalize(&peer, &proposer, &advance)?;
+        ensure(
+            dilithium::control(&node, &advance)? == dilithium::control(&peer, &advance)?,
+            "raw third Native controls differ",
+        )?;
+        std::fs::create_dir(out.join("native-third"))?;
+        native.create_checkpoint(out.join("native-third/db"))?;
+        write(&out.join("advance.json"), &advance)?;
+        write(&out.join("advance-signed.json"), signed)?;
+        write(
+            &out.join("advance-control.json"),
+            &dilithium::control(&node, &advance)?,
+        )?;
+    }
     ensure(
         sender.calls.load(Ordering::SeqCst) == 0 && old_before == digest(&old.state)?,
         "sender signing or original Native mutation",
@@ -545,7 +604,7 @@ fn prepare_retained(
     drop(proposer);
     write(
         &out.join("prepared.json"),
-        &json!({"funded_zero_commitment_primary_sender":first_use && kind==SignatureType::MlDsa65,"funded_zero_commitment_sdk_sender":first_use && kind==SignatureType::Dilithium3,"native_bound_raw_sender":profile==RetainedKind::Raw,"native_bound_sdk_sender":profile==RetainedKind::Sdk && !first_use,"same_retained_first_and_later_signatures":true,"first_reference_to_embedded_identity_unchanged":first_use && kind==SignatureType::MlDsa65,"sdk_embedded_input_unchanged":first_use && kind==SignatureType::Dilithium3,"retained_signed_identity_unchanged":true,"target_height":target_number,"later_height":later.number(),"reference_target":target_number==2,"native_first_use_and_registration":first_use,"native_bound_sdk_first_and_later":profile==RetainedKind::Sdk && !first_use,"native_later_state_changed":true,"new_sender_signing":false,"new_proposer_keys_memory_only_dropped":true,"original_native_unchanged":true}),
+        &json!({"funded_zero_commitment_primary_sender":first_use && kind==SignatureType::MlDsa65,"funded_zero_commitment_sdk_sender":first_use && profile==RetainedKind::Sdk,"funded_zero_commitment_raw_sender":first_use && profile==RetainedKind::Raw,"native_bound_raw_sender":profile==RetainedKind::Raw && !first_use,"native_bound_sdk_sender":profile==RetainedKind::Sdk && !first_use,"same_retained_first_and_later_signatures":true,"first_reference_to_embedded_identity_unchanged":first_use && kind==SignatureType::MlDsa65,"sdk_embedded_input_unchanged":first_use && profile==RetainedKind::Sdk,"raw_embedded_input_unchanged":first_use && profile==RetainedKind::Raw,"retained_signed_identity_unchanged":true,"target_height":target_number,"later_height":later.number(),"third_height":third.as_ref().map(|_|3),"all_three_genuine_headers_and_quorum_controls_frozen":third.is_some(),"reference_target":target_number==2,"native_first_use_and_registration":first_use,"native_bound_sdk_first_and_later":profile==RetainedKind::Sdk && !first_use,"native_later_state_changed":true,"new_sender_signing":false,"new_proposer_keys_memory_only_dropped":true,"original_native_unchanged":true}),
     )
 }
 pub(crate) fn capture(out: &Path) -> Result<(), Error> {
@@ -562,7 +621,7 @@ pub(crate) fn capture(out: &Path) -> Result<(), Error> {
         before == digest(&db.state)?,
         "proposer capture wrote Native state",
     )?;
-    if !matches!(value["version"].as_u64(), Some(8..=12))
+    if !matches!(value["version"].as_u64(), Some(8..=13))
         || value["proposer_key"]
             .as_array()
             .is_none_or(|v| v.len() != 64)
@@ -765,14 +824,18 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
                 "sdk-as-raw-challenge",
             ]);
         }
-        if proof.version == 7 {
+        if matches!(proof.version, 7 | 9) {
             cases.push("wrong-address-tag");
         }
-        if proof.version == 8 {
+        if matches!(proof.version, 8 | 9) {
             cases.extend([
                 "raw-as-sdk-account",
                 "raw-as-primary-account",
-                "raw-as-unbound-account",
+                if proof.version == 9 {
+                    "raw-as-bound-account"
+                } else {
+                    "raw-as-unbound-account"
+                },
                 "raw-as-sdk-transaction",
                 "raw-as-primary-transaction",
                 "raw-as-sdk-signature",
@@ -784,8 +847,13 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
             let mut bad = proof.clone();
             match case {
                 "missing-proposer" => bad.slh_proposer = None,
-                "raw-as-sdk-account" => bad.transactions[0].signature.version = 5,
-                "raw-as-primary-account" => bad.transactions[0].signature.version = 1,
+                "raw-as-sdk-account" => {
+                    bad.transactions[0].signature.version = if proof.version == 9 { 6 } else { 5 }
+                }
+                "raw-as-primary-account" => {
+                    bad.transactions[0].signature.version = if proof.version == 9 { 2 } else { 1 }
+                }
+                "raw-as-bound-account" => bad.transactions[0].signature.version = 3,
                 "raw-as-unbound-account" => bad.transactions[0].signature.version = 4,
                 "raw-as-sdk-transaction" => bad.transactions[0].signature.transaction.version = 3,
                 "raw-as-primary-transaction" => {
@@ -803,7 +871,7 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
                         .challenge
                         .version = 1
                 }
-                "raw-as-sdk-profile" => bad.version = 6,
+                "raw-as-sdk-profile" => bad.version = if proof.version == 9 { 7 } else { 6 },
                 "sdk-as-raw-account" => {
                     bad.transactions[0].signature.version = if proof.version == 7 { 4 } else { 3 }
                 }
@@ -824,7 +892,13 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
                         .version = 2
                 }
                 "wrong-profile" => bad.version = 2,
-                "bound-account-profile" => bad.version = if proof.version == 7 { 6 } else { 4 },
+                "bound-account-profile" => {
+                    bad.version = match proof.version {
+                        9 => 8,
+                        7 => 6,
+                        _ => 4,
+                    }
+                }
                 "missing-address-certificate" => bad.transactions[0].signature.tagged_key = None,
                 "wrong-address-tag" => {
                     bad.transactions[0]
@@ -890,10 +964,26 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
             &json!({"actual_import":imported,"finalized_height":block.number(),"native_controls_match":true}),
         )?;
     }
-    let later: Block = read(&out.join("later.json"))?;
+    let mut later: Block = read(&out.join("later.json"))?;
     if node.chain_store.get_head_hash()? == Some(c.block) {
         node.import_block(later.clone(), &MultiVerifier)?;
     }
+    let ordinary_path = if proof.version == 9 {
+        let advance: Block = read(&out.join("advance.json"))?;
+        ensure(
+            advance.number() == 3
+                && advance.header.parent_hash == later.hash()
+                && advance.header.state_root != later.header.state_root,
+            "retained raw third header differs",
+        )?;
+        if node.chain_store.get_head_hash()? == Some(later.hash()) {
+            node.import_block(advance.clone(), &MultiVerifier)?;
+        }
+        later = advance;
+        out.join("native-third/db")
+    } else {
+        out.join("native-later/db")
+    };
     ensure(
         node.chain_store.get_head_hash()? == Some(later.hash())
             && node.world_state.write().state_root()? == later.header.state_root
@@ -902,7 +992,7 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
     )?;
     let before = digest(fresh.as_ref())?;
     let replay = node.replay_canonical_transactions_with_proof(later.hash(), c.block, &proof)?;
-    let ordinary = Arc::new(RocksDbStore::open_all(out.join("native-later/db"), None)?.state);
+    let ordinary = Arc::new(RocksDbStore::open_all(ordinary_path, None)?.state);
     let ordinary_before = digest(ordinary.as_ref())?;
     let ordinary_node = fixture::node(ordinary.clone(), c.authority, &c.authority_key)?;
     let second =
