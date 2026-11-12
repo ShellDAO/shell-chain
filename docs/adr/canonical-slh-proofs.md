@@ -355,6 +355,24 @@ The full raw-header seventeen-layer proposer graph and bounded dictionary,
 checkpoint, expansion and transport limits remain unchanged. Require durable
 pause/cold generation, CLI zero-new revalidation and real peer admission,
 registration, genuine finality, cold replay and foreign-header refusal. Earlier
-source/frame meanings remain strict. Reference-target proofs, fresh automatic
-generation for this unbound profile, other account/role combinations and public
+source/frame meanings remain strict. Reference-target proofs,
+other account/role combinations and public
 release or activation require separate acceptance.
+
+The Source 13 fresh automatic entry must start from an empty captured job and
+the same retained three-block Native control. Restore the funded genesis with
+an absent sender key, then require ordinary Embedded import to register it and
+queue zero components. The public-only worker durably pauses and cold-generates
+the complete frame 10 without a completed donor or signing capability.
+
+For this first-use target, historical verification must consume both retained
+ordinary successors and the independent Native third-state checkpoint. Checking
+only the second state is incomplete when the genuine third header was already
+frozen. Keep earlier profiles' historical targets unchanged, and keep future
+Reference targets distinct from this first-block flow. Replay against both
+current-three controls without writeback while resolving the absent key from
+the sealed parent, not the current registry. Authenticated availability,
+correct-hash damaged-component refusal, status-provenance RPC failure with
+graceful shutdown, and generated-frame real peer admission/registration/finality,
+cold replay and foreign-header refusal are separate checks. Core proof formats,
+Native policy, defaults and quotas do not change.

@@ -711,7 +711,7 @@ fn verify(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resul
     let changed_history = if (source.has_unbound_senders() || source.has_slh_proposer())
         && native.join("later.json").is_file()
     {
-        let later: shell_core::Block = json_read(&native.join("later.json"))?;
+        let mut later: shell_core::Block = json_read(&native.join("later.json"))?;
         ensure(
             later.header.parent_hash == c.block
                 && later.number() == block.number() + 1
@@ -731,6 +731,22 @@ fn verify(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resul
         if history_node.chain_store.get_head_hash()? == Some(c.block) {
             history_node.import_block(later.clone(), &MultiVerifier)?;
         }
+        let ordinary_path = if proof.version == 9 && block.number() == 1 {
+            let advance: shell_core::Block = json_read(&native.join("advance.json"))?;
+            ensure(
+                advance.number() == 3
+                    && advance.header.parent_hash == later.hash()
+                    && advance.header.state_root != later.header.state_root,
+                "retained raw third control is not a changed child",
+            )?;
+            if history_node.chain_store.get_head_hash()? == Some(later.hash()) {
+                history_node.import_block(advance.clone(), &MultiVerifier)?;
+            }
+            later = advance;
+            native.join("native-third/db")
+        } else {
+            native.join("native-later/db")
+        };
         ensure(
             history_node.chain_store.get_head_hash()? == Some(later.hash())
                 && history_node.world_state.write().state_root()? == later.header.state_root
@@ -755,8 +771,7 @@ fn verify(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resul
         let history_before = digest(history.as_ref())?;
         let replay =
             history_node.replay_canonical_transactions_with_proof(later.hash(), c.block, &proof)?;
-        let ordinary =
-            Arc::new(RocksDbStore::open_all(native.join("native-later/db"), None)?.state);
+        let ordinary = Arc::new(RocksDbStore::open_all(ordinary_path, None)?.state);
         let ordinary_before = digest(ordinary.as_ref())?;
         let ordinary_node = fixture::node(ordinary.clone(), c.authority, &c.authority_key)?;
         ensure(

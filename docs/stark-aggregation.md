@@ -2425,9 +2425,49 @@ Partial or rejected transfer must preserve it. Successful proof-backed import
 must register the original key and match Native receipts/accounts; finality
 separately requires the attached genuine quorum certificate. Cold replay and
 foreign-header refusal remain independent checks. This first-use target does
-not qualify a later Reference proof or fresh background generation. Other
+not qualify a later Reference proof. Other
 accounts/roles, quorum AIR, power-loss recovery, public artifacts and activation
 remain separate acceptance work; production defaults and limits do not change.
+
+For fresh Source 13 background generation, retain the same `raw-first-slh`
+control with all three genuine headers/quorum controls and choose a new output:
+
+```sh
+tests/e2e/slh-canonical.sh automatic-fresh-prepare raw-first-slh raw-first-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-pause raw-first-slh raw-first-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-resume raw-first-slh raw-first-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-verify raw-first-slh raw-first-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-refuse raw-first-slh raw-first-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-rpc-refuse raw-first-slh raw-first-slh-automatic
+tests/e2e/slh-peer-proof.sh prepare raw-first-slh raw-first-slh-automatic raw-first-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh pause raw-first-slh raw-first-slh-automatic raw-first-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh resume raw-first-slh raw-first-slh-automatic raw-first-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh verify raw-first-slh raw-first-slh-automatic raw-first-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh refuse raw-first-slh raw-first-slh-automatic raw-first-slh-automatic-peer
+```
+
+Preparation restores the exact funded genesis and registered proposer while
+leaving the sender unregistered. Ordinary Native import must register the
+Embedded key and capture a queued Source 13 job with zero mathematical
+components and no ready payload. The actual public-only `Node.run` worker
+persists one real component, stops gracefully and cold-resumes that same job
+without opening the completed standalone graph as a donor. Keep successful
+preparation and every durable pause; never recreate dropped signing keys.
+Authenticated RPC retrieval returns frame 10 availability without claiming
+execution authority.
+
+Cold verification must import both retained ordinary successors and replay the
+first proof against current height 3 on independent copied-worker and ordinary
+Native third-state controls. The sealed parent still has no sender key; the
+current registration cannot supply historical authority. Neither current
+database may change during replay. Correct-hash damaged-component refusal and
+an independent status source-hash RPC refusal must leave Native data and the
+original job unchanged; status errors must surface and shut the Node down
+gracefully. The generated frame then follows real peer transfer, cold resume,
+Native registration, genuine attached-certificate finality, cold replay and
+foreign-header refusal. This does not establish a later Reference-target proof,
+power-loss recovery, broader account/role combinations, public release or
+activation.
 
 #### Funded SDK first use with an SLH proposer
 

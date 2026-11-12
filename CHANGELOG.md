@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add fresh Source 13 background-proof coverage for the retained funded raw first-use sender and SLH proposer. Generate from an empty job through durable pause and cold worker recovery, verify authenticated frame 10 availability and historical replay after both ordinary successors, and exercise checkpoint/status refusals plus generated-frame peer admission without new keys, signing or a completed donor.
+
 - Add funded raw Native tag-zero first use with a registered SLH proposer: Source 13, batch 9 and frame 10 bind the full tagged sender address, zero-commitment parent, raw signature domain and complete seventeen-layer proposer graph. Retain three genuine sender transactions and freeze every independent Native header/quorum control before dropping the proposer; cover durable recovery, CLI, registration/finality, historical replay after block 3, peer admission and domain/address/role refusals.
 
 - Document fresh Source 12 background generation for a bound raw Native tag-zero sender and registered SLH proposer. Retain the original signatures and Native controls, begin with an empty job, cold-resume durable progress, and verify authenticated frame 9 retrieval, changed-state history, checkpoint/status refusals and generated-frame peer admission.
