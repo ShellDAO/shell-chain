@@ -805,7 +805,7 @@ fn verify(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resul
     };
     println!(
         "{}",
-        json!({"actual_Node_run_cold_proof_verified":true,"proof_bytes":bytes.len(),"byte_identical_original_graph":prior.map(|_|true),"receipts_state_accounts_match_original":true,"read_only":true,"new_signing":false,"fresh_generation":fresh,"peer_transport":false,"first_use_history":if source.has_unbound_senders(){changed_history.as_ref()}else{None},"slh_proposer_history":if source.has_slh_proposer(){changed_history.as_ref()}else{None},"original_successor2_signed":false})
+        json!({"actual_Node_run_cold_proof_verified":true,"proof_bytes":bytes.len(),"byte_identical_original_graph":prior.map(|_|true),"receipts_state_accounts_match_original":true,"read_only":true,"new_signing":false,"fresh_generation":fresh,"peer_transport":false,"first_use_history":if source.has_unbound_senders(){changed_history.as_ref()}else{None},"slh_proposer_history":if source.has_slh_proposer(){changed_history.as_ref()}else{None},"original_successor2_signed":block.number() > 1 || changed_history.is_some()})
     );
     Ok(())
 }

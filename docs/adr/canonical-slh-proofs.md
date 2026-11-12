@@ -398,3 +398,25 @@ peer cold continuation, attached-certificate finality 2 and cold replay.
 Fresh Reference background generation, other roles, public artifacts and
 activation remain separate checks; core formats, policy, defaults and quotas
 are unchanged.
+
+Fresh Source 13 Reference background generation restores authentic finalized
+parent 1, imports the retained Reference block to queue zero components, and
+persists the original verified target-2 quorum before worker recovery. Preserve
+both registered historical keys and the zero account commitment. Require a new
+empty output, durable one-component pause, graceful shutdown and cold generation
+of the full frame 10 by the actual public-only worker. Reuse no completed
+mathematical donor and generate no keys, signatures, headers or quorums.
+
+Authenticated RPC exposes availability, not execution authority. Require
+read-only target-2 replay after ordinary block 3 on independent controls,
+correct-hash damaged-component refusal without new math, and status-provenance
+RPC failure with graceful shutdown and original job/math/Native preservation.
+The generated graph must separately pass real peer parent-1 admission, cold
+chunk continuation with a fresh nonce, attached-certificate finality 2, cold
+replay and foreign-header refusal. Earlier standalone and first-use acceptance
+remain distinct; defaults, formats, policy and quotas do not change.
+
+The automatic verification receipt derives retained-successor signature provenance
+from an authenticated non-first target or successfully imported historical
+successors. A fixed false flag contradicts a verified Reference target; changing
+this output must not replace keys, proving, Native execution or historical checks.

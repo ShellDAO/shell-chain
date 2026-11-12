@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Document fresh Source 13 raw Reference/SLH background generation from the retained finalized parent 1 and target-2 quorum. Start an empty job, cold-resume durable progress, and cover authenticated frame 10 retrieval, third-state history, checkpoint/status refusals and generated-frame peer admission/finality 2 without new signing or a completed donor. Derive the retained-successor output flag from authenticated target/history evidence instead of a fixed false value.
+
 - Add a public raw Reference/SLH control-reuse entry: replay the existing three genuine headers and quorums with public-only actors, preserve finalized parent 1 and target 2 checkpoints, and prove Source 13/batch 9/frame 10 without new signing or a completed donor. Cover cold recovery, CLI, target-2 finality, third-state history, refusals and real peer admission.
 
 - Add fresh Source 13 background-proof coverage for the retained funded raw first-use sender and SLH proposer. Generate from an empty job through durable pause and cold worker recovery, verify authenticated frame 10 availability and historical replay after both ordinary successors, and exercise checkpoint/status refusals plus generated-frame peer admission without new keys, signing or a completed donor.

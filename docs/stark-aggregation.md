@@ -2519,6 +2519,46 @@ acceptance, broader accounts/roles, power-loss recovery, public release and
 network activation. Keep the earlier first-use graph and all retained Native
 controls; never rerun preparation to replace dropped keys or completed work.
 
+For fresh background generation, keep `raw-reference-slh` and choose a new
+output. The finalized parent-1 checkpoint and genuine target-2 quorum must be
+retained before starting the worker; a current head alone is insufficient.
+
+```sh
+tests/e2e/slh-canonical.sh automatic-fresh-prepare raw-reference-slh raw-reference-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-pause raw-reference-slh raw-reference-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-resume raw-reference-slh raw-reference-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-verify raw-reference-slh raw-reference-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-refuse raw-reference-slh raw-reference-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-rpc-refuse raw-reference-slh raw-reference-slh-automatic
+tests/e2e/slh-peer-proof.sh prepare raw-reference-slh raw-reference-slh-automatic raw-reference-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh pause raw-reference-slh raw-reference-slh-automatic raw-reference-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh resume raw-reference-slh raw-reference-slh-automatic raw-reference-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh verify raw-reference-slh raw-reference-slh-automatic raw-reference-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh refuse raw-reference-slh raw-reference-slh-automatic raw-reference-slh-automatic-peer
+```
+
+Preparation restores authentic finalized parent 1 with both registered keys,
+then imports the exact Reference block through Native execution and captures
+an empty Source 13 job. Preserve target 2 with its original verified quorum
+before `Node.run` recovery. The actual public-only worker must durably pause
+one real component, shut down gracefully and cold-resume that same job without
+opening a completed mathematical donor. No sender/proposer keys, signatures,
+headers or quorum certificates are regenerated. Authenticated frame 10 RPC
+retrieval reports availability separately from execution authority.
+
+Cold historical target-2 replay after ordinary block 3 must match both
+independent Native controls without writeback, using the registered keys from
+sealed parent 1. A damaged inner component with a corrected outer hash must
+fail without new proving or Native changes. An independent status source-hash
+RPC error must surface and stop the worker gracefully, preserving the original
+job and all mathematical rows. The retained-successor output flag reflects
+the authenticated Reference target or successfully imported historical child;
+it must not report this genuine second signature as absent. Finally, the newly generated graph must pass
+real peer transfer from parent 1, durable chunk continuation with a fresh nonce,
+proof-backed target-2 import, attached-certificate finality 2, cold replay and
+genuine foreign-header refusal. This does not establish power-loss recovery,
+broader account/role combinations, public release or network activation.
+
 #### Funded SDK first use with an SLH proposer
 
 Keep the existing `sdk-first-use-output` from the funded unbound SDK entry.
