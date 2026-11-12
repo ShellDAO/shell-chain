@@ -242,3 +242,21 @@ SDK key absence after state 2, no-writeback replay on both controls,
 correct-hash damaged-checkpoint refusal and generated-frame real peer admission
 are independent checks from standalone proof completion. Raw Native tag-zero
 SLH proposer combinations remain open.
+
+
+For the SDK Reference target after first use, preserve all three original SDK
+signed transactions. A separate independent SLH proposer must sign three genuine
+headers and quorum controls before its keys are dropped. Save the independently
+imported, finalized Native parent at height 1 before advancing either control;
+restore that checkpoint for proof import and peer admission of target height 2.
+Validate its canonical header/configuration, state root, finality and historical
+sender/proposer keys, and reject preloaded target state, receipts or block.
+
+Source 11 remains necessary because the account commitment is zero, even though
+the sender key was registered by the prior Embedded transaction. Resolve the
+expected key from the sealed parent instead of inferring registration absence
+from the unbound account profile. Import and finalize the full Reference graph
+at height 2, then replay it read-only after the genuine third block on both
+proof-imported and ordinary Native controls. No SDK signatures or existing
+proposer identities are recreated. Full fresh automatic Reference-target
+production, public artifacts and activation remain separate acceptance work.

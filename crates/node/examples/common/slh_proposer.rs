@@ -161,19 +161,23 @@ impl Signer for PublicRetainedSender {
     }
 }
 pub(crate) fn prepare_first_use(original: &Path, out: &Path) -> Result<(), Error> {
-    prepare_retained(original, out, SignatureType::MlDsa65, true)
+    prepare_retained(original, out, SignatureType::MlDsa65, true, 1)
 }
 pub(crate) fn prepare_sdk_bound(original: &Path, out: &Path) -> Result<(), Error> {
-    prepare_retained(original, out, SignatureType::Dilithium3, false)
+    prepare_retained(original, out, SignatureType::Dilithium3, false, 1)
 }
 pub(crate) fn prepare_sdk_first_use(original: &Path, out: &Path) -> Result<(), Error> {
-    prepare_retained(original, out, SignatureType::Dilithium3, true)
+    prepare_retained(original, out, SignatureType::Dilithium3, true, 1)
+}
+pub(crate) fn prepare_sdk_reference(original: &Path, out: &Path) -> Result<(), Error> {
+    prepare_retained(original, out, SignatureType::Dilithium3, true, 2)
 }
 fn prepare_retained(
     original: &Path,
     out: &Path,
     kind: SignatureType,
     first_use: bool,
+    target_number: u64,
 ) -> Result<(), Error> {
     ensure(
         !out.exists(),
@@ -279,6 +283,40 @@ fn prepare_retained(
             },
         "retained genuine sender first/later signatures differ",
     )?;
+    let advance = if target_number == 2 {
+        ensure(
+            kind == SignatureType::Dilithium3 && first_use,
+            "unsupported retained target",
+        )?;
+        let block: Block = read(&original.join("advance.json"))?;
+        ensure(
+            block.transactions.len() == 1,
+            "retained SDK advance transaction count differs",
+        )?;
+        let signed = block.transactions[0].clone();
+        ensure(
+            !next.pubkey_mode.is_embedded()
+                && !signed.pubkey_mode.is_embedded()
+                && signed.from == reference.from
+                && signed.tx.nonce == 2
+                && signed.signature.sig_type == kind
+                && !DilithiumVerifier.verify_legacy_transcript(
+                    &key,
+                    signed.sender_signing_hash().as_bytes(),
+                    &signed.signature,
+                )
+                && DilithiumVerifier.verify_sdk_transcript(
+                    &key,
+                    signed.sender_signing_hash().as_bytes(),
+                    &signed.signature,
+                ),
+            "retained genuine SDK Reference advance differs",
+        )?;
+        Some(signed)
+    } else {
+        ensure(target_number == 1, "unsupported retained target")?;
+        None
+    };
     let sender = PublicRetainedSender {
         key,
         kind,
@@ -364,7 +402,7 @@ fn prepare_retained(
         node.chain_store.get_pubkey(&first.from)?.is_none() == first_use,
         "mempool changed historical sender registration",
     )?;
-    let block = node.produce_block(&proposer, 100)?;
+    let mut block = node.produce_block(&proposer, 100)?;
     ensure(
         block.transactions == vec![first.clone()]
             && node.chain_store.get_pubkey(&first.from)?.as_deref() == Some(sender.public_key()),
@@ -383,7 +421,30 @@ fn prepare_retained(
         dilithium::control(&peer, &block)? == control,
         "independent first-use Native controls differ",
     )?;
-    control["first_use_parent_unregistered"] = json!(first_use);
+    if target_number == 2 {
+        // Keep an independently imported, finalized parent before either control advances.
+        std::fs::create_dir(out.join("native-parent"))?;
+        receiver.create_checkpoint(out.join("native-parent/db"))?;
+        write(&out.join("retained-embedded.json"), &first)?;
+        write(&out.join("parent-control.json"), &control)?;
+        node.handle_incoming_tx(next.clone(), &MultiVerifier)?;
+        let target = node.produce_block(&proposer, 100)?;
+        ensure(
+            target.number() == 2 && target.transactions == vec![next.clone()],
+            "Reference target differs",
+        )?;
+        peer.import_block(target.clone(), &MultiVerifier)?;
+        finalize(&node, &proposer, &target)?;
+        finalize(&peer, &proposer, &target)?;
+        control = dilithium::control(&node, &target)?;
+        ensure(
+            control == dilithium::control(&peer, &target)?,
+            "Reference Native controls differ",
+        )?;
+        block = target;
+        first = next.clone();
+    }
+    control["first_use_parent_unregistered"] = json!(first_use && target_number == 1);
     std::fs::create_dir(out.join("provider"))?;
     native.create_checkpoint(out.join("provider/db"))?;
     write(
@@ -394,7 +455,13 @@ fn prepare_retained(
             authority_key: proposer.public_key().to_vec(),
             genesis_root: node
                 .chain_store
-                .get_header_by_hash(&block.header.parent_hash)?
+                .get_header_by_hash(
+                    &node
+                        .chain_store
+                        .get_chain_config()?
+                        .ok_or("chain config absent")?
+                        .genesis_hash,
+                )?
                 .ok_or("genesis absent")?
                 .state_root,
             block: block.hash(),
@@ -405,11 +472,12 @@ fn prepare_retained(
     write(&out.join("signed-first.json"), &first)?;
     write(&out.join("original-signed-first.json"), &reference)?;
     write(&out.join("control.json"), &control)?;
-    node.handle_incoming_tx(next.clone(), &MultiVerifier)?;
+    let later_signed = advance.as_ref().unwrap_or(&next);
+    node.handle_incoming_tx(later_signed.clone(), &MultiVerifier)?;
     let later = node.produce_block(&proposer, 100)?;
     ensure(
-        later.number() == 2
-            && later.transactions == vec![next.clone()]
+        later.number() == target_number + 1
+            && later.transactions == vec![later_signed.clone()]
             && later.header.state_root != block.header.state_root,
         "genuine later sender state did not change",
     )?;
@@ -423,7 +491,7 @@ fn prepare_retained(
     std::fs::create_dir(out.join("native-later"))?;
     native.create_checkpoint(out.join("native-later/db"))?;
     write(&out.join("later.json"), &later)?;
-    write(&out.join("later-signed.json"), &next)?;
+    write(&out.join("later-signed.json"), later_signed)?;
     write(
         &out.join("later-control.json"),
         &dilithium::control(&node, &later)?,
@@ -435,7 +503,7 @@ fn prepare_retained(
     drop(proposer);
     write(
         &out.join("prepared.json"),
-        &json!({"funded_zero_commitment_primary_sender":first_use && kind==SignatureType::MlDsa65,"funded_zero_commitment_sdk_sender":first_use && kind==SignatureType::Dilithium3,"native_bound_sdk_sender":!first_use,"same_retained_first_and_later_signatures":true,"first_reference_to_embedded_identity_unchanged":first_use && kind==SignatureType::MlDsa65,"sdk_embedded_input_unchanged":first_use && kind==SignatureType::Dilithium3,"retained_signed_identity_unchanged":true,"native_first_use_and_registration":first_use,"native_bound_sdk_first_and_later":!first_use,"native_later_state_changed":true,"new_sender_signing":false,"new_proposer_keys_memory_only_dropped":true,"original_native_unchanged":true}),
+        &json!({"funded_zero_commitment_primary_sender":first_use && kind==SignatureType::MlDsa65,"funded_zero_commitment_sdk_sender":first_use && kind==SignatureType::Dilithium3,"native_bound_sdk_sender":!first_use,"same_retained_first_and_later_signatures":true,"first_reference_to_embedded_identity_unchanged":first_use && kind==SignatureType::MlDsa65,"sdk_embedded_input_unchanged":first_use && kind==SignatureType::Dilithium3,"retained_signed_identity_unchanged":true,"target_height":target_number,"later_height":later.number(),"reference_target":target_number==2,"native_first_use_and_registration":first_use,"native_bound_sdk_first_and_later":!first_use,"native_later_state_changed":true,"new_sender_signing":false,"new_proposer_keys_memory_only_dropped":true,"original_native_unchanged":true}),
     )
 }
 pub(crate) fn capture(out: &Path) -> Result<(), Error> {
@@ -562,6 +630,9 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
         c.block,
     )?;
     source.verify(&proof)?;
+    let expected_parent_key = ChainStore::new(Arc::new(original.state.clone()))
+        .canonical_parent_view(c.tip, block.header.parent_hash)?
+        .registered_key(&block.transactions[0].from)?;
     let certificate = ChainStore::new(Arc::new(original.state.clone()))
         .get_commit_certificate(&c.block)?
         .ok_or("original SLH certificate absent")?;
@@ -577,7 +648,12 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
         "verified-control"
     };
     if !out.join(directory).exists() {
-        super::prepare_from(out, directory, &out.join("provider/db"))?;
+        if block.number() == 1 {
+            super::prepare_from(out, directory, &out.join("provider/db"))?;
+        } else {
+            let source = RocksDbStore::open_all(out.join("provider/db"), None)?;
+            restore_parent(out, &out.join(directory).join("receiver/db"), &source.state)?;
+        }
     }
     let fresh =
         Arc::new(RocksDbStore::open_all(out.join(directory).join("receiver/db"), None)?.state);
@@ -585,9 +661,48 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
     if refuse {
         ensure(
             node.chain_store.get_head_hash()? == Some(block.header.parent_hash),
-            "negative proposer receiver not at genesis",
+            "negative proposer receiver not at sealed parent",
         )?;
         let before = digest(fresh.as_ref())?;
+        if block.number() == 2 {
+            let mut native_refusals = Vec::new();
+            for case in [
+                "changed-signature",
+                "wrong-derived-address",
+                "changed-message",
+                "wrong-embedded-key",
+            ] {
+                let mut bad = block.transactions[0].clone();
+                match case {
+                    "changed-signature" => bad.signature.data[0] ^= 1,
+                    "wrong-derived-address" => bad.from = Address::from([0x12; 32]),
+                    "changed-message" => bad.tx.value += U256::from(1),
+                    _ => {
+                        let mut key = expected_parent_key
+                            .clone()
+                            .ok_or("Reference parent key absent")?;
+                        key[0] ^= 1;
+                        bad.pubkey_mode = shell_core::PubkeyMode::Embedded(key);
+                    }
+                }
+                let error = node
+                    .handle_incoming_tx(bad, &MultiVerifier)
+                    .err()
+                    .ok_or("invalid Native Reference input accepted")?
+                    .to_string();
+                ensure(
+                    before == digest(fresh.as_ref())?
+                        && node.chain_store.get_pubkey(&block.transactions[0].from)?
+                            == expected_parent_key,
+                    "Native Reference refusal changed parent state or registration",
+                )?;
+                native_refusals.push(json!({"case":case,"error":error,"native_unchanged":true,"parent_key_unchanged":true}));
+            }
+            write(
+                &out.join("native-reference-refusals.json"),
+                &native_refusals,
+            )?;
+        }
         let mut results = Vec::new();
         let mut cases = vec![
             "missing-proposer",
@@ -693,12 +808,12 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
             "full SLH proposer import differs from Native",
         )?;
         ensure(
-            node.fast_finalize_with_certificate(1, c.block, &certificate),
+            node.fast_finalize_with_certificate(block.number(), c.block, &certificate),
             "proof-backed SLH proposer child did not finalize",
         )?;
         write(
             &out.join("proof-import.json"),
-            &json!({"actual_import":imported,"finalized_height":1,"native_controls_match":true}),
+            &json!({"actual_import":imported,"finalized_height":block.number(),"native_controls_match":true}),
         )?;
     }
     let later: Block = read(&out.join("later.json"))?;
@@ -729,13 +844,13 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
             && ordinary_before == digest(ordinary.as_ref())?,
         "SLH proposer historical replay differs or writes back",
     )?;
-    let parent_sender_absent = node
+    let parent_sender_key = node
         .chain_store
         .canonical_parent_view(later.hash(), block.header.parent_hash)?
-        .registered_key(&block.transactions[0].from)?
-        .is_none();
+        .registered_key(&block.transactions[0].from)?;
+    let parent_sender_absent = parent_sender_key.is_none();
     ensure(
-        parent_sender_absent == source.has_unbound_senders()
+        parent_sender_key == expected_parent_key
             && node
                 .chain_store
                 .get_pubkey(&block.transactions[0].from)?
@@ -744,7 +859,7 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
     )?;
     write(
         &out.join("verified.json"),
-        &json!({"full_SLH_proposer_AIR":true,"actual_proof_import":true,"changed_current_height":2,"sealed_parent_sender_key_absent":parent_sender_absent,"current_sender_key_present":true,"read_only_historical_replay":replay,"ordinary_Native_history_matches":true,"both_Native_databases_unchanged":true,"new_signing":false}),
+        &json!({"full_SLH_proposer_AIR":true,"actual_proof_import":true,"changed_current_height":later.number(),"proof_target_height":block.number(),"sealed_parent_sender_key_absent":parent_sender_absent,"current_sender_key_present":true,"read_only_historical_replay":replay,"ordinary_Native_history_matches":true,"both_Native_databases_unchanged":true,"new_signing":false}),
     )
 }
 
@@ -789,5 +904,74 @@ pub(crate) fn publish(out: &Path) -> Result<(), Error> {
     write(
         &published.join("published.json"),
         &json!({"availability_only":true,"outer_hash_checked":true,"native_original_unchanged":true,"payload_bytes":payload.len(),"new_math":0,"new_signing":false}),
+    )
+}
+
+/// Restore the genuine independent Native parent without importing the proof target.
+pub(super) fn restore_parent(
+    native: &Path,
+    receiver_path: &Path,
+    source: &RocksDbStore,
+) -> Result<(), Error> {
+    ensure(
+        !receiver_path.exists(),
+        "parent receiver exists; refusing replacement",
+    )?;
+    let c: fixture::Context = read(&native.join("context.json"))?;
+    let block: Block = read(&native.join("candidate.json"))?;
+    ensure(
+        native.join("provider/db/CURRENT").is_file()
+            && native.join("native-parent/db/CURRENT").is_file(),
+        "initialized Native parent controls required",
+    )?;
+    let parent = RocksDbStore::open_all(native.join("native-parent/db"), None)?;
+    let source_before = digest(source)?;
+    let parent_before = digest(&parent.state)?;
+    let chain = ChainStore::new(Arc::new(source.clone()));
+    let prior = ChainStore::new(Arc::new(parent.state.clone()));
+    let header = prior
+        .get_header_by_hash(&block.header.parent_hash)?
+        .ok_or("saved parent absent")?;
+    let view = chain.canonical_parent_view(c.tip, block.header.parent_hash)?;
+    ensure(
+        block.hash() == c.block
+            && block.number() == 2
+            && prior.get_head_hash()? == Some(block.header.parent_hash)
+            && header.number + 1 == block.number()
+            && chain.get_header_by_hash(&block.header.parent_hash)? == Some(header.clone())
+            && prior.get_chain_config()? == chain.get_chain_config()?
+            && prior.get_block_by_hash(&c.block)?.is_none()
+            && prior.get_receipts(&c.block)?.is_none()
+            && parent
+                .state
+                .get(block.header.state_root.as_bytes())?
+                .is_none(),
+        "saved Native parent is not the canonical target predecessor",
+    )?;
+    let node = fixture::node(
+        Arc::new(parent.state.clone()),
+        c.authority,
+        &c.authority_key,
+    )?;
+    ensure(
+        node.world_state.write().state_root()? == header.state_root
+            && node.finality.read().last_finalized_number() == header.number,
+        "saved parent state or finality differs",
+    )?;
+    for address in [block.transactions[0].from, c.authority] {
+        ensure(
+            prior.get_pubkey(&address)? == view.registered_key(&address)?,
+            "saved parent authority differs",
+        )?;
+    }
+    std::fs::create_dir_all(
+        receiver_path
+            .parent()
+            .ok_or("receiver parent path absent")?,
+    )?;
+    parent.create_checkpoint(receiver_path)?;
+    ensure(
+        source_before == digest(source)? && parent_before == digest(&parent.state)?,
+        "parent restore changed retained Native controls",
     )
 }

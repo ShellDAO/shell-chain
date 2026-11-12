@@ -28,7 +28,7 @@ fn source(native: &Path) -> Result<(fixture::Context, Block, Value), Error> {
     let original: SignedTransaction = read(&native.join("signed-first.json"))?;
     ensure(
         block.hash() == c.block
-            && block.number() == 1
+            && matches!(block.number(), 1 | 2)
             && block.transactions == vec![original]
             && (block.transactions[0].signature.sig_type == SignatureType::SphincsSha2256f
                 || (matches!(
@@ -37,7 +37,7 @@ fn source(native: &Path) -> Result<(fixture::Context, Block, Value), Error> {
                 ) && block.proposer_seal.as_ref().is_some_and(|seal| {
                     seal.sig_type == SignatureType::SphincsSha2256f && c.authority_key.len() == 64
                 }))),
-        "retained first SLH sender or supported-sender/SLH-proposer child required",
+        "retained SLH sender or supported-sender/SLH-proposer child required",
     )?;
     Ok((c, block, read(&native.join("control.json"))?))
 }
@@ -83,9 +83,9 @@ fn prepare(native: &Path, cache: &Path, out: &Path) -> Result<(), Error> {
         .is_some();
     let provider = Arc::new(RocksDbStore::open_all(out.join("provider/db"), None)?.state);
     let provider_node = fixture::node(provider.clone(), c.authority, &c.authority_key)?;
-    provider_node.fast_finalize_with_certificate(1, c.block, &certificate);
+    provider_node.fast_finalize_with_certificate(block.number(), c.block, &certificate);
     ensure(
-        provider_node.finality.read().last_finalized_number() == 1
+        provider_node.finality.read().last_finalized_number() == block.number()
             && provider_node
                 .chain_store
                 .get_commit_certificate(&c.block)?
@@ -97,74 +97,87 @@ fn prepare(native: &Path, cache: &Path, out: &Path) -> Result<(), Error> {
     let parent = chain
         .get_block_by_hash(&block.header.parent_hash)?
         .ok_or("original genesis absent")?;
-    ensure(parent.number() == 0, "original parent must be genesis")?;
-    let receiver = Arc::new(RocksDbStore::open_all(out.join("receiver/db"), None)?.state);
-    ensure(receiver.scan_all()?.is_empty(), "receiver was not fresh")?;
-    WorldState::validate_snapshot_nodes(&original.state, parent.header.state_root)?;
-    for hash in WorldState::collect_snapshot_node_hashes(&original.state, parent.header.state_root)?
-    {
-        let bytes = original
-            .state
-            .get(hash.as_bytes())?
-            .ok_or("reachable genesis node absent")?;
-        ensure(
-            shell_primitives::keccak256(&bytes) == hash,
-            "genesis trie content hash mismatch",
-        )?;
-        receiver.put(hash.as_bytes(), &bytes)?;
+    if parent.number() > 0 {
+        slh_proposer::restore_parent(native, &out.join("receiver/db"), &original.state)?;
     }
-    ensure(
-        receiver.get(block.header.state_root.as_bytes())?.is_none(),
-        "child root preloaded in receiver",
-    )?;
-    let target = ChainStore::new(receiver.clone());
-    target.commit_genesis_block(
-        &parent,
-        &chain.get_chain_config()?.ok_or("chain config absent")?,
-    )?;
-    let view = chain.canonical_parent_view(c.tip, parent.hash())?;
-    for address in [block.transactions[0].from, c.authority] {
-        if let Some(key) = view.registered_key(&address)? {
-            target.put_pubkey(&address, &key)?;
-        } else {
+    let receiver = Arc::new(RocksDbStore::open_all(out.join("receiver/db"), None)?.state);
+    if parent.number() == 0 {
+        ensure(receiver.scan_all()?.is_empty(), "receiver was not fresh")?;
+        WorldState::validate_snapshot_nodes(&original.state, parent.header.state_root)?;
+        for hash in
+            WorldState::collect_snapshot_node_hashes(&original.state, parent.header.state_root)?
+        {
+            let bytes = original
+                .state
+                .get(hash.as_bytes())?
+                .ok_or("reachable genesis node absent")?;
             ensure(
-                address == block.transactions[0].from
-                    && block.transactions[0]
-                        .pubkey_mode
-                        .pubkey_bytes()
-                        .is_some_and(|key| {
-                            (key.len() == 64
-                                && block.transactions[0].signature.sig_type
-                                    == SignatureType::SphincsSha2256f
-                                || key.len() == 1952
-                                    && matches!(
-                                        block.transactions[0].signature.sig_type,
-                                        SignatureType::MlDsa65 | SignatureType::Dilithium3
-                                    )
-                                    && block.proposer_seal.as_ref().is_some_and(|s| {
-                                        s.sig_type == SignatureType::SphincsSha2256f
-                                    }))
-                                && Address::from_public_key(
-                                    key,
-                                    block.transactions[0].signature.sig_type.as_u8(),
-                                ) == address
-                        })
-                    && view
-                        .world_state()?
-                        .get_account(&address)?
-                        .is_some_and(|account| {
-                            account.validation_code_hash.is_none()
-                                && account.pq_pubkey_hash == ShellHash::ZERO
-                        }),
-                "historical key absent outside funded first-use profile",
+                shell_primitives::keccak256(&bytes) == hash,
+                "genesis trie content hash mismatch",
             )?;
+            receiver.put(hash.as_bytes(), &bytes)?;
+        }
+        ensure(
+            receiver.get(block.header.state_root.as_bytes())?.is_none(),
+            "child root preloaded in receiver",
+        )?;
+        let target = ChainStore::new(receiver.clone());
+        target.commit_genesis_block(
+            &parent,
+            &chain.get_chain_config()?.ok_or("chain config absent")?,
+        )?;
+        let view = chain.canonical_parent_view(c.tip, parent.hash())?;
+        for address in [block.transactions[0].from, c.authority] {
+            if let Some(key) = view.registered_key(&address)? {
+                target.put_pubkey(&address, &key)?;
+            } else {
+                ensure(
+                    address == block.transactions[0].from
+                        && block.transactions[0]
+                            .pubkey_mode
+                            .pubkey_bytes()
+                            .is_some_and(|key| {
+                                (key.len() == 64
+                                    && block.transactions[0].signature.sig_type
+                                        == SignatureType::SphincsSha2256f
+                                    || key.len() == 1952
+                                        && matches!(
+                                            block.transactions[0].signature.sig_type,
+                                            SignatureType::MlDsa65 | SignatureType::Dilithium3
+                                        )
+                                        && block.proposer_seal.as_ref().is_some_and(|s| {
+                                            s.sig_type == SignatureType::SphincsSha2256f
+                                        }))
+                                    && Address::from_public_key(
+                                        key,
+                                        block.transactions[0].signature.sig_type.as_u8(),
+                                    ) == address
+                            })
+                        && view
+                            .world_state()?
+                            .get_account(&address)?
+                            .is_some_and(|account| {
+                                account.validation_code_hash.is_none()
+                                    && account.pq_pubkey_hash == ShellHash::ZERO
+                            }),
+                    "historical key absent outside funded first-use profile",
+                )?;
+            }
         }
     }
+    let target = ChainStore::new(receiver.clone());
+    ensure(
+        target.get_head_hash()? == Some(block.header.parent_hash)
+            && target.get_block_by_hash(&c.block)?.is_none()
+            && target.get_receipts(&c.block)?.is_none()
+            && receiver.get(block.header.state_root.as_bytes())?.is_none(),
+        "peer target state preloaded",
+    )?;
     receiver.flush()?;
     write(&out.join("manifest.json"), &manifest)?;
     write(
         &out.join("initial.json"),
-        &json!({"head":parent.hash(),"native_digest":canonical_digest(receiver.as_ref())?,"genesis_reachable_nodes_only":true,"child_root_not_preloaded":true,"native_original_digest":before,"cache_original_digest":cache_before,"original_signature_preserved":true,"provider_original_certificate_verified":true,"provider_finalized_height":1,"automatic_cache_had_certificate":cache_had_certificate,"original_certificate_hash":blake3_hash(&certificate)}),
+        &json!({"head":parent.hash(),"native_digest":canonical_digest(receiver.as_ref())?,"genesis_reachable_nodes_only":parent.number()==0,"genuine_native_parent_checkpoint":parent.number()>0,"parent_height":parent.number(),"child_root_not_preloaded":true,"native_original_digest":before,"cache_original_digest":cache_before,"original_signature_preserved":true,"provider_original_certificate_verified":true,"provider_finalized_height":block.number(),"automatic_cache_had_certificate":cache_had_certificate,"original_certificate_hash":blake3_hash(&certificate)}),
     )?;
     ensure(
         before == digest(&original.state)? && cache_before == digest(&original_cache.state)?,
@@ -256,8 +269,8 @@ async fn run(native: &Path, out: &Path, pause: bool, negative: bool) -> Result<(
             let status=receiver.call("admin_canonicalProofAdmission",json!([c.block])).await?;
             if status["status"]["state"]=="failed" {
                 ensure(negative,&format!("SLH peer candidate failed: {status}"))?;
-                ensure(status["nativeCanonical"]==false && receiver.node.chain_store.get_head_hash()?==Some(serde_json::from_value(initial["head"].clone())?) && receiver.node.chain_store.get_receipts(&c.block)?.is_none() && json!(canonical_digest(receiver.node.store.as_ref())?)==initial["native_digest"],"invalid inner graph changed native genesis")?;
-                write(&out.join("refused.json"),&json!({"admission":status,"correct_outer_hash":true,"genuine_foreign_hash_certificate":true,"genuine_original_signatures":true,"native_genesis_unchanged":true,"served_response_attempts":faults.chunks.load(Ordering::SeqCst)}))?;break;
+                ensure(status["nativeCanonical"]==false && receiver.node.chain_store.get_head_hash()?==Some(serde_json::from_value(initial["head"].clone())?) && receiver.node.chain_store.get_receipts(&c.block)?.is_none() && json!(canonical_digest(receiver.node.store.as_ref())?)==initial["native_digest"],"invalid inner graph changed native parent")?;
+                write(&out.join("refused.json"),&json!({"admission":status,"correct_outer_hash":true,"genuine_foreign_hash_certificate":true,"genuine_original_signatures":true,"native_parent_unchanged":true,"served_response_attempts":faults.chunks.load(Ordering::SeqCst)}))?;break;
             }
             if status["status"]["state"]=="complete" {
                 ensure(!negative,"genuine foreign key-hash proof was accepted")?;
@@ -265,14 +278,14 @@ async fn run(native: &Path, out: &Path, pause: bool, negative: bool) -> Result<(
                 if let Some(key) = block.transactions[0].pubkey_mode.pubkey_bytes() {
                     ensure(receiver.node.chain_store.get_pubkey(&block.transactions[0].from)?.as_deref() == Some(key), "committed Embedded key registration absent")?;
                 }
-                if receiver.node.finality.read().last_finalized_number() < 1 {
+                if receiver.node.finality.read().last_finalized_number() < block.number() {
                     ensure(tokio::time::Instant::now()<deadline,"imported SLH child did not finalize")?;
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
                 let received=receiver.node.store.clone(); let raw=CanonicalProofUploadStore::new(received).payload(&manifest.id())?;
                 ensure(raw.len() as u64==manifest.total_bytes && blake3_hash(&raw)==manifest.payload_hash,"received graph bytes mismatch")?;
-                write(&out.join("complete.json"),&json!({"admission":status,"served_response_attempts":faults.chunks.load(Ordering::SeqCst),"native_receipts_root_accounts_match_original":true,"finalized_height":1,"ordinary_block_discovery":true,"actual_TCP_Noise":true,"operator_fetch_or_import":false,"no_signing":true}))?;break;
+                write(&out.join("complete.json"),&json!({"admission":status,"served_response_attempts":faults.chunks.load(Ordering::SeqCst),"native_receipts_root_accounts_match_original":true,"finalized_height":block.number(),"ordinary_block_discovery":true,"actual_TCP_Noise":true,"operator_fetch_or_import":false,"no_signing":true}))?;break;
             }
             if receiver.node.chain_store.get_head_hash()?==Some(c.block) && status["nativeCanonical"]!=true {return Err("native fallback accepted a pending SLH candidate".into());}
             ensure(tokio::time::Instant::now()<deadline,&format!("SLH peer admission timeout: {status}"))?;
@@ -317,7 +330,7 @@ fn verify(native: &Path, out: &Path) -> Result<(), Error> {
     let node = fixture::node(db.clone(), c.authority, &c.authority_key)?;
     ensure(
         node.chain_store.get_head_hash()? == Some(c.block)
-            && node.finality.read().last_finalized_number() == 1,
+            && node.finality.read().last_finalized_number() == block.number(),
         "cold peer head/finality missing",
     )?;
     if let Some(key) = block.transactions[0].pubkey_mode.pubkey_bytes() {
@@ -342,7 +355,7 @@ fn verify(native: &Path, out: &Path) -> Result<(), Error> {
     )?;
     write(
         &out.join("verified.json"),
-        &json!({"actual_received_graph_cold_replay":replay,"native_unchanged":true,"finalized_height":1,"original_accounts_match":true,"new_math":0,"new_signing":false}),
+        &json!({"actual_received_graph_cold_replay":replay,"native_unchanged":true,"finalized_height":block.number(),"original_accounts_match":true,"new_math":0,"new_signing":false}),
     )
 }
 fn inspect(native: &Path, out: &Path) -> Result<(), Error> {

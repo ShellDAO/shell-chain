@@ -2339,3 +2339,48 @@ genuine state 2, match both Native controls and write neither current database.
 A damaged checkpoint with a corrected component hash must fail without Native
 changes or retries. The generated frame then passes real peer transfer,
 Native key registration/import, attached-certificate finality and cold replay.
+
+
+#### SDK Reference proof with an SLH proposer after first use
+
+Keep all three original signed transactions from `sdk-first-use-output`: the
+Embedded nonce-zero transaction and the Reference transactions with nonces one
+and two. Use the pinned public SDK prerequisites above. This entry creates a
+separate SLH proposer control once; it does not extend or replace a two-block
+control whose proposer keys have already been dropped.
+
+```sh
+tests/e2e/slh-proposer-sdk.sh prepare-reference sdk-first-use-output sdk-reference-slh
+tests/e2e/slh-proposer-sdk.sh capture sdk-reference-slh
+tests/e2e/slh-proposer-sdk.sh pause sdk-reference-slh
+tests/e2e/slh-proposer-sdk.sh resume sdk-reference-slh
+tests/e2e/slh-proposer-sdk.sh verify sdk-reference-slh
+tests/e2e/slh-proposer-sdk.sh refuse sdk-reference-slh
+tests/e2e/slh-proposer-sdk.sh publish sdk-reference-slh
+tests/e2e/slh-peer-proof.sh prepare sdk-reference-slh sdk-reference-slh/published sdk-reference-slh-peer
+tests/e2e/slh-peer-proof.sh pause sdk-reference-slh sdk-reference-slh/published sdk-reference-slh-peer
+tests/e2e/slh-peer-proof.sh resume sdk-reference-slh sdk-reference-slh/published sdk-reference-slh-peer
+tests/e2e/slh-peer-proof.sh verify sdk-reference-slh sdk-reference-slh/published sdk-reference-slh-peer
+tests/e2e/slh-peer-proof.sh refuse sdk-reference-slh sdk-reference-slh/published sdk-reference-slh-peer
+```
+
+Preparation validates the retained SDK signatures before creating the independent
+SLH proposer. It signs three genuine headers and quorum controls, then drops
+the proposer keys; SDK signing is never called. Both Native controls execute the
+original Embedded transaction in block 1, the target Reference transaction in
+block 2 and the later Reference transaction in block 3. The independently
+imported and finalized block-1 checkpoint is preserved before either control
+advances. Proof and peer receivers start from that actual parent, with its
+registered sender key and no target block, receipts or state root preloaded.
+
+The funded account still has a zero key commitment, so the Reference target
+uses Source 11/batch 7/frame 8 and the complete tagged-address/FIPS graph. A zero
+account commitment does not imply an absent registered key: authority must come
+from the sealed block-1 parent. Proof import must match ordinary Native receipts,
+accounts and state root and finalize block 2 with its genuine certificate.
+Cold historical replay after genuine block 3 must reproduce block 2 without
+writing either current database. Durable continuation, ordinary CLI completion
+without new mathematical components, real peer chunk recovery/finality and
+wrong-statement refusals remain required. Full fresh automatic generation for
+this Reference target is separate acceptance work; this entry does not change
+production defaults, quotas or network activation.
