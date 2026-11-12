@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Document full Source 11 background proof generation from an empty job, including continuation of an existing durable pause, authenticated frame retrieval, sealed-parent SDK key absence, historical replay and real peer admission without new signing or a completed proof donor.
+
 - Add funded SDK first-use senders with a registered SLH proposer: Source 11, batch 7 and frame 8 bind the full tagged address, SDK FIPS sender and seventeen-layer proposer graph. Retain original signed inputs across Native registration, durable recovery, CLI/history/peer and refusal checks; restore historical controls against their current canonical tip without changing earlier profiles or limits.
 
 - Document the bound SDK sender/SLH proposer Source 10 empty-job automatic entry, including durable worker recovery, authenticated frame retrieval, changed-state historical replay, damaged-checkpoint refusal and real peer admission without new signing or a completed proof donor.

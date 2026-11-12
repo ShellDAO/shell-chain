@@ -2307,7 +2307,35 @@ absent sealed-parent sender key despite its current registration, and must not
 write either current database. Refusals cover missing/tag-changed address AIR,
 bound/raw/primary account and SDK transaction/challenge substitutions, missing
 proposer layers and genuine wrong-header certificates. Existing size/count/
-expansion limits and default-off production remain unchanged. Full fresh
-automatic Source 11 generation, raw Native tag-zero SLH proposer combinations,
+expansion limits and default-off production remain unchanged. Raw Native
+tag-zero SLH proposer combinations,
 two SLH roles, other accounts, quorum AIR, power-loss recovery, public artifacts
 and network activation remain separate acceptance work.
+
+For background generation, use the same Native control with a new automatic
+output directory. If this job already has a durable initial pause, continue
+with `automatic-fresh-resume`; do not repeat preparation or replace the job.
+
+```sh
+tests/e2e/slh-canonical.sh automatic-fresh-prepare sdk-first-use-slh sdk-first-use-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-pause sdk-first-use-slh sdk-first-use-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-resume sdk-first-use-slh sdk-first-use-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-verify sdk-first-use-slh sdk-first-use-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-refuse sdk-first-use-slh sdk-first-use-slh-automatic
+tests/e2e/slh-peer-proof.sh prepare sdk-first-use-slh sdk-first-use-slh-automatic sdk-first-use-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh pause sdk-first-use-slh sdk-first-use-slh-automatic sdk-first-use-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh resume sdk-first-use-slh sdk-first-use-slh-automatic sdk-first-use-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh verify sdk-first-use-slh sdk-first-use-slh-automatic sdk-first-use-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh refuse sdk-first-use-slh sdk-first-use-slh-automatic sdk-first-use-slh-automatic-peer
+```
+
+Preparation must capture Source 11 through ordinary Native import with zero
+mathematical components and no proof donor. Native key registration must happen
+at commit; the restored genesis sender key stays absent. The worker generates
+durable progress and cold-resumes the complete frame 8 graph, with no new SDK
+or proposer signing. Authenticated RPC retrieval provides availability only.
+Cold verification must replay against the absent sealed-parent sender key after
+genuine state 2, match both Native controls and write neither current database.
+A damaged checkpoint with a corrected component hash must fail without Native
+changes or retries. The generated frame then passes real peer transfer,
+Native key registration/import, attached-certificate finality and cold replay.

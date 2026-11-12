@@ -234,5 +234,11 @@ the key, and historical replay after state 2 must still see the absent parent
 key without writing either current database. Missing/tag-changed address AIR,
 SDK/raw/primary relabeling and wrong-slot proposer certificates must refuse.
 Frame 8 retains the shared dictionary, expansion pool and existing quotas.
-Full empty-job automatic generation remains a separate acceptance from the
-standalone graph; raw Native tag-zero SLH proposer combinations remain open.
+The empty-job automatic entry retains the same Native first/later controls and
+starts without a completed proof donor. A durable initial pause must continue
+from its existing job; never replace it with another preparation. Actual
+public-only worker generation, authenticated frame 8 retrieval, sealed-parent
+SDK key absence after state 2, no-writeback replay on both controls,
+correct-hash damaged-checkpoint refusal and generated-frame real peer admission
+are independent checks from standalone proof completion. Raw Native tag-zero
+SLH proposer combinations remain open.
