@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Document fresh Source 14 Reference background production from the same frozen bound dual-SLH controls, finalized parent 1 and genuine target-2 certificate. Start an empty job, persist a bounded pause and cold-produce the full graph without a completed donor or new signing; cover authenticated frame 11 retrieval, third-state history, checkpoint/status refusals and generated-frame peer admission/finality 2.
+
 - Add a bound dual-SLH Reference control-reuse entry for Source 14: replay the original three signed Native blocks and genuine quorums with public-only actors, retain finalized parent 1 and target 2, then exercise durable proof recovery, CLI reuse, history after block 3, tampering refusals and actual peer import/finality 2. Reuse the raw Reference replay path while preserving its legacy signature domain and funded genesis.
 
 - Cover bound Source 14 empty-job background production with durable pause/cold continuation, authenticated frame 11 retrieval, third-state historical replay, checkpoint/status refusals and generated-frame peer admission. Reuse the original signed Native controls without a completed proof donor or new signing; include batch 10 when replaying both retained successors.

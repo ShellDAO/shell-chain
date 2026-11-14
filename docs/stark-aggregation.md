@@ -2855,6 +2855,48 @@ This Reference flow does not by itself qualify fresh automatic target-2
 generation, funded-unbound dual-SLH first use, other accounts, quorum AIR,
 public release or activation. It does not recreate an older unsigned successor.
 
+##### Fresh background production for Reference block 2
+
+Use the same `both-slh-reference` Native controls and choose a new automatic
+output. No completed checkpoint or proof file is passed to this fresh entry.
+It restores the genuine finalized parent 1, imports the unchanged Reference
+block 2, and persists Source 14 with zero mathematical components. The actual
+background worker must generate the full graph using public-only actors,
+survive a durable pause and cold continuation, and shut down gracefully. Keep
+the original target-2 quorum certificate and changed block-3 controls; do not
+replace any of the original signatures, headers or keys.
+
+```sh
+tests/e2e/slh-canonical.sh automatic-fresh-prepare both-slh-reference both-slh-reference-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-pause both-slh-reference both-slh-reference-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-resume both-slh-reference both-slh-reference-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-verify both-slh-reference both-slh-reference-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-refuse both-slh-reference both-slh-reference-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-rpc-refuse both-slh-reference both-slh-reference-automatic
+tests/e2e/slh-peer-proof.sh prepare both-slh-reference both-slh-reference-automatic both-slh-reference-automatic-peer
+tests/e2e/slh-peer-proof.sh pause both-slh-reference both-slh-reference-automatic both-slh-reference-automatic-peer
+tests/e2e/slh-peer-proof.sh resume both-slh-reference both-slh-reference-automatic both-slh-reference-automatic-peer
+tests/e2e/slh-peer-proof.sh verify both-slh-reference both-slh-reference-automatic both-slh-reference-automatic-peer
+tests/e2e/slh-peer-proof.sh refuse both-slh-reference both-slh-reference-automatic both-slh-reference-automatic-peer
+```
+
+The stable Rust toolchain, locked dependencies, RocksDB prerequisites and
+nonzero failure exits are the same as above. Authenticated RPC retrieval must
+reconstruct and verify frame 11; availability status grants no execution
+authority. Historical replay must resolve the registered keys from parent 1
+and match the original target-2 receipts, accounts and root after ordinary
+block 3, without writing either current store. A damaged component with a
+correct storage hash must refuse without generating new mathematics. A
+separate authenticated source-status refusal must surface its error and shut
+down without changing Native state or the original mathematical job.
+Use the generated graph for real peer continuation and attached-certificate
+finality 2, including cold replay and a genuine foreign-header refusal.
+The statement-dependent WOTS batch count can differ from block 1; every
+retained component and all seventeen layers of both signatures remain
+mandatory under the existing global quotas. This flow does not qualify
+funded-unbound dual-SLH first use, other accounts, quorum AIR, public release
+or network activation.
+
 ##### Fresh background production for the bound pair
 
 Reuse the same `both-slh` Native preparation and all three original signed

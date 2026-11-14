@@ -497,3 +497,15 @@ read-only target-2 replay after block 3, Native and graph tampering refusals,
 and generated-frame peer continuation/import/attached-certificate finality 2.
 Keep raw Reference control replay on its existing legacy signature transcript
 and funded genesis. Fresh automatic target 2 remains a separate assertion.
+
+Qualify Reference target-2 background generation with a genuinely empty
+Source 14 job on the same frozen public controls. Restore finalized parent 1
+and retain the original target-2 certificate. An actual public-only worker
+must durably pause, cold-produce the full graph and serve authenticated frame
+11 availability without a completed donor or new signing. Compare target-2
+history after ordinary block 3 against both current stores without writeback.
+Require correct-hash checkpoint and authenticated source-status refusals with
+graceful shutdown, followed by generated-frame peer continuation/import,
+attached-certificate finality 2, cold replay and foreign-header refusal.
+Component counts follow the genuine message-dependent WOTS batch shape; no
+fixed count from block 1 replaces full verification or changes a quota.
