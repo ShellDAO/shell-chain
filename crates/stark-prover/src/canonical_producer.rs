@@ -303,7 +303,10 @@ impl CanonicalProductionSource {
             Some(seal)
                 if seal.sig_type == SignatureType::SphincsSha2256f
                     && block.transactions.len() == 1
-                    && (block.transactions[0].signature.sig_type == SignatureType::MlDsa65
+                    && (block.transactions[0].signature.sig_type
+                        == SignatureType::SphincsSha2256f
+                        && senders[0].account.pq_pubkey_hash != ShellHash::ZERO
+                        || block.transactions[0].signature.sig_type == SignatureType::MlDsa65
                         || (block.transactions[0].signature.sig_type
                             == SignatureType::Dilithium3
                             && matches!(senders[0].sdk_fips, None | Some(1)))) =>
@@ -323,7 +326,9 @@ impl CanonicalProductionSource {
                     .as_ref()
                     .is_some_and(|seal| seal.sig_type == SignatureType::SphincsSha2256f)
             {
-                if senders[0].sdk_fips == Some(1) {
+                if block.transactions[0].signature.sig_type == SignatureType::SphincsSha2256f {
+                    14
+                } else if senders[0].sdk_fips == Some(1) {
                     if senders[0].account.pq_pubkey_hash == ShellHash::ZERO {
                         11
                     } else {
@@ -431,7 +436,7 @@ impl CanonicalProductionSource {
             .transactions
             .iter()
             .any(|t| t.signature.sig_type == SignatureType::SphincsSha2256f);
-        let profile_valid = (!has_slh || matches!(i.version, 6 | 7))
+        let profile_valid = (!has_slh || matches!(i.version, 6 | 7 | 14))
             && match i.version {
                 1 => i.proposer_key.is_none() && !has_sdk && !has_sdk_proposer,
                 2 => i.proposer_key.is_some() && !has_sdk && !has_sdk_proposer,
@@ -500,6 +505,20 @@ impl CanonicalProductionSource {
                         && i.senders.iter().all(|sender| {
                             (sender.account.pq_pubkey_hash == ShellHash::ZERO) == (i.version == 13)
                         })
+                }
+                14 => {
+                    has_slh
+                        && !has_sdk
+                        && !has_sdk_proposer
+                        && i.block.transactions.len() == 1
+                        && i.proposer_key.is_some()
+                        && i.block
+                            .proposer_seal
+                            .as_ref()
+                            .is_some_and(|seal| seal.sig_type == SignatureType::SphincsSha2256f)
+                        && i.senders
+                            .iter()
+                            .all(|s| s.account.pq_pubkey_hash != ShellHash::ZERO)
                 }
                 _ => false,
             };
@@ -572,7 +591,7 @@ impl CanonicalProductionSource {
             } else {
                 verify_production_signature(key, i.block.hash().as_bytes(), seal)?
             };
-            let shape = if matches!(i.version, 8..=13) {
+            let shape = if matches!(i.version, 8..=14) {
                 key.len() == 64
                     && seal.sig_type == SignatureType::SphincsSha2256f
                     && seal.data.len() == 49856
@@ -678,11 +697,11 @@ impl CanonicalProductionSource {
     }
     /// Explicit large bound or funded-unbound source; requires compact checkpoints.
     pub fn has_slh_senders(&self) -> bool {
-        matches!(self.input.version, 6 | 7)
+        matches!(self.input.version, 6 | 7 | 14)
     }
-    /// Full raw-header SLH proposer with one supported primary, SDK or raw sender.
+    /// Full raw-header SLH proposer with one supported primary, SDK, raw or bound SLH sender.
     pub fn has_slh_proposer(&self) -> bool {
-        matches!(self.input.version, 8..=13)
+        matches!(self.input.version, 8..=14)
     }
     /// Shared bounded witness encoding for either supported large signature role.
     pub fn needs_slh_encoding(&self) -> bool {
@@ -707,6 +726,7 @@ impl CanonicalProductionSource {
         if proof.version
             != (if self.has_slh_proposer() {
                 match self.input.version {
+                    14 => 10,
                     13 => 9,
                     12 => 8,
                     11 => 7,
@@ -736,6 +756,9 @@ impl CanonicalProductionSource {
             return Err("production proof source/count mismatch".into());
         }
         if let Some(seal) = &proof.slh_proposer {
+            if seal.version != if self.input.version == 14 { 2 } else { 1 } {
+                return Err("SLH proposer source proof profile mismatch".into());
+            }
             let block = &self.input.block;
             crate::slh_proposer::verify_graph(
                 seal,
@@ -787,6 +810,17 @@ impl CanonicalProductionSource {
             )?;
         }
         if self.has_slh_senders() {
+            if proof.slh_transactions.as_ref().ok_or("SLH proof absent")?[0].version
+                != if self.input.version == 14 {
+                    3
+                } else if self.input.version == 7 {
+                    2
+                } else {
+                    1
+                }
+            {
+                return Err("SLH sender source proof profile mismatch".into());
+            }
             crate::canonical_slh::verify_at_source(
                 &proof.slh_transactions.as_ref().ok_or("SLH proof absent")?[0],
                 &self.input.parent,
@@ -999,6 +1033,7 @@ impl CanonicalProductionSource {
                 &sender.key,
                 &sender.account,
                 &sender.nodes,
+                self.input.version == 14,
             )?]);
         }
         for (i, (signed, source)) in self
@@ -1106,6 +1141,7 @@ impl CanonicalProductionSource {
                         .proposer_seal
                         .as_ref()
                         .ok_or_else(|| "SLH proposer seal absent".to_string())?,
+                    self.input.version == 14,
                 )?)
             } else {
                 None
@@ -1113,6 +1149,7 @@ impl CanonicalProductionSource {
             slh_transactions,
             version: if self.has_slh_proposer() {
                 match self.input.version {
+                    14 => 10,
                     13 => 9,
                     12 => 8,
                     11 => 7,
@@ -2015,6 +2052,53 @@ mod recovery_tests {
             }
             Err(StorageError::State("live scan forbidden".into()))
         }
+    }
+    #[test]
+    fn both_slh_source_fourteen_is_frozen_bound_and_cannot_relabel_legacy_profiles() {
+        let (db, source) = fixture_transcript_roles(true, false, false, false, true, true);
+        assert_eq!(source.input.version, 14);
+        assert!(
+            source.has_slh_senders() && source.has_slh_proposer() && source.needs_slh_encoding()
+        );
+        assert_eq!(source.input.senders[0].key.len(), 64);
+        assert_eq!(source.input.proposer_key.as_ref().unwrap().len(), 64);
+        assert_ne!(
+            source.input.senders[0].key,
+            *source.input.proposer_key.as_ref().unwrap()
+        );
+        let before = db.scan_all().unwrap();
+        let frozen = ChainStore::new(Arc::new(NoTrieReads(db.clone())));
+        assert_eq!(
+            CanonicalProductionSource::restore(&frozen, source.identity())
+                .unwrap()
+                .identity(),
+            source.identity()
+        );
+        for version in [0, 1, 2, 6, 7, 8, 9, 12, 13, 15] {
+            let mut input: CapturedInputs = serde_json::from_slice(source.identity()).unwrap();
+            input.version = version;
+            assert!(CanonicalProductionSource::restore(
+                &frozen,
+                &serde_json::to_vec(&input).unwrap()
+            )
+            .is_err());
+        }
+        for case in ["unbound", "key", "seal", "sdk", "missing-proposer"] {
+            let mut input: CapturedInputs = serde_json::from_slice(source.identity()).unwrap();
+            match case {
+                "unbound" => input.senders[0].account.pq_pubkey_hash = ShellHash::ZERO,
+                "key" => input.senders[0].key[0] ^= 1,
+                "seal" => input.block.proposer_seal.as_mut().unwrap().data[0] ^= 1,
+                "sdk" => input.senders[0].sdk_fips = Some(1),
+                _ => input.proposer_key = None,
+            }
+            assert!(
+                CanonicalProductionSource::restore(&frozen, &serde_json::to_vec(&input).unwrap())
+                    .is_err(),
+                "{case}"
+            );
+        }
+        assert_eq!(before, db.scan_all().unwrap());
     }
     #[test]
     fn slh_proposer_source_eight_freezes_registered_seal_and_refuses_profile_rebinding() {

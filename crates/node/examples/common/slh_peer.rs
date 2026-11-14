@@ -379,7 +379,14 @@ fn negative(native: &Path, cache: &Path, out: &Path) -> Result<std::path::PathBu
         cache.join("proof.cbor"),
     )?)?;
     if let Some(proposer) = &mut proof.slh_proposer {
-        let foreign = proof.transactions[0].signature.transaction_id.clone();
+        let foreign = if proof.version == 10 {
+            proof.slh_transactions.as_ref().ok_or("SLH sender absent")?[0]
+                .envelope
+                .transaction_id
+                .clone()
+        } else {
+            proof.transactions[0].signature.transaction_id.clone()
+        };
         shell_stark_prover::blake3_hash::verify_hash(&foreign, &foreign.message, &foreign.output)?;
         ensure(
             foreign.message != proposer.header.canonical.message,

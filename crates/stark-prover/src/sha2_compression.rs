@@ -285,8 +285,19 @@ fn native(a: Sha2Algorithm, op: Operation) -> u64 {
         Kind::Shift(n) => op.x >> n,
     }
 }
-fn validate_inputs(a: Sha2Algorithm, inputs: &[CompressionInput]) -> Result<(), String> {
-    if inputs.is_empty() || inputs.len() > MAX_SHA2_BATCH {
+/// Explicit SHA256 batch profile for complete dual-role SLH graphs.
+pub const MAX_WIDE_SHA256_BATCH: usize = 64;
+fn validate_profile(
+    version: u8,
+    a: Sha2Algorithm,
+    inputs: &[CompressionInput],
+) -> Result<(), String> {
+    let max = match (version, a) {
+        (1, _) => MAX_SHA2_BATCH,
+        (2, Sha2Algorithm::Sha256) => MAX_WIDE_SHA256_BATCH,
+        _ => return Err("unsupported SHA2 compression profile".into()),
+    };
+    if inputs.is_empty() || inputs.len() > max {
         return Err("invalid SHA2 compression batch count".into());
     }
     if a == Sha2Algorithm::Sha256
@@ -317,6 +328,7 @@ fn options() -> ProofOptions {
 }
 #[derive(Clone)]
 struct Statement {
+    version: u8,
     algorithm: Sha2Algorithm,
     inputs: Vec<CompressionInput>,
     operations: Vec<u64>,
@@ -333,7 +345,7 @@ impl Statement {
         TraceInfo::new(WIDTH, 2 * self.slots())
     }
     fn validate(&self) -> Result<(), String> {
-        validate_inputs(self.algorithm, &self.inputs)?;
+        validate_profile(self.version, self.algorithm, &self.inputs)?;
         if self.operations.len() != self.algorithm.operations() * self.inputs.len()
             || self.carries.len() != self.carry_count().div_ceil(8)
             || self.algorithm == Sha2Algorithm::Sha256
@@ -422,7 +434,11 @@ impl Statement {
 impl ToElements<BaseElement> for Statement {
     fn to_elements(&self) -> Vec<BaseElement> {
         let mut out = vec![
-            BaseElement::new(u64::from_le_bytes(*b"SHA2CMP1")),
+            BaseElement::new(u64::from_le_bytes(if self.version == 1 {
+                *b"SHA2CMP1"
+            } else {
+                *b"SHA2CMP2"
+            })),
             BaseElement::new(if self.algorithm == Sha2Algorithm::Sha256 {
                 256
             } else {
@@ -622,7 +638,14 @@ pub(crate) fn compression_witness(
     algorithm: Sha2Algorithm,
     inputs: &[CompressionInput],
 ) -> Result<(Vec<u64>, Vec<u8>), String> {
-    validate_inputs(algorithm, inputs)?;
+    compression_witness_profile(1, algorithm, inputs)
+}
+pub(crate) fn compression_witness_profile(
+    version: u8,
+    algorithm: Sha2Algorithm,
+    inputs: &[CompressionInput],
+) -> Result<(Vec<u64>, Vec<u8>), String> {
+    validate_profile(version, algorithm, inputs)?;
     let mut operations = Vec::new();
     let mut carries = Vec::new();
     let mut carry_count = 0;
@@ -656,8 +679,23 @@ pub fn prove_compression_batch(
     algorithm: Sha2Algorithm,
     inputs: &[CompressionInput],
 ) -> Result<Sha2CompressionProof, String> {
-    let (operations, carries) = compression_witness(algorithm, inputs)?;
+    prove_profile(1, algorithm, inputs)
+}
+/// Version two domain-separates up to64 independent SHA256 compressions.
+/// The AIR, rounds, field extension and proof security options are unchanged.
+pub fn prove_wide_sha256_batch(
+    inputs: &[CompressionInput],
+) -> Result<Sha2CompressionProof, String> {
+    prove_profile(2, Sha2Algorithm::Sha256, inputs)
+}
+fn prove_profile(
+    version: u8,
+    algorithm: Sha2Algorithm,
+    inputs: &[CompressionInput],
+) -> Result<Sha2CompressionProof, String> {
+    let (operations, carries) = compression_witness_profile(version, algorithm, inputs)?;
     let statement = Statement {
+        version,
         algorithm,
         inputs: inputs.to_vec(),
         operations: operations.clone(),
@@ -690,7 +728,7 @@ pub fn prove_compression_batch(
     .prove(trace)
     .map_err(|e| format!("SHA2 compression proving: {e:?}"))?;
     Ok(Sha2CompressionProof {
-        version: 1,
+        version,
         algorithm,
         inputs: inputs.to_vec(),
         operations,
@@ -705,8 +743,23 @@ pub fn verify_compression_batch(
     algorithm: Sha2Algorithm,
     expected: &[CompressionInput],
 ) -> Result<Vec<[u64; 8]>, String> {
-    validate_inputs(algorithm, expected)?;
-    if proof.version != 1
+    verify_profile(1, proof, algorithm, expected)
+}
+/// Verify the explicit wide SHA256 profile; legacy proof bytes cannot be relabeled.
+pub fn verify_wide_sha256_batch(
+    proof: &Sha2CompressionProof,
+    expected: &[CompressionInput],
+) -> Result<Vec<[u64; 8]>, String> {
+    verify_profile(2, proof, Sha2Algorithm::Sha256, expected)
+}
+fn verify_profile(
+    version: u8,
+    proof: &Sha2CompressionProof,
+    algorithm: Sha2Algorithm,
+    expected: &[CompressionInput],
+) -> Result<Vec<[u64; 8]>, String> {
+    validate_profile(version, algorithm, expected)?;
+    if proof.version != version
         || proof.algorithm != algorithm
         || proof.inputs != expected
         || proof.proof_bytes.is_empty()
@@ -721,6 +774,7 @@ pub fn verify_compression_batch(
         return Err("invalid SHA2 operation/carry count".into());
     }
     let statement = Statement {
+        version,
         algorithm,
         inputs: expected.to_vec(),
         operations: proof.operations.clone(),
@@ -902,6 +956,54 @@ mod tests {
         check(Sha2Algorithm::Sha512);
     }
     #[test]
+    fn wide_sha256_64_real_compressions_and_strict_transcript_domains() {
+        let inputs: Vec<_> = (0..64)
+            .map(|i| padded(Sha2Algorithm::Sha256, &[i; 32]))
+            .collect();
+        assert!(prove_compression_batch(Sha2Algorithm::Sha256, &inputs).is_err());
+        let proof = prove_wide_sha256_batch(&inputs).unwrap();
+        let bytes = crate::compact_canonical::encode_slh_component(&proof).unwrap();
+        let restored: Sha2CompressionProof =
+            crate::compact_canonical::decode_component(&bytes).unwrap();
+        assert_eq!(restored.proof_bytes, proof.proof_bytes);
+        println!(
+            "wide64 AIR proof_bytes={} bounded_component_bytes={}",
+            proof.proof_bytes.len(),
+            bytes.len()
+        );
+        let outputs = verify_wide_sha256_batch(&restored, &inputs).unwrap();
+        for (i, words) in outputs.iter().enumerate() {
+            let expected = Sha256::digest([i as u8; 32]);
+            let actual: Vec<_> = words
+                .iter()
+                .flat_map(|w| (*w as u32).to_be_bytes())
+                .collect();
+            assert_eq!(actual.as_slice(), expected.as_slice());
+        }
+        let mut wrong = inputs.clone();
+        wrong[63].block[0] ^= 1;
+        assert!(verify_wide_sha256_batch(&proof, &wrong).is_err());
+        let mut bad = proof.clone();
+        bad.operations[0] ^= 1;
+        assert!(verify_wide_sha256_batch(&bad, &inputs).is_err());
+        bad = proof.clone();
+        bad.carries[0] ^= 1;
+        assert!(verify_wide_sha256_batch(&bad, &inputs).is_err());
+        let mut excess = inputs.clone();
+        excess.push(inputs[0].clone());
+        assert!(prove_wide_sha256_batch(&excess).is_err());
+        assert!(verify_wide_sha256_batch(&proof, &excess).is_err());
+        assert!(prove_wide_sha256_batch(&[]).is_err());
+        assert!(validate_profile(2, Sha2Algorithm::Sha512, &inputs[..1]).is_err());
+        let mut wide = prove_wide_sha256_batch(&inputs[..1]).unwrap();
+        wide.version = 1;
+        assert!(verify_compression_batch(&wide, Sha2Algorithm::Sha256, &inputs[..1]).is_err());
+        let mut legacy = prove_compression_batch(Sha2Algorithm::Sha256, &inputs[..1]).unwrap();
+        legacy.version = 2;
+        assert!(verify_wide_sha256_batch(&legacy, &inputs[..1]).is_err());
+        assert!(verify_wide_sha256_batch(&proof, &inputs).is_ok());
+    }
+    #[test]
     fn sha256_rejects_wide_words() {
         let mut p = padded(Sha2Algorithm::Sha256, b"");
         p.block[0] = 1u64 << 32;
@@ -910,6 +1012,7 @@ mod tests {
     #[test]
     fn each_operator_and_carry_is_constrained() {
         let statement = Statement {
+            version: 1,
             algorithm: Sha2Algorithm::Sha512,
             inputs: vec![CompressionInput {
                 chaining_value: [0; 8],

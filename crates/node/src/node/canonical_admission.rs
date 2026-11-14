@@ -164,17 +164,24 @@ impl<S: KvStore + 'static> Node<S> {
         {
             return Ok(false);
         }
-        // The SLH profile has one sender and an independent supported
-        // proposer. Other proposer algorithms retain their existing native path.
-        if block
+        // A supported SLH pair must wait for its proof, rather than entering
+        // the native-only path before dedicated proof transfer can begin.
+        let slh_sender = block
             .transactions
             .iter()
-            .any(|tx| tx.signature.sig_type == shell_crypto::SignatureType::SphincsSha2256f)
+            .any(|tx| tx.signature.sig_type == shell_crypto::SignatureType::SphincsSha2256f);
+        let slh_pair = slh_sender
+            && block.proposer_seal.as_ref().is_some_and(|seal| {
+                seal.sig_type == shell_crypto::SignatureType::SphincsSha2256f
+                    && seal.data.len() == 49856
+            });
+        if slh_sender
             && block.proposer_seal.as_ref().is_none_or(|seal| {
-                !matches!(
+                !(matches!(
                     seal.sig_type,
                     shell_crypto::SignatureType::MlDsa65 | shell_crypto::SignatureType::Dilithium3
-                ) || seal.data.len() != 3309
+                ) && seal.data.len() == 3309
+                    || slh_pair)
             })
         {
             return Ok(false);
@@ -205,6 +212,14 @@ impl<S: KvStore + 'static> Node<S> {
             .chain_store
             .canonical_parent_view(head.hash(), head.hash())
             .map_err(|e| e.to_string())?;
+        if slh_pair
+            && view
+                .registered_key(&block.header.proposer)
+                .map_err(|e| e.to_string())?
+                .is_none_or(|key| key.len() != 64)
+        {
+            return Ok(false);
+        }
         for tx in &block.transactions {
             let registered = view.registered_key(&tx.from).map_err(|e| e.to_string())?;
             let Some(account) = view
@@ -215,7 +230,9 @@ impl<S: KvStore + 'static> Node<S> {
             else {
                 return Ok(false);
             };
-            if account.validation_code_hash.is_some() {
+            if account.validation_code_hash.is_some()
+                || slh_pair && account.pq_pubkey_hash == ShellHash::ZERO
+            {
                 return Ok(false);
             }
             if tx.signature.sig_type == shell_crypto::SignatureType::SphincsSha2256f

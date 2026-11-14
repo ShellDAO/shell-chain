@@ -2,11 +2,14 @@
 use crate::{
     header_hash::{verify_header_hash, BlockHeaderProof},
     production_store::{ProductionError, ProductionStore},
-    sha2_compression::{prove_compression_batch, verify_compression_batch, Sha2Algorithm},
+    sha2_compression::{
+        prove_compression_batch, prove_wide_sha256_batch, verify_compression_batch,
+        verify_wide_sha256_batch, Sha2Algorithm,
+    },
     slh_fors::{prove_fors_using, verify_fors, SlhForsInputs, SlhForsProof},
     slh_sha2::{prove_slh_sha2, verify_slh_sha2},
-    slh_signature::{verify_slh_signature_using, SlhSignatureManifest},
-    slh_xmss::{prove_xmss_using, SlhXmssProof},
+    slh_signature::{verify_slh_signature_profile_using, SlhSignatureManifest},
+    slh_xmss::{prove_xmss_profile_using, SlhXmssProof},
 };
 use serde::{Deserialize, Serialize};
 use shell_core::BlockHeader;
@@ -49,14 +52,18 @@ pub(crate) fn verify_graph(
     hash: &ShellHash,
     seal: &PQSignature,
 ) -> Result<(), String> {
-    if proof.version != 1 || proof.layers.len() != 17 {
+    if !matches!(proof.version, 1 | 2) || proof.layers.len() != 17 {
         return Err("SLH proposer version/layer count mismatch".into());
     }
     verify_header_hash(&proof.header, header, hash)?;
     let expected = inputs(key, hash, seal)?;
-    verify_slh_signature_using(&proof.manifest, &expected, &proof.fors, |layer, _| {
-        Ok(proof.layers[usize::from(layer)].clone())
-    })?;
+    verify_slh_signature_profile_using(
+        proof.version == 2,
+        &proof.manifest,
+        &expected,
+        &proof.fors,
+        |layer, _| Ok(proof.layers[usize::from(layer)].clone()),
+    )?;
     Ok(())
 }
 pub(crate) fn produce<S: KvStore>(
@@ -64,6 +71,7 @@ pub(crate) fn produce<S: KvStore>(
     header: &BlockHeader,
     key: &[u8],
     seal: &PQSignature,
+    wide: bool,
 ) -> Result<SlhProposerSealProof, ProductionError> {
     let hash = header.hash();
     // Callback APIs expose Strings; retain the typed pause to distinguish a
@@ -85,8 +93,9 @@ pub(crate) fn produce<S: KvStore>(
         verify_fors(&fors, &input)?;
         let manifest = SlhSignatureManifest::new(input.clone());
         let mut layers = Vec::new();
-        verify_slh_signature_using(&manifest, &input, &fors, |layer, expected| {
-            let proof = prove_xmss_using(
+        verify_slh_signature_profile_using(wide, &manifest, &input, &fors, |layer, expected| {
+            let proof = prove_xmss_profile_using(
+                wide,
                 expected,
                 |at, inputs| {
                     checked(
@@ -97,10 +106,20 @@ pub(crate) fn produce<S: KvStore>(
                             } else {
                                 format!("slh-proposer-layer-{layer}-chain-{at}")
                             },
-                            || prove_compression_batch(Sha2Algorithm::Sha256, inputs),
+                            || {
+                                if wide && at != 0 {
+                                    prove_wide_sha256_batch(inputs)
+                                } else {
+                                    prove_compression_batch(Sha2Algorithm::Sha256, inputs)
+                                }
+                            },
                             |p| {
-                                verify_compression_batch(p, Sha2Algorithm::Sha256, inputs)
-                                    .map(|_| ())
+                                (if wide && at != 0 {
+                                    verify_wide_sha256_batch(p, inputs)
+                                } else {
+                                    verify_compression_batch(p, Sha2Algorithm::Sha256, inputs)
+                                })
+                                .map(|_| ())
                             },
                         ),
                     )
@@ -128,7 +147,7 @@ pub(crate) fn produce<S: KvStore>(
             ),
         )?;
         let proof = SlhProposerSealProof {
-            version: 1,
+            version: if wide { 2 } else { 1 },
             header: header_proof,
             manifest,
             fors,

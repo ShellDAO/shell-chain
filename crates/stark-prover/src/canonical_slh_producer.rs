@@ -8,11 +8,14 @@ use crate::{
     body_membership::{prove_large_transaction_body_using, LargeTransactionEnvelopeProof},
     canonical_slh::{inputs, verify_at_source, CanonicalSlhTransactionProof},
     production_store::{ProductionError, ProductionStore},
-    sha2_compression::{prove_compression_batch, verify_compression_batch, Sha2Algorithm},
+    sha2_compression::{
+        prove_compression_batch, prove_wide_sha256_batch, verify_compression_batch,
+        verify_wide_sha256_batch, Sha2Algorithm,
+    },
     slh_fors::{prove_fors_using, verify_fors},
     slh_sha2::{prove_slh_sha2, verify_slh_sha2},
-    slh_signature::{verify_slh_signature_using, SlhSignatureManifest},
-    slh_xmss::prove_xmss_using,
+    slh_signature::{verify_slh_signature_profile_using, SlhSignatureManifest},
+    slh_xmss::prove_xmss_profile_using,
     SigBatchEntry,
 };
 use shell_core::{Account, Block, BlockHeader, PQTX_ID_DOMAIN};
@@ -27,6 +30,7 @@ pub(crate) fn produce<S: KvStore>(
     key: &[u8],
     account: &Account,
     nodes: &[Vec<u8>],
+    wide: bool,
 ) -> Result<CanonicalSlhTransactionProof, ProductionError> {
     let signed = &block.transactions[0];
     let hash = |job: &mut ProductionStore<'_, S>, name: &str, bytes: &[u8]| {
@@ -91,8 +95,9 @@ pub(crate) fn produce<S: KvStore>(
         verify_fors(&fors, &input)?;
         let manifest = SlhSignatureManifest::new(input.clone());
         let mut layers = Vec::new();
-        verify_slh_signature_using(&manifest, &input, &fors, |layer, expected| {
-            let proof = prove_xmss_using(
+        verify_slh_signature_profile_using(wide, &manifest, &input, &fors, |layer, expected| {
+            let proof = prove_xmss_profile_using(
+                wide,
                 expected,
                 |at, inputs| {
                     checked(
@@ -103,10 +108,20 @@ pub(crate) fn produce<S: KvStore>(
                             } else {
                                 format!("sender-0-layer-{layer}-chain-{at}")
                             },
-                            || prove_compression_batch(Sha2Algorithm::Sha256, inputs),
+                            || {
+                                if wide && at != 0 {
+                                    prove_wide_sha256_batch(inputs)
+                                } else {
+                                    prove_compression_batch(Sha2Algorithm::Sha256, inputs)
+                                }
+                            },
                             |p| {
-                                verify_compression_batch(p, Sha2Algorithm::Sha256, inputs)
-                                    .map(|_| ())
+                                (if wide && at != 0 {
+                                    verify_wide_sha256_batch(p, inputs)
+                                } else {
+                                    verify_compression_batch(p, Sha2Algorithm::Sha256, inputs)
+                                })
+                                .map(|_| ())
                             },
                         ),
                     )
@@ -173,7 +188,9 @@ pub(crate) fn produce<S: KvStore>(
             })
         })?;
         let proof = CanonicalSlhTransactionProof {
-            version: if account.pq_pubkey_hash == ShellHash::ZERO {
+            version: if wide {
+                3
+            } else if account.pq_pubkey_hash == ShellHash::ZERO {
                 2
             } else {
                 1

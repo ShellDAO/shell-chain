@@ -5,7 +5,7 @@
 //! public inputs, then compare the last proved root with the public key root.
 use crate::{
     slh_fors::{verify_fors, SlhForsInputs, SlhForsProof, SLH_SHA2_256F_SIGNATURE_BYTES},
-    slh_xmss::{verify_xmss, SlhXmssInputs, SlhXmssProof, SLH_XMSS_SIGNATURE_BYTES},
+    slh_xmss::{verify_xmss_profile, SlhXmssInputs, SlhXmssProof, SLH_XMSS_SIGNATURE_BYTES},
 };
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +72,15 @@ pub fn verify_slh_signature_using(
     manifest: &SlhSignatureManifest,
     expected: &SlhForsInputs,
     fors: &SlhForsProof,
+    certificate: impl FnMut(u8, &SlhXmssInputs) -> Result<SlhXmssProof, String>,
+) -> Result<SlhSignatureOutput, String> {
+    verify_slh_signature_profile_using(false, manifest, expected, fors, certificate)
+}
+pub(crate) fn verify_slh_signature_profile_using(
+    wide: bool,
+    manifest: &SlhSignatureManifest,
+    expected: &SlhForsInputs,
+    fors: &SlhForsProof,
     mut certificate: impl FnMut(u8, &SlhXmssInputs) -> Result<SlhXmssProof, String>,
 ) -> Result<SlhSignatureOutput, String> {
     manifest.validate(expected)?;
@@ -87,7 +96,7 @@ pub fn verify_slh_signature_using(
         }
         let input = layer_input(expected, current, layer, tree, leaf);
         let proof = certificate(layer, &input)?;
-        current = verify_xmss(&proof, &input)?;
+        current = verify_xmss_profile(wide, &proof, &input)?;
         roots.push(current);
     }
     if tree != 0 || current != expected.public_root {

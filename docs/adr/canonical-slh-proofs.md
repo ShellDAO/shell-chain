@@ -420,3 +420,56 @@ The automatic verification receipt derives retained-successor signature provenan
 from an authenticated non-first target or successfully imported historical
 successors. A fixed false flag contradicts a verified Reference target; changing
 this output must not replace keys, proving, Native execution or historical checks.
+
+
+Source format 14 composes a bound SLH sender with a registered SLH proposer.
+Batch 10 and frame 11 carry both mandatory role graphs: transaction version 3,
+seal version 2 and seventeen XMSS version-two layers per signature. Legacy
+source, batch, transaction, seal and frame versions cannot carry this pairing.
+Native authority selection, consensus, activation and execution remain external.
+
+The independent WOTS F suffix compressions are grouped into canonical batches
+of at most64. Compression proof version2 has a distinct public transcript tag;
+the SHA256 AIR, full rounds, carry constraints and proof security options are
+unchanged. The shared seed-prefix certificate stays version1. Existing version1
+APIs retain their sixteen-compression bound and transcript bytes. Neither domain
+can be relabeled as the other. This reduces repeated certificate overhead
+without raising any frame, checkpoint, certificate, count, reference or shared
+expansion quota. Witness marker2 restores exact public words only; consumers
+still verify every full proof against independently routed inputs.
+
+Freeze independent genuine Native transfers, headers and quorums1/2/3 before
+dropping temporary keys. Require durable pause and cold continuation, same-job
+CLI verification without new math, actual proof-backed import/finality,
+read-only history after ordinary3 on independent controls, and role/domain/
+layer/signature/compression/header refusals. Published availability also needs
+real peer cold continuation, attached-certificate finality and refusal checks.
+This new cohort does not replace an earlier identity or unsigned successor.
+Funded-unbound/Reference/automatic dual-SLH targets, other accounts, quorum AIR,
+public artifacts and activation require separate acceptance.
+
+
+Frame 11 retains the deterministic wide-compression operation and carry words
+on demand. Eagerly expanding both full role graphs exceeds the existing shared
+JSON budget even when their checkpoint and wire bytes fit. Decode each full
+component under its unchanged 8 MiB bound, retain its compact witness form in
+the frame-11 graph, and restore one certificate through the availability codec
+immediately before the unchanged strict compression verifier. Verify its
+complete original AIR before consuming any output. Public inputs, transcript
+domain, proof bytes and security options stay identical; native witness
+construction supplies no verification authority. The shared expanded graph
+still obeys the same 1 GiB ceiling, with no per-role budget reset. Earlier
+frames and default checkpoint decoding continue to restore full witnesses.
+Full and deferred forms have identical canonical wire bytes; partial omission,
+unknown domains, altered inputs and corrupted proofs remain refusals. A cold
+recovery of a completed job must generate zero new mathematical certificates.
+
+
+Live candidate selection must recognize the same bound two-role profile before
+ordinary block handling can import it natively. With proof admission enabled,
+require a registered 64-byte proposer key, a bound default sender and the exact
+SLH seal width. Stage the untrusted body without advancing the Native head or
+writing receipts; dedicated proof transfer and full verification precede import.
+Keep disabled admission and unsupported funded-unbound pair behavior unchanged.
+An earlier failed peer receiver is retained as evidence; a new public-only
+transport output reuses the same signed Native controls and published graph.

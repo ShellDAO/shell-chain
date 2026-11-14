@@ -1,4 +1,66 @@
 // Included inside node::tests to reuse real signed production/import fixtures.
+#[test]
+fn live_bound_slh_pair_stages_before_native_import_without_extending_unbound_policy() {
+    let proposer = shell_crypto::SphincsSigner::generate();
+    let signer = shell_crypto::SphincsSigner::generate();
+    let authority = Address::from_public_key(proposer.public_key(), proposer.sig_type().as_u8());
+    let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+    for unbound in [false, true] {
+        let mut leader = setup_node_with_store(authority, Arc::new(MemoryDb::new()));
+        leader.config.node_role = crate::config::NodeRole::ValidatorProver;
+        let db = Arc::new(MemoryDb::new());
+        let mut follower = setup_node_with_store(authority, db.clone());
+        for node in [&leader, &follower] {
+            node.register_authority_pubkey(authority, proposer.public_key().to_vec());
+            node.chain_store.put_pubkey(&authority, proposer.public_key()).unwrap();
+            fund_account(node, &sender, U256::from(1_000_000_000_000_000_000u64));
+            let mut account = node.world_state.read().get_account(&sender).unwrap().unwrap();
+            account.pq_pubkey_hash = if unbound { ShellHash::ZERO } else {
+                shell_primitives::blake3_hash(signer.public_key())
+            };
+            node.world_state.write().set_account(&sender, &account).unwrap();
+            if !unbound {
+                node.chain_store.put_pubkey(&sender, signer.public_key()).unwrap();
+            }
+            store_consistent_genesis(node);
+            let cfg = serde_json::from_value(serde_json::json!({
+                "chain_id":1337,"genesis_hash":node.chain_store.get_head_hash().unwrap().unwrap(),
+                "block_commitment_height":1,"fee_accounting_activation_height":1
+            })).unwrap();
+            node.chain_store.put_chain_config(&cfg).unwrap();
+        }
+        submit_signed_tx(&leader, &signer, sender, Transaction {
+            chain_id:1337,nonce:0,to:Some(Address::from([0xab;32])),value:U256::from(1),
+            data:Bytes::new(),gas_limit:100_000,max_fee_per_gas:shell_core::INITIAL_BASE_FEE,
+            max_priority_fee_per_gas:1,access_list:None,tx_type:2,
+            max_fee_per_blob_gas:None,blob_versioned_hashes:None,
+        });
+        let block = leader.produce_block(&proposer, 100).unwrap();
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(block.proposer_seal.as_ref().unwrap().data.len(), 49856);
+        let parent = follower.chain_store.get_head_hash().unwrap();
+        let before = db.scan_all().unwrap();
+        let peer = shell_network::PeerId("slh-provider".into());
+        assert!(!follower.stage_live_candidate(&peer, &block).unwrap());
+        assert_eq!(db.scan_all().unwrap(), before);
+        follower.config.canonical_proof_admission = true;
+        if unbound {
+            assert!(!follower.stage_live_candidate(&peer, &block).unwrap());
+            assert_eq!(db.scan_all().unwrap(), before);
+        } else {
+            let mut bad = block.clone();
+            bad.proposer_seal.as_mut().unwrap().data[0] ^= 1;
+            assert!(follower.stage_live_candidate(&peer, &bad).is_err());
+            assert_eq!(db.scan_all().unwrap(), before);
+            assert!(follower.stage_live_candidate(&peer, &block).unwrap());
+            assert!(follower.canonical_admission_status(block.hash()).unwrap().is_some());
+        }
+        assert_eq!(follower.chain_store.get_head_hash().unwrap(), parent);
+        assert!(follower.chain_store.get_block_by_hash(&block.hash()).unwrap().is_none());
+        assert!(follower.chain_store.get_receipts(&block.hash()).unwrap().is_none());
+    }
+}
+
 fn header_batch_source_fixture<S: KvStore + 'static>(
     follower_store: Arc<S>,
 ) -> (Node<S>, DilithiumSigner, Block, Address, Address) {

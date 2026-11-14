@@ -6,7 +6,11 @@ use shell_crypto::{
 };
 use std::path::PathBuf;
 
-fn finalize(node: &Node<RocksDbStore>, signer: &dyn Signer, block: &Block) -> Result<(), Error> {
+pub(super) fn finalize(
+    node: &Node<RocksDbStore>,
+    signer: &dyn Signer,
+    block: &Block,
+) -> Result<(), Error> {
     let authority = block.header.proposer;
     let mut round = shell_consensus::wpoa_state::WPoaRound::new(
         block.number(),
@@ -812,7 +816,7 @@ pub(crate) fn capture(out: &Path) -> Result<(), Error> {
         before == digest(&db.state)?,
         "proposer capture wrote Native state",
     )?;
-    if !matches!(value["version"].as_u64(), Some(8..=13))
+    if !matches!(value["version"].as_u64(), Some(8..=14))
         || value["proposer_key"]
             .as_array()
             .is_none_or(|v| v.len() != 64)
@@ -859,14 +863,24 @@ pub(crate) fn prove(out: &Path, pause: bool) -> Result<(), Error> {
         },
     )?;
     let result = source.produce(&mut job);
-    write(
-        &out.join(if pause {
-            "proof-paused.json"
-        } else {
-            "proof-progress.json"
-        }),
-        &job.progress(),
-    )?;
+    // Preserve the first failed attempt's receipt when a completed job is
+    // recovered after an encoding/output failure. Never replace its evidence.
+    let progress_base = if pause {
+        "proof-paused"
+    } else {
+        "proof-progress"
+    };
+    let progress_file = (0..64)
+        .map(|attempt| {
+            if attempt == 0 {
+                format!("{progress_base}.json")
+            } else {
+                format!("{progress_base}-{attempt}.json")
+            }
+        })
+        .find(|name| !out.join(name).exists())
+        .ok_or("production progress receipt limit")?;
+    write(&out.join(&progress_file), &job.progress())?;
     drop(job);
     if pause {
         ensure(
@@ -905,7 +919,7 @@ pub(crate) fn prove(out: &Path, pause: bool) -> Result<(), Error> {
     )?;
     write(
         &out.join("proof-complete.json"),
-        &json!({"source_version":serde_json::from_slice::<Value>(source.identity())?["version"],"batch_version":proof.version,"frame_version":proof.version+1,"proposer_full17_layers":true,"source_native_unchanged":true,"new_signing":false,"proof_bytes":payload.len()}),
+        &json!({"source_version":serde_json::from_slice::<Value>(source.identity())?["version"],"batch_version":proof.version,"frame_version":proof.version+1,"proposer_full17_layers":true,"sender_full17_layers":proof.version==10,"source_native_unchanged":true,"new_signing":false,"proof_bytes":payload.len(),"progress_file":progress_file}),
     )
 }
 pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
@@ -1003,6 +1017,17 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
             "changed-signature",
             "foreign-header-certificate",
         ];
+        if proof.version == 10 {
+            cases.extend([
+                "missing-sender",
+                "legacy-sender-profile",
+                "legacy-seal-profile",
+                "missing-sender-layer",
+                "changed-sender-signature",
+                "changed-chain-proof",
+                "wide-as-legacy",
+            ]);
+        }
         if source.has_unbound_senders() {
             cases.extend(["bound-account-profile", "missing-address-certificate"]);
         }
@@ -1038,6 +1063,32 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
             let mut bad = proof.clone();
             match case {
                 "missing-proposer" => bad.slh_proposer = None,
+                "missing-sender" => bad.slh_transactions = None,
+                "legacy-sender-profile" => {
+                    bad.slh_transactions.as_mut().ok_or("sender absent")?[0].version = 1
+                }
+                "legacy-seal-profile" => {
+                    bad.slh_proposer.as_mut().ok_or("seal absent")?.version = 1
+                }
+                "missing-sender-layer" => {
+                    bad.slh_transactions.as_mut().ok_or("sender absent")?[0]
+                        .layers
+                        .pop();
+                }
+                "changed-sender-signature" => {
+                    bad.slh_transactions.as_mut().ok_or("sender absent")?[0]
+                        .fors
+                        .inputs
+                        .signature[0] ^= 1
+                }
+                "changed-chain-proof" => {
+                    bad.slh_transactions.as_mut().ok_or("sender absent")?[0].layers[0].chains[0]
+                        .proof_bytes[0] ^= 1
+                }
+                "wide-as-legacy" => {
+                    bad.slh_transactions.as_mut().ok_or("sender absent")?[0].layers[0].chains[0]
+                        .version = 1
+                }
                 "raw-as-sdk-account" => {
                     bad.transactions[0].signature.version = if proof.version == 9 { 6 } else { 5 }
                 }
@@ -1111,7 +1162,13 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
                         .signature[0] ^= 1
                 }
                 _ => {
-                    let valid = &bad.transactions[0].signature.transaction_id;
+                    let valid = if proof.version == 10 {
+                        &bad.slh_transactions.as_ref().ok_or("SLH sender absent")?[0]
+                            .envelope
+                            .transaction_id
+                    } else {
+                        &bad.transactions[0].signature.transaction_id
+                    };
                     bad.slh_proposer
                         .as_mut()
                         .ok_or("SLH absent")?
@@ -1159,7 +1216,7 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
     if node.chain_store.get_head_hash()? == Some(c.block) {
         node.import_block(later.clone(), &MultiVerifier)?;
     }
-    let ordinary_path = if proof.version == 9 && block.number() == 1 {
+    let ordinary_path = if matches!(proof.version, 9 | 10) && block.number() == 1 {
         let advance: Block = read(&out.join("advance.json"))?;
         ensure(
             advance.number() == 3

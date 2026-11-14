@@ -1,13 +1,15 @@
 //! Complete SHA2-256f WOTS+ and four-level XMSS layer certificates.
 //!
 //! F hashes share one authenticated seed-prefix state and use canonical batches
-//! of at most sixteen suffix compressions. The verifier derives every chain
+//! of at most sixteen suffix compressions in version one, or sixty-four in the
+//! explicit version-two profile. The verifier derives every chain
 //! step from independently supplied message/checksum digits. This proves one
 //! XMSS layer; a full signature must also bind FORS and all17 layer transitions.
 use crate::{
     sha2_compression::{
-        prove_compression_batch, verify_compression_batch, CompressionInput, Sha2Algorithm,
-        Sha2CompressionProof, MAX_SHA2_BATCH, SHA256_INITIAL_STATE,
+        prove_compression_batch, verify_compression_batch, verify_wide_sha256_batch,
+        CompressionInput, Sha2Algorithm, Sha2CompressionProof, MAX_SHA2_BATCH,
+        MAX_WIDE_SHA256_BATCH, SHA256_INITIAL_STATE,
     },
     slh_sha2::{prove_slh_sha2, verify_slh_sha2, SlhSha2Address, SlhSha2Proof, SlhSha2Request},
 };
@@ -30,7 +32,7 @@ pub struct SlhXmssProof {
     pub version: u8,
     pub inputs: SlhXmssInputs,
     pub prefix: Sha2CompressionProof,
-    /// Ascending hash-step waves; active chain indices ascending, groups<=16.
+    /// Ascending hash-step waves and chain indices; groups<=16 (v1) or64 (v2).
     pub chains: Vec<Sha2CompressionProof>,
     pub wots_public_key: SlhSha2Proof,
     pub authentication: Vec<SlhSha2Proof>,
@@ -56,16 +58,10 @@ fn digits(message: &[u8; 32]) -> [u8; 67] {
     result[66] = (checksum & 15) as u8;
     result
 }
-fn batches(message: &[u8; 32]) -> usize {
+fn batches(message: &[u8; 32], max: usize) -> usize {
     let digits = digits(message);
     (0..15)
-        .map(|step| {
-            digits
-                .iter()
-                .filter(|&&x| x <= step)
-                .count()
-                .div_ceil(MAX_SHA2_BATCH)
-        })
+        .map(|step| digits.iter().filter(|&&x| x <= step).count().div_ceil(max))
         .sum()
 }
 fn words(bytes: &[u8; 64]) -> [u64; 16] {
@@ -117,6 +113,7 @@ fn output(words: [u64; 8]) -> [u8; 32] {
 fn chains(
     input: &SlhXmssInputs,
     cv: [u64; 8],
+    max: usize,
     mut compress: impl FnMut(&[CompressionInput]) -> Result<Vec<[u64; 8]>, String>,
 ) -> Result<Vec<[u8; 32]>, String> {
     let digits = digits(&input.message);
@@ -126,7 +123,7 @@ fn chains(
         .collect::<Vec<[u8; 32]>>();
     for step in 0..15 {
         let active = (0..67).filter(|&i| digits[i] <= step).collect::<Vec<_>>();
-        for group in active.chunks(MAX_SHA2_BATCH) {
+        for group in active.chunks(max) {
             let inputs = group
                 .iter()
                 .map(|&i| suffix(input, cv, i, step, &nodes[i]))
@@ -209,17 +206,30 @@ pub fn prove_xmss(input: &SlhXmssInputs) -> Result<SlhXmssProof, String> {
 /// Every returned checkpoint is verified before any output is consumed.
 pub fn prove_xmss_using(
     input: &SlhXmssInputs,
+    compression: impl FnMut(usize, &[CompressionInput]) -> Result<Sha2CompressionProof, String>,
+    hash: impl FnMut(usize, &SlhSha2Request) -> Result<SlhSha2Proof, String>,
+) -> Result<SlhXmssProof, String> {
+    prove_xmss_profile_using(false, input, compression, hash)
+}
+pub(crate) fn prove_xmss_profile_using(
+    wide: bool,
+    input: &SlhXmssInputs,
     mut compression: impl FnMut(usize, &[CompressionInput]) -> Result<Sha2CompressionProof, String>,
     mut hash: impl FnMut(usize, &SlhSha2Request) -> Result<SlhSha2Proof, String>,
 ) -> Result<SlhXmssProof, String> {
+    let max = if wide {
+        MAX_WIDE_SHA256_BATCH
+    } else {
+        MAX_SHA2_BATCH
+    };
     validate(input)?;
     let expected = [prefix(&input.public_seed)];
     let prefix = compression(0, &expected)?;
     let cv = verify_compression_batch(&prefix, Sha2Algorithm::Sha256, &expected)?[0];
-    let mut proofs = Vec::with_capacity(batches(&input.message));
-    let nodes = chains(input, cv, |inputs| {
+    let mut proofs = Vec::with_capacity(batches(&input.message, max));
+    let nodes = chains(input, cv, max, |inputs| {
         let proof = compression(proofs.len() + 1, inputs)?;
-        let values = verify_compression_batch(&proof, Sha2Algorithm::Sha256, inputs)?;
+        let values = verify_chain(wide, &proof, inputs)?;
         proofs.push(proof);
         Ok(values)
     })?;
@@ -232,7 +242,7 @@ pub fn prove_xmss_using(
     })?;
     let wots_public_key = hashes.remove(0);
     Ok(SlhXmssProof {
-        version: 1,
+        version: if wide { 2 } else { 1 },
         inputs: input.clone(),
         prefix,
         chains: proofs,
@@ -243,10 +253,34 @@ pub fn prove_xmss_using(
 /// Return one complete XMSS layer root. This does not bind all17 layers or
 /// independently authorize a Native signature/canonical source.
 pub fn verify_xmss(proof: &SlhXmssProof, expected: &SlhXmssInputs) -> Result<[u8; 32], String> {
+    verify_xmss_profile(false, proof, expected)
+}
+fn verify_chain(
+    wide: bool,
+    proof: &Sha2CompressionProof,
+    inputs: &[CompressionInput],
+) -> Result<Vec<[u64; 8]>, String> {
+    if wide {
+        let full = crate::compact_canonical::witness::materialize_wide(proof)?;
+        verify_wide_sha256_batch(&full, inputs)
+    } else {
+        verify_compression_batch(proof, Sha2Algorithm::Sha256, inputs)
+    }
+}
+pub(crate) fn verify_xmss_profile(
+    wide: bool,
+    proof: &SlhXmssProof,
+    expected: &SlhXmssInputs,
+) -> Result<[u8; 32], String> {
+    let max = if wide {
+        MAX_WIDE_SHA256_BATCH
+    } else {
+        MAX_SHA2_BATCH
+    };
     validate(expected)?;
-    if proof.version != 1
+    if proof.version != if wide { 2 } else { 1 }
         || proof.inputs != *expected
-        || proof.chains.len() != batches(&expected.message)
+        || proof.chains.len() != batches(&expected.message, max)
         || proof.authentication.len() != 4
     {
         return Err("invalid XMSS version/inputs/canonical batch/authentication count".into());
@@ -257,8 +291,8 @@ pub fn verify_xmss(proof: &SlhXmssProof, expected: &SlhXmssInputs) -> Result<[u8
         &[prefix(&expected.public_seed)],
     )?[0];
     let mut at = 0;
-    let nodes = chains(expected, cv, |inputs| {
-        let values = verify_compression_batch(&proof.chains[at], Sha2Algorithm::Sha256, inputs)?;
+    let nodes = chains(expected, cv, max, |inputs| {
+        let values = verify_chain(wide, &proof.chains[at], inputs)?;
         at += 1;
         Ok(values)
     })?;
@@ -350,7 +384,9 @@ mod tests {
                     .map(|x| x.to_digit(16).unwrap() as u8),
             );
             assert_eq!(got.as_slice(), expected);
-            assert!(batches(&message) <= 75);
+            assert!(batches(&message, MAX_SHA2_BATCH) <= 75);
+            assert!(batches(&message, MAX_WIDE_SHA256_BATCH) <= 30);
+            assert!(batches(&message, MAX_WIDE_SHA256_BATCH) <= batches(&message, MAX_SHA2_BATCH));
             let calls = got.iter().map(|&x| usize::from(15 - x)).sum::<usize>();
             assert!((45..=990).contains(&calls));
         }

@@ -2739,3 +2739,77 @@ and the Node must stop gracefully without new signing or proving:
 ```sh
 tests/e2e/slh-canonical.sh automatic-fresh-rpc-refuse sdk-reference-slh sdk-reference-slh-automatic
 ```
+
+
+#### Bound SLH sender and SLH proposer
+
+A bound default account and a registered proposer can both use the 64-byte
+SHA2-256f public key and 49,856-byte signature. Capture selects Source 14,
+batch 10 and availability frame 11. The sender account proof and exact large
+transaction envelope remain mandatory, as does the proposer's raw-header proof.
+Both signatures require FORS and all seventeen XMSS layers; the Native caller
+still authenticates the selected authority, quorum, activation and execution.
+
+This profile uses transaction proof version 3 and seal proof version 2, with
+XMSS version 2. Its independent WOTS suffix compressions use canonical batches
+of at most 64 and SHA256 compression proof version 2. The public statement has
+a distinct transcript domain. Legacy version-one compression/XMSS batches stay
+at 16; changing a version label cannot convert either proof domain. The SHA256
+rounds, carries, AIR constraints, field extension and security options remain
+unchanged. Deterministic witness omission only reduces availability bytes and
+never replaces mathematical verification. Frame/checkpoint, certificate/count,
+reference and shared expansion ceilings remain unchanged.
+
+Run the regression from a repository checkout with the stable Rust toolchain,
+locked dependencies and RocksDB build prerequisites. Preparation refuses an
+existing output and creates independent, memory-only test keys with isolated
+chain-10 funding. It signs all three transfers and genuine headers/quorum
+controls on two stores before dropping the keys. Keep that output for every
+subsequent step; do not rerun preparation to replace retained inputs.
+
+```sh
+tests/e2e/slh-both-proof.sh prepare both-slh
+tests/e2e/slh-both-proof.sh capture both-slh
+tests/e2e/slh-both-proof.sh pause both-slh
+tests/e2e/slh-both-proof.sh resume both-slh
+tests/e2e/slh-both-proof.sh verify both-slh
+tests/e2e/slh-both-proof.sh refuse both-slh
+tests/e2e/slh-both-proof.sh publish both-slh
+tests/e2e/slh-peer-proof.sh prepare both-slh both-slh/published both-slh-peer
+tests/e2e/slh-peer-proof.sh pause both-slh both-slh/published both-slh-peer
+tests/e2e/slh-peer-proof.sh resume both-slh both-slh/published both-slh-peer
+tests/e2e/slh-peer-proof.sh verify both-slh both-slh/published both-slh-peer
+tests/e2e/slh-peer-proof.sh refuse both-slh both-slh/published both-slh-peer
+```
+
+A nonzero exit marks a failed step. Resume uses the same durable job and verifies
+every retained component before use. Run `shell-node produce-block-proof` with
+the same `provider` data directory, captured block/tip and `proof` output to
+check CLI reuse without new mathematics. Import must match the independent
+Native receipts, accounts and root, then finalize with the retained genuine
+quorum. Historical replay after ordinary block 3 must resolve the sealed parent
+and write neither current store. Role/version, missing-layer, signature,
+compression and foreign-header refusals must preserve the parent. Published
+bytes supply availability; actual peer import and attached-certificate finality
+remain separate checks.
+
+This bound profile does not qualify funded-unbound dual-SLH first use, a
+separate Reference target, fresh automatic generation, other accounts, quorum
+AIR, public release or network activation. Retained controls from this entry
+are an independent cohort; they do not recreate any older unsigned successor.
+
+
+Frame 11 retains the deterministic wide-compression operation and carry words
+on demand. Eagerly expanding both full role graphs exceeds the existing shared
+JSON budget even when their checkpoint and wire bytes fit. Decode each full
+component under its unchanged 8 MiB bound, retain its compact witness form in
+the frame-11 graph, and restore one certificate through the availability codec
+immediately before the unchanged strict compression verifier. Verify its
+complete original AIR before consuming any output. Public inputs, transcript
+domain, proof bytes and security options stay identical; native witness
+construction supplies no verification authority. The shared expanded graph
+still obeys the same 1 GiB ceiling, with no per-role budget reset. Earlier
+frames and default checkpoint decoding continue to restore full witnesses.
+Full and deferred forms have identical canonical wire bytes; partial omission,
+unknown domains, altered inputs and corrupted proofs remain refusals. A cold
+recovery of a completed job must generate zero new mathematical certificates.

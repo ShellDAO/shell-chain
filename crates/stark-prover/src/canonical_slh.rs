@@ -6,7 +6,9 @@ use crate::{
     body_membership::{verify_large_transaction_envelope, LargeTransactionEnvelopeProof},
     mldsa_source::VerifiedSignatureEntry,
     slh_fors::{SlhForsInputs, SlhForsProof, SLH_SHA2_256F_SIGNATURE_BYTES},
-    slh_signature::{verify_slh_signature_using, SlhSignatureManifest, SLH_HYPERTREE_LAYERS},
+    slh_signature::{
+        verify_slh_signature_profile_using, SlhSignatureManifest, SLH_HYPERTREE_LAYERS,
+    },
     slh_xmss::SlhXmssProof,
     SigBatchEntry,
 };
@@ -17,7 +19,8 @@ use shell_primitives::ShellHash;
 use shell_storage::{CanonicalParentView, KvStore};
 
 /// Version one binds a registered account; version two proves a funded unbound
-/// account's tagged address. Both require all seventeen layer certificates.
+/// account's tagged address. Version three binds a registered account with the
+/// explicit wide-WOTS profile. Every version requires all seventeen layers.
 /// Neither the manifest nor a persisted status is cryptographic authority.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,8 +71,11 @@ pub(crate) fn verify_at_source(
     account: &Account,
 ) -> Result<VerifiedSignatureEntry, String> {
     let unbound = account.pq_pubkey_hash == ShellHash::ZERO;
-    if proof.version != if unbound { 2 } else { 1 }
-        || proof.layers.len() != usize::from(SLH_HYPERTREE_LAYERS)
+    if !(if unbound {
+        proof.version == 2
+    } else {
+        matches!(proof.version, 1 | 3)
+    }) || proof.layers.len() != usize::from(SLH_HYPERTREE_LAYERS)
     {
         return Err("canonical SLH proof version/layer count mismatch".into());
     }
@@ -107,9 +113,13 @@ pub(crate) fn verify_at_source(
     verify_large_transaction_envelope(&proof.envelope, header, signed, index, &id)?;
     // The expected message comes from the proved signing payload above. No native
     // signature verifier or SHA digest participates in this acceptance predicate.
-    verify_slh_signature_using(&proof.manifest, &expected, &proof.fors, |layer, _| {
-        Ok(proof.layers[usize::from(layer)].clone())
-    })?;
+    verify_slh_signature_profile_using(
+        proof.version == 3,
+        &proof.manifest,
+        &expected,
+        &proof.fors,
+        |layer, _| Ok(proof.layers[usize::from(layer)].clone()),
+    )?;
     let mut entry = SigBatchEntry::from_signed_transaction(signed);
     entry.msg_hash = expected.message;
     let mut bytes = entry.msg_hash.to_vec();

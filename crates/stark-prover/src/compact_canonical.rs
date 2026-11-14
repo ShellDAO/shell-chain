@@ -1,7 +1,7 @@
 //! Bounded, lossless certificate availability encoding. Decoding grants no authority.
 //! Legacy JSON remains byte-for-byte available; native callers still verify full AIR.
 mod slh;
-mod witness;
+pub(crate) mod witness;
 use crate::canonical_batch::{CanonicalSignatureBatchProof, MAX_CANONICAL_SIGNATURE_BATCH};
 use ciborium::Value as Cbor;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -20,6 +20,7 @@ const SLH_SDK_PROPOSER_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v7/";
 const SLH_SDK_FIRST_USE_PROPOSER_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v8/";
 const SLH_RAW_PROPOSER_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v9/";
 const SLH_RAW_FIRST_USE_PROPOSER_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v10/";
+const SLH_BOTH_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v11/";
 const SLH_PAYLOAD: &[u8] = b"\0canonical-proof/cbor/v4/";
 const WITNESS_COMPONENT: &[u8] = b"\0canonical-component/cbor/v2/";
 const COMPONENT: &[u8] = b"\0canonical-component/cbor/v1/";
@@ -402,6 +403,7 @@ struct Unpacker<'a> {
     pool_json: usize,
     hash_containers: bool,
     grouped: bool,
+    deferred_wide: bool,
 }
 impl<'a> Unpacker<'a> {
     fn new(certificates: &'a [Certificate], hash_containers: bool) -> Result<Self, String> {
@@ -422,6 +424,7 @@ impl<'a> Unpacker<'a> {
             pool_json: 0,
             hash_containers,
             grouped: false,
+            deferred_wide: false,
         })
     }
     fn expand(&mut self, v: Value, budget: &mut usize, remaining: usize) -> Result<Value, String> {
@@ -443,7 +446,11 @@ impl<'a> Unpacker<'a> {
                 // Retain only size metadata, never inflated JSON certificate trees.
                 // Each recipient gets a freshly decoded untrusted value and full AIR.
                 let value = if self.grouped {
-                    witness::decode(&self.certificates[index].data.0)?
+                    if self.deferred_wide {
+                        witness::decode_deferred_wide(&self.certificates[index].data.0)?
+                    } else {
+                        witness::decode(&self.certificates[index].data.0)?
+                    }
                 } else {
                     decode_value(&self.certificates[index].data.0)?
                 };
@@ -503,10 +510,52 @@ pub fn encode_payload(
     limit: usize,
     compact: bool,
 ) -> Result<Vec<u8>, String> {
+    if proof.version == 10 {
+        if proof.proposer.is_some()
+            || !proof.transactions.is_empty()
+            || proof
+                .slh_transactions
+                .as_ref()
+                .is_none_or(|v| v.len() != 1 || v[0].version != 3)
+            || proof.slh_proposer.as_ref().is_none_or(|v| v.version != 2)
+        {
+            return Err("both-SLH compact role/profile/count mismatch".into());
+        }
+        let mut packer = Packer {
+            witnesses: true,
+            ..Default::default()
+        };
+        let sender = slh::encode(
+            &mut packer,
+            &proof.slh_transactions.as_ref().ok_or("SLH sender absent")?[0],
+        )?;
+        let proposer = slh::encode_proposer(
+            &mut packer,
+            proof.slh_proposer.as_ref().ok_or("SLH proposer absent")?,
+        )?;
+        let frame = Frame {
+            format_version: 11,
+            proof_version: 10,
+            transactions: vec![sender],
+            proposer: None,
+            slh_proposer: Some(proposer),
+            certificates: packer.certificates,
+        };
+        template_bound(&frame)?;
+        let body = cbor(
+            &frame,
+            limit
+                .min(MAX_BYTES)
+                .checked_sub(SLH_BOTH_PAYLOAD.len())
+                .ok_or("compact payload byte limit")?,
+        )?;
+        return Ok([SLH_BOTH_PAYLOAD, body.as_slice()].concat());
+    }
     if matches!(proof.version, 4..=9) {
         if proof.proposer.is_some()
             || proof.slh_transactions.is_some()
             || proof.transactions.len() != 1
+            || proof.slh_proposer.as_ref().is_none_or(|v| v.version != 1)
         {
             return Err("SLH proposer compact profile/count mismatch".into());
         }
@@ -565,7 +614,10 @@ pub fn encode_payload(
     if proof.version == 3 {
         if !proof.transactions.is_empty()
             || proof.proposer.is_none()
-            || proof.slh_transactions.as_ref().is_none_or(|v| v.len() != 1)
+            || proof
+                .slh_transactions
+                .as_ref()
+                .is_none_or(|v| v.len() != 1 || !matches!(v[0].version, 1 | 2))
         {
             return Err("compact SLH profile/count mismatch".into());
         }
@@ -736,34 +788,35 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
     if bytes.len() > MAX_BYTES {
         return Err("canonical payload byte limit".into());
     }
-    let (bytes, version) =
-        if let Some(bytes) = bytes.strip_prefix(SLH_RAW_FIRST_USE_PROPOSER_PAYLOAD) {
-            (bytes, 10)
-        } else if let Some(bytes) = bytes.strip_prefix(SLH_RAW_PROPOSER_PAYLOAD) {
-            (bytes, 9)
-        } else if let Some(bytes) = bytes.strip_prefix(SLH_SDK_FIRST_USE_PROPOSER_PAYLOAD) {
-            (bytes, 8)
-        } else if let Some(bytes) = bytes.strip_prefix(SLH_SDK_PROPOSER_PAYLOAD) {
-            (bytes, 7)
-        } else if let Some(bytes) = bytes.strip_prefix(SLH_FIRST_USE_PROPOSER_PAYLOAD) {
-            (bytes, 6)
-        } else if let Some(bytes) = bytes.strip_prefix(SLH_PROPOSER_PAYLOAD) {
-            (bytes, 5)
-        } else if let Some(bytes) = bytes.strip_prefix(SLH_PAYLOAD) {
-            (bytes, 4)
-        } else if let Some(bytes) = bytes.strip_prefix(HASH_PAYLOAD) {
-            (bytes, 3)
-        } else if let Some(bytes) = bytes.strip_prefix(PAYLOAD) {
-            (bytes, 2)
-        } else {
-            return serde_json::from_slice(bytes).map_err(|e| e.to_string());
-        };
+    let (bytes, version) = if let Some(bytes) = bytes.strip_prefix(SLH_BOTH_PAYLOAD) {
+        (bytes, 11)
+    } else if let Some(bytes) = bytes.strip_prefix(SLH_RAW_FIRST_USE_PROPOSER_PAYLOAD) {
+        (bytes, 10)
+    } else if let Some(bytes) = bytes.strip_prefix(SLH_RAW_PROPOSER_PAYLOAD) {
+        (bytes, 9)
+    } else if let Some(bytes) = bytes.strip_prefix(SLH_SDK_FIRST_USE_PROPOSER_PAYLOAD) {
+        (bytes, 8)
+    } else if let Some(bytes) = bytes.strip_prefix(SLH_SDK_PROPOSER_PAYLOAD) {
+        (bytes, 7)
+    } else if let Some(bytes) = bytes.strip_prefix(SLH_FIRST_USE_PROPOSER_PAYLOAD) {
+        (bytes, 6)
+    } else if let Some(bytes) = bytes.strip_prefix(SLH_PROPOSER_PAYLOAD) {
+        (bytes, 5)
+    } else if let Some(bytes) = bytes.strip_prefix(SLH_PAYLOAD) {
+        (bytes, 4)
+    } else if let Some(bytes) = bytes.strip_prefix(HASH_PAYLOAD) {
+        (bytes, 3)
+    } else if let Some(bytes) = bytes.strip_prefix(PAYLOAD) {
+        (bytes, 2)
+    } else {
+        return serde_json::from_slice(bytes).map_err(|e| e.to_string());
+    };
     let frame: Frame = uncbor(bytes)?;
     if frame.format_version != version
         || frame.transactions.is_empty()
         || frame.transactions.len() > MAX_CANONICAL_SIGNATURE_BATCH
-        || (!matches!(version, 5..=10) && frame.slh_proposer.is_some())
-        || (if matches!(version, 5..=10) {
+        || (!matches!(version, 5..=11) && frame.slh_proposer.is_some())
+        || (if matches!(version, 5..=11) {
             frame.proof_version != version - 1
                 || frame.transactions.len() != 1
                 || frame.proposer.is_some()
@@ -785,7 +838,8 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
     }
     let mut unpacker = Unpacker::new(&frame.certificates, version >= 3)?;
     unpacker.grouped = version >= 4;
-    let mut slh_transactions = (version == 4).then(Vec::new);
+    unpacker.deferred_wide = version == 11;
+    let mut slh_transactions = matches!(version, 4 | 11).then(Vec::new);
     let mut slh_budget = MAX_POOL_JSON;
     let mut transactions = Vec::with_capacity(frame.transactions.len());
     for bytes in frame.transactions {
@@ -833,6 +887,21 @@ pub fn decode_payload(bytes: &[u8]) -> Result<CanonicalSignatureBatchProof, Stri
         .map(|bytes| slh::decode_proposer(&mut unpacker, bytes, &mut slh_budget))
         .transpose()?;
     unpacker.finish()?;
+    if slh_proposer
+        .as_ref()
+        .is_some_and(|p| p.version != if version == 11 { 2 } else { 1 })
+        || slh_transactions.as_ref().is_some_and(|v| {
+            v.iter().any(|p| {
+                if version == 11 {
+                    p.version != 3
+                } else {
+                    !matches!(p.version, 1 | 2)
+                }
+            })
+        })
+    {
+        return Err("compact SLH role graph version mismatch".into());
+    }
     Ok(CanonicalSignatureBatchProof {
         slh_proposer,
         slh_transactions,
@@ -991,6 +1060,11 @@ mod tests {
     #[test]
     fn slh_proposer_frame_relabeling_cannot_hide_or_add_a_mandatory_role() {
         for (prefix, format, proof, small, slh, count) in [
+            (SLH_BOTH_PAYLOAD, 11, 10, false, false, 1),
+            (SLH_BOTH_PAYLOAD, 11, 9, false, true, 1),
+            (SLH_BOTH_PAYLOAD, 11, 10, true, true, 1),
+            (SLH_BOTH_PAYLOAD, 11, 10, false, true, 2),
+            (SLH_BOTH_PAYLOAD, 10, 10, false, true, 1),
             (SLH_RAW_FIRST_USE_PROPOSER_PAYLOAD, 10, 9, false, false, 1),
             (SLH_RAW_FIRST_USE_PROPOSER_PAYLOAD, 10, 8, false, true, 1),
             (SLH_RAW_FIRST_USE_PROPOSER_PAYLOAD, 10, 9, true, true, 1),
