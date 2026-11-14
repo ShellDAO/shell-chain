@@ -731,7 +731,7 @@ fn verify(native: &Path, prior: Option<&Path>, out: &Path, fresh: bool) -> Resul
         if history_node.chain_store.get_head_hash()? == Some(c.block) {
             history_node.import_block(later.clone(), &MultiVerifier)?;
         }
-        let ordinary_path = if proof.version == 9 && block.number() == 1 {
+        let ordinary_path = if matches!(proof.version, 9 | 10) && block.number() == 1 {
             let advance: shell_core::Block = json_read(&native.join("advance.json"))?;
             ensure(
                 advance.number() == 3

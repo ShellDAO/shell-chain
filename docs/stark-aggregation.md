@@ -2793,7 +2793,7 @@ compression and foreign-header refusals must preserve the parent. Published
 bytes supply availability; actual peer import and attached-certificate finality
 remain separate checks.
 
-This bound profile does not qualify funded-unbound dual-SLH first use, a
+The standalone workflow does not by itself qualify funded-unbound dual-SLH first use, a
 separate Reference target, fresh automatic generation, other accounts, quorum
 AIR, public release or network activation. Retained controls from this entry
 are an independent cohort; they do not recreate any older unsigned successor.
@@ -2813,3 +2813,45 @@ frames and default checkpoint decoding continue to restore full witnesses.
 Full and deferred forms have identical canonical wire bytes; partial omission,
 unknown domains, altered inputs and corrupted proofs remain refusals. A cold
 recovery of a completed job must generate zero new mathematical certificates.
+
+##### Fresh background production for the bound pair
+
+Reuse the same `both-slh` Native preparation and all three original signed
+transfers, headers and quorum controls. Do not run preparation again to replace
+keys or inputs. This path starts a separate empty mathematical job; it must not
+open or transplant the completed standalone proof. The existing stable-toolchain
+and RocksDB prerequisites apply.
+
+```sh
+tests/e2e/slh-canonical.sh automatic-fresh-prepare both-slh both-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-pause both-slh both-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-resume both-slh both-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-verify both-slh both-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-refuse both-slh both-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-rpc-refuse both-slh both-slh-automatic
+tests/e2e/slh-peer-proof.sh prepare both-slh both-slh-automatic both-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh pause both-slh both-slh-automatic both-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh resume both-slh both-slh-automatic both-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh verify both-slh both-slh-automatic both-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh refuse both-slh both-slh-automatic both-slh-automatic-peer
+```
+
+Ordinary Native import must capture a queued Source 14 job with zero components.
+The actual public-only `Node.run` actor must persist one component, shut down
+gracefully, and cold-resume the complete seventeen-layer graphs for both roles.
+Keep the same output after interruption and continue with
+`automatic-fresh-resume`; never replace its Native data or partial job. A
+nonzero exit marks a failed step. The authenticated manifest and chunks grant
+availability, while proof-backed import and the retained genuine quorum still
+control execution and finality.
+
+Cold verification must import both ordinary successors before replaying target
+1 against changed height 3, resolve the original sealed-parent keys, match
+receipts, root and accounts on both controls, and write neither current store.
+Correct-hash damaged-component and status-source refusals must stop gracefully
+without new signing or Native changes. Transfer the generated frame through the
+actual peer channel, retain three chunks, cold-resume at the next index with a
+fresh nonce, then verify import, attached-certificate finality and a genuine
+foreign-header refusal. A warm standalone job does not qualify this fresh path.
+Funded-unbound/Reference dual-SLH targets, other accounts, quorum AIR, public
+release and network activation remain separate acceptance conditions.

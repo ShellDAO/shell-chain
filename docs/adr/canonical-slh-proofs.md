@@ -473,3 +473,15 @@ writing receipts; dedicated proof transfer and full verification precede import.
 Keep disabled admission and unsupported funded-unbound pair behavior unchanged.
 An earlier failed peer receiver is retained as evidence; a new public-only
 transport output reuses the same signed Native controls and published graph.
+
+Bound two-role background production needs its own empty-job qualification.
+Ordinary import captures Source 14 with zero mathematical components; an actual
+public-only worker must persist a bounded pause and cold-produce frame 11
+without a completed donor, new keys or signing. Reuse the same three genuine
+Native headers, transactions and quorums. For batch 10 target 1, historical
+verification must import both retained successors and compare target replay
+against independent changed-height-3 controls without writing either store.
+Authenticated availability remains separate from execution authority. Require
+damaged-checkpoint and status-source refusals, graceful shutdown, and actual
+generated-frame peer continuation, import/finality and foreign-header refusal.
+Keep all existing resource ceilings, formats, defaults and activation rules.
