@@ -185,6 +185,12 @@ pub(crate) fn prepare_raw_first_use(original: &Path, out: &Path) -> Result<(), E
     prepare_retained(original, out, RetainedKind::Raw, true, 1)
 }
 pub(crate) fn reuse_raw_reference(original: &Path, out: &Path) -> Result<(), Error> {
+    reuse_reference(original, out, SignatureType::Dilithium3)
+}
+pub(crate) fn reuse_both_reference(original: &Path, out: &Path) -> Result<(), Error> {
+    reuse_reference(original, out, SignatureType::SphincsSha2256f)
+}
+fn reuse_reference(original: &Path, out: &Path, kind: SignatureType) -> Result<(), Error> {
     ensure(
         !out.exists(),
         "Reference output exists; refusing replacement",
@@ -194,8 +200,14 @@ pub(crate) fn reuse_raw_reference(original: &Path, out: &Path) -> Result<(), Err
     let first: Block = read(&original.join("candidate.json"))?;
     let target: Block = read(&original.join("later.json"))?;
     let later: Block = read(&original.join("advance.json"))?;
+    let bound_slh = kind == SignatureType::SphincsSha2256f;
+    let profile_matches = if bound_slh {
+        prepared["bound_SLH_sender"] == true && prepared["SLH_proposer"] == true
+    } else {
+        kind == SignatureType::Dilithium3 && prepared["funded_zero_commitment_raw_sender"] == true
+    };
     ensure(
-        prepared["funded_zero_commitment_raw_sender"] == true
+        profile_matches
             && prepared["all_three_genuine_headers_and_quorum_controls_frozen"] == true
             && c.block == first.hash()
             && c.tip == first.hash()
@@ -209,15 +221,26 @@ pub(crate) fn reuse_raw_reference(original: &Path, out: &Path) -> Result<(), Err
             && first.transactions.len() == 1
             && target.transactions.len() == 1
             && later.transactions.len() == 1,
-        "retained funded raw first/Reference/third controls required",
+        "retained sender profile and first/Reference/third controls required",
     )?;
-    let key = first.transactions[0]
-        .pubkey_mode
-        .pubkey_bytes()
-        .ok_or("retained raw Embedded public key absent")?;
+    let source = RocksDbStore::open_all(original.join("native-third/db"), None)?;
+    let before = digest(&source.state)?;
+    let chain = ChainStore::new(Arc::new(source.state.clone()));
+    let key = if bound_slh {
+        chain
+            .canonical_parent_view(later.hash(), first.header.parent_hash)?
+            .registered_key(&first.transactions[0].from)?
+            .ok_or("retained bound SLH parent key absent")?
+    } else {
+        first.transactions[0]
+            .pubkey_mode
+            .pubkey_bytes()
+            .ok_or("retained raw Embedded public key absent")?
+            .to_vec()
+    };
     let sender = PublicRetainedSender {
-        key: key.to_vec(),
-        kind: SignatureType::Dilithium3,
+        key: key.clone(),
+        kind,
         calls: AtomicUsize::new(0),
     };
     let proposer = PublicRetainedSender {
@@ -226,7 +249,7 @@ pub(crate) fn reuse_raw_reference(original: &Path, out: &Path) -> Result<(), Err
         calls: AtomicUsize::new(0),
     };
     ensure(
-        key.len() == 1952
+        key.len() == if bound_slh { 64 } else { 1952 }
             && c.authority_key.len() == 64
             && Address::from_public_key(&c.authority_key, proposer.kind.as_u8()) == c.authority
             && [&first, &target, &later]
@@ -234,27 +257,34 @@ pub(crate) fn reuse_raw_reference(original: &Path, out: &Path) -> Result<(), Err
                 .enumerate()
                 .all(|(nonce, block)| {
                     let signed = &block.transactions[0];
-                    signed.from == Address::from_public_key(key, sender.kind.as_u8())
+                    signed.from == Address::from_public_key(&key, sender.kind.as_u8())
                         && signed.tx.nonce == nonce as u64
                         && signed.signature.sig_type == sender.kind
-                        && signed.pubkey_mode.is_embedded() == (nonce == 0)
+                        && signed.pubkey_mode.is_embedded() == (!bound_slh && nonce == 0)
                         && block.header.proposer == c.authority
-                        && DilithiumVerifier.verify_legacy_transcript(
-                            key,
-                            signed.sender_signing_hash().as_bytes(),
-                            &signed.signature,
-                        )
-                        && !DilithiumVerifier.verify_sdk_transcript(
-                            key,
-                            signed.sender_signing_hash().as_bytes(),
-                            &signed.signature,
-                        )
+                        && if bound_slh {
+                            signed.signature.data.len() == 49_856
+                                && MultiVerifier
+                                    .verify(
+                                        &key,
+                                        signed.sender_signing_hash().as_bytes(),
+                                        &signed.signature,
+                                    )
+                                    .unwrap_or(false)
+                        } else {
+                            DilithiumVerifier.verify_legacy_transcript(
+                                &key,
+                                signed.sender_signing_hash().as_bytes(),
+                                &signed.signature,
+                            ) && !DilithiumVerifier.verify_sdk_transcript(
+                                &key,
+                                signed.sender_signing_hash().as_bytes(),
+                                &signed.signature,
+                            )
+                        }
                 }),
-        "retained raw identities, signature domain or public proposer differ",
+        "retained identities, signature domain or public proposer differ",
     )?;
-    let source = RocksDbStore::open_all(original.join("native-third/db"), None)?;
-    let before = digest(&source.state)?;
-    let chain = ChainStore::new(Arc::new(source.state.clone()));
     ensure(
         chain.get_head_hash()? == Some(later.hash())
             && chain.get_pubkey(&c.authority)?.as_deref() == Some(c.authority_key.as_slice()),
@@ -271,8 +301,8 @@ pub(crate) fn reuse_raw_reference(original: &Path, out: &Path) -> Result<(), Err
         )?;
     }
     std::fs::create_dir(out)?;
-    let native = dilithium::genesis(&out.join("native/db"), &sender, &proposer, true)?;
-    let receiver = dilithium::genesis(&out.join("receiver/db"), &sender, &proposer, true)?;
+    let native = dilithium::genesis(&out.join("native/db"), &sender, &proposer, !bound_slh)?;
+    let receiver = dilithium::genesis(&out.join("receiver/db"), &sender, &proposer, !bound_slh)?;
     let node = fixture::node(
         Arc::new(native.state.clone()),
         c.authority,
@@ -290,8 +320,9 @@ pub(crate) fn reuse_raw_reference(original: &Path, out: &Path) -> Result<(), Err
             && node
                 .chain_store
                 .get_pubkey(&first.transactions[0].from)?
-                .is_none(),
-        "replayed funded genesis differs from retained control",
+                .as_deref()
+                == bound_slh.then_some(key.as_slice()),
+        "replayed genesis differs from retained control",
     )?;
     for (block, name) in [
         (&first, "control.json"),
@@ -337,12 +368,16 @@ pub(crate) fn reuse_raw_reference(original: &Path, out: &Path) -> Result<(), Err
         native.create_checkpoint(path)?;
     }
     let mut control: Value = read(&original.join("later-control.json"))?;
-    control["first_use_parent_unregistered"] = json!(false);
+    if !bound_slh {
+        control["first_use_parent_unregistered"] = json!(false);
+    }
     write(
         &out.join("parent-control.json"),
         &read::<Value>(&original.join("control.json"))?,
     )?;
-    write(&out.join("retained-embedded.json"), &first.transactions[0])?;
+    if !bound_slh {
+        write(&out.join("retained-embedded.json"), &first.transactions[0])?;
+    }
     write(
         &out.join("original-signed-first.json"),
         &first.transactions[0],
@@ -372,7 +407,7 @@ pub(crate) fn reuse_raw_reference(original: &Path, out: &Path) -> Result<(), Err
     )?;
     write(
         &out.join("prepared.json"),
-        &json!({"funded_zero_commitment_raw_sender":true,"reference_target":true,"target_height":2,"parent_height":1,"later_height":3,"retained_headers_and_quorums_reused":true,"all_three_genuine_sender_signatures_unchanged":true,"new_keys":false,"new_signing":false,"new_headers_or_quorums":false,"completed_math_donor_opened":false,"original_native_unchanged":true,"genuine_parent1_and_target2_quorums_persisted":true,"independent_native_replays_match_frozen_controls":true}),
+        &json!({"funded_zero_commitment_raw_sender":!bound_slh,"bound_SLH_sender":bound_slh,"SLH_proposer":true,"reference_target":true,"target_height":2,"parent_height":1,"later_height":3,"retained_headers_and_quorums_reused":true,"all_three_genuine_sender_signatures_unchanged":true,"new_keys":false,"new_signing":false,"new_headers_or_quorums":false,"completed_math_donor_opened":false,"original_native_unchanged":true,"genuine_parent1_and_target2_quorums_persisted":true,"independent_native_replays_match_frozen_controls":true}),
     )
 }
 pub(crate) fn prepare_first_use(original: &Path, out: &Path) -> Result<(), Error> {

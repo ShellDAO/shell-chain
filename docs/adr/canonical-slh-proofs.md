@@ -485,3 +485,15 @@ Authenticated availability remains separate from execution authority. Require
 damaged-checkpoint and status-source refusals, graceful shutdown, and actual
 generated-frame peer continuation, import/finality and foreign-header refusal.
 Keep all existing resource ceilings, formats, defaults and activation rules.
+
+The bound pair's Reference target requires separate acceptance against the
+same frozen Native controls. Public-only replay must preserve the original
+bound genesis, signed blocks and genuine certificates, with finalized parent 1
+and Reference target 2. Retargeting must not create keys, sign new transactions
+or quorum votes, or substitute a completed graph for target-2 production.
+Require durable/cold full Source 14 production, same-job CLI reuse with zero
+new mathematics, original Native receipts/accounts/root and finality 2,
+read-only target-2 replay after block 3, Native and graph tampering refusals,
+and generated-frame peer continuation/import/attached-certificate finality 2.
+Keep raw Reference control replay on its existing legacy signature transcript
+and funded genesis. Fresh automatic target 2 remains a separate assertion.

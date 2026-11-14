@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add a bound dual-SLH Reference control-reuse entry for Source 14: replay the original three signed Native blocks and genuine quorums with public-only actors, retain finalized parent 1 and target 2, then exercise durable proof recovery, CLI reuse, history after block 3, tampering refusals and actual peer import/finality 2. Reuse the raw Reference replay path while preserving its legacy signature domain and funded genesis.
+
 - Cover bound Source 14 empty-job background production with durable pause/cold continuation, authenticated frame 11 retrieval, third-state historical replay, checkpoint/status refusals and generated-frame peer admission. Reuse the original signed Native controls without a completed proof donor or new signing; include batch 10 when replaying both retained successors.
 
 - Add bound SLH sender/SLH proposer Source 14, batch 10 and frame 11. Both roles require their complete seventeen-layer SHA2-256f signature graph; enabled live admission stages this bound pair before Native import while preserving default-off and unsupported unbound policy. An explicit domain-separated SHA256/WOTS batch profile reduces availability overhead while preserving legacy batches, full AIR/security options and all existing global quotas. Frame 11 retains deterministic wide public words on demand and restores one bounded certificate before strict full AIR verification, preserving the shared expansion ceiling and original proof bytes. Add a regression entry that freezes genuine three-block Native controls before dropping independent temporary keys, then exercises durable recovery, CLI, import/finality, third-state history, refusal and peer flows.

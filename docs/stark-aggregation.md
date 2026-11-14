@@ -2814,6 +2814,47 @@ Full and deferred forms have identical canonical wire bytes; partial omission,
 unknown domains, altered inputs and corrupted proofs remain refusals. A cold
 recovery of a completed job must generate zero new mathematical certificates.
 
+##### Reference target from the same bound pair
+
+Keep the original `both-slh` Native output. Its three genuine signed transfers,
+headers and quorum certificates are sufficient to select Reference block 2
+against finalized parent 1. The reuse command opens no completed proof donor
+and uses public-only actors whose signing operation fails. It reconstructs the
+same funded, bound genesis and replays the retained blocks and certificates on
+two stores. It creates no keys, signatures, headers or quorum votes. Choose a
+new output directory; existing outputs and a different sender profile refuse.
+
+```sh
+tests/e2e/slh-both-proof.sh reuse-reference both-slh both-slh-reference
+tests/e2e/slh-both-proof.sh capture both-slh-reference
+tests/e2e/slh-both-proof.sh pause both-slh-reference
+tests/e2e/slh-both-proof.sh resume both-slh-reference
+tests/e2e/slh-both-proof.sh verify both-slh-reference
+tests/e2e/slh-both-proof.sh refuse both-slh-reference
+tests/e2e/slh-both-proof.sh publish both-slh-reference
+tests/e2e/slh-peer-proof.sh prepare both-slh-reference both-slh-reference/published both-slh-reference-peer
+tests/e2e/slh-peer-proof.sh pause both-slh-reference both-slh-reference/published both-slh-reference-peer
+tests/e2e/slh-peer-proof.sh resume both-slh-reference both-slh-reference/published both-slh-reference-peer
+tests/e2e/slh-peer-proof.sh verify both-slh-reference both-slh-reference/published both-slh-reference-peer
+tests/e2e/slh-peer-proof.sh refuse both-slh-reference both-slh-reference/published both-slh-reference-peer
+```
+
+The toolchain, dependencies and failure exits are the same as above. Capture
+must select Source 14/batch 10/frame 11 with the exact Reference transaction and
+both registered parent keys. Pause and cold continuation retain the same
+durable job. Use `shell-node produce-block-proof` with the `both-slh-reference/provider`
+data directory, captured block/tip and `both-slh-reference/proof` output to
+verify CLI reuse with zero new mathematics and identical frame bytes.
+Proof-backed import must match the original block-2 receipts, accounts and
+root, then finalize with its original certificate. Historical replay after
+ordinary block 3 must preserve both current stores. Native transaction
+tampering and incomplete, altered or wrong-domain role graphs must leave
+parent 1 unchanged. The real peer flow must resume its partial download,
+import block 2 and authenticate its attached quorum before finality 2.
+This Reference flow does not by itself qualify fresh automatic target-2
+generation, funded-unbound dual-SLH first use, other accounts, quorum AIR,
+public release or activation. It does not recreate an older unsigned successor.
+
 ##### Fresh background production for the bound pair
 
 Reuse the same `both-slh` Native preparation and all three original signed
