@@ -129,6 +129,24 @@ pub fn prove_commit_quorum_persistent<S: KvStore>(
     source: &CommitQuorumSource,
     limit: Option<NonZeroUsize>,
 ) -> Result<(CommitQuorumProof, ProductionProgress), ProductionError> {
+    commit_quorum_persistent(store, source, limit, false)
+}
+
+/// Reverify all original certificates without initializing a job or invoking
+/// any proving closure. Missing or invalid components refuse rather than heal.
+pub fn reverify_commit_quorum_persistent<S: KvStore>(
+    store: &mut S,
+    source: &CommitQuorumSource,
+) -> Result<(CommitQuorumProof, ProductionProgress), ProductionError> {
+    commit_quorum_persistent(store, source, None, true)
+}
+
+fn commit_quorum_persistent<S: KvStore>(
+    store: &mut S,
+    source: &CommitQuorumSource,
+    limit: Option<NonZeroUsize>,
+    read_only: bool,
+) -> Result<(CommitQuorumProof, ProductionProgress), ProductionError> {
     source.validate()?;
     // Validate the strict public arithmetic and native signatures before opening
     // a mutable job. Native verification selects a transcript only for proving.
@@ -176,7 +194,11 @@ pub fn prove_commit_quorum_persistent<S: KvStore>(
         legacy.push(raw);
     }
     let bytes = bounded_json(&("commit-signature-weight-v1", source), 1024 * 1024)?;
-    let mut job = ProductionStore::open_shared_matrix(store, &bytes, limit)?;
+    let mut job = if read_only {
+        ProductionStore::open_existing_shared_matrix(store, &bytes)?
+    } else {
+        ProductionStore::open_shared_matrix(store, &bytes, limit)?
+    };
     let weight = job.checkpoint(
         "commit-weight",
         || prove_quorum_weight(&source.context),

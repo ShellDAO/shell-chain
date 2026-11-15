@@ -52,6 +52,40 @@ untrusted fixture cannot supply production authority. This is a process-cold
 CBOR fixture check, not RocksDB recovery or peer authentication. Existing
 output directories refuse rather than overwrite retained evidence.
 
+To migrate that same completed job to real RocksDB and check a process-cold
+proof output, run:
+
+```sh
+cargo run --locked -p shell-stark-prover --example commit-quorum -- restore quorum-fixture/source.cbor quorum-fixture/job-complete.cbor quorum-job
+cargo run --locked -p shell-stark-prover --example commit-quorum -- prove quorum-fixture/source.cbor quorum-job quorum-proof.cbor
+cargo run --locked -p shell-stark-prover --example commit-quorum -- verify quorum-fixture/source.cbor quorum-job quorum-proof.cbor
+cargo test --locked -p shell-stark-prover --lib production_store::tests -- --nocapture
+cargo test --locked -p shell-stark-prover --example commit-quorum verification_output_comparison -- --nocapture
+```
+
+Use a new, separate `quorum-job` directory. `restore` checks every original
+certificate before opening a persistent output, writes the exact public rows
+atomically, flushes, and reverifies them from RocksDB. This imports a completed
+checkpoint, not a fresh proof computation. `prove` can also create a separate
+job directly from an independently supplied source; its optional positive
+component limit pauses after bounded new work. Complete proof output is written
+only after full verification. Existing valid identical output is reusable;
+conflicting output refuses before the job opens.
+
+`verify` requires an existing pinned source, database and output. Its dedicated
+checkpoint path never initializes a source or invokes a proving closure, even
+when a structurally consistent partial job lacks a certificate. Invalid cached
+proofs refuse rather than heal. Every reused certificate and the full output
+are checked, with zero new proofs and unchanged logical source/component rows.
+An output that disappears during verification refuses instead of being recreated.
+RocksDB may update its own logs on open; this is not a byte-for-byte database
+directory immutability claim. Retain all input files and job directories after
+a failed attempt. Native chain execution/history in RocksDB, fresh generation
+from zero, other signer profiles and public release remain separate acceptance
+work. The self-contained production-store regressions check missing-source,
+missing-component and invalid-cache refusals without requiring saved keys or
+external fixtures.
+
 Current registry and address/key matching remain Native context predicates.
 This does not establish historical penalty provenance or the selector in AIR,
 add a consensus carrier, activate a network schedule, or replace the ordinary

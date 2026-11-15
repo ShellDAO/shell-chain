@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add separate RocksDB commit-quorum proof jobs and explicit verification-only checkpoint intake. Migrate a retained complete public job without new signing or proof generation, reverify after process restart, and preserve exact proof outputs. Missing or invalid checkpoints refuse without initializing, repairing or proving; existing Native formats and activation remain unchanged.
+
 - Compose full lattice-signature AIR with strict weighted-quorum AIR for an independently selected current Native commit context. Add separate resumable proof jobs and an explicit Node finality entry that requires both proofs, rechecks current weights and keys, and persists the original certificate. This development entry does not activate a network format or prove historical authority, proposer selection or penalty lifecycle.
 
 - Reject duplicate commit-certificate signers before JSON collection or address normalization can discard a claimed signature. Preserve unique tagged and legacy hex certificates, including single historical address spellings; rejected certificates leave finality and stored evidence unchanged.

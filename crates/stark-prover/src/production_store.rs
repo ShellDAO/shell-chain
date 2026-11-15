@@ -65,6 +65,7 @@ pub struct ProductionStore<'a, S: KvStore> {
     limit: Option<NonZeroUsize>,
     added: usize,
     reused: usize,
+    read_only: bool,
     interrupt: Option<&'a dyn Fn() -> bool>,
     reuse: Option<&'a ComponentReuse<'a>>,
     local_reuse: BTreeMap<String, String>,
@@ -114,6 +115,22 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
     }
     pub(crate) fn shared_matrix_encoding(&self) -> bool {
         self.index.version == 3
+    }
+
+    /// Reverify an existing job without initializing a source or proving a
+    /// missing component. The source/index checks below must still succeed.
+    pub(crate) fn open_existing_shared_matrix(
+        store: &'a mut S,
+        source: &[u8],
+    ) -> Result<Self, ProductionError> {
+        if store.get(INDEX).map_err(failure)?.is_none() {
+            return Err(failure(
+                "verification requires an existing production index",
+            ));
+        }
+        let mut job = Self::open_shared_matrix(store, source, None)?;
+        job.read_only = true;
+        Ok(job)
     }
 
     fn open_format(
@@ -213,6 +230,7 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
             limit,
             added: 0,
             reused: 0,
+            read_only: false,
             interrupt: None,
             reuse: None,
             local_reuse: BTreeMap::new(),
@@ -282,6 +300,9 @@ impl<'a, S: KvStore> ProductionStore<'a, S> {
             self.reused += 1;
             eprintln!("Reverified {name}");
             return Ok(p);
+        }
+        if self.read_only {
+            return Err(failure("missing checkpoint in verification-only job"));
         }
         if self.limit.is_some_and(|n| self.added >= n.get()) {
             return Err(ProductionError::Paused);
@@ -675,6 +696,63 @@ mod tests {
             Err(ProductionError::Paused)
         ));
         assert_eq!(job.progress().components, 0);
+    }
+    #[test]
+    fn verification_only_requires_existing_source_and_never_proves_missing_components() {
+        let mut db = MemoryDb::new();
+        assert!(ProductionStore::open_existing_shared_matrix(&mut db, b"source").is_err());
+        assert!(db.scan_all().unwrap().is_empty());
+        let mut job = ProductionStore::open_shared_matrix(&mut db, b"source", None).unwrap();
+        job.checkpoint("cached", || Ok(7u32), |_| Ok(())).unwrap();
+        drop(job);
+        let before = db.scan_all().unwrap();
+        assert!(ProductionStore::open_existing_shared_matrix(&mut db, b"different").is_err());
+        assert_eq!(db.scan_all().unwrap(), before);
+        let mut job = ProductionStore::open_existing_shared_matrix(&mut db, b"source").unwrap();
+        assert_eq!(
+            job.checkpoint(
+                "cached",
+                || panic!("cached proof regenerated"),
+                |v: &u32| if *v == 7 {
+                    Ok(())
+                } else {
+                    Err("wrong cached value".into())
+                }
+            )
+            .unwrap(),
+            7
+        );
+        assert!(job
+            .checkpoint(
+                "missing",
+                || -> Result<u32, String> { panic!("missing proof generated") },
+                |_| Ok(())
+            )
+            .is_err());
+        assert_eq!(job.progress().newly_proved, 0);
+        assert_eq!(job.progress().reused, 1);
+        drop(job);
+        assert_eq!(db.scan_all().unwrap(), before);
+    }
+
+    #[test]
+    fn verification_only_rejects_invalid_cached_predicate_without_repair() {
+        let mut db = MemoryDb::new();
+        let mut job = ProductionStore::open_shared_matrix(&mut db, b"source", None).unwrap();
+        job.checkpoint("cached", || Ok(7u32), |_| Ok(())).unwrap();
+        drop(job);
+        let before = db.scan_all().unwrap();
+        let mut job = ProductionStore::open_existing_shared_matrix(&mut db, b"source").unwrap();
+        assert!(job
+            .checkpoint(
+                "cached",
+                || -> Result<u32, String> { panic!("invalid cache repaired") },
+                |_| Err("predicate refused".into())
+            )
+            .is_err());
+        assert_eq!(job.progress().newly_proved, 0);
+        drop(job);
+        assert_eq!(db.scan_all().unwrap(), before);
     }
     #[test]
     fn quota_unknown_keys_and_failed_verification_never_publish() {

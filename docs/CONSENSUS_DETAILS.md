@@ -784,6 +784,16 @@ and compares the resulting Native finality rows with the original control.
 Its authority configuration is trusted fixture input, and the backing store
 is MemoryDb; it does not establish RocksDB recovery or peer authentication.
 
+The separate `shell-stark-prover` example `commit-quorum` restores a completed
+public checkpoint into an exclusively owned RocksDB job, reopens it across
+processes, and writes or verifies the complete proof output. Verification-only
+intake requires an existing source and every component; a missing certificate
+cannot invoke proof generation or initialize a new job. Source and component
+rows stay unchanged during verification, although RocksDB may maintain its own
+log files. This is proof-job persistence, separate from Native chain data and
+Native RocksDB execution or historical authority. The
+[development flow](adr/commit-quorum-proof.md) retains the original public inputs.
+
 The bounded development profile supports at most sixteen lattice signers,
 including ML-DSA-65, genuine PQClean Dilithium3 and its existing SDK FIPS
 transcript. Existing checkpoint quotas still apply. SLH quorum signatures,
