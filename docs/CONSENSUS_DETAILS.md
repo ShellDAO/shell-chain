@@ -807,6 +807,19 @@ changed-proof, certificate, weight, target and tip refusals. This controlled
 single-authority profile does not prove historical weight/key provenance or
 exercise peer transport. See the [executable flow](adr/commit-quorum-proof.md).
 
+`Node::import_block_with_commit_proof` is an explicit offline fresh-child entry.
+It requires the independently selected current canonical parent, active body
+commitments and complete QC signature/weight AIR before executing the supplied
+body. It rechecks current authority context and parent after execution, holding
+the consensus read lock through the durable commit. Executed state, block,
+receipts, certificate, signer evidence and finalized cursor share the existing
+canonical overlay's single backend batch; memory state and finality publish
+after that batch succeeds. The explicit entry grants no sender/proposer AIR
+claim and does not enable network intake. The `quorum-native receive` flow
+reuses retained public controls and proofs, tests backend failure rollback and
+activation/refusal boundaries, then compares complete Native rows to an
+independent ordinary importer before a cold history check.
+
 The bounded development profile supports at most sixteen lattice signers,
 including ML-DSA-65, genuine PQClean Dilithium3 and its existing SDK FIPS
 transcript. Existing checkpoint quotas still apply. SLH quorum signatures,

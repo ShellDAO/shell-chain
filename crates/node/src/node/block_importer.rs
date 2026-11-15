@@ -19,7 +19,7 @@ pub struct CanonicalProofReplay {
     pub proved_proposer_signature: bool,
 }
 
-/// Read-only execution replay with a full commit-signature/weight proof. Sender
+/// Native execution result with a full commit-signature/weight proof. Sender
 /// transaction signatures remain Native; current validator context is trusted
 /// independently and does not establish historical penalty provenance.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1969,7 +1969,95 @@ impl<S: KvStore + 'static> Node<S> {
     /// potential fork and skipped. If there is a gap (block number is
     /// more than one ahead of head), missing blocks are requested.
     pub fn import_block(&self, block: Block, _verifier: &dyn Verifier) -> Result<(), NodeError> {
-        self.import_block_inner(block, false, None)
+        self.import_block_inner(block, false, None, None)
+    }
+
+    /// Exclusively import and finalize one fresh canonical child with full QC
+    /// signature/weight AIR. Native execution, receipts, certificate, signer
+    /// evidence and finality share one backend batch. Ordinary transaction and
+    /// proposer authorization remain Native. Call only while this node is offline.
+    pub fn import_block_with_commit_proof(
+        &mut self,
+        expected_parent: ShellHash,
+        block: Block,
+        cert: &[u8],
+        proof: &shell_stark_prover::commit_quorum::CommitQuorumProof,
+    ) -> Result<CanonicalQuorumReplay, NodeError> {
+        let head = self
+            .chain_store
+            .get_head_block()?
+            .ok_or(NodeError::NoGenesis)?;
+        let config = self
+            .chain_store
+            .get_chain_config()?
+            .ok_or(NodeError::NoGenesis)?;
+        if head.hash() != expected_parent
+            || block.header.parent_hash != expected_parent
+            || head.number().checked_add(1) != Some(block.number())
+            || config.chain_id != self.config.chain_id
+            || self.chain_store.get_block_hash_by_number(0)? != Some(config.genesis_hash)
+            || config
+                .block_commitment_height
+                .is_none_or(|h| block.number() < h)
+            || block
+                .system_transactions
+                .iter()
+                .any(|tx| tx.kind != SystemTxKind::BlockGasReward)
+        {
+            return Err(NodeError::Startup(
+                "fresh quorum import parent/identity/profile mismatch".into(),
+            ));
+        }
+        let view = self
+            .chain_store
+            .canonical_parent_view(expected_parent, expected_parent)?;
+        if view.config() != &config {
+            return Err(NodeError::Startup(
+                "quorum import configuration changed before snapshot".into(),
+            ));
+        }
+        let registry = load_algorithm_registry(&view.world_state()?)
+            .map_err(|e| NodeError::Startup(format!("quorum import registry: {e}")))?;
+        let source = self
+            .commit_quorum_source_for_header(
+                &block.header,
+                cert,
+                &self.consensus.read().validator_weights(),
+            )
+            .map_err(NodeError::Startup)?;
+        let verified = with_algorithm_registry_override(&registry, || {
+            shell_stark_prover::commit_quorum::verify_commit_quorum(proof, &source)
+        })
+        .map_err(|e| NodeError::Startup(format!("fresh quorum proof: {e}")))?;
+        let hash = block.hash();
+        with_algorithm_registry_override(&registry, || {
+            self.import_block_inner(block, true, None, Some((cert, &verified, &config)))
+        })?;
+        let imported = self
+            .chain_store
+            .get_head_block()?
+            .ok_or(NodeError::NoGenesis)?;
+        if imported.hash() != hash
+            || self.chain_store.get_finalized_number()? != Some(imported.number())
+        {
+            return Err(NodeError::Startup(
+                "quorum import did not publish exact child/finality".into(),
+            ));
+        }
+        Ok(CanonicalQuorumReplay {
+            execution: CanonicalProofReplay {
+                tip: hash,
+                block: hash,
+                parent: expected_parent,
+                state_root: imported.header.state_root,
+                receipts: self.chain_store.get_receipts(&hash)?.ok_or_else(|| {
+                    NodeError::Startup("quorum import receipts unavailable".into())
+                })?,
+                proved_sender_signatures: 0,
+                proved_proposer_signature: false,
+            },
+            proved_commit_signatures: source.signatures.len(),
+        })
     }
 
     /// Import a block whose commit certificate has already been verified by
@@ -1980,7 +2068,7 @@ impl<S: KvStore + 'static> Node<S> {
         block: Block,
         _verifier: &dyn Verifier,
     ) -> Result<(), NodeError> {
-        self.import_block_inner(block, true, None)
+        self.import_block_inner(block, true, None, None)
     }
 
     /// Exclusively import one fresh canonical child using complete sender proofs.
@@ -2087,7 +2175,7 @@ impl<S: KvStore + 'static> Node<S> {
             .map_err(|e| NodeError::Startup(format!("proof import parent registry: {e}")))?;
         with_algorithm_registry_override(&registry, || {
             let hash = block.hash();
-            self.import_block_inner(block, false, Some(verified))?;
+            self.import_block_inner(block, false, Some(verified), None)?;
             let imported = self
                 .chain_store
                 .get_head_block()?
@@ -2116,6 +2204,11 @@ impl<S: KvStore + 'static> Node<S> {
         block: Block,
         finalized_import: bool,
         signature_proof: Option<&VerifiedCanonicalSignatureBatch>,
+        commit_proof: Option<(
+            &[u8],
+            &shell_stark_prover::commit_quorum::VerifiedCommitQuorum,
+            &shell_storage::ChainConfig,
+        )>,
     ) -> Result<(), NodeError> {
         self.chain_store.verify_block_body_commitment(&block)?;
         let block_store = self.block_store();
@@ -2150,6 +2243,12 @@ impl<S: KvStore + 'static> Node<S> {
                     "proof import context changed before execution".into(),
                 ));
             }
+        }
+
+        if commit_proof.is_some() && transition != BlockImportTransition::CanonicalNext {
+            return Err(NodeError::Startup(
+                "quorum proof requires a fresh canonical child".into(),
+            ));
         }
 
         // Retain authenticated ancestors anywhere in the unfinalized suffix,
@@ -2324,7 +2423,12 @@ impl<S: KvStore + 'static> Node<S> {
         let mut algorithm_registry_rollback = signature_proof
             .is_none()
             .then(AlgorithmRegistryRollback::new);
-        let import_store = Arc::new(shell_storage::OverlayStore::new(self.store.clone()));
+        let overlay = shell_storage::OverlayStore::new(self.store.clone());
+        let import_store = Arc::new(if commit_proof.is_some() {
+            overlay.with_write_limit(64 * 1024 * 1024)?
+        } else {
+            overlay
+        });
         let imported_state_root = if !block.transactions.is_empty() || !stark_settlements.is_empty()
         {
             // Validate all transactions before execution (F-181):
@@ -2723,7 +2827,38 @@ impl<S: KvStore + 'static> Node<S> {
             }
         }
         import_cs.put_block_signers(&block.hash(), &[proposer_evidence])?;
+        // Recheck the exact parent and current authority tuple after slow AIR
+        // verification/execution, retaining the consensus read lock through the
+        // single durable canonical/finality batch. Rejection leaves only an overlay.
+        let quorum_guard = commit_proof.map(|_| self.consensus.read());
+        if let Some((cert, verified, expected_config)) = commit_proof {
+            let source = self
+                .commit_quorum_source_for_header(
+                    &block.header,
+                    cert,
+                    &quorum_guard
+                        .as_ref()
+                        .expect("quorum context lock")
+                        .validator_weights(),
+                )
+                .map_err(NodeError::Startup)?;
+            if self.chain_store.get_head_hash()? != Some(block.header.parent_hash)
+                || self.chain_store.get_chain_config()?.as_ref() != Some(expected_config)
+                || !verified.matches_source(&source)
+            {
+                return Err(NodeError::Startup(
+                    "quorum import context changed before commit".into(),
+                ));
+            }
+            import_cs.set_finalized_with_certificate_and_signers(
+                block.number(),
+                &block.hash(),
+                cert,
+                &source.signatures,
+            )?;
+        }
         import_cs.commit_canonical_overlay(&block, Some(receipts.as_slice()))?;
+        drop(quorum_guard);
 
         // Commit to storage.
         let committed_world_state = WorldState::at_root(self.store.clone(), &imported_state_root)?;
@@ -2736,6 +2871,13 @@ impl<S: KvStore + 'static> Node<S> {
         prover.remove_settled_pending(&stark_settlements);
         self.feed_l2_scheduler_from_settlements(&stark_settlements, block.number());
         consensus.register_fork_choice_block(block_hash, block.header.parent_hash, block.number());
+        if commit_proof.is_some() {
+            self.finality
+                .write()
+                .set_finalized_direct(block.number(), block_hash);
+            self.advance_fork_choice_finality(block.number(), block_hash);
+            self.metrics.update_finality(block.number(), block.number());
+        }
 
         // Track the last block proposed by each validator for offline-slash detection.
         self.last_proposed_by

@@ -140,6 +140,55 @@ not establish independent peer transport, power-loss recovery, sender-signature
 AIR, changing historical validator provenance, or all activation combinations.
 Repository-wide CI and public release acceptance remain required separately.
 
+To import and finalize block 1 in one durable transaction, reuse those same
+complete public controls and proof with a new receiver directory:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- receive native-quorum native-quorum-proof.cbor native-quorum-import
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- receive-verify native-quorum native-quorum-proof.cbor native-quorum-import
+```
+
+The exclusive offline `Node::import_block_with_commit_proof` reconstructs the
+fresh child's authority context from its independent current parent and registry;
+it does not require storing the target header before verifying its full QC proof.
+It rejects a stale parent, inactive body-commitment profile or damaged proof,
+certificate and body without publishing a child. After execution it rechecks the
+parent and current authority tuple, retaining the consensus read lock through
+one canonical backend batch containing state, block, receipts, the original
+certificate, signer evidence and finalized cursor. In-memory world state and
+finality update after the durable batch succeeds. Duplicate/stale imports refuse.
+Sender and proposer cryptography remain Native, and validator/key provenance is
+still a separate trust input. This entry does not opt a running node into new
+network intake or supply historical penalty context.
+
+`receive` creates no new signing keys or proof graphs. It reuses the original
+three genuine blocks/quorums and complete proof, checks changed proof, weight,
+signature graph, certificate, parent, body and activation refusals, then injects
+a failure at the final backend batch. The attempted batch must contain the
+canonical head, finalized cursor and exact certificate, while all durable rows
+and the in-memory world/finality remain at genesis. Retrying the same original
+inputs with that controlled storage fault removed must execute and finalize
+block 1 together, then follow the retained blocks 2 and 3. The example compares
+all logical Native rows with an independent ordinary importer and replays block
+1 after state 3. `receive-verify` reopens both stores in another process and
+checks persisted state/receipts, signer evidence, finality and no-write history
+and duplicate refusals. This tests a controlled RocksDB batch failure and
+process reopen; power loss and real peer transport require separate acceptance.
+Inactive profiles use separate genesis configurations. An attempted change to
+an existing stored configuration must refuse without modifying it. Retain all
+directories after any unexpected nonzero exit. If a `receive` attempt stopped
+while both original receivers still match their funded genesis, continue those
+same public inputs without resetting or replacing the stores:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- receive-resume native-quorum native-quorum-proof.cbor native-quorum-import
+```
+
+This continuation requires both original genesis heads, zero finality and equal
+logical rows. It then checks the immutable-configuration refusal and uses
+separate genesis databases for omitted and future activation heights. A partial
+receiver beyond this precise genesis state refuses; preserve it for diagnosis.
+
 Current registry and address/key matching remain Native context predicates.
 This does not establish historical penalty provenance or the selector in AIR,
 add a consensus carrier, activate a network schedule, or replace the ordinary

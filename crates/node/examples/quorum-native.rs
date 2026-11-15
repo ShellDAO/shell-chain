@@ -62,7 +62,21 @@ fn node(path: &Path, control: &Control, initialize: bool) -> Result<Node<RocksDb
         )?;
     }
     let stores = RocksDbStore::open_all(path, None)?;
-    let store = Arc::new(stores.state);
+    node_on_store(Arc::new(stores.state), control, initialize)
+}
+fn node_on_store<S: KvStore + 'static>(
+    store: Arc<S>,
+    control: &Control,
+    initialize: bool,
+) -> Result<Node<S>, Error> {
+    node_on_store_with_activation(store, control, initialize, Some(1))
+}
+fn node_on_store_with_activation<S: KvStore + 'static>(
+    store: Arc<S>,
+    control: &Control,
+    initialize: bool,
+    commitment_height: Option<u64>,
+) -> Result<Node<S>, Error> {
     let chain = Arc::new(ChainStore::new(store.clone()));
     if initialize {
         ensure(
@@ -81,7 +95,7 @@ fn node(path: &Path, control: &Control, initialize: bool) -> Result<Node<RocksDb
         chain.put_pubkey(&control.sender, &control.sender_key)?;
         chain.put_pubkey(&control.authority, &control.authority_key)?;
         let cfg: ChainConfig = serde_json::from_value(
-            serde_json::json!({"chain_id":1337,"genesis_hash":control.genesis.hash(),"fee_accounting_activation_height":1,"native_address_context_height":1,"block_commitment_height":1}),
+            serde_json::json!({"chain_id":1337,"genesis_hash":control.genesis.hash(),"fee_accounting_activation_height":1,"native_address_context_height":1,"block_commitment_height":commitment_height}),
         )?;
         chain.commit_genesis_block(&control.genesis, &cfg)?;
     }
@@ -106,7 +120,7 @@ fn node(path: &Path, control: &Control, initialize: bool) -> Result<Node<RocksDb
         Arc::new(RwLock::new(WPoaEngine::new(poa, Arc::new(MultiVerifier))));
     Ok(Node::new(config, store, chain, world, pool, consensus))
 }
-fn balances(node: &Node<RocksDbStore>, c: &Control, count: usize) -> Result<(), Error> {
+fn balances<S: KvStore + 'static>(node: &Node<S>, c: &Control, count: usize) -> Result<(), Error> {
     let state = node.world_state.read();
     let sender = state.get_account(&c.sender)?.ok_or("sender missing")?;
     let recipient = state
@@ -536,12 +550,311 @@ fn inspect(root: &Path) -> Result<(), Error> {
     );
     Ok(())
 }
+type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+struct FailingBatch {
+    inner: RocksDbStore,
+    armed: std::sync::atomic::AtomicBool,
+    attempted: std::sync::atomic::AtomicBool,
+    complete_tuple: std::sync::atomic::AtomicBool,
+    certificate: Vec<u8>,
+}
+impl KvStore for FailingBatch {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, shell_storage::StorageError> {
+        self.inner.get(key)
+    }
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), shell_storage::StorageError> {
+        self.inner.put(key, value)
+    }
+    fn delete(&self, key: &[u8]) -> Result<(), shell_storage::StorageError> {
+        self.inner.delete(key)
+    }
+    fn flush(&self) -> Result<(), shell_storage::StorageError> {
+        self.inner.flush()
+    }
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<Rows, shell_storage::StorageError> {
+        self.inner.scan_prefix(prefix)
+    }
+    fn snapshot_prefixes(
+        &self,
+        prefixes: &[&[u8]],
+        max_bytes: usize,
+    ) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>, shell_storage::StorageError> {
+        self.inner.snapshot_prefixes(prefixes, max_bytes)
+    }
+    fn write_batch(
+        &self,
+        batch: shell_storage::WriteBatch,
+    ) -> Result<(), shell_storage::StorageError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.armed.swap(false, SeqCst) {
+            let puts = batch
+                .ops()
+                .iter()
+                .filter_map(|op| match op {
+                    shell_storage::WriteBatchOp::Put { key, value } => {
+                        Some((key.as_slice(), value.as_slice()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            self.attempted.store(true, SeqCst);
+            self.complete_tuple.store(
+                puts.iter().any(|(key, _)| *key == b"HEAD")
+                    && puts.iter().any(|(key, _)| *key == b"FINALIZED")
+                    && puts.iter().any(|(_, value)| *value == self.certificate),
+                SeqCst,
+            );
+            return Err(shell_storage::StorageError::Database(
+                "injected canonical batch failure".into(),
+            ));
+        }
+        self.inner.write_batch(batch)
+    }
+}
+fn receive(
+    controls: &Path,
+    proof_file: &Path,
+    root: &Path,
+    fresh: bool,
+    resume: bool,
+) -> Result<(), Error> {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let c: Control = read(&controls.join("control.cbor"))?;
+    let source: CommitQuorumSource = read(&controls.join("source.cbor"))?;
+    let proof: CommitQuorumProof = read(proof_file)?;
+    ensure(
+        c.blocks.len() == 3 && c.certificates.len() == 3,
+        "original complete controls required",
+    )?;
+    if fresh {
+        std::fs::create_dir(root)?;
+    } else {
+        ensure(
+            root.join("db/CURRENT").is_file() && root.join("control-db/CURRENT").is_file(),
+            "existing import controls required",
+        )?;
+    }
+    let stores = RocksDbStore::open_all(root.join("db"), None)?;
+    let store = Arc::new(FailingBatch {
+        inner: stores.state,
+        armed: AtomicBool::new(false),
+        attempted: AtomicBool::new(false),
+        complete_tuple: AtomicBool::new(false),
+        certificate: c.certificates[0].clone(),
+    });
+    let mut receiver = node_on_store(store.clone(), &c, fresh)?;
+    let normal = node(&root.join("control-db"), &c, fresh)?;
+    if fresh || resume {
+        ensure(
+            receiver.chain_store.get_head_hash()? == Some(c.genesis.hash())
+                && normal.chain_store.get_head_hash()? == Some(c.genesis.hash())
+                && receiver.finality.read().last_finalized_number() == 0
+                && normal.finality.read().last_finalized_number() == 0
+                && receiver.store.scan_all()? == normal.store.scan_all()?,
+            "resume requires original unchanged genesis controls",
+        )?;
+        let before = receiver.store.scan_all()?;
+        for case in 0..7 {
+            let mut altered = proof.clone();
+            let mut cert = c.certificates[0].clone();
+            let mut block = c.blocks[0].clone();
+            let mut parent = c.genesis.hash();
+            match case {
+                0 => altered.version = 0,
+                1 => altered.weight.proof_bytes[0] ^= 1,
+                2 => altered.signatures[0].version = 0,
+                3 => {
+                    let mut sig = source.signatures[0].signature.clone();
+                    sig.data[0] ^= 1;
+                    cert = Node::<RocksDbStore>::encode_commit_certificate(&HashMap::from([(
+                        c.authority,
+                        sig,
+                    )]))?;
+                }
+                4 => parent = c.blocks[0].hash(),
+                5 => block.transactions[0].signature.data[0] ^= 1,
+                _ => receiver
+                    .consensus
+                    .write()
+                    .set_authorities_with_weights(vec![c.authority], vec![2]),
+            }
+            let refused = receiver
+                .import_block_with_commit_proof(parent, block, &cert, &altered)
+                .is_err();
+            receiver
+                .consensus
+                .write()
+                .set_authorities_with_weights(vec![c.authority], vec![1]);
+            ensure(
+                refused
+                    && receiver.store.scan_all()? == before
+                    && receiver.finality.read().last_finalized_number() == 0,
+                "fresh quorum refusal changed Native rows/finality",
+            )?;
+        }
+        let original_config = receiver
+            .chain_store
+            .get_chain_config()?
+            .ok_or("configuration absent")?;
+        let mut changed_config = original_config.clone();
+        changed_config.block_commitment_height = None;
+        // Retained genesis configuration is immutable. Recheck the original
+        // failed operation as an expected refusal rather than bypassing it.
+        ensure(
+            receiver
+                .chain_store
+                .put_chain_config(&changed_config)
+                .is_err()
+                && receiver.store.scan_all()? == before,
+            "stored configuration mutation accepted/wrote rows",
+        )?;
+        for (name, activation) in [("inactive-none", None), ("inactive-two", Some(2))] {
+            let path = root.join(name);
+            let initialize = !path.exists();
+            ensure(
+                initialize || path.join("CURRENT").is_file(),
+                "inactive control database incomplete",
+            )?;
+            let stores = RocksDbStore::open_all(&path, None)?;
+            let mut inactive =
+                node_on_store_with_activation(Arc::new(stores.state), &c, initialize, activation)?;
+            ensure(
+                inactive
+                    .chain_store
+                    .get_chain_config()?
+                    .ok_or("inactive configuration absent")?
+                    .block_commitment_height
+                    == activation,
+                "inactive genesis configuration differs",
+            )?;
+            let rows = inactive.store.scan_all()?;
+            ensure(
+                inactive
+                    .import_block_with_commit_proof(
+                        c.genesis.hash(),
+                        c.blocks[0].clone(),
+                        &c.certificates[0],
+                        &proof,
+                    )
+                    .is_err()
+                    && inactive.store.scan_all()? == rows
+                    && inactive.finality.read().last_finalized_number() == 0,
+                "inactive genesis quorum import accepted/wrote rows",
+            )?;
+        }
+        store.armed.store(true, SeqCst);
+        ensure(
+            receiver
+                .import_block_with_commit_proof(
+                    c.genesis.hash(),
+                    c.blocks[0].clone(),
+                    &c.certificates[0],
+                    &proof,
+                )
+                .is_err(),
+            "injected batch failure accepted",
+        )?;
+        ensure(
+            store.attempted.load(SeqCst)
+                && store.complete_tuple.load(SeqCst)
+                && receiver.store.scan_all()? == before
+                && receiver.chain_store.get_head_hash()? == Some(c.genesis.hash())
+                && receiver.world_state.write().state_root()? == c.genesis.header.state_root
+                && receiver.finality.read().last_finalized_number() == 0,
+            "canonical batch failure published partial execution/QC/finality",
+        )?;
+        let result = receiver.import_block_with_commit_proof(
+            c.genesis.hash(),
+            c.blocks[0].clone(),
+            &c.certificates[0],
+            &proof,
+        )?;
+        ensure(
+            result.proved_commit_signatures == 1
+                && result.execution.proved_sender_signatures == 0
+                && result.execution.state_root == c.blocks[0].header.state_root
+                && Some(result.execution.receipts)
+                    == receiver.chain_store.get_receipts(&c.blocks[0].hash())?
+                && receiver.finality.read().last_finalized_number() == 1,
+            "atomic full quorum import result differs",
+        )?;
+        normal.import_block(c.blocks[0].clone(), &MultiVerifier)?;
+        ensure(
+            normal.fast_finalize_with_certificate(1, c.blocks[0].hash(), &c.certificates[0]),
+            "Native reference finality failed",
+        )?;
+        for block in &c.blocks[1..] {
+            receiver.import_block(block.clone(), &MultiVerifier)?;
+            normal.import_block(block.clone(), &MultiVerifier)?;
+        }
+        receiver.store.flush()?;
+        normal.store.flush()?;
+    }
+    balances(&receiver, &c, 3)?;
+    balances(&normal, &c, 3)?;
+    ensure(
+        receiver.store.scan_all()? == normal.store.scan_all()?,
+        "atomic/ordinary independent Native stores differ",
+    )?;
+    ensure(
+        normal.chain_store.get_finalized_number()? == Some(1)
+            && normal.finality.read().last_finalized_number() == 1,
+        "cold normal finality mismatch",
+    )?;
+    ensure(
+        receiver.chain_store.get_finalized_number()? == Some(1)
+            && receiver.finality.read().last_finalized_number() == 1
+            && receiver
+                .chain_store
+                .get_commit_certificate(&c.blocks[0].hash())?
+                == Some(c.certificates[0].clone())
+            && receiver
+                .chain_store
+                .get_block_signers(&c.blocks[0].hash())?
+                == source.signatures,
+        "cold proof import evidence/finality mismatch",
+    )?;
+    let before = receiver.store.scan_all()?;
+    let result = receiver.replay_canonical_block_with_commit_proof(
+        c.blocks[2].hash(),
+        c.blocks[0].hash(),
+        &c.certificates[0],
+        &proof,
+    )?;
+    let normal_before = normal.store.scan_all()?;
+    ensure(
+        result
+            == normal.replay_canonical_block_with_commit_proof(
+                c.blocks[2].hash(),
+                c.blocks[0].hash(),
+                &c.certificates[0],
+                &proof,
+            )?
+            && receiver
+                .import_block_with_commit_proof(
+                    c.genesis.hash(),
+                    c.blocks[0].clone(),
+                    &c.certificates[0],
+                    &proof,
+                )
+                .is_err()
+            && receiver.store.scan_all()? == before
+            && normal.store.scan_all()? == normal_before,
+        "cold import history/duplicate refusal changed Native rows",
+    )?;
+    println!(
+        "{}",
+        serde_json::json!({"freshAtomicImport":fresh || resume,"resumedOriginalPartial":resume,"backendFailureRollbackChecked":fresh || resume,"independentNativeRowsEqual":true,"currentHeight":3,"finalized":1,"commitSignaturesProved":1,"senderAndProposerCryptoNative":true,"historicalRowsUnchanged":true,"originalControlsAndProofReused":true,"newSigningOrProofGeneration":false,"realPeerTransport":false})
+    );
+    Ok(())
+}
 fn main() -> Result<(), Error> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("receive" | "receive-resume" | "receive-verify") if args.len() == 4 => receive(Path::new(&args[1]), Path::new(&args[2]), Path::new(&args[3]), args[0] == "receive", args[0] == "receive-resume"),
         Some("prepare") if args.len() == 2 => prepare(Path::new(&args[1])),
         Some("inspect") if args.len() == 2 => inspect(Path::new(&args[1])),
         Some("verify") if args.len() == 3 => verify(Path::new(&args[1]), Path::new(&args[2])),
-        _ => Err("usage: quorum-native prepare <new-control-directory> | inspect <control-directory> | verify <control-directory> <full-quorum-proof.cbor>".into()),
+        _ => Err("usage: quorum-native prepare <new-control-directory> | inspect <control-directory> | verify <control-directory> <full-quorum-proof.cbor> | receive <original-controls> <full-proof.cbor> <new-import-directory> | receive-resume <original-controls> <full-proof.cbor> <original-genesis-import-directory> | receive-verify <original-controls> <full-proof.cbor> <existing-import-directory>".into()),
     }
 }

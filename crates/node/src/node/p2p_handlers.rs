@@ -854,16 +854,13 @@ impl<S: KvStore + 'static> Node<S> {
         cert: &[u8],
         weights: &HashMap<Address, u64>,
     ) -> Result<shell_stark_prover::commit_quorum::CommitQuorumSource, String> {
-        use shell_stark_prover::{
-            commit_quorum::CommitQuorumSource,
-            weighted_quorum::{AuthorityWeight, QuorumWeightContext},
-        };
         let header = self
             .chain_store
             .get_header_by_hash(&block_hash)
             .map_err(|e| e.to_string())?
             .ok_or("commit proof header missing")?;
-        if header.number != block_number
+        if header.hash() != block_hash
+            || header.number != block_number
             || self
                 .chain_store
                 .get_block_hash_by_number(block_number)
@@ -872,6 +869,21 @@ impl<S: KvStore + 'static> Node<S> {
         {
             return Err("commit proof target is not the canonical stored header".into());
         }
+        self.commit_quorum_source_for_header(&header, cert, weights)
+    }
+
+    /// Fresh child headers are selected by the caller's independent parent,
+    /// never by a field supplied only by the proof.
+    pub(super) fn commit_quorum_source_for_header(
+        &self,
+        header: &BlockHeader,
+        cert: &[u8],
+        weights: &HashMap<Address, u64>,
+    ) -> Result<shell_stark_prover::commit_quorum::CommitQuorumSource, String> {
+        use shell_stark_prover::{
+            commit_quorum::CommitQuorumSource,
+            weighted_quorum::{AuthorityWeight, QuorumWeightContext},
+        };
         let signatures =
             Self::decode_commit_certificate(cert).ok_or("invalid commit certificate")?;
         let mut entries = Vec::with_capacity(signatures.len());
@@ -896,8 +908,8 @@ impl<S: KvStore + 'static> Node<S> {
             context: QuorumWeightContext {
                 chain_id: self.config.chain_id,
                 parent_hash: header.parent_hash,
-                block_hash,
-                block_number,
+                block_hash: header.hash(),
+                block_number: header.number,
                 authorities,
                 signers: entries.iter().map(|e| e.address).collect(),
             },
