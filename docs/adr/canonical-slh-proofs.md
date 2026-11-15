@@ -601,3 +601,20 @@ as permission to erase the durable mathematical job or replace its history.
 This naming rule grants no execution authority and does not override earlier
 errors, complete a partial graph or establish interrupted-host recovery beyond
 the steps actually checked.
+
+SHA2 compression proving retains its low-degree extension in the existing
+column matrix representation. Evaluate each trace polynomial over the same
+full domain and commit to the same ordered rows with the existing Merkle
+implementation; read current/next frames and produce the same query openings
+without transposing all evaluated column batches into a second full padded
+row matrix. The private adapter explicitly requires this AIR's current single
+main segment and unpartitioned commitment. The direct prover dependency names
+the existing locked library's public query type; it adds no library version or
+proof protocol. Keep all compression limits, full 64-wide SHA256 work, 122 trace
+columns, terminal blinding row, field extension, proof options, versions and
+verification paths unchanged. Both SHA256 and SHA512 trace polynomials, every
+LDE frame including wraparound, commitments and serialized queries are checked
+against the previous backend. Real full-width compression proofs and rejection
+checks remain required. An allocation change and a passing component test do
+not by themselves qualify a full background job, public artifact or network
+activation, or establish the cause of an earlier external termination.

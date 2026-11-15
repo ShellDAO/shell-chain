@@ -5,14 +5,15 @@
 //! native SHA implementation. Callers must bind the independently expected
 //! compression inputs, padding/chaining and higher-level signature structure.
 use serde::{Deserialize, Serialize};
+use winter_prover::proof::Queries;
 use winterfell::{
-    crypto::{hashers::Blake3_256, DefaultRandomCoin, MerkleTree},
+    crypto::{hashers::Blake3_256, DefaultRandomCoin, MerkleTree, VectorCommitment},
     math::{fields::f64::BaseElement, FieldElement, ToElements},
     matrix::ColMatrix,
     verify, AcceptableOptions, Air, AirContext, Assertion, BatchingMethod, CompositionPoly,
-    CompositionPolyTrace, DefaultConstraintCommitment, DefaultConstraintEvaluator, DefaultTraceLde,
-    EvaluationFrame, FieldExtension, PartitionOptions, Proof, ProofOptions, Prover, StarkDomain,
-    TraceInfo, TracePolyTable, TraceTable, TransitionConstraintDegree,
+    CompositionPolyTrace, DefaultConstraintCommitment, DefaultConstraintEvaluator, EvaluationFrame,
+    FieldExtension, PartitionOptions, Proof, ProofOptions, Prover, StarkDomain, TraceInfo,
+    TraceLde, TracePolyTable, TraceTable, TransitionConstraintDegree,
 };
 
 /// Independent compression blocks in one proof; not a native transaction limit.
@@ -567,6 +568,103 @@ type Hasher = Blake3_256<BaseElement>;
 type Commitment = MerkleTree<Hasher>;
 type Coin = DefaultRandomCoin<Hasher>;
 
+// Keep the existing SHA2 trace domain and commitment, but avoid holding both
+// column batches and a second full row-major LDE during transposition.
+struct ColumnTraceLde<E: FieldElement<BaseField = BaseElement>> {
+    evaluations: ColMatrix<BaseElement>,
+    commitment: Commitment,
+    info: TraceInfo,
+    blowup: usize,
+    extension: std::marker::PhantomData<E>,
+}
+
+impl<E: FieldElement<BaseField = BaseElement>> ColumnTraceLde<E> {
+    fn new(
+        info: &TraceInfo,
+        trace: &ColMatrix<BaseElement>,
+        domain: &StarkDomain<BaseElement>,
+        partitions: PartitionOptions,
+    ) -> (Self, TracePolyTable<E>) {
+        // This AIR uses a single, unpartitioned main trace. Fail closed if its
+        // layout or options change instead of silently changing the commitment.
+        assert_eq!(info.num_aux_segments(), 0);
+        assert_eq!(
+            partitions.partition_size::<BaseElement>(trace.num_cols()),
+            trace.num_cols()
+        );
+        let polynomials = trace.interpolate_columns();
+        let evaluations = polynomials.evaluate_columns_over(domain);
+        let commitment = evaluations.commit_to_rows::<Hasher, Commitment>();
+        (
+            Self {
+                evaluations,
+                commitment,
+                info: info.clone(),
+                blowup: domain.trace_to_lde_blowup(),
+                extension: std::marker::PhantomData,
+            },
+            TracePolyTable::new(polynomials),
+        )
+    }
+}
+
+impl<E: FieldElement<BaseField = BaseElement>> TraceLde<E> for ColumnTraceLde<E> {
+    type HashFn = Hasher;
+    type VC = Commitment;
+
+    fn get_main_trace_commitment(&self) -> <Hasher as winterfell::crypto::Hasher>::Digest {
+        self.commitment.commitment()
+    }
+
+    fn set_aux_trace(
+        &mut self,
+        _: &ColMatrix<E>,
+        _: &StarkDomain<BaseElement>,
+    ) -> (ColMatrix<E>, <Hasher as winterfell::crypto::Hasher>::Digest) {
+        panic!("SHA2 compression has no auxiliary trace")
+    }
+
+    fn read_main_trace_frame_into(&self, step: usize, frame: &mut EvaluationFrame<BaseElement>) {
+        let next = (step + self.blowup) % self.trace_len();
+        self.evaluations.read_row_into(step, frame.current_mut());
+        self.evaluations.read_row_into(next, frame.next_mut());
+    }
+
+    fn read_aux_trace_frame_into(&self, _: usize, _: &mut EvaluationFrame<E>) {
+        panic!("SHA2 compression has no auxiliary trace")
+    }
+
+    fn query(&self, positions: &[usize]) -> Vec<Queries> {
+        let rows = positions
+            .iter()
+            .map(|&position| {
+                let mut row = vec![BaseElement::ZERO; self.evaluations.num_cols()];
+                self.evaluations.read_row_into(position, &mut row);
+                row
+            })
+            .collect();
+        let (_, opening) = self
+            .commitment
+            .open_many(positions)
+            .expect("SHA2 trace query opening");
+        vec![Queries::new::<Hasher, BaseElement, Commitment>(
+            opening, rows,
+        )]
+    }
+
+    fn trace_len(&self) -> usize {
+        self.evaluations.num_rows()
+    }
+
+    fn blowup(&self) -> usize {
+        self.blowup
+    }
+
+    fn trace_info(&self) -> &TraceInfo {
+        &self.info
+    }
+}
+
 struct CompressionProver {
     statement: Statement,
     options: ProofOptions,
@@ -579,8 +677,7 @@ impl Prover for CompressionProver {
     type HashFn = Hasher;
     type VC = Commitment;
     type RandomCoin = Coin;
-    type TraceLde<E: FieldElement<BaseField = BaseElement>> =
-        DefaultTraceLde<E, Hasher, Commitment>;
+    type TraceLde<E: FieldElement<BaseField = BaseElement>> = ColumnTraceLde<E>;
     type ConstraintCommitment<E: FieldElement<BaseField = BaseElement>> =
         DefaultConstraintCommitment<E, Hasher, Commitment>;
     type ConstraintEvaluator<'a, E: FieldElement<BaseField = BaseElement>> =
@@ -601,7 +698,7 @@ impl Prover for CompressionProver {
         domain: &StarkDomain<BaseElement>,
         partitions: PartitionOptions,
     ) -> (Self::TraceLde<E>, TracePolyTable<E>) {
-        DefaultTraceLde::new(info, trace, domain, partitions)
+        ColumnTraceLde::new(info, trace, domain, partitions)
     }
 
     fn new_evaluator<'a, E: FieldElement<BaseField = BaseElement>>(
@@ -808,7 +905,9 @@ fn verify_profile(
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256, Sha512};
+    use winter_prover::Serializable;
     use winterfell::math::StarkField;
+    use winterfell::{math::fields::QuadExtension, DefaultTraceLde};
 
     fn padded(a: Sha2Algorithm, message: &[u8]) -> CompressionInput {
         let mut block = [0u8; 128];
@@ -954,6 +1053,73 @@ mod tests {
     #[test]
     fn sha512_real_batch_and_refusals() {
         check(Sha2Algorithm::Sha512);
+    }
+    #[test]
+    fn column_lde_matches_default_polynomials_frames_commitment_and_queries() {
+        type Extension = QuadExtension<BaseElement>;
+        for algorithm in [Sha2Algorithm::Sha256, Sha2Algorithm::Sha512] {
+            let inputs = vec![padded(algorithm, b"column LDE compatibility")];
+            let (operations, carries) = compression_witness_profile(1, algorithm, &inputs).unwrap();
+            let statement = Statement {
+                version: 1,
+                algorithm,
+                inputs,
+                operations,
+                carries,
+            };
+            let info = statement.trace_info();
+            let domain = StarkDomain::new(&CompressionAir::new(info.clone(), statement, options()));
+            // Nonconstant values exercise every column, not just a valid trace's
+            // constrained bits. The real compression tests check the AIR itself.
+            let trace = ColMatrix::new(
+                (0..WIDTH)
+                    .map(|column| {
+                        (0..info.length())
+                            .map(|row| {
+                                BaseElement::new((column as u64 + 1) * (row as u64 % 257 + 3))
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            );
+            let (columns, polynomials) = ColumnTraceLde::<Extension>::new(
+                &info,
+                &trace,
+                &domain,
+                PartitionOptions::default(),
+            );
+            let (default, expected_polynomials) =
+                DefaultTraceLde::<Extension, Hasher, Commitment>::new(
+                    &info,
+                    &trace,
+                    &domain,
+                    PartitionOptions::default(),
+                );
+            assert_eq!(columns.trace_info(), default.trace_info());
+            assert_eq!(columns.trace_len(), default.trace_len());
+            assert_eq!(columns.blowup(), default.blowup());
+            assert_eq!(
+                columns.get_main_trace_commitment(),
+                default.get_main_trace_commitment()
+            );
+            assert_eq!(
+                polynomials.main_trace_polys().collect::<Vec<_>>(),
+                expected_polynomials.main_trace_polys().collect::<Vec<_>>()
+            );
+            let mut frame = EvaluationFrame::new(WIDTH);
+            let mut expected_frame = EvaluationFrame::new(WIDTH);
+            for step in 0..columns.trace_len() {
+                columns.read_main_trace_frame_into(step, &mut frame);
+                default.read_main_trace_frame_into(step, &mut expected_frame);
+                assert_eq!(frame.current(), expected_frame.current());
+                assert_eq!(frame.next(), expected_frame.next());
+            }
+            let positions = [0, 1, columns.blowup() - 1, columns.trace_len() - 1];
+            let actual = columns.query(&positions);
+            let expected = default.query(&positions);
+            assert_eq!(actual.len(), expected.len());
+            assert_eq!(actual[0].to_bytes(), expected[0].to_bytes());
+        }
     }
     #[test]
     fn wide_sha256_64_real_compressions_and_strict_transcript_domains() {

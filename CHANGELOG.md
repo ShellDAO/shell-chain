@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Keep SHA2 compression trace extensions in columns while proving, avoiding the second full padded allocation used for row transposition. Preserve the existing compression limits, trace geometry, security options, commitments and proof format; verify SHA256 and SHA512 column/frame/query equivalence against the existing backend and retain full 64-compression coverage.
+
 - Publish a new queued state for interrupted canonical proof jobs before exposing a restarted worker, so a previous pause cannot appear to be the result of the new attempt. Keep completed jobs unchanged. Preserve the first background-production runtime receipt and write later outcome summaries to numbered files. A repeated bounded pause, including cold recovery of an interrupted job, no longer returns `AlreadyExists` after valid work has been persisted and the node has stopped. These changes cover retry state and receipt publication; full proof generation remains a separate requirement.
 
 - Allow Reference block 2 from retained first-use dual-SLH controls: preserve the original zero-commitment genesis and Embedded first transaction and replay genuine registration/quorums on two stores. The registered parent key permits Reference use, while the account commitment stays zero and still requires Source 15/batch 11/frame 12 with full tagged-address AIR. Keep bound-origin Source 14 and raw-sender replay compatible; require durable cold proofs, CLI reuse, Native history/finality, altered-input refusals and generated-frame peer admission without new signing. Completed jobs reuse an identical manifest and keep separate completion receipts for each attempt; conflicting output still refuses.

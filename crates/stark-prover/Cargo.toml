@@ -9,6 +9,7 @@ description = "STARK-based aggregate proof for PQ (Dilithium3) signature batches
 
 [dependencies]
 winterfell.workspace = true
+winter-prover = { version = "=0.13.1", default-features = false, features = ["std"] }
 blake3 = { workspace = true }
 shell-crypto = { path = "../crypto" }
 shell-core = { path = "../core" }

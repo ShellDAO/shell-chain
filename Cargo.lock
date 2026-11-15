@@ -6538,6 +6538,7 @@ dependencies = [
  "shell-storage",
  "thiserror 2.0.18",
  "tracing",
+ "winter-prover",
  "winterfell",
 ]
 
