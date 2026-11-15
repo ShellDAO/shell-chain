@@ -536,3 +536,22 @@ wrong keys, signatures, roles, layers, compression domains and foreign headers
 must refuse without advancing Native state. Fresh automatic production and
 Reference target-2 proof production remain separate qualifications; retained
 successor signatures alone do not qualify them or public release/activation.
+
+
+Fresh Source 15 production starts with an empty job after ordinary Native
+import of the same frozen Embedded target 1. An actual public-only worker
+must persist a bounded pause and cold-produce frame 12 without opening a
+completed donor or creating new Native keys/signatures/headers/quorums. Both
+full seventeen-layer signatures and the BLAKE3 tagged-address/account/body/
+header predicates remain mandatory, with unchanged security and shared limits.
+
+Authenticated RPC availability must expose the actual produced bytes and
+reject unauthenticated status access. Retain genuine Native finality 1 and
+read-only block-1 history after ordinary block 3 on both current stores: the
+sealed-parent sender key is absent even though the current sender is registered.
+Require correct-hash damaged-component refusal without new math and an
+authenticated status-source error with graceful shutdown and original job/
+Native preservation. The generated graph separately needs real peer cold
+continuation/import/attached-certificate finality 1, cold replay and foreign-
+header refusal. A later Reference target uses registered-parent Source 14,
+not a relabeled Source 15 graph; public artifacts and activation remain open.

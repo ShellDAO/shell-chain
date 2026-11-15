@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Document fresh Source 15 background generation for funded first-use SLH senders and registered SLH proposers. Reuse frozen genuine Embedded/Reference controls, start an empty job, durably pause and cold-produce both full signature graphs without a completed donor or new signing. Cover authenticated frame 12 retrieval, finality 1, history after block 3, checkpoint/status refusals and generated-frame peer admission.
+
 - Add funded-unbound SLH sender first use with a registered SLH proposer: Source 15, batch 11 and frame 12 require the complete tagged sender-address proof, zero-commitment parent and both seventeen-layer signature graphs. Enabled admission stages this pair before Native import; durable recovery, CLI reuse, registration/finality, history after block 3 and actual peer checks use frozen genuine Embedded/Reference controls. Legacy bound profiles, default-off admission, activation and shared resource limits remain unchanged.
 
 - Document fresh Source 14 Reference background production from the same frozen bound dual-SLH controls, finalized parent 1 and genuine target-2 certificate. Start an empty job, persist a bounded pause and cold-produce the full graph without a completed donor or new signing; cover authenticated frame 11 retrieval, third-state history, checkpoint/status refusals and generated-frame peer admission/finality 2.

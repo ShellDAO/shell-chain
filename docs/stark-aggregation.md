@@ -2991,3 +2991,53 @@ disabled by default and gated by activation; enabled admission stages the
 first-use pair before Native import. This standalone flow does not qualify
 fresh automatic production, Reference target-2 production, other accounts,
 quorum AIR, public artifacts or network activation.
+
+
+##### Fresh background production for first-use dual SLH
+
+Keep the `first-use-both-slh` Native output prepared above. Its genuine
+Embedded first transaction, Reference successors, headers and quorum
+certificates are reused unchanged. Choose a new sibling output directory.
+The fresh entry opens no completed proof donor and uses public-only actors
+whose Native signing operation fails. It creates no new Native keys,
+transactions, headers or quorum votes.
+
+```sh
+tests/e2e/slh-canonical.sh automatic-fresh-prepare first-use-both-slh first-use-both-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-pause first-use-both-slh first-use-both-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-resume first-use-both-slh first-use-both-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-verify first-use-both-slh first-use-both-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-refuse first-use-both-slh first-use-both-slh-automatic
+tests/e2e/slh-canonical.sh automatic-fresh-rpc-refuse first-use-both-slh first-use-both-slh-automatic
+tests/e2e/slh-peer-proof.sh prepare first-use-both-slh first-use-both-slh-automatic first-use-both-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh pause first-use-both-slh first-use-both-slh-automatic first-use-both-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh resume first-use-both-slh first-use-both-slh-automatic first-use-both-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh verify first-use-both-slh first-use-both-slh-automatic first-use-both-slh-automatic-peer
+tests/e2e/slh-peer-proof.sh refuse first-use-both-slh first-use-both-slh-automatic first-use-both-slh-automatic-peer
+```
+
+Use the stable Rust toolchain, locked dependencies and RocksDB prerequisites
+above. Existing outputs refuse before any overwrite; every failed command
+exits nonzero. Ordinary Native import must queue Source 15 with zero
+mathematical components, then an actual worker must persist a bounded pause
+and stop gracefully. A cold worker continues that same job through both
+seventeen-layer signatures and the complete BLAKE3 tagged-address, account,
+envelope and raw-header proofs. Authenticated RPC retrieves the resulting
+batch 11/frame 12 bytes; unauthenticated producer-status requests must refuse.
+Availability status alone grants no execution authority.
+
+The original first-use parent has no registered sender key. After ordinary
+blocks 2/3, the current sender key exists, while historical verification of
+block 1 must still resolve the absent sealed-parent key and leave both current
+stores unchanged. Retain genuine finality 1. A correct storage hash on a damaged
+checkpoint must not replace AIR verification or cause new proving; an
+authenticated source-status error must surface and stop the worker gracefully.
+Both refusals preserve the original job, mathematics and Native data. The
+generated frame separately needs real peer cold continuation, import and
+attached-certificate finality 1, cold replay and foreign-header refusal.
+
+This fresh first-use qualification is separate from standalone production and
+CLI reuse. It changes no defaults, activation rules, proof domains, security
+options or resource ceilings. A later Reference target has a registered
+parent and uses the bound Source 14 profile; it is a separate assertion. Public
+artifacts, other accounts, quorum AIR and network activation remain separate.
