@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Reject duplicate commit-certificate signers before JSON collection or address normalization can discard a claimed signature. Preserve unique tagged and legacy hex certificates, including single historical address spellings; rejected certificates leave finality and stored evidence unchanged.
+
 - Add a separate bounded weighted-quorum arithmetic AIR ingredient with exact public context binding, strict greater-than-two-thirds checks, durable component reuse and a cold-verification example. It grants no Native authorization and does not yet compose signer cryptography, consensus history or Node finality.
 
 - Keep SHA2 compression trace extensions in columns while proving, avoiding the second full padded allocation used for row transposition. Preserve the existing compression limits, trace geometry, security options, commitments and proof format; verify SHA256 and SHA512 column/frame/query equivalence against the existing backend and retain full 64-compression coverage.

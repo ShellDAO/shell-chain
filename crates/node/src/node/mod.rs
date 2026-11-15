@@ -22882,6 +22882,78 @@ mod tests {
         }
 
         #[test]
+        fn fast_finalize_rejects_duplicate_certificate_signers() {
+            for legacy in [false, true] {
+                let (node, signer) = setup_wpoa_node();
+                let authority = node.config.proposer_address.unwrap();
+                node.register_authority_pubkey(authority, signer.public_key().to_vec());
+                let genesis_hash = store_genesis_wpoa(&node);
+                let block_hash = store_next_wpoa_block(&node, genesis_hash);
+                let signature = signer.sign(block_hash.as_bytes()).unwrap();
+                let name = authority.to_string();
+                let alias = format!("Address({authority})");
+                let good = if legacy {
+                    serde_json::to_string(&hex::encode(&signature.data)).unwrap()
+                } else {
+                    serde_json::to_string(&signature).unwrap()
+                };
+                let bad = if legacy {
+                    serde_json::to_string("not-hex").unwrap()
+                } else {
+                    let mut corrupt = signature.clone();
+                    corrupt.data[0] ^= 1;
+                    serde_json::to_string(&corrupt).unwrap()
+                };
+                let encode = |pairs: &[(&str, &str)]| {
+                    format!(
+                        "{{{}}}",
+                        pairs
+                            .iter()
+                            .map(|(key, value)| {
+                                format!("{}:{value}", serde_json::to_string(key).unwrap())
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                    .into_bytes()
+                };
+                let before = node.store.scan_all().unwrap();
+                let duplicates = [
+                    encode(&[(&name, &bad), (&name, &good)]),
+                    encode(&[(&name, &good), (&name, &bad)]),
+                    encode(&[(&name, &good), (&name, &good)]),
+                    encode(&[(&name, &good), (&alias, &good)]),
+                    encode(&[(&alias, &good), (&name, &good)]),
+                ];
+                for cert in &duplicates {
+                    assert!(
+                        !node.fast_finalize_with_certificate(1, block_hash, cert),
+                        "duplicate signer accepted (legacy={legacy})"
+                    );
+                    assert_eq!(node.finality.read().last_finalized_number(), 0);
+                    assert_eq!(node.store.scan_all().unwrap(), before);
+                }
+                // A unique historical spelling remains supported. Rejections
+                // must not poison the genuine quorum's subsequent persistence.
+                let valid = encode(&[(&alias, &good)]);
+                assert!(node.fast_finalize_with_certificate(1, block_hash, &valid));
+                assert_eq!(node.finality.read().last_finalized_number(), 1);
+                assert_eq!(node.chain_store.get_finalized_number().unwrap(), Some(1));
+                assert_eq!(
+                    node.chain_store
+                        .get_commit_certificate(&block_hash)
+                        .unwrap(),
+                    Some(valid)
+                );
+                let finalized = node.store.scan_all().unwrap();
+                for cert in &duplicates {
+                    assert!(!node.fast_finalize_with_certificate(1, block_hash, cert));
+                    assert_eq!(node.store.scan_all().unwrap(), finalized);
+                }
+            }
+        }
+
+        #[test]
         fn fast_finalize_rejects_certificate_with_malformed_signer() {
             let (node, signer) = setup_wpoa_node();
             let authority = node.config.proposer_address.unwrap();

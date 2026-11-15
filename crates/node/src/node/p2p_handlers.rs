@@ -1,5 +1,50 @@
 use super::*;
 
+/// Decode every claimed signer before a map can discard duplicate JSON names
+/// or different historical spellings of the same address.
+struct CertificateSignatures<T>(HashMap<Address, T>);
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for CertificateSignatures<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SignaturesVisitor<T>(std::marker::PhantomData<T>);
+        impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for SignaturesVisitor<T> {
+            type Value = CertificateSignatures<T>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a certificate with unique signer addresses")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut signatures = HashMap::new();
+                while let Some(raw) = map.next_key::<String>()? {
+                    let name = raw
+                        .strip_prefix("Address(")
+                        .and_then(|s| s.strip_suffix(')'))
+                        .unwrap_or(&raw);
+                    let address = name.parse::<Address>().map_err(|_| {
+                        <M::Error as serde::de::Error>::custom("invalid certificate signer")
+                    })?;
+                    match signatures.entry(address) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(map.next_value::<T>()?);
+                        }
+                        std::collections::hash_map::Entry::Occupied(_) => {
+                            return Err(<M::Error as serde::de::Error>::custom(
+                                "duplicate certificate signer",
+                            ));
+                        }
+                    }
+                }
+                Ok(CertificateSignatures(signatures))
+            }
+        }
+        deserializer.deserialize_map(SignaturesVisitor(std::marker::PhantomData))
+    }
+}
+
 impl<S: KvStore + 'static> Node<S> {
     /// Handle a transaction received from the network.
     pub fn handle_incoming_tx(
@@ -570,33 +615,20 @@ impl<S: KvStore + 'static> Node<S> {
         serde_json::to_vec(&cert)
     }
 
-    fn parse_certificate_signer(raw: &str) -> Option<Address> {
-        if let Some(inner) = raw
-            .strip_prefix("Address(")
-            .and_then(|s| s.strip_suffix(')'))
-        {
-            inner.parse().ok()
-        } else {
-            raw.parse().ok()
-        }
-    }
-
     fn decode_commit_certificate(
         cert: &[u8],
     ) -> Option<HashMap<Address, shell_crypto::PQSignature>> {
-        if let Ok(raw) = serde_json::from_slice::<HashMap<String, shell_crypto::PQSignature>>(cert)
+        if let Ok(raw) =
+            serde_json::from_slice::<CertificateSignatures<shell_crypto::PQSignature>>(cert)
         {
-            return raw
-                .into_iter()
-                .map(|(addr, sig)| Self::parse_certificate_signer(&addr).map(|a| (a, sig)))
-                .collect();
+            return Some(raw.0);
         }
 
         // Legacy sidecars encoded {Address(...) -> sig_hex} and implicitly used Dilithium3.
-        let raw = serde_json::from_slice::<HashMap<String, String>>(cert).ok()?;
-        raw.into_iter()
+        let raw = serde_json::from_slice::<CertificateSignatures<String>>(cert).ok()?;
+        raw.0
+            .into_iter()
             .map(|(addr, sig_hex)| {
-                let addr = Self::parse_certificate_signer(&addr)?;
                 let data = hex::decode(sig_hex).ok()?;
                 Some((
                     addr,
@@ -962,5 +994,80 @@ impl<S: KvStore + 'static> Node<S> {
             .consensus
             .write()
             .handle_view_change_message(msg, total_weight))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shell_crypto::{PQSignature, SignatureType};
+    use shell_storage::MemoryDb;
+
+    #[test]
+    fn commit_certificate_codec_preserves_unique_formats_and_tags() {
+        // Codec compatibility only: these short byte strings are not
+        // claimed to be valid signatures or accepted Native certificates.
+        let first = Address::from([1; 32]);
+        let second = Address::from([2; 32]);
+        for kind in [
+            SignatureType::Dilithium3,
+            SignatureType::MlDsa65,
+            SignatureType::SphincsSha2256f,
+        ] {
+            let signatures = HashMap::from([
+                (first, PQSignature::new(kind, vec![3, 4])),
+                (second, PQSignature::new(kind, vec![5, 6])),
+            ]);
+            let bytes = Node::<MemoryDb>::encode_commit_certificate(&signatures).unwrap();
+            assert_eq!(
+                Node::<MemoryDb>::decode_commit_certificate(&bytes),
+                Some(signatures.clone())
+            );
+            let aliases = serde_json::to_vec(&HashMap::from([
+                (format!("Address({first})"), signatures[&first].clone()),
+                (second.to_string(), signatures[&second].clone()),
+            ]))
+            .unwrap();
+            assert_eq!(
+                Node::<MemoryDb>::decode_commit_certificate(&aliases),
+                Some(signatures)
+            );
+            let mut trailing = bytes;
+            trailing.extend_from_slice(b"{}");
+            assert!(Node::<MemoryDb>::decode_commit_certificate(&trailing).is_none());
+        }
+        let legacy = serde_json::to_vec(&HashMap::from([
+            (format!("Address({first})"), "0304"),
+            (second.to_string(), "0506"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            Node::<MemoryDb>::decode_commit_certificate(&legacy),
+            Some(HashMap::from([
+                (
+                    first,
+                    PQSignature::new(SignatureType::Dilithium3, vec![3, 4])
+                ),
+                (
+                    second,
+                    PQSignature::new(SignatureType::Dilithium3, vec![5, 6])
+                ),
+            ]))
+        );
+        let mixed = serde_json::to_vec(&serde_json::json!({
+            first.to_string(): serde_json::to_value(
+                PQSignature::new(SignatureType::Dilithium3, vec![3,4])
+            ).unwrap(),
+            second.to_string(): "0506"
+        }))
+        .unwrap();
+        assert!(Node::<MemoryDb>::decode_commit_certificate(&mixed).is_none());
+        for invalid in [b"[]".as_slice(), b"null", b"{\"invalid\":\"0304\"}"] {
+            assert!(Node::<MemoryDb>::decode_commit_certificate(invalid).is_none());
+        }
+        assert_eq!(
+            Node::<MemoryDb>::decode_commit_certificate(b"{}"),
+            Some(HashMap::new())
+        );
     }
 }

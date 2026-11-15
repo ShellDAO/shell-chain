@@ -457,6 +457,11 @@ the current repository script rather than the older script bundled with that tag
 When a quorum is reached, the node stores a **commit certificate** sidecar keyed
 by block hash. The sidecar contains the quorum signatures as a map of validator
 address to `PQSignature`, preserving the signature algorithm tag for verification.
+Each decoded signer address must occur once. Repeated JSON names and different
+names normalizing to the same address are rejected before signature collection,
+so a later valid value cannot hide an earlier corrupt claimed signature. This
+also applies to legacy hex-signature sidecars. Unique historical `Address(...)`
+names remain supported; the current encoder emits unique canonical names.
 The certificate is intentionally stored outside the block header so finality can
 be deployed without changing existing block hashes.
 
