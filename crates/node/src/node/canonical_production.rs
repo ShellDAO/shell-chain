@@ -955,15 +955,20 @@ impl<S: KvStore + 'static> Node<S> {
         self.canonical_production.compact_accounts()?;
         self.canonical_production.compact_legacy()?;
         // Publish the explicit new-session retry before returning the handle.
-        // RPC observers must not mistake the previous session's failure for the
-        // new attempt's result while its worker is still waiting for readiness.
+        // RPC observers must not mistake the previous session's failure, pause
+        // or in-flight state for this attempt while it waits for readiness.
         {
             let owner = &self.canonical_production;
             let mut guard = owner.lock.lock();
             let mut changes = Vec::new();
             for hash in owner.ids()? {
                 if let Some(mut status) = owner.status(hash)? {
-                    if status.state == CanonicalProductionState::Failed {
+                    if matches!(
+                        status.state,
+                        CanonicalProductionState::Failed
+                            | CanonicalProductionState::Paused
+                            | CanonicalProductionState::Proving
+                    ) {
                         status.state = CanonicalProductionState::Queued;
                         status.error = None;
                         changes.push((record_key(hash), encode(&status)?));
@@ -1466,6 +1471,79 @@ mod tests {
         assert_eq!(before, db.scan_all().unwrap());
         assert!(db.scan_prefix(PREFIX).unwrap().is_empty());
     }
+    #[tokio::test]
+    async fn unfinished_sessions_publish_retry_before_readiness_without_changing_checkpoints() {
+        for state in [
+            CanonicalProductionState::Paused,
+            CanonicalProductionState::Proving,
+            CanonicalProductionState::Failed,
+        ] {
+            let mut cfg = NodeConfig::dev(Address::ZERO);
+            cfg.node_role = crate::NodeRole::Prover;
+            cfg.canonical_proof_production = true;
+            let db = Arc::new(MemoryDb::new());
+            let (node, _) = crate::NodeBuilder::new(cfg, db.clone()).build().unwrap();
+            let node = Arc::new(node);
+            let source = br#"{"retained":"not dispatched before readiness"}"#.to_vec();
+            let block = ShellHash::from([0x40; 32]);
+            let complete = ShellHash::from([0x41; 32]);
+            let mut changes = vec![(key(b"jobs"), encode(&vec![block, complete]).unwrap())];
+            for (hash, prior) in [
+                (block, state),
+                (complete, CanonicalProductionState::Complete),
+            ] {
+                let status = CanonicalProductionStatus {
+                    version: 1,
+                    block_hash: hash,
+                    block_number: 1,
+                    source_hash: blake3_hash(&source),
+                    state: prior.clone(),
+                    components: 1,
+                    checkpoint_bytes: 64,
+                    newly_proved: 1,
+                    reused: 0,
+                    manifest: None,
+                    error: (prior != CanonicalProductionState::Complete)
+                        .then(|| "previous attempt".into()),
+                };
+                changes.push((record_key(hash), encode(&status).unwrap()));
+                changes.push((source_key(hash), source.clone()));
+            }
+            {
+                let owner = &node.canonical_production;
+                let mut guard = owner.lock.lock();
+                owner
+                    .write_locked(changes, &mut guard, DATA_CEILING)
+                    .unwrap();
+            }
+            let before = db.scan_all().unwrap();
+            let complete_before = db.get(&record_key(complete)).unwrap();
+            node.prover_ready.store(false, Ordering::Release);
+            let worker = node.start_canonical_production().unwrap().unwrap();
+            let status = node.canonical_production.status(block).unwrap().unwrap();
+            assert_eq!(status.state, CanonicalProductionState::Queued);
+            assert!(status.error.is_none());
+            assert_eq!((status.components, status.checkpoint_bytes), (1, 64));
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            assert_eq!(
+                node.canonical_production
+                    .status(block)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                CanonicalProductionState::Queued
+            );
+            worker.shutdown().await;
+            assert_eq!(complete_before, db.get(&record_key(complete)).unwrap());
+            let retained = |rows: Vec<(Vec<u8>, Vec<u8>)>| {
+                rows.into_iter()
+                    .filter(|(k, _)| k != &key(b"bytes") && k != &record_key(block))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(retained(before), retained(db.scan_all().unwrap()));
+        }
+    }
+
     #[tokio::test]
     async fn failed_job_is_rechecked_once_per_worker_session_without_native_writes() {
         let mut cfg = NodeConfig::dev(Address::ZERO);

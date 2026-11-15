@@ -651,14 +651,25 @@ async fn exercise(
         json!(native_digest(&db.state)?) == expected_native,
         "automatic production changed native canonical data",
     )?;
+    let receipt_stem = if pause {
+        "runtime-paused"
+    } else if refuse {
+        "runtime-refused"
+    } else {
+        "runtime-complete"
+    };
+    let receipt = (0..64)
+        .map(|attempt| {
+            out.join(if attempt == 0 {
+                format!("{receipt_stem}.json")
+            } else {
+                format!("{receipt_stem}-{attempt}.json")
+            })
+        })
+        .find(|path| !path.exists())
+        .ok_or("automatic runtime receipt attempt limit")?;
     save(
-        &out.join(if pause {
-            "runtime-paused.json"
-        } else if refuse {
-            "runtime-refused.json"
-        } else {
-            "runtime-complete.json"
-        }),
+        &receipt,
         &json!({"observed":terminal,"durable":saved,"native_unchanged":true,"new_signing":false,"graceful_Node_run_shutdown":true,"fresh_generation":fresh}),
     )
 }

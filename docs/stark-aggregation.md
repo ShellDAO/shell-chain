@@ -3108,3 +3108,49 @@ caching. It changes allocation behavior, while proof domains, compression
 batches, security settings and Native state remain the same. Keep the output
 directory so completed components can be reverified and reused; this variant
 does not establish default-allocator completion on every constrained host.
+
+##### Repeated background pauses and interrupted-job receipts
+
+`automatic-fresh-prepare` requires a new output. Keep an existing job when
+pausing or resuming it; do not rerun preparation to replace that output.
+A new worker session exposes `queued` for unfinished jobs before readiness;
+a previous `paused` or `proving` value is not the result of the new attempt.
+Completed jobs retain their status. A worker terminated externally can have
+durable components without a new terminal summary. A cold bounded pause must reverify its available components,
+persist at most its configured new-component budget, stop gracefully and
+preserve the original Native state and certificates.
+
+The first `runtime-paused.json` remains the original attempt's receipt. A later
+successful pause writes `runtime-paused-1.json`, then the next unused numbered
+name. The same naming rule applies to refusal and completion summaries after
+their earlier checks succeed. Each outcome has at most 64 summary names;
+exhaustion refuses receipt creation while retaining prior files and job data.
+Inspect the matching attempt and durable RPC status instead of treating the
+first receipt as the newest state. A successful bounded pause establishes
+that recovery boundary; it does not establish full graph generation, chunk
+availability, historical replay or peer acceptance.
+
+For the first-use-origin Reference job, retain the same zero-commitment Native
+controls and registered parent key. With an exact retained compiled example,
+the following sequence prepares a new job once, pauses it, retains the example
+and checks a repeated pause. For an existing job, skip preparation and keep
+its original files. Choose a new tool directory.
+
+```sh
+tests/e2e/slh-canonical.sh automatic-fresh-prepare first-use-both-slh-reference first-use-both-slh-reference-auto
+tests/e2e/slh-canonical.sh automatic-fresh-pause first-use-both-slh-reference first-use-both-slh-reference-auto
+mkdir -m 700 proof-tools
+cp target/release/examples/slh-canonical proof-tools/
+MallocSpaceEfficient=1 proof-tools/slh-canonical automatic-fresh-pause first-use-both-slh-reference first-use-both-slh-reference-auto
+```
+
+Here `proof-tools/slh-canonical` is a retained copy of the executable built by
+`tests/e2e/slh-canonical.sh` with the same source, stable toolchain, locked
+dependencies and RocksDB feature. The allocator is scoped to that child
+command. Preserve the first summary, every completed component, Native data
+and original signatures; compare the new numbered summary's durable counts
+and unchanged-Native result. This example qualifies a bounded recovery step.
+An external termination of the uninterrupted full worker remains a separate
+failure until its cause or execution environment is resolved; the allocator
+variant and successful pause alone do not establish full completion or public
+network activation.

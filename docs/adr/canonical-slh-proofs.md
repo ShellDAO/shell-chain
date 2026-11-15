@@ -584,3 +584,20 @@ first completion receipt and write later completion receipts beside their
 corresponding progress attempts, so resuming an already completed job or
 finishing interrupted output publication does not require new mathematics
 or destruction of prior evidence.
+
+A new production worker session must publish `queued` for unfinished paused,
+proving or failed records before returning its handle, including while
+readiness is false. Keep completed records and retained source/component bytes
+unchanged. Observers must wait for the new attempt rather than accept a prior
+pause as current work. Background-production outcome summaries are immutable
+per attempt as well.
+After the actual worker has stopped and durable status and Native checks have
+passed, keep the first `runtime-paused.json`, `runtime-refused.json` or
+`runtime-complete.json`. A later attempt reaching that same outcome writes
+`runtime-paused-1.json` (or the corresponding outcome) and subsequent unused
+numbered names. Continue to use create-new writes and refuse when the bounded
+receipt namespace is exhausted. A failed summary write must not be interpreted
+as permission to erase the durable mathematical job or replace its history.
+This naming rule grants no execution authority and does not override earlier
+errors, complete a partial graph or establish interrupted-host recovery beyond
+the steps actually checked.
