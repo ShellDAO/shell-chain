@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add a separate bounded weighted-quorum arithmetic AIR ingredient with exact public context binding, strict greater-than-two-thirds checks, durable component reuse and a cold-verification example. It grants no Native authorization and does not yet compose signer cryptography, consensus history or Node finality.
+
 - Keep SHA2 compression trace extensions in columns while proving, avoiding the second full padded allocation used for row transposition. Preserve the existing compression limits, trace geometry, security options, commitments and proof format; verify SHA256 and SHA512 column/frame/query equivalence against the existing backend and retain full 64-compression coverage.
 
 - Publish a new queued state for interrupted canonical proof jobs before exposing a restarted worker, so a previous pause cannot appear to be the result of the new attempt. Keep completed jobs unchanged. Preserve the first background-production runtime receipt and write later outcome summaries to numbered files. A repeated bounded pause, including cold recovery of an interrupted job, no longer returns `AlreadyExists` after valid work has been persisted and the node has stopped. These changes cover retry state and receipt publication; full proof generation remains a separate requirement.

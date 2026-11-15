@@ -74,6 +74,7 @@ pub mod scheduler;
 pub mod shake_sponge;
 pub mod slh_proposer;
 pub mod state_machine;
+pub mod weighted_quorum;
 
 pub use amendment::{
     amendment_key, ProofAmendment, ProofPointer, ProofRange, StoredProofArtifact,
