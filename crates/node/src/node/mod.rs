@@ -1,7 +1,7 @@
 //! Running node with event loop and block production.
 
 mod block_importer;
-pub use block_importer::CanonicalProofReplay;
+pub use block_importer::{CanonicalProofReplay, CanonicalQuorumReplay};
 mod block_producer;
 mod canonical_admission;
 mod canonical_production;

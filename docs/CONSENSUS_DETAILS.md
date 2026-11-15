@@ -794,6 +794,19 @@ log files. This is proof-job persistence, separate from Native chain data and
 Native RocksDB execution or historical authority. The
 [development flow](adr/commit-quorum-proof.md) retains the original public inputs.
 
+`Node::replay_canonical_block_with_commit_proof` freezes the selected canonical
+parent, verifies the full quorum proof against independently reconstructed
+current authority context, and reexecutes the retained body in a bounded
+read-only overlay. It checks execution, commitments and receipts after later
+state changes without advancing finality or writing current Native rows.
+Transaction authorization still uses Native cryptography; the result reports
+zero proved sender signatures. The `quorum-native` RocksDB example uses a
+genuine ML-DSA-65 authority, three executed transfers and independent importer
+stores. It checks proof finality, a process-cold reopen, historical replay and
+changed-proof, certificate, weight, target and tip refusals. This controlled
+single-authority profile does not prove historical weight/key provenance or
+exercise peer transport. See the [executable flow](adr/commit-quorum-proof.md).
+
 The bounded development profile supports at most sixteen lattice signers,
 including ML-DSA-65, genuine PQClean Dilithium3 and its existing SDK FIPS
 transcript. Existing checkpoint quotas still apply. SLH quorum signatures,

@@ -18,6 +18,15 @@ pub struct CanonicalProofReplay {
     #[serde(default, skip_serializing_if = "unproved_seal")]
     pub proved_proposer_signature: bool,
 }
+
+/// Read-only execution replay with a full commit-signature/weight proof. Sender
+/// transaction signatures remain Native; current validator context is trusted
+/// independently and does not establish historical penalty provenance.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CanonicalQuorumReplay {
+    pub execution: CanonicalProofReplay,
+    pub proved_commit_signatures: usize,
+}
 fn unproved_seal(value: &bool) -> bool {
     !*value
 }
@@ -1016,6 +1025,92 @@ impl<S: KvStore + 'static> Node<S> {
             receipts,
             proved_sender_signatures: verified.len(),
             proved_proposer_signature: verified.proposer_seal().is_some(),
+        })
+    }
+
+    /// Reexecute an independently selected canonical block at its frozen parent
+    /// without finalizing or writing the current store. QC signatures require
+    /// full AIR; ordinary transaction authorization still uses Native crypto.
+    pub fn replay_canonical_block_with_commit_proof(
+        &self,
+        expected_tip: ShellHash,
+        expected_block: ShellHash,
+        cert: &[u8],
+        proof: &shell_stark_prover::commit_quorum::CommitQuorumProof,
+    ) -> Result<CanonicalQuorumReplay, NodeError> {
+        let header = self
+            .chain_store
+            .get_header_by_hash(&expected_block)?
+            .ok_or_else(|| NodeError::Startup("quorum replay header unavailable".into()))?;
+        let view = self
+            .chain_store
+            .canonical_parent_view(expected_tip, header.parent_hash)?;
+        if view.config().chain_id != self.config.chain_id {
+            return Err(NodeError::Startup(
+                "quorum replay chain identity mismatch".into(),
+            ));
+        }
+        let frozen = ChainStore::new(view.store());
+        let block = frozen
+            .get_block_by_hash(&expected_block)?
+            .ok_or_else(|| NodeError::Startup("quorum replay body unavailable".into()))?;
+        if block.header != header
+            || block
+                .system_transactions
+                .iter()
+                .any(|tx| tx.kind != SystemTxKind::BlockGasReward)
+        {
+            return Err(NodeError::Startup(
+                "quorum replay canonical profile mismatch".into(),
+            ));
+        }
+        self.verify_import_economics(
+            &block,
+            &Block {
+                header: view.parent().clone(),
+                transactions: vec![],
+                system_transactions: vec![],
+                proposer_seal: None,
+            },
+        )?;
+        self.verify_incoming_witness_root(&block)?;
+        self.verify_import_sig_aggregate_proof(&block)?;
+        let source = self
+            .commit_quorum_source(header.number, expected_block, cert)
+            .map_err(NodeError::Startup)?;
+        if source.context.parent_hash != view.parent().hash()
+            || source.context.chain_id != view.config().chain_id
+        {
+            return Err(NodeError::Startup(
+                "quorum replay authority context mismatch".into(),
+            ));
+        }
+        let registry = load_algorithm_registry(&view.world_state()?)
+            .map_err(|e| NodeError::Startup(format!("quorum replay algorithm registry: {e}")))?;
+        with_algorithm_registry_override(&registry, || {
+            shell_stark_prover::commit_quorum::verify_commit_quorum(proof, &source)
+        })
+        .map_err(|e| NodeError::Startup(format!("quorum signature proof: {e}")))?;
+        let overlay = Arc::new(OverlayStore::new(view.store()).with_write_limit(64 * 1024 * 1024)?);
+        let (receipts, settlements) = with_algorithm_registry_override(&registry, || {
+            self.replay_fork_block_inner(&block, view.parent().state_root, overlay, None)
+        })?;
+        if !settlements.is_empty() {
+            return Err(NodeError::Startup(
+                "quorum replay unexpected settlement".into(),
+            ));
+        }
+        Ok(CanonicalQuorumReplay {
+            execution: CanonicalProofReplay {
+                tip: view.tip(),
+                block: expected_block,
+                parent: view.parent().hash(),
+                state_root: header.state_root,
+                receipts,
+                proved_sender_signatures: 0,
+                proved_proposer_signature: false,
+            },
+            proved_commit_signatures: source.signatures.len(),
         })
     }
 

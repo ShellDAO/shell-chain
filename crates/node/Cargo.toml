@@ -71,3 +71,7 @@ required-features = ["rocksdb"]
 [[example]]
 name = "slh-canonical"
 required-features = ["rocksdb"]
+
+[[example]]
+name = "quorum-native"
+required-features = ["rocksdb"]
