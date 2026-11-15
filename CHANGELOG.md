@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Allow Reference block 2 from retained first-use dual-SLH controls: preserve the original zero-commitment genesis and Embedded first transaction and replay genuine registration/quorums on two stores. The registered parent key permits Reference use, while the account commitment stays zero and still requires Source 15/batch 11/frame 12 with full tagged-address AIR. Keep bound-origin Source 14 and raw-sender replay compatible; require durable cold proofs, CLI reuse, Native history/finality, altered-input refusals and generated-frame peer admission without new signing. Completed jobs reuse an identical manifest and keep separate completion receipts for each attempt; conflicting output still refuses.
+
 - Document fresh Source 15 background generation for funded first-use SLH senders and registered SLH proposers. Reuse frozen genuine Embedded/Reference controls, start an empty job, durably pause and cold-produce both full signature graphs without a completed donor or new signing. Cover authenticated frame 12 retrieval, finality 1, history after block 3, checkpoint/status refusals and generated-frame peer admission.
 
 - Add funded-unbound SLH sender first use with a registered SLH proposer: Source 15, batch 11 and frame 12 require the complete tagged sender-address proof, zero-commitment parent and both seventeen-layer signature graphs. Enabled admission stages this pair before Native import; durable recovery, CLI reuse, registration/finality, history after block 3 and actual peer checks use frozen genuine Embedded/Reference controls. Legacy bound profiles, default-off admission, activation and shared resource limits remain unchanged.

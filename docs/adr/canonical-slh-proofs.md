@@ -553,5 +553,34 @@ Require correct-hash damaged-component refusal without new math and an
 authenticated status-source error with graceful shutdown and original job/
 Native preservation. The generated graph separately needs real peer cold
 continuation/import/attached-certificate finality 1, cold replay and foreign-
-header refusal. A later Reference target uses registered-parent Source 14,
-not a relabeled Source 15 graph; public artifacts and activation remain open.
+header refusal. Reference use can have a registered key while the account
+commitment is still zero; it continues to require Source 15. Source 14 requires
+a nonzero account commitment. Public artifacts and activation remain open.
+
+The Reference reuse entry accepts either a bound-at-genesis SLH sender or a
+funded first-use SLH origin. These share the sender algorithm but require
+different genesis reconstruction. Preserve the original zero commitment and
+Embedded first transaction for the latter, authenticate all three original
+signatures/headers/quorums, and replay the same registration on two stores
+without signing. Conflicting origin markers must refuse before opening a
+source database or creating output; raw-sender and bound-origin behavior
+remain compatible.
+
+Registry entries and account commitments are separate predicates. Reference
+target 2 from the first-use origin has a registered parent key but retains
+the zero commitment, so its complete graph uses Source 15/batch 11/frame 12
+with full BLAKE3 tagged-address AIR. The bound-origin cohort keeps Source 14
+because its parent commitment is nonzero. The first transaction's graph cannot
+stand in for this different message and parent state. Require durable cold
+production, same-job CLI reuse, proof-backed Native finality 2, read-only
+history after block 3 with the registered sealed-parent key, signed-input and
+role/layer/domain refusals, and actual generated-frame peer cold import with
+the genuine attached quorum. Fresh automatic Reference production and
+public release/activation remain separate assertions.
+
+Output recovery must also accept an already persisted, byte-identical
+manifest. A different manifest must refuse without replacement. Keep the
+first completion receipt and write later completion receipts beside their
+corresponding progress attempts, so resuming an already completed job or
+finishing interrupted output publication does not require new mathematics
+or destruction of prior evidence.

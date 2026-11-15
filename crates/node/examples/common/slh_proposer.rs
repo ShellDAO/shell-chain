@@ -200,9 +200,14 @@ fn reuse_reference(original: &Path, out: &Path, kind: SignatureType) -> Result<(
     let first: Block = read(&original.join("candidate.json"))?;
     let target: Block = read(&original.join("later.json"))?;
     let later: Block = read(&original.join("advance.json"))?;
-    let bound_slh = kind == SignatureType::SphincsSha2256f;
-    let profile_matches = if bound_slh {
-        prepared["bound_SLH_sender"] == true && prepared["SLH_proposer"] == true
+    let slh_sender = kind == SignatureType::SphincsSha2256f;
+    let unbound_genesis = !slh_sender || prepared["funded_zero_commitment_SLH_sender"] == true;
+    let profile_matches = if slh_sender {
+        prepared["SLH_proposer"] == true
+            && ((prepared["bound_SLH_sender"] == true && !unbound_genesis)
+                || (prepared["bound_SLH_sender"] == false
+                    && unbound_genesis
+                    && prepared["native_first_use_and_registration"] == true))
     } else {
         kind == SignatureType::Dilithium3 && prepared["funded_zero_commitment_raw_sender"] == true
     };
@@ -226,7 +231,7 @@ fn reuse_reference(original: &Path, out: &Path, kind: SignatureType) -> Result<(
     let source = RocksDbStore::open_all(original.join("native-third/db"), None)?;
     let before = digest(&source.state)?;
     let chain = ChainStore::new(Arc::new(source.state.clone()));
-    let key = if bound_slh {
+    let key = if !unbound_genesis {
         chain
             .canonical_parent_view(later.hash(), first.header.parent_hash)?
             .registered_key(&first.transactions[0].from)?
@@ -235,7 +240,7 @@ fn reuse_reference(original: &Path, out: &Path, kind: SignatureType) -> Result<(
         first.transactions[0]
             .pubkey_mode
             .pubkey_bytes()
-            .ok_or("retained raw Embedded public key absent")?
+            .ok_or("retained first Embedded public key absent")?
             .to_vec()
     };
     let sender = PublicRetainedSender {
@@ -249,7 +254,7 @@ fn reuse_reference(original: &Path, out: &Path, kind: SignatureType) -> Result<(
         calls: AtomicUsize::new(0),
     };
     ensure(
-        key.len() == if bound_slh { 64 } else { 1952 }
+        key.len() == if slh_sender { 64 } else { 1952 }
             && c.authority_key.len() == 64
             && Address::from_public_key(&c.authority_key, proposer.kind.as_u8()) == c.authority
             && [&first, &target, &later]
@@ -260,9 +265,9 @@ fn reuse_reference(original: &Path, out: &Path, kind: SignatureType) -> Result<(
                     signed.from == Address::from_public_key(&key, sender.kind.as_u8())
                         && signed.tx.nonce == nonce as u64
                         && signed.signature.sig_type == sender.kind
-                        && signed.pubkey_mode.is_embedded() == (!bound_slh && nonce == 0)
+                        && signed.pubkey_mode.is_embedded() == (unbound_genesis && nonce == 0)
                         && block.header.proposer == c.authority
-                        && if bound_slh {
+                        && if slh_sender {
                             signed.signature.data.len() == 49_856
                                 && MultiVerifier
                                     .verify(
@@ -301,8 +306,13 @@ fn reuse_reference(original: &Path, out: &Path, kind: SignatureType) -> Result<(
         )?;
     }
     std::fs::create_dir(out)?;
-    let native = dilithium::genesis(&out.join("native/db"), &sender, &proposer, !bound_slh)?;
-    let receiver = dilithium::genesis(&out.join("receiver/db"), &sender, &proposer, !bound_slh)?;
+    let native = dilithium::genesis(&out.join("native/db"), &sender, &proposer, unbound_genesis)?;
+    let receiver = dilithium::genesis(
+        &out.join("receiver/db"),
+        &sender,
+        &proposer,
+        unbound_genesis,
+    )?;
     let node = fixture::node(
         Arc::new(native.state.clone()),
         c.authority,
@@ -321,7 +331,7 @@ fn reuse_reference(original: &Path, out: &Path, kind: SignatureType) -> Result<(
                 .chain_store
                 .get_pubkey(&first.transactions[0].from)?
                 .as_deref()
-                == bound_slh.then_some(key.as_slice()),
+                == (!unbound_genesis).then_some(key.as_slice()),
         "replayed genesis differs from retained control",
     )?;
     for (block, name) in [
@@ -368,14 +378,14 @@ fn reuse_reference(original: &Path, out: &Path, kind: SignatureType) -> Result<(
         native.create_checkpoint(path)?;
     }
     let mut control: Value = read(&original.join("later-control.json"))?;
-    if !bound_slh {
+    if unbound_genesis {
         control["first_use_parent_unregistered"] = json!(false);
     }
     write(
         &out.join("parent-control.json"),
         &read::<Value>(&original.join("control.json"))?,
     )?;
-    if !bound_slh {
+    if unbound_genesis {
         write(&out.join("retained-embedded.json"), &first.transactions[0])?;
     }
     write(
@@ -407,7 +417,7 @@ fn reuse_reference(original: &Path, out: &Path, kind: SignatureType) -> Result<(
     )?;
     write(
         &out.join("prepared.json"),
-        &json!({"funded_zero_commitment_raw_sender":!bound_slh,"bound_SLH_sender":bound_slh,"SLH_proposer":true,"reference_target":true,"target_height":2,"parent_height":1,"later_height":3,"retained_headers_and_quorums_reused":true,"all_three_genuine_sender_signatures_unchanged":true,"new_keys":false,"new_signing":false,"new_headers_or_quorums":false,"completed_math_donor_opened":false,"original_native_unchanged":true,"genuine_parent1_and_target2_quorums_persisted":true,"independent_native_replays_match_frozen_controls":true}),
+        &json!({"funded_zero_commitment_raw_sender":!slh_sender,"bound_SLH_sender":slh_sender && !unbound_genesis,"funded_zero_commitment_SLH_sender":slh_sender && unbound_genesis,"first_use_SLH_origin":slh_sender && unbound_genesis,"SLH_proposer":true,"reference_target":true,"target_height":2,"parent_height":1,"later_height":3,"retained_headers_and_quorums_reused":true,"all_three_genuine_sender_signatures_unchanged":true,"new_keys":false,"new_signing":false,"new_headers_or_quorums":false,"completed_math_donor_opened":false,"original_native_unchanged":true,"genuine_parent1_and_target2_quorums_persisted":true,"independent_native_replays_match_frozen_controls":true}),
     )
 }
 pub(crate) fn prepare_first_use(original: &Path, out: &Path) -> Result<(), Error> {
@@ -947,13 +957,24 @@ pub(crate) fn prove(out: &Path, pause: bool) -> Result<(), Error> {
         total_bytes: payload.len() as u64,
         payload_hash: blake3_hash(&payload),
     };
-    write(&out.join("manifest.json"), &manifest)?;
+    let manifest_path = out.join("manifest.json");
+    if manifest_path.exists() {
+        let expected = serde_json::to_vec(&manifest)?;
+        ensure(
+            std::fs::metadata(&manifest_path)?.len() == expected.len() as u64
+                && std::fs::read(&manifest_path)? == expected,
+            "immutable SLH proposer manifest differs",
+        )?;
+    } else {
+        write(&manifest_path, &manifest)?;
+    }
     ensure(
         before == digest(&native.state)?,
         "proving changed Native source",
     )?;
+    let complete_file = progress_file.replacen("proof-progress", "proof-complete", 1);
     write(
-        &out.join("proof-complete.json"),
+        &out.join(complete_file),
         &json!({"source_version":serde_json::from_slice::<Value>(source.identity())?["version"],"batch_version":proof.version,"frame_version":proof.version+1,"proposer_full17_layers":true,"sender_full17_layers":matches!(proof.version,10|11),"source_native_unchanged":true,"new_signing":false,"proof_bytes":payload.len(),"progress_file":progress_file}),
     )
 }

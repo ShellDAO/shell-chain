@@ -3038,6 +3038,73 @@ attached-certificate finality 1, cold replay and foreign-header refusal.
 
 This fresh first-use qualification is separate from standalone production and
 CLI reuse. It changes no defaults, activation rules, proof domains, security
-options or resource ceilings. A later Reference target has a registered
-parent and uses the bound Source 14 profile; it is a separate assertion. Public
+options or resource ceilings. A later Reference target can have a registered
+parent key while its account commitment is still zero; it continues to require
+Source 15. Source 14 requires a nonzero account commitment. Public
 artifacts, other accounts, quorum AIR and network activation remain separate.
+
+##### Reference block 2 after first-use dual-SLH registration
+
+Keep the same `first-use-both-slh` Native controls. The existing reuse entry
+also accepts this first-use origin: it restores the original zero-commitment
+genesis, replays the genuine Embedded first transaction and quorum, then
+selects Reference block 2 against registered parent 1. It creates no keys,
+signatures, headers or votes and opens no completed mathematics donor. Choose
+a new output; existing outputs and conflicting origin markers refuse.
+
+```sh
+tests/e2e/slh-both-proof.sh reuse-reference first-use-both-slh first-use-both-slh-reference
+tests/e2e/slh-both-proof.sh capture first-use-both-slh-reference
+tests/e2e/slh-both-proof.sh pause first-use-both-slh-reference
+tests/e2e/slh-both-proof.sh resume first-use-both-slh-reference
+tests/e2e/slh-both-proof.sh verify first-use-both-slh-reference
+tests/e2e/slh-both-proof.sh refuse first-use-both-slh-reference
+tests/e2e/slh-both-proof.sh publish first-use-both-slh-reference
+tests/e2e/slh-peer-proof.sh prepare first-use-both-slh-reference first-use-both-slh-reference/published first-use-both-slh-reference-peer
+tests/e2e/slh-peer-proof.sh pause first-use-both-slh-reference first-use-both-slh-reference/published first-use-both-slh-reference-peer
+tests/e2e/slh-peer-proof.sh resume first-use-both-slh-reference first-use-both-slh-reference/published first-use-both-slh-reference-peer
+tests/e2e/slh-peer-proof.sh verify first-use-both-slh-reference first-use-both-slh-reference/published first-use-both-slh-reference-peer
+tests/e2e/slh-peer-proof.sh refuse first-use-both-slh-reference first-use-both-slh-reference/published first-use-both-slh-reference-peer
+```
+
+The same stable toolchain, locked dependencies, RocksDB prerequisites and
+nonzero failure exits apply. The target uses Source 15/batch 11/frame 12:
+the registered parent 1 key permits Reference use, but the account commitment
+remains zero. Key registration does not make that commitment nonzero. Both
+complete seventeen-layer signatures, the full BLAKE3 tagged-address proof,
+account, envelope and raw-header predicates remain required. Do not downgrade
+to Source 14 or reuse the first transaction's message-dependent mathematics.
+The separate bound-origin cohort with a nonzero commitment retains Source 14.
+
+After the durable pause and cold full continuation, run `shell-node
+produce-block-proof` against `first-use-both-slh-reference/provider`, its
+captured block/tip and `first-use-both-slh-reference/proof` output to require
+zero new mathematics and byte-identical frame reuse. Proof-backed Native
+import must match the retained block-2 receipts, accounts and root and use
+its original certificate for finality 2. After ordinary block 3, historical
+verification must still use the registered sealed-parent key and leave both
+current stores unchanged. Signed-input and altered role/layer/domain
+refusals must preserve parent 1. Generated-frame peer acceptance separately
+requires cold continuation, import 2, attached-certificate finality 2, cold
+replay and correct-hash foreign-header refusal. Fresh automatic target-2
+production, other accounts, quorum AIR, public artifacts and activation
+require separate verification.
+
+Resuming a completed job must reverify and reuse its saved components and
+identical frame/manifest. A conflicting manifest refuses without replacement.
+The first completion receipt stays intact; later attempts write a completion
+receipt corresponding to their own progress file, preserving each result.
+
+On a constrained macOS host, an explicit execution variant uses the system
+allocator policy below while continuing the same saved job:
+
+```sh
+MallocSpaceEfficient=1 tests/e2e/slh-both-proof.sh resume first-use-both-slh-reference
+```
+
+[Apple's allocator implementation](https://github.com/apple-oss-distributions/libmalloc/blob/libmalloc-715.140.5/src/malloc.c#L1717-L1740)
+provides this policy to release freed pages eagerly and reduce large-allocation
+caching. It changes allocation behavior, while proof domains, compression
+batches, security settings and Native state remain the same. Keep the output
+directory so completed components can be reverified and reused; this variant
+does not establish default-allocator completion on every constrained host.
