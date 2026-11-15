@@ -1340,7 +1340,7 @@ fn produce_matrix<S: KvStore>(
     Ok(matrix)
 }
 
-fn prove_signature<S: KvStore>(
+pub(crate) fn prove_signature<S: KvStore>(
     job: &mut ProductionStore<'_, S>,
     prefix: &str,
     pk: &[u8],

@@ -62,7 +62,7 @@ pub struct QuorumWeightContext {
 }
 
 impl QuorumWeightContext {
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.authorities.is_empty()
             || self.authorities.len() > MAX_QUORUM_AUTHORITIES
             || self.signers.len() > self.authorities.len()

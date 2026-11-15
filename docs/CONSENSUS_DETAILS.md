@@ -763,6 +763,35 @@ public log addresses. Receipt bloom hashing still follows its own activation
 schedule. Before native activation, existing log-address rules remain intact.
 
 
+### Development commit-quorum proof composition
+
+The source-only `Node::commit_quorum_source` entry captures the canonical stored
+header, current effective authority weights, and the exact decoded certificate
+signers and keys. A separate `prove_commit_quorum_persistent` job produces full
+lattice-signature proofs over the existing raw 32-byte block hash and the strict
+weighted-quorum arithmetic proof. Reopening checks the original source and
+reverifies every reused component. The job store must be separate from chain data.
+
+`Node::fast_finalize_with_certificate_proof` independently reconstructs this
+context, requires both proof predicates, and rechecks the context while holding
+the consensus read lock through the atomic finality write. Its exact-tuple
+verifier has no native cryptographic fallback. The original certificate, signer
+evidence and finality cursor use the existing persistence path.
+
+The `commit-quorum-cold` development example restores the public CBOR fixtures
+in a fresh process, reverifies a completed job without new proof generation,
+and compares the resulting Native finality rows with the original control.
+Its authority configuration is trusted fixture input, and the backing store
+is MemoryDb; it does not establish RocksDB recovery or peer authentication.
+
+The bounded development profile supports at most sixteen lattice signers,
+including ML-DSA-65, genuine PQClean Dilithium3 and its existing SDK FIPS
+transcript. Existing checkpoint quotas still apply. SLH quorum signatures,
+historical authority and penalty provenance, proposer selection, network
+transport and public release acceptance remain separate work. Ordinary
+certificate formats and network activation rules remain unchanged. See the
+[design decision](adr/commit-quorum-proof.md) for the executable source check.
+
 ### Validator activity observations
 
 On source builds containing `shell_getValidatorVotes`, the read-only RPC walks

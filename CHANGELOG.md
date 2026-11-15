@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Compose full lattice-signature AIR with strict weighted-quorum AIR for an independently selected current Native commit context. Add separate resumable proof jobs and an explicit Node finality entry that requires both proofs, rechecks current weights and keys, and persists the original certificate. This development entry does not activate a network format or prove historical authority, proposer selection or penalty lifecycle.
+
 - Reject duplicate commit-certificate signers before JSON collection or address normalization can discard a claimed signature. Preserve unique tagged and legacy hex certificates, including single historical address spellings; rejected certificates leave finality and stored evidence unchanged.
 
 - Add a separate bounded weighted-quorum arithmetic AIR ingredient with exact public context binding, strict greater-than-two-thirds checks, durable component reuse and a cold-verification example. It grants no Native authorization and does not yet compose signer cryptography, consensus history or Node finality.

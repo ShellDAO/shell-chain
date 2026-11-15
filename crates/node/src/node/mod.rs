@@ -22882,6 +22882,142 @@ mod tests {
         }
 
         #[test]
+        fn commit_quorum_air_persistent_native_finality() {
+            use shell_stark_prover::{
+                commit_quorum::{prove_commit_quorum_persistent, verify_commit_quorum},
+                production_store::ProductionError,
+            };
+            let (node, signer) = setup_wpoa_node();
+            let authority = node.config.proposer_address.unwrap();
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
+            let genesis = store_genesis_wpoa(&node);
+            let hash = store_next_wpoa_block(&node, genesis);
+            let signature = signer.sign(hash.as_bytes()).unwrap();
+            let cert = Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(
+                authority,
+                signature.clone(),
+            )]))
+            .unwrap();
+            let source = node.commit_quorum_source(1, hash, &cert).unwrap();
+            // Only public, reproducible inputs are retained; the private test
+            // signing identity is never serialized or required by proof workers.
+            drop(signer);
+            let artifacts =
+                std::env::var_os("SHELL_COMMIT_QUORUM_ARTIFACTS").map(std::path::PathBuf::from);
+            if let Some(dir) = &artifacts {
+                std::fs::create_dir(dir).unwrap();
+            }
+            fn save<T: serde::Serialize>(dir: &Option<std::path::PathBuf>, name: &str, value: &T) {
+                if let Some(dir) = dir {
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(dir.join(name))
+                        .unwrap();
+                    ciborium::ser::into_writer(value, &mut file).unwrap();
+                    file.sync_all().unwrap();
+                }
+            }
+            save(&artifacts, "source.cbor", &source);
+            let native_before = node.store.scan_all().unwrap();
+            save(&artifacts, "native-before.cbor", &native_before);
+            let mut job = MemoryDb::new();
+            assert!(matches!(
+                prove_commit_quorum_persistent(&mut job, &source, std::num::NonZeroUsize::new(1)),
+                Err(ProductionError::Paused)
+            ));
+            let paused = job.scan_all().unwrap();
+            save(&artifacts, "job-paused.cbor", &paused);
+            assert_eq!(node.store.scan_all().unwrap(), native_before);
+            // Reconstruct another store solely from persisted public job rows.
+            let mut reopened = MemoryDb::new();
+            for (key, value) in &paused {
+                reopened.put(key, value).unwrap();
+            }
+            let mut changed = source.clone();
+            changed.context.chain_id += 1;
+            assert!(prove_commit_quorum_persistent(&mut reopened, &changed, None).is_err());
+            assert_eq!(reopened.scan_all().unwrap(), paused);
+            let (mut proof, progress) =
+                prove_commit_quorum_persistent(&mut reopened, &source, None).unwrap();
+            assert!(progress.newly_proved > 0 && progress.reused >= 1);
+            save(&artifacts, "proof.cbor", &proof);
+            let completed = reopened.scan_all().unwrap();
+            save(&artifacts, "job-complete.cbor", &completed);
+            let token = verify_commit_quorum(&proof, &source).unwrap();
+            assert!(token
+                .verify(
+                    &source.signatures[0].public_key,
+                    hash.as_bytes(),
+                    &signature
+                )
+                .unwrap());
+            assert!(!token
+                .verify(
+                    &source.signatures[0].public_key,
+                    genesis.as_bytes(),
+                    &signature
+                )
+                .unwrap());
+            assert_eq!(node.store.scan_all().unwrap(), native_before);
+            for field in 0..5 {
+                let mut changed = source.clone();
+                match field {
+                    0 => changed.context.chain_id += 1,
+                    1 => changed.context.parent_hash = ShellHash::ZERO,
+                    2 => changed.context.block_number += 1,
+                    3 => changed.context.authorities[0].weight += 1,
+                    _ => changed.signatures[0].public_key[0] ^= 1,
+                }
+                assert!(verify_commit_quorum(&proof, &changed).is_err());
+            }
+            // Signature and weight subproofs are both mandatory. No native
+            // signature fallback can turn a damaged proof into authorization.
+            proof.version = 0;
+            assert!(!node.fast_finalize_with_certificate_proof(1, hash, &cert, &proof));
+            proof.version = 1;
+            proof.weight.proof_bytes[0] ^= 1;
+            assert!(!node.fast_finalize_with_certificate_proof(1, hash, &cert, &proof));
+            proof.weight.proof_bytes[0] ^= 1;
+            proof.signatures[0].version = 0;
+            assert!(!node.fast_finalize_with_certificate_proof(1, hash, &cert, &proof));
+            proof.signatures[0].version = 2;
+            let mut corrupt = signature.clone();
+            corrupt.data[0] ^= 1;
+            let bad_cert =
+                Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(authority, corrupt)]))
+                    .unwrap();
+            assert!(!node.fast_finalize_with_certificate_proof(1, hash, &bad_cert, &proof));
+            node.consensus
+                .write()
+                .set_authorities_with_weights(vec![authority], vec![2]);
+            assert!(!node.fast_finalize_with_certificate_proof(1, hash, &cert, &proof));
+            node.consensus
+                .write()
+                .set_authorities_with_weights(vec![authority], vec![1]);
+            assert_eq!(node.finality.read().last_finalized_number(), 0);
+            assert_eq!(node.store.scan_all().unwrap(), native_before);
+            assert!(node.fast_finalize_with_certificate_proof(1, hash, &cert, &proof));
+            assert_eq!(node.finality.read().last_finalized_number(), 1);
+            assert_eq!(node.chain_store.get_finalized_number().unwrap(), Some(1));
+            assert_eq!(
+                node.chain_store.get_commit_certificate(&hash).unwrap(),
+                Some(cert.clone())
+            );
+            assert_eq!(
+                node.chain_store.get_block_signers(&hash).unwrap(),
+                source.signatures
+            );
+            let finalized = node.store.scan_all().unwrap();
+            save(&artifacts, "native-finalized.cbor", &finalized);
+            proof.signatures[0].version = 0;
+            assert!(!node.fast_finalize_with_certificate_proof(1, hash, &cert, &proof));
+            assert_eq!(node.store.scan_all().unwrap(), finalized);
+            assert_eq!(reopened.scan_all().unwrap(), completed);
+            save(&artifacts, "progress.cbor", &progress);
+        }
+
+        #[test]
         fn fast_finalize_rejects_duplicate_certificate_signers() {
             for legacy in [false, true] {
                 let (node, signer) = setup_wpoa_node();

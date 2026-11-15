@@ -643,11 +643,20 @@ impl<S: KvStore + 'static> Node<S> {
         signatures: &HashMap<Address, shell_crypto::PQSignature>,
         block_hash: ShellHash,
     ) -> Vec<shell_core::BlockSignerEvidence> {
+        self.commit_signer_evidence_using(signatures, block_hash, &MultiVerifier)
+    }
+
+    fn commit_signer_evidence_using(
+        &self,
+        signatures: &HashMap<Address, shell_crypto::PQSignature>,
+        block_hash: ShellHash,
+        verifier: &dyn Verifier,
+    ) -> Vec<shell_core::BlockSignerEvidence> {
         signatures
             .iter()
             .filter_map(|(address, signature)| {
                 let public_key = self.authority_pubkey(address).ok().flatten()?;
-                if !MultiVerifier
+                if !verifier
                     .verify(&public_key, block_hash.as_bytes(), signature)
                     .unwrap_or(false)
                 {
@@ -671,18 +680,35 @@ impl<S: KvStore + 'static> Node<S> {
         block_hash: ShellHash,
         cert: &[u8],
     ) -> bool {
+        self.verify_commit_certificate_using(block_number, block_hash, cert, None, &MultiVerifier)
+    }
+
+    fn verify_commit_certificate_using(
+        &self,
+        block_number: u64,
+        block_hash: ShellHash,
+        cert: &[u8],
+        weights: Option<&HashMap<Address, u64>>,
+        verifier: &dyn Verifier,
+    ) -> bool {
         let Some(signatures) = Self::decode_commit_certificate(cert) else {
             warn!(block_number, %block_hash, "FF.7: invalid commit certificate encoding");
             return false;
         };
-        let weights = self.consensus.read().validator_weights();
+        // Preserve the ordinary path's sampling order: decode first, then
+        // obtain current weights. The proof path supplies its locked snapshot.
+        let current_weights = weights
+            .is_none()
+            .then(|| self.consensus.read().validator_weights());
+        let weights = weights
+            .or(current_weights.as_ref())
+            .expect("current or locked weights");
         let total_weight = weights.values().copied().fold(0u64, u64::saturating_add);
         if total_weight == 0 {
             warn!(block_number, %block_hash, "FF.7: certificate cannot be verified without active validator weight");
             return false;
         }
         let quorum = FinalityState::strict_quorum_weight(total_weight);
-        let verifier = MultiVerifier;
         let mut signed_weight = 0u64;
 
         for (signer, sig) in signatures {
@@ -800,6 +826,135 @@ impl<S: KvStore + 'static> Node<S> {
         block_hash: ShellHash,
         cert: &[u8],
     ) -> bool {
+        self.fast_finalize_with_certificate_using(
+            block_number,
+            block_hash,
+            cert,
+            &MultiVerifier,
+            None,
+        )
+    }
+
+    /// Capture the current Native authority context independently of an offline
+    /// proof. This is not authenticated historical penalty context.
+    pub fn commit_quorum_source(
+        &self,
+        block_number: u64,
+        block_hash: ShellHash,
+        cert: &[u8],
+    ) -> Result<shell_stark_prover::commit_quorum::CommitQuorumSource, String> {
+        let weights = self.consensus.read().validator_weights();
+        self.commit_quorum_source_using(block_number, block_hash, cert, &weights)
+    }
+
+    fn commit_quorum_source_using(
+        &self,
+        block_number: u64,
+        block_hash: ShellHash,
+        cert: &[u8],
+        weights: &HashMap<Address, u64>,
+    ) -> Result<shell_stark_prover::commit_quorum::CommitQuorumSource, String> {
+        use shell_stark_prover::{
+            commit_quorum::CommitQuorumSource,
+            weighted_quorum::{AuthorityWeight, QuorumWeightContext},
+        };
+        let header = self
+            .chain_store
+            .get_header_by_hash(&block_hash)
+            .map_err(|e| e.to_string())?
+            .ok_or("commit proof header missing")?;
+        if header.number != block_number
+            || self
+                .chain_store
+                .get_block_hash_by_number(block_number)
+                .map_err(|e| e.to_string())?
+                != Some(block_hash)
+        {
+            return Err("commit proof target is not the canonical stored header".into());
+        }
+        let signatures =
+            Self::decode_commit_certificate(cert).ok_or("invalid commit certificate")?;
+        let mut entries = Vec::with_capacity(signatures.len());
+        for (address, signature) in signatures {
+            let public_key = self
+                .authority_pubkey(&address)
+                .map_err(|e| e.to_string())?
+                .ok_or("commit signer key unknown")?;
+            entries.push(shell_core::BlockSignerEvidence {
+                address,
+                public_key,
+                signature,
+            });
+        }
+        entries.sort_by(|a, b| a.address.as_bytes().cmp(b.address.as_bytes()));
+        let mut authorities: Vec<_> = weights
+            .iter()
+            .map(|(&address, &weight)| AuthorityWeight { address, weight })
+            .collect();
+        authorities.sort_by(|a, b| a.address.as_bytes().cmp(b.address.as_bytes()));
+        Ok(CommitQuorumSource {
+            context: QuorumWeightContext {
+                chain_id: self.config.chain_id,
+                parent_hash: header.parent_hash,
+                block_hash,
+                block_number,
+                authorities,
+                signers: entries.iter().map(|e| e.address).collect(),
+            },
+            signatures: entries,
+        })
+    }
+
+    /// Explicit source-only proof path; ordinary wire formats and activation
+    /// remain unchanged. Full signature and weight proofs must pass first.
+    pub fn fast_finalize_with_certificate_proof(
+        &self,
+        block_number: u64,
+        block_hash: ShellHash,
+        cert: &[u8],
+        proof: &shell_stark_prover::commit_quorum::CommitQuorumProof,
+    ) -> bool {
+        let Ok(source) = self.commit_quorum_source(block_number, block_hash, cert) else {
+            return false;
+        };
+        let Ok(verified) = shell_stark_prover::commit_quorum::verify_commit_quorum(proof, &source)
+        else {
+            return false;
+        };
+        self.fast_finalize_with_certificate_using(
+            block_number,
+            block_hash,
+            cert,
+            &verified,
+            Some(&verified),
+        )
+    }
+
+    fn fast_finalize_with_certificate_using(
+        &self,
+        block_number: u64,
+        block_hash: ShellHash,
+        cert: &[u8],
+        verifier: &dyn Verifier,
+        proof: Option<&shell_stark_prover::commit_quorum::VerifiedCommitQuorum>,
+    ) -> bool {
+        // Keep weight changes outside the final context check and atomic Native
+        // commit. The slow proof verification happened before acquiring this lock.
+        let consensus = proof.map(|_| self.consensus.read());
+        let weights = consensus.as_ref().map(|guard| guard.validator_weights());
+        if let Some(proof) = proof {
+            let Ok(current) = self.commit_quorum_source_using(
+                block_number,
+                block_hash,
+                cert,
+                weights.as_ref().expect("proof context lock"),
+            ) else {
+                return false;
+            };
+            if !proof.matches_source(&current) {
+                return false;
+            }
+        }
         let canonical_hash = match self.chain_store.get_block_hash_by_number(block_number) {
             Ok(Some(hash)) => hash,
             Ok(None) => {
@@ -841,13 +996,22 @@ impl<S: KvStore + 'static> Node<S> {
             }
         }
 
-        if !self.verify_commit_certificate(block_number, block_hash, cert) {
+        if !self.verify_commit_certificate_using(
+            block_number,
+            block_hash,
+            cert,
+            weights.as_ref(),
+            verifier,
+        ) {
             return false;
         }
 
         let signatures =
             Self::decode_commit_certificate(cert).expect("verified certificate encoding");
-        let signer_evidence = self.commit_signer_evidence(&signatures, block_hash);
+        let signer_evidence = self.commit_signer_evidence_using(&signatures, block_hash, verifier);
+        if signer_evidence.len() != signatures.len() {
+            return false;
+        }
 
         let advanced = {
             let mut finality = self.finality.write();
@@ -874,6 +1038,7 @@ impl<S: KvStore + 'static> Node<S> {
                 finality.set_finalized_direct(block_number, block_hash)
             }
         };
+        drop(consensus);
         if advanced {
             self.advance_fork_choice_finality(block_number, block_hash);
             let current_head = self
