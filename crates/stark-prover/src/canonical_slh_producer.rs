@@ -189,7 +189,11 @@ pub(crate) fn produce<S: KvStore>(
         })?;
         let proof = CanonicalSlhTransactionProof {
             version: if wide {
-                3
+                if account.pq_pubkey_hash == ShellHash::ZERO {
+                    4
+                } else {
+                    3
+                }
             } else if account.pq_pubkey_hash == ShellHash::ZERO {
                 2
             } else {

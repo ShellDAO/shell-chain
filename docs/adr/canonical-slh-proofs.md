@@ -467,10 +467,11 @@ recovery of a completed job must generate zero new mathematical certificates.
 
 Live candidate selection must recognize the same bound two-role profile before
 ordinary block handling can import it natively. With proof admission enabled,
-require a registered 64-byte proposer key, a bound default sender and the exact
+require a registered 64-byte proposer key, a supported default sender and the exact
 SLH seal width. Stage the untrusted body without advancing the Native head or
 writing receipts; dedicated proof transfer and full verification precede import.
-Keep disabled admission and unsupported funded-unbound pair behavior unchanged.
+Keep disabled admission and activation boundaries unchanged. Funded-unbound
+pairs require the explicit Source 15 profile described below.
 An earlier failed peer receiver is retained as evidence; a new public-only
 transport output reuses the same signed Native controls and published graph.
 
@@ -509,3 +510,29 @@ graceful shutdown, followed by generated-frame peer continuation/import,
 attached-certificate finality 2, cold replay and foreign-header refusal.
 Component counts follow the genuine message-dependent WOTS batch shape; no
 fixed count from block 1 replaces full verification or changes a quota.
+
+
+Source 15 extends the dual-SLH graph to funded first use. Its parent account
+commitment is zero and its first transaction embeds the 64-byte sender key.
+Transaction proof version 4 requires the full BLAKE3 tagged-key address AIR
+for the exact sender, alongside account, large-envelope, FORS and all seventeen
+XMSS layers. Batch 11 and frame 12 require that sender plus seal version 2;
+Source 14/batch 10/frame 11 remain bound-only. Source 7 and transaction version
+2 retain the narrow legacy profile. Relabeling any of these domains refuses.
+
+Frame 12 reuses frame 11's deferred wide witnesses and strict full AIR verifier,
+including one shared expansion budget across both roles. It changes no SHA256
+constraints, security options, global quota, activation rule or default setting.
+Enabled live admission stages a valid first-use pair without importing Native
+state; disabled or pre-activation admission leaves that state unchanged.
+
+The prepare-first-use entry freezes genuine Embedded block 1 and Reference
+blocks 2/3, headers and quorums on independent Native stores before dropping
+temporary keys. Preserve that cohort for capture, durable pause/cold full
+production, zero-new-math CLI reuse, proof-backed registration/import/finality
+1, read-only history after ordinary block 3 and actual peer cold continuation.
+Missing or incorrect address certificates, bound/narrow profile substitution,
+wrong keys, signatures, roles, layers, compression domains and foreign headers
+must refuse without advancing Native state. Fresh automatic production and
+Reference target-2 proof production remain separate qualifications; retained
+successor signatures alone do not qualify them or public release/activation.

@@ -1,16 +1,17 @@
 // Included inside node::tests to reuse real signed production/import fixtures.
 #[test]
-fn live_bound_slh_pair_stages_before_native_import_without_extending_unbound_policy() {
+fn live_bound_and_first_use_slh_pairs_stage_before_native_import() {
     let proposer = shell_crypto::SphincsSigner::generate();
     let signer = shell_crypto::SphincsSigner::generate();
     let authority = Address::from_public_key(proposer.public_key(), proposer.sig_type().as_u8());
     let sender = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
     for unbound in [false, true] {
+      for activation in [None, Some(2), Some(1)] {
         let mut leader = setup_node_with_store(authority, Arc::new(MemoryDb::new()));
         leader.config.node_role = crate::config::NodeRole::ValidatorProver;
         let db = Arc::new(MemoryDb::new());
         let mut follower = setup_node_with_store(authority, db.clone());
-        for node in [&leader, &follower] {
+        for (node, commitment_height) in [(&leader, Some(1)), (&follower, activation)] {
             node.register_authority_pubkey(authority, proposer.public_key().to_vec());
             node.chain_store.put_pubkey(&authority, proposer.public_key()).unwrap();
             fund_account(node, &sender, U256::from(1_000_000_000_000_000_000u64));
@@ -25,16 +26,25 @@ fn live_bound_slh_pair_stages_before_native_import_without_extending_unbound_pol
             store_consistent_genesis(node);
             let cfg = serde_json::from_value(serde_json::json!({
                 "chain_id":1337,"genesis_hash":node.chain_store.get_head_hash().unwrap().unwrap(),
-                "block_commitment_height":1,"fee_accounting_activation_height":1
+                "block_commitment_height":commitment_height,"fee_accounting_activation_height":1
             })).unwrap();
             node.chain_store.put_chain_config(&cfg).unwrap();
         }
-        submit_signed_tx(&leader, &signer, sender, Transaction {
+        let tx = Transaction {
             chain_id:1337,nonce:0,to:Some(Address::from([0xab;32])),value:U256::from(1),
             data:Bytes::new(),gas_limit:100_000,max_fee_per_gas:shell_core::INITIAL_BASE_FEE,
             max_priority_fee_per_gas:1,access_list:None,tx_type:2,
             max_fee_per_blob_gas:None,blob_versioned_hashes:None,
-        });
+        };
+        let mut signed = shell_core::SignedTransaction::new(
+            sender,
+            tx.clone(),
+            signer.sign(tx.signing_hash(signer.sig_type().as_u8()).as_bytes()).unwrap(),
+        );
+        if unbound {
+            signed.pubkey_mode = shell_core::PubkeyMode::Embedded(signer.public_key().to_vec());
+        }
+        leader.handle_incoming_tx(signed, &MultiVerifier).unwrap();
         let block = leader.produce_block(&proposer, 100).unwrap();
         assert_eq!(block.transactions.len(), 1);
         assert_eq!(block.proposer_seal.as_ref().unwrap().data.len(), 49856);
@@ -44,20 +54,22 @@ fn live_bound_slh_pair_stages_before_native_import_without_extending_unbound_pol
         assert!(!follower.stage_live_candidate(&peer, &block).unwrap());
         assert_eq!(db.scan_all().unwrap(), before);
         follower.config.canonical_proof_admission = true;
-        if unbound {
+        if activation != Some(1) {
             assert!(!follower.stage_live_candidate(&peer, &block).unwrap());
             assert_eq!(db.scan_all().unwrap(), before);
-        } else {
-            let mut bad = block.clone();
-            bad.proposer_seal.as_mut().unwrap().data[0] ^= 1;
-            assert!(follower.stage_live_candidate(&peer, &bad).is_err());
-            assert_eq!(db.scan_all().unwrap(), before);
-            assert!(follower.stage_live_candidate(&peer, &block).unwrap());
-            assert!(follower.canonical_admission_status(block.hash()).unwrap().is_some());
+            continue;
         }
+        let mut bad = block.clone();
+        bad.proposer_seal.as_mut().unwrap().data[0] ^= 1;
+        assert!(follower.stage_live_candidate(&peer, &bad).is_err());
+        assert_eq!(db.scan_all().unwrap(), before);
+        assert!(follower.stage_live_candidate(&peer, &block).unwrap());
+        assert!(follower.canonical_admission_status(block.hash()).unwrap().is_some());
+        assert_eq!(follower.chain_store.get_pubkey(&sender).unwrap().is_none(), unbound);
         assert_eq!(follower.chain_store.get_head_hash().unwrap(), parent);
         assert!(follower.chain_store.get_block_by_hash(&block.hash()).unwrap().is_none());
         assert!(follower.chain_store.get_receipts(&block.hash()).unwrap().is_none());
+      }
     }
 }
 

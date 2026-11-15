@@ -771,7 +771,8 @@ fn main() -> Result<(), Error> {
             admission_runtime::dilithium::prepare(out, false, true, false)
         }
         "prepare-slh-proposer" => admission_runtime::slh_proposer::prepare(out),
-        "prepare-both-slh" => admission_runtime::slh_both::prepare(out),
+        "prepare-both-slh" => admission_runtime::slh_both::prepare(out, false),
+        "prepare-first-use-both-slh" => admission_runtime::slh_both::prepare(out, true),
         "capture-both-slh" => admission_runtime::slh_proposer::capture(out),
         "pause-both-slh" => admission_runtime::slh_proposer::prove(out, true),
         "resume-both-slh" => admission_runtime::slh_proposer::prove(out, false),

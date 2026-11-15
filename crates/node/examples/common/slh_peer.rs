@@ -379,7 +379,7 @@ fn negative(native: &Path, cache: &Path, out: &Path) -> Result<std::path::PathBu
         cache.join("proof.cbor"),
     )?)?;
     if let Some(proposer) = &mut proof.slh_proposer {
-        let foreign = if proof.version == 10 {
+        let foreign = if matches!(proof.version, 10 | 11) {
             proof.slh_transactions.as_ref().ok_or("SLH sender absent")?[0]
                 .envelope
                 .transaction_id

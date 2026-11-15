@@ -20,7 +20,8 @@ use shell_storage::{CanonicalParentView, KvStore};
 
 /// Version one binds a registered account; version two proves a funded unbound
 /// account's tagged address. Version three binds a registered account with the
-/// explicit wide-WOTS profile. Every version requires all seventeen layers.
+/// explicit wide-WOTS profile; version four proves a funded unbound account's
+/// address with that wide profile. Every version requires all seventeen layers.
 /// Neither the manifest nor a persisted status is cryptographic authority.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,7 +73,7 @@ pub(crate) fn verify_at_source(
 ) -> Result<VerifiedSignatureEntry, String> {
     let unbound = account.pq_pubkey_hash == ShellHash::ZERO;
     if !(if unbound {
-        proof.version == 2
+        matches!(proof.version, 2 | 4)
     } else {
         matches!(proof.version, 1 | 3)
     }) || proof.layers.len() != usize::from(SLH_HYPERTREE_LAYERS)
@@ -114,7 +115,7 @@ pub(crate) fn verify_at_source(
     // The expected message comes from the proved signing payload above. No native
     // signature verifier or SHA digest participates in this acceptance predicate.
     verify_slh_signature_profile_using(
-        proof.version == 3,
+        matches!(proof.version, 3 | 4),
         &proof.manifest,
         &expected,
         &proof.fors,

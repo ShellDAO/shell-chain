@@ -851,7 +851,7 @@ pub(crate) fn capture(out: &Path) -> Result<(), Error> {
         before == digest(&db.state)?,
         "proposer capture wrote Native state",
     )?;
-    if !matches!(value["version"].as_u64(), Some(8..=14))
+    if !matches!(value["version"].as_u64(), Some(8..=15))
         || value["proposer_key"]
             .as_array()
             .is_none_or(|v| v.len() != 64)
@@ -954,7 +954,7 @@ pub(crate) fn prove(out: &Path, pause: bool) -> Result<(), Error> {
     )?;
     write(
         &out.join("proof-complete.json"),
-        &json!({"source_version":serde_json::from_slice::<Value>(source.identity())?["version"],"batch_version":proof.version,"frame_version":proof.version+1,"proposer_full17_layers":true,"sender_full17_layers":proof.version==10,"source_native_unchanged":true,"new_signing":false,"proof_bytes":payload.len(),"progress_file":progress_file}),
+        &json!({"source_version":serde_json::from_slice::<Value>(source.identity())?["version"],"batch_version":proof.version,"frame_version":proof.version+1,"proposer_full17_layers":true,"sender_full17_layers":matches!(proof.version,10|11),"source_native_unchanged":true,"new_signing":false,"proof_bytes":payload.len(),"progress_file":progress_file}),
     )
 }
 pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
@@ -1052,7 +1052,7 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
             "changed-signature",
             "foreign-header-certificate",
         ];
-        if proof.version == 10 {
+        if matches!(proof.version, 10 | 11) {
             cases.extend([
                 "missing-sender",
                 "legacy-sender-profile",
@@ -1066,6 +1066,9 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
         if source.has_unbound_senders() {
             cases.extend(["bound-account-profile", "missing-address-certificate"]);
         }
+        if proof.version == 11 {
+            cases.extend(["bound-sender-profile", "narrow-unbound-profile"]);
+        }
         if matches!(proof.version, 6 | 7) {
             cases.extend([
                 "sdk-as-raw-account",
@@ -1075,7 +1078,7 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
                 "sdk-as-raw-challenge",
             ]);
         }
-        if matches!(proof.version, 7 | 9) {
+        if matches!(proof.version, 7 | 9 | 11) {
             cases.push("wrong-address-tag");
         }
         if matches!(proof.version, 8 | 9) {
@@ -1101,6 +1104,12 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
                 "missing-sender" => bad.slh_transactions = None,
                 "legacy-sender-profile" => {
                     bad.slh_transactions.as_mut().ok_or("sender absent")?[0].version = 1
+                }
+                "bound-sender-profile" => {
+                    bad.slh_transactions.as_mut().ok_or("sender absent")?[0].version = 3
+                }
+                "narrow-unbound-profile" => {
+                    bad.slh_transactions.as_mut().ok_or("sender absent")?[0].version = 2
                 }
                 "legacy-seal-profile" => {
                     bad.slh_proposer.as_mut().ok_or("seal absent")?.version = 1
@@ -1171,19 +1180,26 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
                 "wrong-profile" => bad.version = 2,
                 "bound-account-profile" => {
                     bad.version = match proof.version {
+                        11 => 10,
                         9 => 8,
                         7 => 6,
                         _ => 4,
                     }
                 }
-                "missing-address-certificate" => bad.transactions[0].signature.tagged_key = None,
+                "missing-address-certificate" => {
+                    if let Some(senders) = &mut bad.slh_transactions {
+                        senders[0].tagged_key = None;
+                    } else {
+                        bad.transactions[0].signature.tagged_key = None;
+                    }
+                }
                 "wrong-address-tag" => {
-                    bad.transactions[0]
-                        .signature
-                        .tagged_key
-                        .as_mut()
-                        .ok_or("address certificate absent")?
-                        .message[0] ^= 1
+                    let tagged = if let Some(senders) = &mut bad.slh_transactions {
+                        &mut senders[0].tagged_key
+                    } else {
+                        &mut bad.transactions[0].signature.tagged_key
+                    };
+                    tagged.as_mut().ok_or("address certificate absent")?.message[0] ^= 1;
                 }
                 "missing-layer" => {
                     bad.slh_proposer.as_mut().ok_or("SLH absent")?.layers.pop();
@@ -1197,7 +1213,7 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
                         .signature[0] ^= 1
                 }
                 _ => {
-                    let valid = if proof.version == 10 {
+                    let valid = if matches!(proof.version, 10 | 11) {
                         &bad.slh_transactions.as_ref().ok_or("SLH sender absent")?[0]
                             .envelope
                             .transaction_id
@@ -1251,7 +1267,7 @@ pub(crate) fn verify(out: &Path, refuse: bool) -> Result<(), Error> {
     if node.chain_store.get_head_hash()? == Some(c.block) {
         node.import_block(later.clone(), &MultiVerifier)?;
     }
-    let ordinary_path = if matches!(proof.version, 9 | 10) && block.number() == 1 {
+    let ordinary_path = if matches!(proof.version, 9..=11) && block.number() == 1 {
         let advance: Block = read(&out.join("advance.json"))?;
         ensure(
             advance.number() == 3

@@ -1,7 +1,7 @@
 //! Complete canonical sender verification over trusted local context.
 //! Legacy profiles use native body selection; SLH sender proofs verify the
 //! large envelope/header relation. A separate profile proves raw SLH proposer
-//! seals with one supported primary, SDK, raw or bound SLH sender.
+//! seals with one supported default-account sender, including SLH first use.
 //! Consensus and execution remain native.
 use crate::{
     account_state::AccountStateProof,
@@ -65,14 +65,15 @@ pub struct CanonicalSignatureBatchProof {
 impl CanonicalSignatureBatchProof {
     fn valid_profile(&self) -> bool {
         if let Some(seal) = &self.slh_proposer {
-            if self.version == 10 {
+            if matches!(self.version, 10 | 11) {
                 return seal.version == 2
                     && self.proposer.is_none()
                     && self.transactions.is_empty()
-                    && self
-                        .slh_transactions
-                        .as_ref()
-                        .is_some_and(|v| v.len() == 1 && v[0].version == 3);
+                    && self.slh_transactions.as_ref().is_some_and(|v| {
+                        v.len() == 1
+                            && v[0].version == if self.version == 11 { 4 } else { 3 }
+                            && (self.version != 11 || v[0].tagged_key.is_some())
+                    });
             }
             return seal.version == 1
                 && matches!(self.version, 4..=9)
@@ -183,7 +184,7 @@ pub fn verify_canonical_signature_batch<S: KvStore + 'static>(
     if !proof.valid_profile()
         || block.transactions.is_empty()
         || block.transactions.len() > MAX_CANONICAL_SIGNATURE_BATCH
-        || (if matches!(proof.version, 3 | 10) {
+        || (if matches!(proof.version, 3 | 10 | 11) {
             proof.slh_transactions.as_ref().map_or(0, Vec::len)
         } else {
             proof.transactions.len()
@@ -241,7 +242,7 @@ fn verify_batch_at_parent<S: KvStore + 'static>(
     if !proof.valid_profile()
         || block.transactions.is_empty()
         || block.transactions.len() > MAX_CANONICAL_SIGNATURE_BATCH
-        || (if matches!(proof.version, 3 | 10) {
+        || (if matches!(proof.version, 3 | 10 | 11) {
             proof.slh_transactions.as_ref().map_or(0, Vec::len)
         } else {
             proof.transactions.len()
@@ -300,9 +301,9 @@ fn verify_batch_at_parent<S: KvStore + 'static>(
                     )
                     && proof.transactions[0].signature.transaction.version == 2
             }
-            10 => {
+            10 | 11 => {
                 sender.signature.sig_type == SignatureType::SphincsSha2256f
-                    && account.pq_pubkey_hash != ShellHash::ZERO
+                    && (account.pq_pubkey_hash == ShellHash::ZERO) == (proof.version == 11)
             }
             _ => false,
         };
@@ -325,7 +326,7 @@ fn verify_batch_at_parent<S: KvStore + 'static>(
     let mut seen = std::collections::HashSet::new();
     let mut signatures = Vec::with_capacity(block.transactions.len());
     for (index, tx) in block.transactions.iter().enumerate() {
-        let entry = if matches!(proof.version, 3 | 10) {
+        let entry = if matches!(proof.version, 3 | 10 | 11) {
             crate::canonical_slh::verify_at_parent(
                 view,
                 &block.header,
@@ -389,7 +390,7 @@ mod tests {
         let legacy: CanonicalSignatureBatchProof = serde_json::from_slice(bytes).unwrap();
         assert!(legacy.valid_profile());
         assert_eq!(serde_json::to_vec(&legacy).unwrap(), bytes);
-        for version in [0, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
+        for version in [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] {
             let value = serde_json::json!({"version":version,"transactions":[]});
             let proof: CanonicalSignatureBatchProof = serde_json::from_value(value).unwrap();
             assert!(!proof.valid_profile());

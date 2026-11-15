@@ -230,9 +230,7 @@ impl<S: KvStore + 'static> Node<S> {
             else {
                 return Ok(false);
             };
-            if account.validation_code_hash.is_some()
-                || slh_pair && account.pq_pubkey_hash == ShellHash::ZERO
-            {
+            if account.validation_code_hash.is_some() {
                 return Ok(false);
             }
             if tx.signature.sig_type == shell_crypto::SignatureType::SphincsSha2256f

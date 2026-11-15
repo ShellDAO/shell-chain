@@ -8,8 +8,8 @@ if [[ $# == 3 && $1 == reuse-reference ]]; then
   cargo build --locked --release -p shell-node --features rocksdb --example mldsa-produce-proof
   exec "${CARGO_TARGET_DIR:-target}/release/examples/mldsa-produce-proof" reuse-both-slh-reference "$2" "$3"
 fi
-if [[ $# != 2 || ( $1 != prepare && $1 != capture && $1 != pause && $1 != resume && $1 != verify && $1 != refuse && $1 != publish ) ]]; then
-  echo "usage: $0 prepare|capture|pause|resume|verify|refuse|publish output; reuse-reference retained-native-output reference-output" >&2
+if [[ $# != 2 || ( $1 != prepare && $1 != prepare-first-use && $1 != capture && $1 != pause && $1 != resume && $1 != verify && $1 != refuse && $1 != publish ) ]]; then
+  echo "usage: $0 prepare|prepare-first-use|capture|pause|resume|verify|refuse|publish output; reuse-reference retained-native-output reference-output" >&2
   exit 2
 fi
 cd "$(dirname "$0")/../.."

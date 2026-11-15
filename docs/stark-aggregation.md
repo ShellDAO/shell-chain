@@ -2938,3 +2938,56 @@ fresh nonce, then verify import, attached-certificate finality and a genuine
 foreign-header refusal. A warm standalone job does not qualify this fresh path.
 Funded-unbound/Reference dual-SLH targets, other accounts, quorum AIR, public
 release and network activation remain separate acceptance conditions.
+
+
+##### Funded first-use SLH sender and SLH proposer
+
+A funded default account whose parent key commitment is zero can send its
+first SLH transaction with an Embedded 64-byte key to a registered SLH
+proposer. Source 15, batch 11 and availability frame 12 require transaction
+proof version 4, including the complete tagged-key address AIR for the exact
+sender, and seal version 2. Both signatures still require FORS and all
+seventeen XMSS layers. The bound Source 14 profile and narrow first-use
+Source 7 profile retain their original domains and cannot be relabeled.
+
+Use the same stable Rust, locked dependencies and RocksDB prerequisites as
+above. The following preparation refuses an existing output. It creates
+independent memory-only test keys, funds a zero-commitment chain-10 account,
+and freezes genuine Embedded block 1 plus Reference blocks 2/3 and their
+headers/quorums on two Native stores before dropping both keys. Keep this
+output throughout the workflow; subsequent commands do not sign again.
+
+```sh
+tests/e2e/slh-both-proof.sh prepare-first-use first-use-both-slh
+tests/e2e/slh-both-proof.sh capture first-use-both-slh
+tests/e2e/slh-both-proof.sh pause first-use-both-slh
+tests/e2e/slh-both-proof.sh resume first-use-both-slh
+tests/e2e/slh-both-proof.sh verify first-use-both-slh
+tests/e2e/slh-both-proof.sh refuse first-use-both-slh
+tests/e2e/slh-both-proof.sh publish first-use-both-slh
+tests/e2e/slh-peer-proof.sh prepare first-use-both-slh first-use-both-slh/published first-use-both-slh-peer
+tests/e2e/slh-peer-proof.sh pause first-use-both-slh first-use-both-slh/published first-use-both-slh-peer
+tests/e2e/slh-peer-proof.sh resume first-use-both-slh first-use-both-slh/published first-use-both-slh-peer
+tests/e2e/slh-peer-proof.sh verify first-use-both-slh first-use-both-slh/published first-use-both-slh-peer
+tests/e2e/slh-peer-proof.sh refuse first-use-both-slh first-use-both-slh/published first-use-both-slh-peer
+```
+
+Each command exits nonzero on failure. Cold resume must verify the retained
+components and finish both full role graphs. Run `shell-node produce-block-proof`
+with this output's `provider`, captured block/tip and `proof` directory to
+verify same-job CLI reuse with zero new mathematical components. Successful
+import must register the Embedded sender key, match independent Native
+receipts/accounts/root and finalize block 1 with the retained genuine quorum.
+History after ordinary block 3 must resolve the original zero-commitment
+parent and write neither current store. Refusals cover missing/wrong address
+proofs, bound/narrow profile substitution, role/domain/layer/signature and
+foreign-header changes. Actual peer transfer must continue a cold partial
+fetch and independently import/finalize the published graph.
+
+Frame 12 uses frame 11's bounded deferred-witness restoration and unchanged
+strict AIR verifier. It retains the single shared JSON expansion ceiling and
+all frame/checkpoint/certificate/count/reference limits. Admission remains
+disabled by default and gated by activation; enabled admission stages the
+first-use pair before Native import. This standalone flow does not qualify
+fresh automatic production, Reference target-2 production, other accounts,
+quorum AIR, public artifacts or network activation.

@@ -1,8 +1,8 @@
-//! Independent bound SLH sender and proposer Native controls.
+//! Independent bound or funded first-use SLH sender/proposer Native controls.
 use super::*;
 use shell_crypto::{SphincsSigner, Verifier};
 
-pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
+pub(crate) fn prepare(out: &Path, unbound: bool) -> Result<(), Error> {
     ensure(
         !out.exists(),
         "both-SLH output exists; refusing replacement",
@@ -18,8 +18,9 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
         "independent SLH actor profile differs",
     )?;
     std::fs::create_dir(out)?;
-    let native = dilithium::genesis(&out.join("native/db"), &sender, &proposer, false)?;
-    let receiver = dilithium::genesis(&out.join("receiver/db"), &sender, &proposer, false)?;
+    let native = dilithium::genesis(&out.join("native/db"), &sender, &proposer, unbound)?;
+    let receiver = dilithium::genesis(&out.join("receiver/db"), &sender, &proposer, unbound)?;
+    let sender_address = Address::from_public_key(sender.public_key(), sender.sig_type().as_u8());
     let mut node = fixture::node(
         Arc::new(native.state.clone()),
         authority,
@@ -37,7 +38,19 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
     let mut intake_refusals = Vec::new();
     let mut import_refusals = Vec::new();
     for nonce in 0..3 {
-        let signed = dilithium::signed(&sender, nonce)?;
+        let mut signed = dilithium::signed(&sender, nonce)?;
+        if unbound && nonce == 0 {
+            ensure(
+                node.chain_store.get_pubkey(&sender_address)?.is_none()
+                    && node
+                        .world_state
+                        .write()
+                        .get_account(&sender_address)?
+                        .is_some_and(|a| a.pq_pubkey_hash == ShellHash::ZERO),
+                "funded first-use parent must have zero commitment and no sender key",
+            )?;
+            signed.pubkey_mode = shell_core::PubkeyMode::Embedded(sender.public_key().to_vec());
+        }
         ensure(
             signed.signature.data.len() == 49_856
                 && MultiVerifier.verify(
@@ -48,13 +61,23 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
             "genuine SLH sender signature refused",
         )?;
         if nonce == 0 {
-            for case in ["message", "signature-byte", "wrong-owner", "nonce"] {
+            let mut cases = vec!["message", "signature-byte", "wrong-owner", "nonce"];
+            if unbound {
+                cases.extend(["reference-without-key", "wrong-embedded-key"]);
+            }
+            for case in cases {
                 let mut bad = signed.clone();
                 match case {
                     "message" => bad.tx.value = U256::from(2),
                     "signature-byte" => bad.signature.data[0] ^= 1,
                     "wrong-owner" => {
                         bad.signature = other.sign(signed.sender_signing_hash().as_bytes())?
+                    }
+                    "reference-without-key" => bad.pubkey_mode = shell_core::PubkeyMode::Reference,
+                    "wrong-embedded-key" => {
+                        let mut key = sender.public_key().to_vec();
+                        key[0] ^= 1;
+                        bad.pubkey_mode = shell_core::PubkeyMode::Embedded(key);
                     }
                     _ => bad.tx.nonce = 1,
                 }
@@ -107,11 +130,20 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
         peer.import_block(block.clone(), &MultiVerifier)?;
         slh_proposer::finalize(&node, &proposer, &block)?;
         slh_proposer::finalize(&peer, &proposer, &block)?;
-        let control = dilithium::control(&node, &block)?;
+        ensure(
+            node.chain_store.get_pubkey(&sender_address)?.as_deref() == Some(sender.public_key())
+                && peer.chain_store.get_pubkey(&sender_address)?.as_deref()
+                    == Some(sender.public_key()),
+            "Native sender registration differs across signed controls",
+        )?;
+        let mut control = dilithium::control(&node, &block)?;
         ensure(
             dilithium::control(&peer, &block)? == control,
             "independent both-SLH controls differ",
         )?;
+        if unbound {
+            control["first_use_parent_unregistered"] = json!(nonce == 0);
+        }
         let (checkpoint, header, transaction, result) = match nonce {
             0 => (
                 "provider",
@@ -164,7 +196,8 @@ pub(crate) fn prepare(out: &Path) -> Result<(), Error> {
         &out.join("prepared.json"),
         &json!({
             "independent_new_native_cohort":true,
-            "bound_SLH_sender":true,"SLH_proposer":true,
+            "bound_SLH_sender":!unbound,"funded_zero_commitment_SLH_sender":unbound,
+            "native_first_use_and_registration":unbound,"SLH_proposer":true,
             "key_bytes":64,"signature_bytes":49856,
             "all_three_genuine_headers_and_quorum_controls_frozen":true,
             "independent_native_import_receipts_accounts_root_and_finality":true,
