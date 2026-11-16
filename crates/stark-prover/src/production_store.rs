@@ -55,7 +55,7 @@ pub struct ProductionProgress {
     pub newly_proved: usize,
     pub reused: usize,
 }
-type ComponentReuse<'a> = dyn Fn(&str) -> Result<Option<Vec<u8>>, String> + 'a;
+pub(crate) type ComponentReuse<'a> = dyn Fn(&str) -> Result<Option<Vec<u8>>, String> + 'a;
 
 /// The caller must exclusively own this separate job store. No chain writes are made.
 /// Every reused certificate is decoded and verified against the current inputs.

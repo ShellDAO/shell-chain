@@ -189,6 +189,60 @@ logical rows. It then checks the immutable-configuration refusal and uses
 separate genesis databases for omitted and future activation heights. A partial
 receiver beyond this precise genesis state refuses; preserve it for diagnosis.
 
+For a two-authority development check, retain the original primary controls and
+completed job, then export the same three block hashes for an installed SDK:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- co-sign-input native-quorum quorum-messages.json
+node tests/e2e/sdk-quorum-cosign.mjs quorum-messages.json sdk-quorum-signatures.json sdk-package-directory
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- augment native-quorum sdk-quorum-signatures.json two-signer-quorum
+cargo run --locked -p shell-stark-prover --example commit-quorum -- prove-reusing two-signer-quorum/source.cbor two-signer-job two-signer-proof.cbor native-quorum/source.cbor native-quorum-job 1
+# Paused is an expected nonzero exit; preserve both jobs and all public inputs.
+cargo run --locked -p shell-stark-prover --example commit-quorum -- prove-reusing two-signer-quorum/source.cbor two-signer-job two-signer-proof.cbor native-quorum/source.cbor native-quorum-job
+cargo run --locked -p shell-stark-prover --example commit-quorum -- verify two-signer-quorum/source.cbor two-signer-job two-signer-proof.cbor
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- receive-one two-signer-quorum two-signer-proof.cbor two-signer-import
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- receive-one-verify two-signer-quorum two-signer-proof.cbor two-signer-import
+```
+
+The JavaScript helper requires Node 20.19 or later and an SDK installation that
+exports `shell-sdk/adapters` and `shell-sdk/signer` (the development check uses
+SDK 0.14.0-rc.3 with Noble 0.6.0). `sdk-package-directory` is the installed or source-built SDK package directory containing its
+`package.json`; omit it when that package is the current directory. It invokes
+the actual `ShellSigner` API, writes only the public key, address and all three
+raw block-hash signatures to a new file, and disposes the temporary private key.
+A source-built or cached installation must be labeled as that substitution;
+using it does not qualify a fresh public npm package or website flow.
+
+`augment` verifies the original primary signatures and the SDK FIPS transcript,
+preserves the original headers/transactions/genesis, and creates a new trusted
+current authority configuration with primary weight 2 and SDK weight 1. This is
+an independent development genesis configuration, not proof of a historical
+validator-set transition. The original primary private identity is never
+recreated. Primary-only certificates at exactly two thirds must refuse, and a
+full proof cannot omit either signature graph or use an old single-signer
+weight context.
+
+Use separate, exclusively owned source-pinned donor and destination jobs.
+`prove-reusing` cryptographically reverifies the donor, maps only exact
+signature/key/address/tag and message matches, and verifies every borrowed
+certificate again against the destination inputs. Weight proofs are never
+borrowed. A missing matched donor component refuses rather than regenerating
+its old math. Borrowed checkpoints may add rows even when no new mathematical
+proof is computed. The completed destination is independently cold-verifiable
+without the donor. The donor's logical rows remain unchanged; RocksDB may
+maintain logs on open. Copy a closed donor job first if its original directory
+must remain byte-for-byte unchanged, retaining and checking both copies.
+
+`receive-one` deliberately ends at the first genuine block and finality 1,
+checking independent Native row equality, both signature graphs, strict quorum,
+activation/refusal boundaries and backend-batch rollback; the second command
+reopens that same first-block state. All three genuine co-signatures remain
+available. Mixed-authority successor sync and historical replay after a later
+state change remain required acceptance work: ordinary import of the original
+single-authority block 2 does not supply the certified-view provenance required
+by the new weighted proposer schedule. This check does not disable the selector
+or claim the earlier single-authority three-block test covers that combination.
+
 Current registry and address/key matching remain Native context predicates.
 This does not establish historical penalty provenance or the selector in AIR,
 add a consensus carrier, activate a network schedule, or replace the ordinary

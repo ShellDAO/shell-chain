@@ -129,7 +129,7 @@ pub fn prove_commit_quorum_persistent<S: KvStore>(
     source: &CommitQuorumSource,
     limit: Option<NonZeroUsize>,
 ) -> Result<(CommitQuorumProof, ProductionProgress), ProductionError> {
-    commit_quorum_persistent(store, source, limit, false)
+    commit_quorum_persistent(store, source, limit, false, None)
 }
 
 /// Reverify all original certificates without initializing a job or invoking
@@ -138,7 +138,53 @@ pub fn reverify_commit_quorum_persistent<S: KvStore>(
     store: &mut S,
     source: &CommitQuorumSource,
 ) -> Result<(CommitQuorumProof, ProductionProgress), ProductionError> {
-    commit_quorum_persistent(store, source, None, true)
+    commit_quorum_persistent(store, source, None, true, None)
+}
+
+/// Reverify a complete, independently pinned donor before opening destination
+/// checkpoints. Only exact key/address/signature/transcript and message matches
+/// may supply untrusted component bytes; every borrowed certificate is verified
+/// again against the destination input. Weight proofs are never borrowed.
+/// Both stores must be separate and exclusively owned by the caller.
+pub fn prove_commit_quorum_persistent_reusing<S: KvStore, D: KvStore>(
+    store: &mut S,
+    source: &CommitQuorumSource,
+    limit: Option<NonZeroUsize>,
+    donor: &mut D,
+    donor_source: &CommitQuorumSource,
+) -> Result<(CommitQuorumProof, ProductionProgress), ProductionError> {
+    source.validate()?;
+    reverify_commit_quorum_persistent(donor, donor_source)?;
+    let reuse = |name: &str| {
+        let Some(name) = donor_component_name(source, donor_source, name) else {
+            return Ok(None);
+        };
+        let key = [b"production/component/".as_slice(), name.as_bytes()].concat();
+        donor
+            .get(&key)
+            .map_err(|e| e.to_string())?
+            .map(Some)
+            .ok_or_else(|| "missing input-matched donor checkpoint".to_string())
+    };
+    commit_quorum_persistent(store, source, limit, false, Some(&reuse))
+}
+
+fn donor_component_name(
+    source: &CommitQuorumSource,
+    donor: &CommitQuorumSource,
+    name: &str,
+) -> Option<String> {
+    if source.context.block_hash != donor.context.block_hash {
+        return None;
+    }
+    let (position, suffix) = name.strip_prefix("commit-signer-")?.split_once('-')?;
+    let index: usize = position.parse().ok()?;
+    if position != index.to_string() || suffix.is_empty() {
+        return None;
+    }
+    let entry = source.signatures.get(index)?;
+    let old = donor.signatures.iter().position(|other| other == entry)?;
+    Some(format!("commit-signer-{old}-{suffix}"))
 }
 
 fn commit_quorum_persistent<S: KvStore>(
@@ -146,6 +192,7 @@ fn commit_quorum_persistent<S: KvStore>(
     source: &CommitQuorumSource,
     limit: Option<NonZeroUsize>,
     read_only: bool,
+    reuse: Option<&crate::production_store::ComponentReuse<'_>>,
 ) -> Result<(CommitQuorumProof, ProductionProgress), ProductionError> {
     source.validate()?;
     // Validate the strict public arithmetic and native signatures before opening
@@ -199,6 +246,9 @@ fn commit_quorum_persistent<S: KvStore>(
     } else {
         ProductionStore::open_shared_matrix(store, &bytes, limit)?
     };
+    if let Some(reuse) = reuse {
+        job = job.with_reuse(reuse);
+    }
     let weight = job.checkpoint(
         "commit-weight",
         || prove_quorum_weight(&source.context),
@@ -222,4 +272,63 @@ fn commit_quorum_persistent<S: KvStore>(
     };
     verify_commit_quorum(&proof, source)?;
     Ok((proof, job.progress()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::weighted_quorum::{AuthorityWeight, QuorumWeightContext};
+    use shell_primitives::{Address, ShellHash};
+    fn source() -> CommitQuorumSource {
+        let address = Address::from([1; 32]);
+        CommitQuorumSource {
+            context: QuorumWeightContext {
+                chain_id: 1337,
+                parent_hash: ShellHash::ZERO,
+                block_hash: ShellHash::from([3; 32]),
+                block_number: 1,
+                authorities: vec![AuthorityWeight { address, weight: 1 }],
+                signers: vec![address],
+            },
+            signatures: vec![BlockSignerEvidence {
+                address,
+                public_key: vec![4; 1952],
+                signature: PQSignature::new(SignatureType::MlDsa65, vec![5; 3309]),
+            }],
+        }
+    }
+    #[test]
+    fn donor_policy_matches_exact_signature_message_and_relocated_position() {
+        let donor = source();
+        let mut current = donor.clone();
+        current.context.authorities[0].weight = 2;
+        let mut added = current.signatures[0].clone();
+        added.address = Address::from([0; 32]);
+        added.public_key[0] ^= 1;
+        current.signatures.insert(0, added);
+        assert_eq!(
+            donor_component_name(&current, &donor, "commit-signer-1-key").as_deref(),
+            Some("commit-signer-0-key")
+        );
+        assert!(donor_component_name(&current, &donor, "commit-signer-0-key").is_none());
+        for name in [
+            "commit-weight",
+            "commit-signer-01-key",
+            "commit-signer-1-",
+            "commit-signer-2-key",
+        ] {
+            assert!(donor_component_name(&current, &donor, name).is_none());
+        }
+        for field in 0..5 {
+            let mut changed = current.clone();
+            match field {
+                0 => changed.context.block_hash = ShellHash::ZERO,
+                1 => changed.signatures[1].public_key[0] ^= 1,
+                2 => changed.signatures[1].signature.data[0] ^= 1,
+                3 => changed.signatures[1].signature.sig_type = SignatureType::Dilithium3,
+                _ => changed.signatures[1].address = Address::from([2; 32]),
+            };
+            assert!(donor_component_name(&changed, &donor, "commit-signer-1-key").is_none());
+        }
+    }
 }

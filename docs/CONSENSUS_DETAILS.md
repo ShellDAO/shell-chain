@@ -820,6 +820,26 @@ reuses retained public controls and proofs, tests backend failure rollback and
 activation/refusal boundaries, then compares complete Native rows to an
 independent ordinary importer before a cold history check.
 
+`prove_commit_quorum_persistent_reusing` reverifies a complete independent donor
+before destination checkpoints. Exact signature/key/address/tag and raw message
+matches permit checked component reuse across signer positions; the changed
+quorum context receives a new weight proof. Every borrowed component is still
+verified by its ordinary AIR verifier. Missing or invalid donor certificates
+refuse without repair or proof generation, and standard cold verification of
+the completed destination needs no donor. Native chain data remains separate.
+
+The SDK co-signing development entry retains three genuine signatures from an
+installed `ShellSigner`/`Dilithium3` adapter before disposing its temporary key.
+It combines them with the original primary certificates without changing block
+headers. A primary weight of 2 alone is exactly two thirds of total weight 3 and
+must refuse; both signers' full signature graphs plus the weight proof are
+required. `receive-one` checks atomic block-1 import, persistence, refusal and
+cold reopening under this trusted current authority configuration. It does not
+establish mixed-authority successor sync or history after a later state change:
+the original single-authority block 2 has a different weighted proposer under
+this configuration and needs the actual certified sync path. No proposer check
+is disabled to treat an ordinary import as certified.
+
 The bounded development profile supports at most sixteen lattice signers,
 including ML-DSA-65, genuine PQClean Dilithium3 and its existing SDK FIPS
 transcript. Existing checkpoint quotas still apply. SLH quorum signatures,

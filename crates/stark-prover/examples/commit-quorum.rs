@@ -1,8 +1,8 @@
 //! Separate source-bound RocksDB quorum proof jobs; never a Native chain store.
 use serde::{de::DeserializeOwned, Serialize};
 use shell_stark_prover::commit_quorum::{
-    prove_commit_quorum_persistent, reverify_commit_quorum_persistent, verify_commit_quorum,
-    CommitQuorumProof, CommitQuorumSource,
+    prove_commit_quorum_persistent, prove_commit_quorum_persistent_reusing,
+    reverify_commit_quorum_persistent, verify_commit_quorum, CommitQuorumProof, CommitQuorumSource,
 };
 use shell_storage::{KvStore, MemoryDb, RocksDbStore, WriteBatch};
 use std::{
@@ -110,6 +110,27 @@ fn main() -> Result<(), Error> {
             if progress.newly_proved != 0 || job.scan_all()? != rows { return Err("RocksDB checkpoint differs from original rows".into()); }
             println!("{}", serde_json::json!({"checkpointMigrated":true,"freshGeneration":false,"nativeAuthorization":false,"progress":progress}));
         }
+        Some("prove-reusing") if args.len() == 6 || args.len() == 7 => {
+            let source: CommitQuorumSource = read(Path::new(&args[1]))?;
+            let donor_source: CommitQuorumSource = read(Path::new(&args[4]))?;
+            let root=Path::new(&args[2]);let output=Path::new(&args[3]);let donor_root=Path::new(&args[5]);
+            let limit=args.get(6).map(|v|v.parse::<NonZeroUsize>()).transpose()?;
+            output_preflight(output,&source)?;
+            existing_root(donor_root,&donor_source)?;
+            if root == donor_root { return Err("donor and destination must be separate".into()); }
+            if root.exists() || root.is_symlink() { existing_root(root,&source)?; }
+            else { new_root(root,&source)?; }
+            let stores=RocksDbStore::open_all(root.join("db"),None)?;
+            let donor_stores=RocksDbStore::open_all(donor_root.join("db"),None)?;
+            let mut job=stores.chain;let mut donor=donor_stores.chain;
+            let before=donor.scan_all()?;
+            let result=prove_commit_quorum_persistent_reusing(&mut job,&source,limit,&mut donor,&donor_source);
+            if donor.scan_all()? != before { return Err("donor logical rows changed".into()); }
+            let (proof,progress)=result?;
+            verify_commit_quorum(&proof,&source)?;
+            write(output,&proof)?;
+            println!("{}",serde_json::json!({"fullSignatureAndWeightAirVerified":true,"donorRowsUnchanged":true,"nativeAuthorization":false,"progress":progress}));
+        }
         Some("prove" | "verify") if args.len() == 4 || (args[0] == "prove" && args.len() == 5) => {
             let source: CommitQuorumSource = read(Path::new(&args[1]))?;
             let limit = args.get(4).map(|v| v.parse::<NonZeroUsize>()).transpose()?;
@@ -137,7 +158,7 @@ fn main() -> Result<(), Error> {
             else { write(output, &proof)?; }
             println!("{}", serde_json::json!({"fullSignatureAndWeightAirVerified":true,"verificationOnly":verify_only,"nativeAuthorization":false,"progress":progress}));
         }
-        _ => return Err("usage: commit-quorum restore <source.cbor> <completed-job-rows.cbor> <new-job-directory> | prove <source.cbor> <separate-job-directory> <proof.cbor> [component-limit] | verify <source.cbor> <existing-job-directory> <proof.cbor>".into()),
+        _ => return Err("usage: commit-quorum prove-reusing <source.cbor> <separate-job-directory> <proof.cbor> <donor-source.cbor> <donor-job-directory> [component-limit] | restore <source.cbor> <completed-job-rows.cbor> <new-job-directory> | prove <source.cbor> <separate-job-directory> <proof.cbor> [component-limit] | verify <source.cbor> <existing-job-directory> <proof.cbor>".into()),
     }
     Ok(())
 }

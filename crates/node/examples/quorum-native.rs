@@ -17,6 +17,8 @@ const INITIAL: u64 = 1_000_000_000;
 
 #[derive(Serialize, Deserialize)]
 struct Control {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    co_authority: Option<(Address, Vec<u8>)>,
     authority: Address,
     authority_key: Vec<u8>,
     sender: Address,
@@ -94,6 +96,10 @@ fn node_on_store_with_activation<S: KvStore + 'static>(
         )?;
         chain.put_pubkey(&control.sender, &control.sender_key)?;
         chain.put_pubkey(&control.authority, &control.authority_key)?;
+        if let Some((address, key)) = &control.co_authority {
+            chain.put_pubkey(address, key)?;
+        }
+
         let cfg: ChainConfig = serde_json::from_value(
             serde_json::json!({"chain_id":1337,"genesis_hash":control.genesis.hash(),"fee_accounting_activation_height":1,"native_address_context_height":1,"block_commitment_height":commitment_height}),
         )?;
@@ -112,13 +118,26 @@ fn node_on_store_with_activation<S: KvStore + 'static>(
     config.chain_id = 1337;
     config.mempool.chain_id = 1337;
     config.enable_stark_aggregation = false;
-    let mut poa = WPoaConfig::from_poa(PoaConfig::new(vec![control.authority], 1));
+    if let Some((address, key)) = &control.co_authority {
+        ensure(
+            chain.get_pubkey(address)?.as_ref() == Some(key),
+            "co-authority registry mismatch",
+        )?;
+    }
+    let (authorities, weights) = authority_weights(control);
+    let mut poa = WPoaConfig::with_weights(PoaConfig::new(authorities, 1), weights);
     poa.chain_id = 1337;
     config.consensus = shell_node::ConsensusEngineConfig::WPoa(poa.clone());
     let pool = Arc::new(TxPool::new(config.mempool.clone()));
     let consensus: Arc<RwLock<dyn ConsensusEngine>> =
         Arc::new(RwLock::new(WPoaEngine::new(poa, Arc::new(MultiVerifier))));
     Ok(Node::new(config, store, chain, world, pool, consensus))
+}
+fn authority_weights(c: &Control) -> (Vec<Address>, Vec<u64>) {
+    match &c.co_authority {
+        Some((address, _)) => (vec![c.authority, *address], vec![2, 1]),
+        None => (vec![c.authority], vec![1]),
+    }
 }
 fn balances<S: KvStore + 'static>(node: &Node<S>, c: &Control, count: usize) -> Result<(), Error> {
     let state = node.world_state.read();
@@ -143,6 +162,7 @@ fn prepare(root: &Path) -> Result<(), Error> {
     let authority = MlDsaSigner::generate();
     let sender = DilithiumSigner::generate();
     let mut c = Control {
+        co_authority: None,
         authority: Address::from_public_key(authority.public_key(), authority.sig_type().as_u8()),
         authority_key: authority.public_key().to_vec(),
         sender: Address::from_public_key(sender.public_key(), sender.sig_type().as_u8()),
@@ -360,7 +380,7 @@ fn verify(root: &Path, proof_file: &Path) -> Result<(), Error> {
             &proof,
         )?;
         ensure(
-            result.proved_commit_signatures == 1
+            result.proved_commit_signatures == source.signatures.len()
                 && result.execution.proved_sender_signatures == 0
                 && result.execution.state_root == c.blocks[0].header.state_root
                 && Some(result.execution.receipts.clone())
@@ -407,7 +427,7 @@ fn verify(root: &Path, proof_file: &Path) -> Result<(), Error> {
         current
             .consensus
             .write()
-            .set_authorities_with_weights(vec![c.authority], vec![1]);
+            .set_authorities_with_weights(authority_weights(&c).0, authority_weights(&c).1);
         ensure(
             changed_weight_refused,
             "changed current quorum weights accepted",
@@ -503,6 +523,7 @@ fn inspect(root: &Path) -> Result<(), Error> {
             .from;
         let authority = block.header.proposer;
         Control {
+            co_authority: None,
             authority,
             authority_key: chain
                 .get_pubkey(&authority)?
@@ -617,6 +638,7 @@ fn receive(
     root: &Path,
     fresh: bool,
     resume: bool,
+    count: usize,
 ) -> Result<(), Error> {
     use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
     let c: Control = read(&controls.join("control.cbor"))?;
@@ -654,7 +676,7 @@ fn receive(
             "resume requires original unchanged genesis controls",
         )?;
         let before = receiver.store.scan_all()?;
-        for case in 0..7 {
+        for case in 0..if c.co_authority.is_some() { 8 } else { 7 } {
             let mut altered = proof.clone();
             let mut cert = c.certificates[0].clone();
             let mut block = c.blocks[0].clone();
@@ -673,6 +695,9 @@ fn receive(
                 }
                 4 => parent = c.blocks[0].hash(),
                 5 => block.transactions[0].signature.data[0] ^= 1,
+                7 => {
+                    altered.signatures.pop();
+                }
                 _ => receiver
                     .consensus
                     .write()
@@ -684,7 +709,7 @@ fn receive(
             receiver
                 .consensus
                 .write()
-                .set_authorities_with_weights(vec![c.authority], vec![1]);
+                .set_authorities_with_weights(authority_weights(&c).0, authority_weights(&c).1);
             ensure(
                 refused
                     && receiver.store.scan_all()? == before
@@ -770,7 +795,7 @@ fn receive(
             &proof,
         )?;
         ensure(
-            result.proved_commit_signatures == 1
+            result.proved_commit_signatures == source.signatures.len()
                 && result.execution.proved_sender_signatures == 0
                 && result.execution.state_root == c.blocks[0].header.state_root
                 && Some(result.execution.receipts)
@@ -778,20 +803,37 @@ fn receive(
                 && receiver.finality.read().last_finalized_number() == 1,
             "atomic full quorum import result differs",
         )?;
+        if c.co_authority.is_some() {
+            let primary = source
+                .signatures
+                .iter()
+                .find(|e| e.address == c.authority)
+                .ok_or("primary entry absent")?;
+            let only = Node::<RocksDbStore>::encode_commit_certificate(&HashMap::from([(
+                c.authority,
+                primary.signature.clone(),
+            )]))?;
+            let rows = receiver.store.scan_all()?;
+            ensure(
+                !receiver.fast_finalize_with_certificate(1, c.blocks[0].hash(), &only)
+                    && receiver.store.scan_all()? == rows,
+                "exact two-thirds primary-only certificate accepted",
+            )?;
+        }
         normal.import_block(c.blocks[0].clone(), &MultiVerifier)?;
         ensure(
             normal.fast_finalize_with_certificate(1, c.blocks[0].hash(), &c.certificates[0]),
             "Native reference finality failed",
         )?;
-        for block in &c.blocks[1..] {
+        for block in &c.blocks[1..count] {
             receiver.import_block(block.clone(), &MultiVerifier)?;
             normal.import_block(block.clone(), &MultiVerifier)?;
         }
         receiver.store.flush()?;
         normal.store.flush()?;
     }
-    balances(&receiver, &c, 3)?;
-    balances(&normal, &c, 3)?;
+    balances(&receiver, &c, count)?;
+    balances(&normal, &c, count)?;
     ensure(
         receiver.store.scan_all()? == normal.store.scan_all()?,
         "atomic/ordinary independent Native stores differ",
@@ -816,7 +858,7 @@ fn receive(
     )?;
     let before = receiver.store.scan_all()?;
     let result = receiver.replay_canonical_block_with_commit_proof(
-        c.blocks[2].hash(),
+        c.blocks[count - 1].hash(),
         c.blocks[0].hash(),
         &c.certificates[0],
         &proof,
@@ -825,7 +867,7 @@ fn receive(
     ensure(
         result
             == normal.replay_canonical_block_with_commit_proof(
-                c.blocks[2].hash(),
+                c.blocks[count - 1].hash(),
                 c.blocks[0].hash(),
                 &c.certificates[0],
                 &proof,
@@ -844,17 +886,152 @@ fn receive(
     )?;
     println!(
         "{}",
-        serde_json::json!({"freshAtomicImport":fresh || resume,"resumedOriginalPartial":resume,"backendFailureRollbackChecked":fresh || resume,"independentNativeRowsEqual":true,"currentHeight":3,"finalized":1,"commitSignaturesProved":1,"senderAndProposerCryptoNative":true,"historicalRowsUnchanged":true,"originalControlsAndProofReused":true,"newSigningOrProofGeneration":false,"realPeerTransport":false})
+        serde_json::json!({"freshAtomicImport":fresh || resume,"resumedOriginalPartial":resume,"backendFailureRollbackChecked":fresh || resume,"independentNativeRowsEqual":true,"currentHeight":count,"finalized":1,"commitSignaturesProved":source.signatures.len(),"senderAndProposerCryptoNative":true,"historicalRowsUnchanged":true,"originalControlsAndProofReused":true,"newSigningOrProofGeneration":false,"realPeerTransport":false})
+    );
+    Ok(())
+}
+fn co_sign_input(controls: &Path, output: &Path) -> Result<(), Error> {
+    let c: Control = read(&controls.join("control.cbor"))?;
+    ensure(
+        c.blocks.len() == 3 && c.certificates.len() == 3,
+        "complete original controls required",
+    )?;
+    let value = serde_json::json!({"version":1,"messages":c.blocks.iter().map(|b|format!("0x{}",hex::encode(b.hash().as_bytes()))).collect::<Vec<_>>()});
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)?;
+    serde_json::to_writer(&file, &value)?;
+    file.sync_all()?;
+    Ok(())
+}
+fn augment(controls: &Path, signed: &Path, output: &Path) -> Result<(), Error> {
+    use shell_core::BlockSignerEvidence;
+    use shell_crypto::{PQSignature, SignatureType, Verifier};
+    use shell_stark_prover::weighted_quorum::AuthorityWeight;
+    let mut c: Control = read(&controls.join("control.cbor"))?;
+    let mut source: CommitQuorumSource = read(&controls.join("source.cbor"))?;
+    ensure(
+        c.co_authority.is_none()
+            && c.blocks.len() == 3
+            && source.signatures.len() == 1
+            && source.context.chain_id == 1337
+            && source.context.block_hash == c.blocks[0].hash()
+            && source.signatures[0].address == c.authority
+            && source.signatures[0].public_key == c.authority_key,
+        "original single primary controls required",
+    )?;
+    let file = std::fs::File::open(signed)?;
+    ensure(file.metadata()?.len() <= 128 * 1024, "co-sign input bound")?;
+    let value: serde_json::Value = serde_json::from_reader(file)?;
+    ensure(
+        value["version"] == 1 && value["algorithm"] == "Dilithium3",
+        "co-sign format/tag mismatch",
+    )?;
+    let key = hex::decode(
+        value["publicKey"]
+            .as_str()
+            .ok_or("co-key absent")?
+            .trim_start_matches("0x"),
+    )?;
+    let address: Address = serde_json::from_value(value["address"].clone())?;
+    ensure(
+        address == Address::from_public_key(&key, 0) && address != c.authority,
+        "SDK address/key mismatch",
+    )?;
+    let signatures = value["signatures"]
+        .as_array()
+        .ok_or("co-signatures absent")?;
+    ensure(signatures.len() == 3, "all original co-signatures required")?;
+    for (i, block) in c.blocks.iter().enumerate() {
+        let message = hex::decode(
+            signatures[i]["message"]
+                .as_str()
+                .ok_or("co-message absent")?
+                .trim_start_matches("0x"),
+        )?;
+        let sig = PQSignature::new(
+            SignatureType::Dilithium3,
+            hex::decode(
+                signatures[i]["signature"]
+                    .as_str()
+                    .ok_or("co-signature absent")?
+                    .trim_start_matches("0x"),
+            )?,
+        );
+        ensure(
+            message == block.hash().as_bytes()
+                && shell_crypto::DilithiumVerifier.verify_sdk_transcript(&key, &message, &sig)
+                && !shell_crypto::DilithiumVerifier.verify_legacy_transcript(&key, &message, &sig),
+            "co-signature is not SDK FIPS transcript",
+        )?;
+        let original: HashMap<String, PQSignature> = serde_json::from_slice(&c.certificates[i])?;
+        ensure(
+            original.len() == 1,
+            "single original primary certificate required",
+        )?;
+        let primary = original
+            .get(&c.authority.to_string())
+            .ok_or("primary signature absent")?
+            .clone();
+        ensure(
+            MultiVerifier.verify(&c.authority_key, &message, &primary)?,
+            "original primary signature invalid",
+        )?;
+        c.certificates[i] = Node::<RocksDbStore>::encode_commit_certificate(&HashMap::from([
+            (c.authority, primary),
+            (address, sig.clone()),
+        ]))?;
+        if i == 0 {
+            source.signatures.push(BlockSignerEvidence {
+                address,
+                public_key: key.clone(),
+                signature: sig,
+            });
+        }
+    }
+    c.co_authority = Some((address, key));
+    source
+        .signatures
+        .sort_by(|a, b| a.address.as_bytes().cmp(b.address.as_bytes()));
+    source.context.signers = source.signatures.iter().map(|e| e.address).collect();
+    source.context.authorities = vec![
+        AuthorityWeight {
+            address: c.authority,
+            weight: 2,
+        },
+        AuthorityWeight { address, weight: 1 },
+    ];
+    source
+        .context
+        .authorities
+        .sort_by(|a, b| a.address.as_bytes().cmp(b.address.as_bytes()));
+    std::fs::create_dir(output)?;
+    write(&output.join("control.cbor"), &c)?;
+    write(&output.join("source.cbor"), &source)?;
+    for (i, block) in c.blocks.iter().enumerate() {
+        write(&output.join(format!("block-{}.cbor", i + 1)), block)?;
+        write(
+            &output.join(format!("certificate-{}.cbor", i + 1)),
+            &c.certificates[i],
+        )?;
+    }
+    println!(
+        "{}",
+        serde_json::json!({"originalBlocksUnchanged":true,"originalPrimarySignaturesReused":3,"SDKCoSignaturesVerified":3,"primaryWeight":2,"coWeight":1,"primaryProofPosition":source.signatures.iter().position(|e|e.address==c.authority),"newPrimarySigning":false,"threeBlockMixedNativeFollowAcceptance":false})
     );
     Ok(())
 }
 fn main() -> Result<(), Error> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("receive" | "receive-resume" | "receive-verify") if args.len() == 4 => receive(Path::new(&args[1]), Path::new(&args[2]), Path::new(&args[3]), args[0] == "receive", args[0] == "receive-resume"),
+        Some("co-sign-input") if args.len()==3 => co_sign_input(Path::new(&args[1]),Path::new(&args[2])),
+        Some("augment") if args.len()==4 => augment(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3])),
+
+        Some("receive" | "receive-resume" | "receive-verify" | "receive-one" | "receive-one-verify") if args.len() == 4 => receive(Path::new(&args[1]), Path::new(&args[2]), Path::new(&args[3]), args[0] == "receive" || args[0] == "receive-one", args[0] == "receive-resume", if args[0].starts_with("receive-one") {1} else {3}),
         Some("prepare") if args.len() == 2 => prepare(Path::new(&args[1])),
         Some("inspect") if args.len() == 2 => inspect(Path::new(&args[1])),
         Some("verify") if args.len() == 3 => verify(Path::new(&args[1]), Path::new(&args[2])),
-        _ => Err("usage: quorum-native prepare <new-control-directory> | inspect <control-directory> | verify <control-directory> <full-quorum-proof.cbor> | receive <original-controls> <full-proof.cbor> <new-import-directory> | receive-resume <original-controls> <full-proof.cbor> <original-genesis-import-directory> | receive-verify <original-controls> <full-proof.cbor> <existing-import-directory>".into()),
+        _ => Err("usage: quorum-native co-sign-input <original-controls> <new-messages.json> | augment <original-controls> <sdk-signatures.json> <new-two-signer-controls> | receive-one <two-signer-controls> <full-proof.cbor> <new-import-directory> | receive-one-verify <two-signer-controls> <full-proof.cbor> <existing-import-directory> | prepare <new-control-directory> | inspect <control-directory> | verify <control-directory> <full-quorum-proof.cbor> | receive <original-controls> <full-proof.cbor> <new-import-directory> | receive-resume <original-controls> <full-proof.cbor> <original-genesis-import-directory> | receive-verify <original-controls> <full-proof.cbor> <existing-import-directory>".into()),
     }
 }

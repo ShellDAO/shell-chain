@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Reuse verified commit-signer components across independently pinned quorum jobs when the exact key, address, signature, transcript and raw message match, including changed signer positions. Reprove changed weight context, recheck every borrowed component and keep incomplete or invalid donors from triggering repair. Add a source SDK co-signing entry and a bounded two-authority first-block atomic import check; multi-authority certified successor transport and later-state history remain separate acceptance.
+
 - Add an exclusive offline fresh-child import that requires complete commit-signature and weight AIR before Native execution. Commit the executed state, canonical block, receipts, original certificate, signer evidence and finality in one backend batch; an injected final-batch failure leaves durable rows and in-memory state unchanged. Reuse retained genuine blocks and proofs for independent Native and process-cold history checks.
 
 - Add read-only canonical replay with full commit-signature and weight proofs alongside Native transaction execution. A self-contained RocksDB example creates genuine primary-authority quorums and three transfers, proof-finalizes an independent receiver, and checks historical receipts, fees, balances and refusal paths after later state changes. Authority context remains independently trusted; historical validator provenance, peer transport and public activation require separate acceptance.
