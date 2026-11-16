@@ -1,4 +1,4 @@
-//! Full lattice-signature AIR and strict weight AIR for an expected commit context.
+//! Full signature AIR and strict weight AIR for an expected commit context.
 //! Native supplies current authority keys and weights independently. Historical
 //! provenance, proposer selection and penalty lifecycle are not proved here.
 use crate::{
@@ -15,6 +15,7 @@ use shell_storage::KvStore;
 use std::num::NonZeroUsize;
 
 pub mod payload;
+pub mod slh;
 
 pub const MAX_COMMIT_PROOF_SIGNERS: usize = 16;
 
@@ -38,12 +39,16 @@ impl CommitQuorumSource {
         }
         for (entry, address) in self.signatures.iter().zip(&self.context.signers) {
             if entry.address != *address
-                || entry.public_key.len() != 1952
-                || entry.signature.data.len() != 3309
-                || !matches!(
-                    entry.signature.sig_type,
-                    SignatureType::MlDsa65 | SignatureType::Dilithium3
-                )
+                || !match entry.signature.sig_type {
+                    SignatureType::MlDsa65 | SignatureType::Dilithium3 => {
+                        entry.public_key.len() == 1952 && entry.signature.data.len() == 3309
+                    }
+                    SignatureType::SphincsSha2256f => {
+                        entry.public_key.len() == 64
+                            && entry.signature.data.len()
+                                == crate::slh_fors::SLH_SHA2_256F_SIGNATURE_BYTES
+                    }
+                }
                 || shell_crypto::infer_signature_type_from_address(&entry.public_key, address)
                     != Some(entry.signature.sig_type)
             {
@@ -61,6 +66,13 @@ pub struct CommitQuorumProof {
     pub weight: QuorumWeightProof,
     #[serde(deserialize_with = "payload::deserialize_signatures")]
     pub signatures: Vec<Mldsa65VerificationProof>,
+    /// Empty and omitted in legacy version one; version two carries complete SLH graphs.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "payload::deserialize_slh_signatures"
+    )]
+    pub slh_signatures: Vec<slh::CommitSlhProof>,
 }
 
 /// Only full proof verification constructs this exact-tuple verifier. It is not
@@ -103,11 +115,30 @@ pub fn verify_commit_quorum(
     expected: &CommitQuorumSource,
 ) -> Result<VerifiedCommitQuorum, String> {
     expected.validate()?;
-    if proof.version != 1 || proof.signatures.len() != expected.signatures.len() {
+    let slh_count = expected
+        .signatures
+        .iter()
+        .filter(|e| e.signature.sig_type == SignatureType::SphincsSha2256f)
+        .count();
+    if proof.version != if slh_count == 0 { 1 } else { 2 }
+        || proof.signatures.len() != expected.signatures.len() - slh_count
+        || proof.slh_signatures.len() != slh_count
+    {
         return Err("commit proof version/signature count mismatch".into());
     }
     verify_quorum_weight(&proof.weight, &expected.context)?;
-    for (proof, entry) in proof.signatures.iter().zip(&expected.signatures) {
+    let mut lattice = proof.signatures.iter();
+    let mut slh = proof.slh_signatures.iter();
+    for entry in &expected.signatures {
+        if entry.signature.sig_type == SignatureType::SphincsSha2256f {
+            slh::verify(
+                slh.next().ok_or("commit SLH proof absent")?,
+                entry,
+                &expected.context.block_hash,
+            )?;
+            continue;
+        }
+        let proof = lattice.next().ok_or("commit lattice proof absent")?;
         let verify = match (entry.signature.sig_type, proof.version) {
             (SignatureType::MlDsa65 | SignatureType::Dilithium3, 1) => verify_mldsa65,
             (SignatureType::Dilithium3, 2) => verify_dilithium3,
@@ -258,14 +289,25 @@ fn commit_quorum_persistent<S: KvStore>(
                     message,
                     &entry.signature,
                 ),
-                _ => false,
+                SignatureType::SphincsSha2256f => shell_crypto::SphincsVerifier
+                    .verify(&entry.public_key, message, &entry.signature)
+                    .unwrap_or(false),
             };
         if !valid {
             return Err("invalid commit source signature".to_string().into());
         }
         legacy.push(raw);
     }
-    let bytes = bounded_json(&("commit-signature-weight-v1", source), 1024 * 1024)?;
+    let has_slh = source
+        .signatures
+        .iter()
+        .any(|e| e.signature.sig_type == SignatureType::SphincsSha2256f);
+    let domain = if has_slh {
+        "commit-signature-weight-v2"
+    } else {
+        "commit-signature-weight-v1"
+    };
+    let bytes = bounded_json(&(domain, source), 1024 * 1024)?;
     let mut job = if read_only {
         ProductionStore::open_existing_shared_matrix(store, &bytes)?
     } else {
@@ -284,7 +326,17 @@ fn commit_quorum_persistent<S: KvStore>(
             |p| verify_quorum_weight(p, &source.context).map(|_| ()),
         )?;
         let mut signatures = Vec::with_capacity(source.signatures.len());
+        let mut slh_signatures = Vec::new();
         for (i, (entry, raw)) in source.signatures.iter().zip(legacy).enumerate() {
+            if entry.signature.sig_type == SignatureType::SphincsSha2256f {
+                slh_signatures.push(slh::prove(
+                    &mut job,
+                    &format!("commit-signer-{i}"),
+                    entry,
+                    &source.context.block_hash,
+                )?);
+                continue;
+            }
             signatures.push(crate::canonical_producer::prove_signature(
                 &mut job,
                 &format!("commit-signer-{i}"),
@@ -295,9 +347,10 @@ fn commit_quorum_persistent<S: KvStore>(
             )?);
         }
         let proof = CommitQuorumProof {
-            version: 1,
+            version: if has_slh { 2 } else { 1 },
             weight,
             signatures,
+            slh_signatures,
         };
         verify_commit_quorum(&proof, source)?;
         Ok(proof)
@@ -330,6 +383,140 @@ mod tests {
                 signature: PQSignature::new(SignatureType::MlDsa65, vec![5; 3309]),
             }],
         }
+    }
+
+    fn slh_source() -> CommitQuorumSource {
+        use shell_crypto::{Signer, SphincsSigner};
+        let signer = SphincsSigner::generate();
+        let mut source = source();
+        let address = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        source.context.authorities[0].address = address;
+        source.context.signers[0] = address;
+        source.signatures[0] = BlockSignerEvidence {
+            address,
+            public_key: signer.public_key().to_vec(),
+            signature: signer.sign(source.context.block_hash.as_bytes()).unwrap(),
+        };
+        source
+    }
+    #[test]
+    fn genuine_slh_source_pauses_after_weight_and_read_only_reopen_never_heals_missing_graph() {
+        use shell_storage::MemoryDb;
+        let source = slh_source();
+        source.validate().unwrap();
+        let mut db = MemoryDb::new();
+        assert!(matches!(
+            prove_commit_quorum_persistent(&mut db, &source, NonZeroUsize::new(1)),
+            Err(ProductionError::Paused)
+        ));
+        let rows = db.scan_all().unwrap();
+        assert!(rows
+            .iter()
+            .any(|(k, _)| k.as_slice() == b"production/component/commit-weight"));
+        assert!(!rows
+            .iter()
+            .any(|(k, _)| k.starts_with(b"production/component/commit-signer-0-fors-")));
+        // Reuse the genuine stored weight certificate; a native-valid signature
+        // and correct arithmetic still cannot stand in for the full SLH graph.
+        let frozen = bounded_json(&("commit-signature-weight-v2", &source), 1024 * 1024).unwrap();
+        let weight: QuorumWeightProof = {
+            let mut reader =
+                ProductionStore::open_existing_shared_matrix(&mut db, &frozen).unwrap();
+            reader
+                .checkpoint(
+                    "commit-weight",
+                    || Err("must not regenerate cached weight".into()),
+                    |p| verify_quorum_weight(p, &source.context).map(|_| ()),
+                )
+                .unwrap()
+        };
+        let entry = &source.signatures[0];
+        assert!(shell_crypto::SphincsVerifier
+            .verify(
+                &entry.public_key,
+                source.context.block_hash.as_bytes(),
+                &entry.signature
+            )
+            .unwrap());
+        let input = crate::slh_fors::SlhForsInputs {
+            public_seed: entry.public_key[..32].try_into().unwrap(),
+            public_root: entry.public_key[32..].try_into().unwrap(),
+            message: *source.context.block_hash.as_bytes(),
+            signature: entry.signature.data.to_vec(),
+        };
+        let incomplete = CommitQuorumProof {
+            version: 2,
+            weight,
+            signatures: vec![],
+            slh_signatures: vec![slh::CommitSlhProof {
+                version: 2,
+                manifest: crate::slh_signature::SlhSignatureManifest::new(input.clone()),
+                fors: crate::slh_fors::SlhForsProof {
+                    version: 1,
+                    inputs: input,
+                    hashes: vec![],
+                },
+                layers: vec![],
+            }],
+        };
+        assert!(verify_commit_quorum(&incomplete, &source)
+            .unwrap_err()
+            .contains("layer count"));
+        assert_eq!(db.scan_all().unwrap(), rows);
+
+        assert!(reverify_commit_quorum_persistent(&mut db, &source).is_err());
+        assert_eq!(db.scan_all().unwrap(), rows);
+        let mut changed = source.clone();
+        changed.signatures[0].signature.data[0] ^= 1;
+        assert!(prove_commit_quorum_persistent(&mut db, &changed, NonZeroUsize::new(1)).is_err());
+        assert_eq!(db.scan_all().unwrap(), rows);
+    }
+    #[test]
+    fn legacy_payload_has_exact_old_three_field_encoding_and_cannot_authorize_slh() {
+        #[derive(Serialize)]
+        struct Legacy<'a> {
+            version: u8,
+            weight: &'a QuorumWeightProof,
+            signatures: &'a Vec<Mldsa65VerificationProof>,
+        }
+        let source = slh_source();
+        let mut proof = CommitQuorumProof {
+            version: 1,
+            weight: QuorumWeightProof {
+                version: 1,
+                context: source.context.clone(),
+                prefixes: vec![[0, 0]],
+                proof_bytes: vec![1],
+            },
+            signatures: vec![],
+            slh_signatures: vec![],
+        };
+        let old = crate::compact_canonical::cbor(
+            &Legacy {
+                version: 1,
+                weight: &proof.weight,
+                signatures: &proof.signatures,
+            },
+            4096,
+        )
+        .unwrap();
+        let encoded = payload::encode(&proof, 4096).unwrap();
+        assert_eq!(
+            encoded,
+            [b"\0commit-quorum/cbor/v1/".as_slice(), old.as_slice()].concat()
+        );
+        assert!(verify_commit_quorum(&proof, &source)
+            .unwrap_err()
+            .contains("signature count"));
+        proof.version = 2;
+        assert!(payload::encode(&proof, 4096).is_err());
+        assert!(verify_commit_quorum(&proof, &source).is_err());
+        let mut changed = source.clone();
+        changed.signatures[0].public_key.push(0);
+        assert!(changed.validate().is_err());
+        changed = source.clone();
+        changed.signatures[0].signature.sig_type = SignatureType::MlDsa65;
+        assert!(changed.validate().is_err());
     }
     #[test]
     fn donor_policy_matches_exact_signature_message_and_relocated_position() {

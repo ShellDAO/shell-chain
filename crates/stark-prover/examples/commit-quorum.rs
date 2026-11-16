@@ -86,6 +86,29 @@ fn output_preflight(output: &Path, source: &CommitQuorumSource) -> Result<(), Er
 fn main() -> Result<(), Error> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("verify-wire") if args.len()==3 => {
+            let source:CommitQuorumSource=read(Path::new(&args[1]))?;
+            let proof:CommitQuorumProof=read(Path::new(&args[2]))?;
+            verify_commit_quorum(&proof,&source)?;
+            check_output(Path::new(&args[2]),&proof)?;
+            let payload=shell_stark_prover::commit_quorum::payload::encode(&proof,shell_core::MAX_CANONICAL_PROOF_BYTES as usize)?;
+            let restored=shell_stark_prover::commit_quorum::payload::decode(&payload)?;
+            verify_commit_quorum(&restored,&source)?;
+            if shell_stark_prover::commit_quorum::payload::encode(&restored,payload.len())?!=payload {return Err("quorum wire roundtrip changed bytes".into());}
+            println!("{}",serde_json::json!({"fullWeightAndSignatureAIRVerified":true,"proofVersion":proof.version,"originalProofCBORUnchanged":true,"payloadRoundtripByteEqual":true,"signers":source.signatures.len(),"newSigningOrProving":false}));
+        }
+        Some("checkpoints") if args.len()==3 => {
+            let source:CommitQuorumSource=read(Path::new(&args[1]))?;
+            let root=Path::new(&args[2]);existing_root(root,&source)?;
+            let stores=RocksDbStore::open_all(root.join("db"),None)?;let mut job=stores.chain;
+            let before=job.scan_all()?;
+            let result=reverify_commit_quorum_persistent(&mut job,&source);
+            if job.scan_all()?!=before {return Err("read-only checkpoint verification changed logical rows".into());}
+            let retained=before.iter().filter(|(key,_)|key.starts_with(b"production/component/")).count();
+            println!("{}",serde_json::json!({"checkpointReplayReadOnly":true,"complete":result.is_ok(),"retainedComponents":retained,"nativeAuthorization":false,"firstRefusal":result.as_ref().err().map(ToString::to_string)}));
+            let(proof,progress)=result?;verify_commit_quorum(&proof,&source)?;
+            if progress.newly_proved!=0 {return Err("read-only checkpoint verification generated a component".into());}
+        }
         Some("restore") if args.len() == 4 => {
             let source: CommitQuorumSource = read(Path::new(&args[1]))?;
             let root = Path::new(&args[3]);
@@ -158,7 +181,7 @@ fn main() -> Result<(), Error> {
             else { write(output, &proof)?; }
             println!("{}", serde_json::json!({"fullSignatureAndWeightAirVerified":true,"verificationOnly":verify_only,"nativeAuthorization":false,"progress":progress}));
         }
-        _ => return Err("usage: commit-quorum prove-reusing <source.cbor> <separate-job-directory> <proof.cbor> <donor-source.cbor> <donor-job-directory> [component-limit] | restore <source.cbor> <completed-job-rows.cbor> <new-job-directory> | prove <source.cbor> <separate-job-directory> <proof.cbor> [component-limit] | verify <source.cbor> <existing-job-directory> <proof.cbor>".into()),
+        _ => return Err("usage: commit-quorum checkpoints <source.cbor> <existing-job-directory> | verify-wire <source.cbor> <proof.cbor> | prove-reusing <source.cbor> <separate-job-directory> <proof.cbor> <donor-source.cbor> <donor-job-directory> [component-limit] | restore <source.cbor> <completed-job-rows.cbor> <new-job-directory> | prove <source.cbor> <separate-job-directory> <proof.cbor> [component-limit] | verify <source.cbor> <existing-job-directory> <proof.cbor>".into()),
     }
     Ok(())
 }
@@ -204,7 +227,50 @@ mod quorum_payload_boundaries {
                 proof_bytes: vec![1, 2],
             },
             signatures: vec![],
+            slh_signatures: vec![],
         }
+    }
+    #[test]
+    fn slh_payload_domain_and_signer_bound_do_not_grant_cryptographic_authority() {
+        use shell_stark_prover::{
+            commit_quorum::slh::CommitSlhProof,
+            slh_fors::{SlhForsInputs, SlhForsProof},
+            slh_signature::SlhSignatureManifest,
+        };
+        let input = SlhForsInputs {
+            public_seed: [1; 32],
+            public_root: [2; 32],
+            message: [3; 32],
+            signature: vec![],
+        };
+        let raw = CommitSlhProof {
+            version: 2,
+            manifest: SlhSignatureManifest::new(input.clone()),
+            fors: SlhForsProof {
+                version: 1,
+                inputs: input,
+                hashes: vec![],
+            },
+            layers: vec![],
+        };
+        let mut proof = untrusted_fixture();
+        proof.version = 2;
+        proof.slh_signatures = vec![raw.clone()];
+        let encoded = payload::encode(&proof, 16_384).unwrap();
+        assert!(encoded.starts_with(b"\0commit-quorum/cbor/v2/"));
+        assert_eq!(payload::decode(&encoded).unwrap().slh_signatures.len(), 1);
+        let prefix = b"\0commit-quorum/cbor/v2/";
+        let wrong = [
+            b"\0commit-quorum/cbor/v1/".as_slice(),
+            &encoded[prefix.len()..],
+        ]
+        .concat();
+        assert!(payload::decode(&wrong).is_err());
+        proof.version = 1;
+        assert!(payload::encode(&proof, 16_384).is_err());
+        proof.version = 2;
+        proof.slh_signatures = vec![raw; 17];
+        assert!(payload::encode(&proof, 16_384).is_err());
     }
     #[test]
     fn exact_budget_domain_trailer_and_noncanonical_map() {

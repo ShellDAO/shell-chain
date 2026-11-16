@@ -717,3 +717,63 @@ test controls and the existing complete proof, performs no new authority signing
 or proving, and exits nonzero on failure while retaining the stores. The RPC-only
 phase makes the consumption boundary deterministic; it does not suspend a running
 event loop or qualify power-loss durability, process crashes or network activation.
+
+
+## Experimental SHA2-256f commit-signature composition
+
+The proof-job backend also accepts a genuine SHA2-256f authority source. It
+combines strict weight AIR with the existing complete FORS and seventeen-layer
+XMSS/WOTS graph for each SLH signer. The explicit wide-WOTS profile retains the
+original security options and all layers. Native signature checks select valid
+production inputs; they never replace missing AIR certificates during proof
+verification. This source-only extension remains experimental: complete SLH
+output, its availability size and positive end-to-end Native acceptance are
+still pending validation. It does not change the current accumulator protocol,
+network activation or default-off admission/production settings.
+
+Lattice-only sources keep their original job binding, version-one proof and
+byte-identical `commit-quorum/cbor/v1` payload. Sources containing SLH use a
+separate version-two job binding and payload domain. Version two carries lattice
+and SLH certificates in separate bounded lists; independently expected signer
+order and algorithm select each certificate. Counts, complete inputs and every
+signature graph must match before any proof-backed verifier is returned. The
+shared 256 MiB availability cap and maximum sixteen signers remain unchanged;
+a complete artifact must actually fit before availability can be claimed.
+The public Rust proof struct adds an optional `slh_signatures` list. Existing
+Rust struct literals need `slh_signatures: Vec::new()`; its empty value is omitted
+from legacy serialization.
+
+Use fresh local test controls and a separate proof job:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- prepare-slh slh-quorum-controls
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- inspect-slh slh-quorum-controls
+cargo run --locked -p shell-stark-prover --example commit-quorum -- prove slh-quorum-controls/source.cbor slh-quorum-job slh-quorum-proof.cbor 1
+cargo run --locked -p shell-stark-prover --example commit-quorum -- checkpoints slh-quorum-controls/source.cbor slh-quorum-job
+```
+
+Preparation generates temporary keys, runs an ordinary Native transfer with a
+real SLH authority block/certificate and an independent follower, then discards
+the private keys. It preserves signed controls before source validation. Inspect
+reuses those exact controls and refuses conflicting retained sources. A component
+limit applies to newly generated certificates: a bounded pause exits nonzero,
+keeps verified checkpoints and does not create a complete proof output. Resume
+with the same `prove` inputs and job; do not repeat preparation. `checkpoints`
+replays retained components without generating missing certificates or changing
+logical rows, reports the first refusal and exits nonzero while incomplete.
+Neither a retained component count nor an ordinary Native certificate authorizes
+full-quorum AIR import.
+
+Only after the complete graph exists, verify and import it:
+
+```sh
+cargo run --locked -p shell-stark-prover --example commit-quorum -- verify slh-quorum-controls/source.cbor slh-quorum-job slh-quorum-proof.cbor
+cargo run --locked -p shell-stark-prover --example commit-quorum -- verify-wire slh-quorum-controls/source.cbor slh-quorum-proof.cbor
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- accept-slh slh-quorum-controls slh-quorum-proof.cbor slh-quorum-import
+```
+
+The import entry requires full AIR verification before the atomic canonical
+write and compares cold persisted rows, receipts, balances, nonce, fees and
+finalized height with the independent Native control. Invalid or cross-profile
+proofs must leave genesis rows/finality unchanged with no child receipts. The
+positive SLH endpoint remains open until this complete sequence succeeds.

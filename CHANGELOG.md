@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add experimental SHA2-256f commit-signature AIR composition with full FORS/seventeen-layer graphs, source-bound resumable jobs and a separate v2 payload. Preserve lattice v1 serialized bytes; complete SLH output and Native end-to-end validation remain pending. Rust proof literals now include an empty `slh_signatures` list.
 - Add an authenticated HTTP and physical cold-reopen regression for queued explicit quorum recheck intent: preserve proof bytes and genesis state before consumption, then require one complete event-loop verification and independently persisted Native results across restart.
 - Add a real peer/RPC regression proving that a correctly hashed but cryptographically altered quorum payload remains rejected after an explicit retry and cold reopen, with unchanged canonical state.
 - Connect authenticated explicit recheck of intact rejected full-QC candidates to a durable proof-bound request consumed by the canonical event loop. Preserve generation and bytes, keep automatic retries off, and require complete reverification before Native commit.

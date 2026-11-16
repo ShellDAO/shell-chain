@@ -5,7 +5,7 @@ use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shell_consensus::{ConsensusEngine, PoaConfig, WPoaConfig, WPoaEngine};
 use shell_core::{Account, Block, BlockHeader, SignedTransaction, Transaction};
-use shell_crypto::{DilithiumSigner, MlDsaSigner, MultiVerifier, Signer};
+use shell_crypto::{DilithiumSigner, MlDsaSigner, MultiVerifier, Signer, SphincsSigner};
 use shell_mempool::TxPool;
 use shell_node::{Node, NodeConfig};
 use shell_primitives::{blake3_hash, Address, U256};
@@ -159,9 +159,13 @@ fn balances<S: KvStore + 'static>(node: &Node<S>, c: &Control, count: usize) -> 
         "Native nonce/value/fee balance mismatch",
     )
 }
-fn prepare(root: &Path, certified_spacing: bool) -> Result<(), Error> {
+fn prepare(root: &Path, certified_spacing: bool, slh: bool) -> Result<(), Error> {
     std::fs::create_dir(root)?;
-    let authority = MlDsaSigner::generate();
+    let authority: Box<dyn Signer> = if slh {
+        Box::new(SphincsSigner::generate())
+    } else {
+        Box::new(MlDsaSigner::generate())
+    };
     let sender = DilithiumSigner::generate();
     let mut c = Control {
         co_authority: None,
@@ -233,7 +237,7 @@ fn prepare(root: &Path, certified_spacing: bool) -> Result<(), Error> {
                 shell_consensus::VIEW_CHANGE_TIMEOUT_MS,
             ));
         }
-        let block = provider.produce_block(&authority, 1)?;
+        let block = provider.produce_block(authority.as_ref(), 1)?;
         ensure(
             block.transactions.len() == 1 && block.header.gas_used == 21_000,
             "Native transfer not executed",
@@ -260,6 +264,28 @@ fn prepare(root: &Path, certified_spacing: bool) -> Result<(), Error> {
                 && Some(receipts) == follower.chain_store.get_receipts(&block.hash())?,
             "Native receipt/import mismatch",
         )?;
+        if nonce == 0 && slh {
+            ensure(
+                provider.fast_finalize_with_certificate(1, block.hash(), &cert)
+                    && follower.fast_finalize_with_certificate(1, block.hash(), &cert),
+                "ordinary SLH Native QC control failed",
+            )?;
+            c.blocks.push(block.clone());
+            c.certificates.push(cert.clone());
+            write(&root.join("control.cbor"), &c)?;
+            provider.store.flush()?;
+            follower.store.flush()?;
+            balances(&provider, &c, 1)?;
+            balances(&follower, &c, 1)?;
+            println!(
+                "{}",
+                serde_json::json!({"ordinaryNativeSLHAuthorityAccepted":true,"head":1,"finalized":1,"independentReceiptsEqual":true,"authorityKeyBytes":c.authority_key.len(),"signedControlsRetained":true,"privateKeysPersisted":false})
+            );
+            // Keep the exact original signed block/certificate even if source capture refuses.
+            let source = provider.commit_quorum_source(1, block.hash(), &cert)?;
+            write(&root.join("source.cbor"), &source)?;
+            return Ok(());
+        }
         if nonce == 0 {
             let source = provider.commit_quorum_source(1, block.hash(), &cert)?;
             write(&root.join("source.cbor"), &source)?;
@@ -1349,6 +1375,65 @@ fn follow(controls: &Path, proof_file: &Path, root: &Path) -> Result<(), Error> 
     Ok(())
 }
 
+fn accept_slh(controls: &Path, proof_file: &Path, root: &Path) -> Result<(), Error> {
+    let c: Control = read(&controls.join("control.cbor"))?;
+    let proof: CommitQuorumProof = read(proof_file)?;
+    ensure(
+        c.blocks.len() == 1 && c.certificates.len() == 1 && c.authority_key.len() == 64,
+        "original SLH controls required",
+    )?;
+    std::fs::create_dir(root)?;
+    let mut receiver = node(&root.join("db"), &c, true)?;
+    let before = receiver.store.scan_all()?;
+    match receiver.import_block_with_commit_proof(
+        c.genesis.hash(),
+        c.blocks[0].clone(),
+        &c.certificates[0],
+        &proof,
+    ) {
+        Ok(result) => ensure(
+            result.proved_commit_signatures == 1
+                && result.execution.state_root == c.blocks[0].header.state_root,
+            "SLH proof execution result mismatch",
+        )?,
+        Err(error) => {
+            ensure(
+                receiver.store.scan_all()? == before
+                    && receiver.finality.read().last_finalized_number() == 0
+                    && receiver
+                        .chain_store
+                        .get_receipts(&c.blocks[0].hash())?
+                        .is_none(),
+                "SLH import refusal changed canonical state",
+            )?;
+            println!(
+                "{}",
+                serde_json::json!({"slhCommitProofRejectedWithoutNativeMutation":true,"head":0,"finalized":0,"noChildReceipts":true,"error":error.to_string()})
+            );
+            return Err(error.into());
+        }
+    }
+    balances(&receiver, &c, 1)?;
+    receiver.store.flush()?;
+    drop(receiver);
+    let reopened = node(&root.join("db"), &c, false)?;
+    let reference = node(&controls.join("control-db"), &c, false)?;
+    ensure(
+        reopened.chain_store.get_head_hash()? == Some(c.blocks[0].hash())
+            && reopened.chain_store.get_finalized_number()? == Some(1)
+            && reopened.store.scan_all()? == reference.store.scan_all()?
+            && reopened.chain_store.get_receipts(&c.blocks[0].hash())?
+                == reference.chain_store.get_receipts(&c.blocks[0].hash())?,
+        "SLH cold Native result differs from independent reference",
+    )?;
+    balances(&reopened, &c, 1)?;
+    println!(
+        "{}",
+        serde_json::json!({"fullSLHCommitAIRImported":true,"provedCommitSignatures":1,"head":1,"finalized":1,"independentColdNativeRowsReceiptsBalancesNonceFeesEqual":true,"newAuthoritySigningOrProving":false})
+    );
+    Ok(())
+}
+
 fn main() -> Result<(), Error> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -1364,11 +1449,24 @@ fn main() -> Result<(), Error> {
         Some("augment") if args.len()==4 => augment(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3])),
 
         Some("receive" | "receive-resume" | "receive-verify" | "receive-one" | "receive-one-verify") if args.len() == 4 => receive(Path::new(&args[1]), Path::new(&args[2]), Path::new(&args[3]), args[0] == "receive" || args[0] == "receive-one", args[0] == "receive-resume", if args[0].starts_with("receive-one") {1} else {3}),
-        Some("prepare") if args.len() == 2 => prepare(Path::new(&args[1]),false),
-        Some("prepare-certified") if args.len() == 2 => prepare(Path::new(&args[1]),true),
+        Some("accept-slh") if args.len()==4 => accept_slh(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3])),
+        Some("prepare-slh") if args.len()==2 => prepare(Path::new(&args[1]),false,true),
+        Some("inspect-slh") if args.len()==2 => {
+            let root=Path::new(&args[1]);
+            let c:Control=read(&root.join("control.cbor"))?;
+            ensure(c.blocks.len()==1 && c.certificates.len()==1 && c.authority_key.len()==64,"original one-block SLH controls required")?;
+            let n=node(&root.join("provider-db"),&c,false)?;
+            let source=n.commit_quorum_source(1,c.blocks[0].hash(),&c.certificates[0])?;
+            source.validate()?;
+            let path=root.join("source.cbor");
+            if path.exists() {ensure(read::<CommitQuorumSource>(&path)?==source,"retained SLH source differs")?;} else {write(&path,&source)?;}
+            println!("{}",serde_json::json!({"originalSLHQuorumSourceCaptured":true,"signers":source.signatures.len(),"newAuthoritySigningOrProving":false}));Ok(())
+        },
+        Some("prepare") if args.len() == 2 => prepare(Path::new(&args[1]),false,false),
+        Some("prepare-certified") if args.len() == 2 => prepare(Path::new(&args[1]),true,false),
         Some("inspect-follow") if args.len() == 2 => inspect_follow(Path::new(&args[1])),
         Some("inspect") if args.len() == 2 => inspect(Path::new(&args[1])),
         Some("verify") if args.len() == 3 => verify(Path::new(&args[1]), Path::new(&args[2])),
-        _ => Err("usage: quorum-native live-cold-intent-recheck <controls> <proof> <retained-rejected-root> <independent-first-block-db> | live-explicit-recheck <controls> <proof> <retained-rejected-receiver-root> <independent-first-block-db> | producer-seed <controls> <completed-job-root> <owned-provider-db> | producer-live|producer-cold|producer-corrupt|producer-disabled|producer-manifest|producer-auto|producer-auto-wait|producer-auto-resume|producer-auto-partial|producer-auto-worker|producer-auto-recover|producer-auto-batch-fault|producer-auto-batch-recover|producer-intact-rejection <controls> <owned-provider-db> <new-receiver-root> <full-proof.cbor> | live-pause|live-import|live-cold|live-history3|live-default|live-invalid-recheck <controls> <proof> <receiver-root> <owned-provider-db> | rpc-pause <controls> <proof> <existing-native-root> | rpc-verify <controls> <proof> <existing-native-root> | rpc-recheck <controls> <proof> <existing-native-root> | prepare-certified <new-timed-controls> | inspect-follow <two-signer-controls> | follow-peer <two-signer-controls> <full-proof.cbor> <existing-first-block-directory> | follow-verify <two-signer-controls> <full-proof.cbor> <existing-follow-directory> | co-sign-input <original-controls> <new-messages.json> | augment <original-controls> <sdk-signatures.json> <new-two-signer-controls> | receive-one <two-signer-controls> <full-proof.cbor> <new-import-directory> | receive-one-verify <two-signer-controls> <full-proof.cbor> <existing-import-directory> | prepare <new-control-directory> | inspect <control-directory> | verify <control-directory> <full-quorum-proof.cbor> | receive <original-controls> <full-proof.cbor> <new-import-directory> | receive-resume <original-controls> <full-proof.cbor> <original-genesis-import-directory> | receive-verify <original-controls> <full-proof.cbor> <existing-import-directory>".into()),
+        _ => Err("usage: quorum-native accept-slh <slh-controls> <complete-proof.cbor> <new-import-directory> | prepare-slh <new-control-directory> | inspect-slh <retained-slh-controls> | live-cold-intent-recheck <controls> <proof> <retained-rejected-root> <independent-first-block-db> | live-explicit-recheck <controls> <proof> <retained-rejected-receiver-root> <independent-first-block-db> | producer-seed <controls> <completed-job-root> <owned-provider-db> | producer-live|producer-cold|producer-corrupt|producer-disabled|producer-manifest|producer-auto|producer-auto-wait|producer-auto-resume|producer-auto-partial|producer-auto-worker|producer-auto-recover|producer-auto-batch-fault|producer-auto-batch-recover|producer-intact-rejection <controls> <owned-provider-db> <new-receiver-root> <full-proof.cbor> | live-pause|live-import|live-cold|live-history3|live-default|live-invalid-recheck <controls> <proof> <receiver-root> <owned-provider-db> | rpc-pause <controls> <proof> <existing-native-root> | rpc-verify <controls> <proof> <existing-native-root> | rpc-recheck <controls> <proof> <existing-native-root> | prepare-certified <new-timed-controls> | inspect-follow <two-signer-controls> | follow-peer <two-signer-controls> <full-proof.cbor> <existing-first-block-directory> | follow-verify <two-signer-controls> <full-proof.cbor> <existing-follow-directory> | co-sign-input <original-controls> <new-messages.json> | augment <original-controls> <sdk-signatures.json> <new-two-signer-controls> | receive-one <two-signer-controls> <full-proof.cbor> <new-import-directory> | receive-one-verify <two-signer-controls> <full-proof.cbor> <existing-import-directory> | prepare <new-control-directory> | inspect <control-directory> | verify <control-directory> <full-quorum-proof.cbor> | receive <original-controls> <full-proof.cbor> <new-import-directory> | receive-resume <original-controls> <full-proof.cbor> <original-genesis-import-directory> | receive-verify <original-controls> <full-proof.cbor> <existing-import-directory>".into()),
     }
 }
