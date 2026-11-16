@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Connect default-off full-QC admission to typed dedicated-peer manifest discovery, automatic bounded transfer and cold waiting-source continuation; preserve legacy sender requests and independent artifact permissions.
+
+
 - Add opt-in node-owned complete QC proof production, source-bound checkpoint recovery, cold reverification and typed artifact availability in an isolated bounded store.
 
 - Add a separate, default-off full-quorum admission mode for fresh certified peer sync: bounded durable pending sources, explicit version-two proof transfer, CPU verification and serialized atomic canonical/finality commit.

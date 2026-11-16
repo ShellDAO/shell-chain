@@ -374,9 +374,10 @@ For an exact next child at the existing block-commitment activation boundary,
 the normal requested `BlockResponse` supplies the body and original QC. The
 node retains them as bounded untrusted inputs before canonical execution. An
 uncertified gossip block cannot bypass that requirement in this mode. The
-operator explicitly uploads or fetches the exact version-two manifest through
-the existing authenticated proof methods. Quorum artifacts do not participate
-in automatic sender discovery.
+node discovers a matching version-two manifest through the dedicated authenticated
+peer protocol, then pulls and fully verifies its bytes. Explicit authenticated
+upload or fetch remains supported. Quorum discovery requires its own option;
+sender permission never enables it.
 
 The existing admission queue and worker lifetime are reused: at most two
 retained candidates, a 2 MiB body, a 64 KiB QC and one active verification worker.
@@ -419,8 +420,8 @@ Provider and receiver directories must be owned, closed stores between commands.
 No original authority signing or new proof generation is required by these
 continuation commands.
 
-This bounded local profile does not provide automatic quorum production or
-discovery, an unbounded retained queue, full successor QC AIR, historical
+This bounded local profile does not provide an unbounded retained queue,
+full successor QC AIR, historical
 validator/penalty/selector provenance, network activation or public artifact
 acceptance. Existing fork/reorganization paths retain Native certificate
 verification; this option is not a chain-wide full-PQ verification switch.
@@ -454,7 +455,8 @@ cache. `admin_quorumProofProduction` returns progress and its manifest. Cache
 state is `ready`, indicating byte availability; it does not provide a Native
 execution receipt or an import authorization token. An independently running
 receiver must still perform full verification and canonical execution. Automatic
-quorum discovery is separate; explicit authenticated manifest fetch is supported.
+quorum discovery uses typed dedicated-peer requests and availability messages;
+explicit authenticated manifest fetch remains supported.
 
 An operator may recover an already complete, separately owned quorum job through
 `Node::recover_quorum_production_job` while the node is offline. The node selects
@@ -497,7 +499,54 @@ separate acceptance cases.
 
 This complete-job recovery flow reuses the existing genuine graph to avoid
 repeating input-equivalent mathematics. It does not qualify fresh-from-zero
-full generation on every host, automatic discovery, successor/fork QC AIR,
+full generation on every host, successor/fork QC AIR,
 historical validator/penalty/selector provenance, an unbounded job archive,
 network activation or public artifacts. Sender and proposer authorization
 remain Native in this profile, and the full-PQ parent promise remains open.
+
+## Automatic quorum availability and cold continuation
+
+Manifest discovery keeps transport envelope version one and requests an explicit
+`artifact_version`: one for sender proofs, two for complete QC proofs. The field
+is omitted on sender requests and defaults to one when absent, preserving legacy
+sender wire messages. Unknown roles refuse; an older provider that ignores the
+new field cannot downgrade a quorum candidate to a sender manifest. Nonzero
+response nonces bind the requested block and authenticated peer. Unsolicited
+availability messages still require a matching independently retained candidate,
+network identity, body and QC before any proof bytes are allocated.
+
+With `canonical_quorum_admission` enabled, the ordinary certified-sync path
+retains the next child and discovers version-two availability automatically.
+Only matching role-two bytes enter the existing bounded pull and full verifier;
+the same serialized atomic importer supplies the canonical result. A cold
+waiting receiver may discover the proof from a different authenticated provider.
+Discovery responses and persisted progress remain untrusted status, and the
+sender and quorum permission switches remain separate and default off.
+
+After creating a complete provider with the earlier production commands, a new
+receiver needs no proof upload, fetch or verify RPC:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-auto timed-two-signer-quorum producer-native/db automatic-proof-receiver timed-two-signer-proof.cbor
+```
+
+To check a durable availability gap, first prepare a separate provider containing
+only the canonical first block, then restart the waiting receiver against the
+complete provider:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- receive-one timed-two-signer-quorum timed-two-signer-proof.cbor body-only-provider
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-auto-wait timed-two-signer-quorum body-only-provider/db waiting-proof-receiver timed-two-signer-proof.cbor
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-auto-resume timed-two-signer-quorum producer-native/db waiting-proof-receiver timed-two-signer-proof.cbor
+```
+
+The wait command requires no proof cache, preserves genesis Native state and
+retains the genuine body/QC. The resume command reopens those waiting inputs,
+rechecks the complete provider graph, automatically discovers and transfers the
+proof through real TCP/Noise, and requires the receiver's committed/finalized
+block one, independent receipts, balance, nonce and fee results. The proof file
+is used only for an independent expected payload identity on the provider;
+it is never uploaded or handed to the receiver as a manifest. Unexpected failures
+exit nonzero; retain all partial inputs and stores. These controlled flows do
+not qualify successor/fork QC AIR, historical authority provenance, all-host
+fresh proof generation, public artifacts or network activation.

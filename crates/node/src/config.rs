@@ -244,7 +244,7 @@ pub struct NodeConfig {
     pub canonical_proof_production: bool,
     /// Consume full sender graphs for eligible ordinary peer candidates (default off).
     pub canonical_proof_admission: bool,
-    /// Require complete QC AIR for fresh certified peer children; explicit manifest2 fetch.
+    /// Discover and require complete QC AIR for fresh certified peer children; default off.
     pub canonical_quorum_admission: bool,
     /// Produce full QC graphs in a disjoint bounded local store; default off.
     pub canonical_quorum_production: bool,

@@ -564,12 +564,17 @@ impl<S: KvStore + 'static> Node<S> {
         nonce: u64,
         manifest: Option<CanonicalProofManifest>,
     ) -> Result<(), String> {
-        if !self.config.canonical_proof_admission {
+        if !self.config.canonical_proof_admission && !self.config.canonical_quorum_admission {
             return Ok(());
         }
         let Some(mut r) = self.admission_record(block)? else {
             return Ok(());
         };
+        if (r.version == 1 && !self.config.canonical_proof_admission)
+            || (r.version == 2 && !self.config.canonical_quorum_admission)
+        {
+            return Ok(());
+        }
         if r.state == AdmissionState::Complete
             || (r.state == AdmissionState::Verifying && self.live_admission.lock().worker.is_some())
         {
@@ -595,8 +600,8 @@ impl<S: KvStore + 'static> Node<S> {
             return Ok(());
         };
         m.validate()?;
-        if m.version != 1 {
-            return Err("sender admission requires a signature-batch manifest".into());
+        if m.version != r.version {
+            return Err("candidate manifest artifact role mismatch".into());
         }
         if m.block_hash != r.block {
             return Err("candidate manifest block mismatch".into());
@@ -613,7 +618,10 @@ impl<S: KvStore + 'static> Node<S> {
             .get_chain_config()
             .map_err(|e| e.to_string())?
             .ok_or("native configuration absent")?;
-        if m.chain_id != cfg.chain_id || m.genesis_hash != cfg.genesis_hash {
+        if m.chain_id != self.config.chain_id
+            || m.chain_id != cfg.chain_id
+            || m.genesis_hash != cfg.genesis_hash
+        {
             return Err("candidate manifest network mismatch".into());
         }
         let body = self.admission_body(&r)?;
@@ -625,6 +633,10 @@ impl<S: KvStore + 'static> Node<S> {
         {
             // Recovery after native commit must use the canonical source checks.
             self.validate_proof_upload_source(&m)?;
+        } else if r.version == shell_core::COMMIT_QUORUM_ARTIFACT_VERSION {
+            let certificate = self.admission_certificate(&r)?;
+            self.live_quorum_context(r.parent, &body, &certificate)
+                .map_err(|e| e.to_string())?;
         } else {
             self.validate_live_candidate_source(r.parent, &body)
                 .map_err(|e| e.to_string())?;
@@ -906,10 +918,15 @@ impl<S: KvStore + 'static> Node<S> {
         let r = self.pending_admission().ok().flatten().or_else(|| {
             self.admission_ids().ok()?.into_iter().find_map(|id| {
                 let r = self.admission_record(id).ok().flatten()?;
-                (r.state == AdmissionState::Failed && r.attempts < 2).then_some(r)
+                (r.state == AdmissionState::Failed
+                    && r.attempts < 2
+                    && ((r.version == 1 && self.config.canonical_proof_admission)
+                        || (r.version == 2 && self.config.canonical_quorum_admission)))
+                    .then_some(r)
             })
         })?;
-        if r.version != 1
+        if (r.version == 1 && !self.config.canonical_proof_admission)
+            || (r.version == 2 && !self.config.canonical_quorum_admission)
             || (r.state == AdmissionState::Verifying && self.live_admission.lock().worker.is_some())
         {
             return None;
@@ -930,6 +947,7 @@ impl<S: KvStore + 'static> Node<S> {
             peer,
             shell_network::NetworkMessage::CanonicalProofManifestRequest {
                 version: 1,
+                artifact_version: r.version,
                 block_hash: r.block,
                 nonce,
             },
@@ -945,8 +963,8 @@ impl<S: KvStore + 'static> Node<S> {
             .unwrap_or_default();
         let mut actions = vec![];
         for m in manifests {
-            // Quorum artifacts use explicit operator fetches, never sender discovery.
-            if m.version != 1 || self.validate_proof_upload_source(&m).is_err() {
+            // The manifest role is checked again against the receiver's own pending source.
+            if self.validate_proof_upload_source(&m).is_err() {
                 continue;
             }
             let mut runtime = self.live_admission.lock();
@@ -1057,6 +1075,95 @@ mod tests {
             .scan_prefix(shell_storage::CANONICAL_PROOF_CACHE_PREFIX)
             .unwrap()
             .is_empty());
+    }
+    #[test]
+    fn quorum_discovery_checks_role_peer_nonce_network_and_source_before_allocation() {
+        let db = Arc::new(MemoryDb::new());
+        let mut node =
+            super::super::tests::setup_node_with_store(Address::from([1; 32]), db.clone());
+        node.config.canonical_quorum_admission = true;
+        assert!(!node.config.canonical_proof_admission);
+        let genesis = ShellHash::from([1; 32]);
+        let config: shell_storage::ChainConfig = serde_json::from_value(
+            serde_json::json!({"chain_id":node.config.chain_id,"genesis_hash":genesis}),
+        )
+        .unwrap();
+        node.chain_store.put_chain_config(&config).unwrap();
+        let block = ShellHash::from([7; 32]);
+        let peer = PeerId("provider".into());
+        let r = AdmissionRecord {
+            version: 2,
+            block,
+            number: 1,
+            parent: genesis,
+            source_hash: ShellHash::ZERO,
+            peer: peer.0.clone(),
+            state: AdmissionState::Waiting,
+            manifest: None,
+            quorum_certificate_hash: Some(ShellHash::ZERO),
+            attempts: 0,
+            hash_retries: 0,
+            error: None,
+        };
+        node.save_admission(&r).unwrap();
+        db.put(
+            &key(b"jobs", None),
+            &serde_json::to_vec(&vec![block]).unwrap(),
+        )
+        .unwrap();
+        let (_, request) = node
+            .live_discovery_request(std::slice::from_ref(&peer))
+            .unwrap();
+        let nonce = match request {
+            shell_network::NetworkMessage::CanonicalProofManifestRequest {
+                artifact_version: 2,
+                nonce,
+                ..
+            } => nonce,
+            other => panic!("unexpected role: {other:?}"),
+        };
+        let m = CanonicalProofManifest {
+            version: 2,
+            chain_id: node.config.chain_id,
+            genesis_hash: genesis,
+            block_hash: block,
+            total_bytes: 1,
+            payload_hash: ShellHash::ZERO,
+        };
+        let before = db.scan_all().unwrap();
+        node.accept_live_manifest(&PeerId("foreign".into()), block, nonce, Some(m.clone()))
+            .unwrap();
+        node.accept_live_manifest(&peer, block, nonce + 1, Some(m.clone()))
+            .unwrap();
+        let mut wrong = m.clone();
+        wrong.version = 1;
+        assert!(node
+            .accept_live_manifest(&peer, block, nonce, Some(wrong))
+            .unwrap_err()
+            .contains("role mismatch"));
+        let mut wrong = m.clone();
+        wrong.chain_id += 1;
+        assert!(node
+            .accept_live_manifest(&peer, block, nonce, Some(wrong))
+            .unwrap_err()
+            .contains("network mismatch"));
+        // Even a matching envelope must reconstruct independently retained body/QC.
+        assert!(node
+            .accept_live_manifest(&peer, block, nonce, Some(m.clone()))
+            .unwrap_err()
+            .contains("body absent"));
+        assert_eq!(db.scan_all().unwrap(), before);
+        assert!(db
+            .scan_prefix(shell_storage::CANONICAL_PROOF_CACHE_PREFIX)
+            .unwrap()
+            .is_empty());
+        node.config.canonical_quorum_admission = false;
+        node.config.canonical_proof_admission = true;
+        node.accept_live_manifest(&peer, block, 0, Some(m)).unwrap();
+        assert!(node
+            .live_discovery_request(std::slice::from_ref(&peer))
+            .is_none());
+        assert_eq!(db.scan_all().unwrap(), before);
     }
     #[test]
     fn disabled_quorum_role_cannot_inherit_sender_permission() {

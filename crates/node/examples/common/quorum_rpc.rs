@@ -615,7 +615,7 @@ async fn exercise_live(
         let checked=provider.verify(m.id()).await?;
         ensure(checked.state==CanonicalProofUploadState::Verified&&checked.result.as_ref().is_some_and(|v|v["execution"]["tip"]==serde_json::to_value(c.blocks[2].hash()).unwrap()),"provider historical proof verification failed")?;
         receiver.connected(&provider.peer(),&m).await?;
-        receiver.call("admin_fetchCanonicalProof",json!([provider.peer(),m])).await?;
+        match receiver.call("admin_fetchCanonicalProof",json!([provider.peer(),m])).await {Ok(_)=>{},Err(e) if e.to_string().contains("busy")=>{},Err(e)=>return Err(e),}
         let verified=wait_upload(&receiver,m.id()).await?;
         let value=verified.result.as_ref().ok_or("fresh quorum receipt absent")?;
         let stored=receiver.node.chain_store.get_receipts(&c.blocks[0].hash())?.ok_or("fresh receipts missing")?;
@@ -833,7 +833,7 @@ async fn exercise_producer(
         vec![],
         false,
         false,
-        mode != "producer-disabled",
+        !matches!(mode, "producer-disabled" | "producer-auto-wait"),
     )
     .await?;
     let before = production_native_rows(&provider.node)?;
@@ -849,6 +849,18 @@ async fn exercise_producer(
             ensure(provider.call("admin_quorumProofProduction",json!([c.blocks[0].hash()])).await.is_err()&&production_native_rows(&provider.node)?==before,"wrong-role completed metadata accepted or changed Native")?;
             println!("{}",json!({"wrongRoleProducerMetadataRejected":true,"NativeRowsUnchanged":true,"noCachedAuthorization":true}));return Ok(());
         }
+        if mode=="producer-auto-wait" {
+            ensure(provider.node.store.scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?.is_empty(),"wait provider already has proof bytes")?;
+            std::fs::create_dir(receiver_root)?;
+            let receiver=Live::start_mode(&receiver_root.join("db"),&c,vec![provider.dial()],true,true).await?;
+            let outcome=async {
+                let pending=wait_pending(&receiver,&c).await?;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                ensure(receiver.node.chain_store.get_head_hash()?==Some(c.genesis.hash())&&receiver.node.chain_store.get_finalized_number()?.unwrap_or(0)==0&&receiver.node.store.scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?.is_empty()&&pending["status"]["manifest"].is_null(),"missing availability imported child or allocated proof bytes")?;
+                println!("{}",json!({"automaticQuorumWaitingPersisted":true,"head":0,"proofCacheEmpty":true,"pending":pending,"noOperatorProofCalls":true,"sourceNativeRowsUnchanged":production_native_rows(&provider.node)?==before}));Ok::<_,Error>(())
+            }.await;
+            receiver.stop().await?;return outcome;
+        }
         let status=wait_production(&provider,c.blocks[0].hash()).await?;
         if mode=="producer-corrupt" {
             ensure(status["status"]["state"]=="failed"&&status["status"]["error"].is_string()&&production_native_rows(&provider.node)?==before&&provider.node.store.scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?.is_empty(),"corrupt owned job healed, wrote Native, or published bytes")?;
@@ -861,16 +873,37 @@ async fn exercise_producer(
         if mode=="producer-cold"{
             println!("{}",json!({"coldNodeQuorumProducerReverified":true,"NativeRowsUnchanged":true,"status":status,"readyBytesNotNativeAuthorization":true}));return Ok(());
         }
-        ensure(mode=="producer-live","unknown producer mode")?;std::fs::create_dir(receiver_root)?;
-        let receiver=Live::start_mode(&receiver_root.join("db"),&c,vec![provider.dial()],true,true).await?;
+        ensure(matches!(mode,"producer-live"|"producer-auto"|"producer-auto-resume"),"unknown producer mode")?;
+        let resume=mode=="producer-auto-resume";
+        if resume {ensure(receiver_root.join("db/CURRENT").is_file(),"resume needs retained waiting receiver")?;}else{std::fs::create_dir(receiver_root)?;}
+        let automatic=mode!="producer-live";
+        if automatic {
+            let initial=node(&receiver_root.join("db"),&c,!resume)?;
+            ensure(initial.chain_store.get_head_hash()?==Some(c.genesis.hash())&&initial.store.scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?.is_empty(),"automatic receiver must start at genesis with no proof bytes")?;
+        }
+        let receiver=Live::start_mode(&receiver_root.join("db"),&c,vec![provider.dial()],true,!resume&&!automatic).await?;
         let transfer=async{
-            wait_pending(&receiver,&c).await?;ensure(receiver.node.chain_store.get_head_hash()?==Some(c.genesis.hash()),"receiver imported before produced proof")?;
-            receiver.connected(&provider.peer(),&manifest).await?;receiver.call("admin_fetchCanonicalProof",json!([provider.peer(),manifest])).await?;
-            let verified=wait_upload(&receiver,manifest.id()).await?;
+            wait_pending(&receiver,&c).await?;
+            if mode=="producer-live" {
+                receiver.connected(&provider.peer(),&manifest).await?;
+                match receiver.call("admin_fetchCanonicalProof",json!([provider.peer(),manifest])).await {
+                    Ok(_)=>{},Err(e) if e.to_string().contains("busy")=>{},Err(e)=>return Err(e),
+                }
+            }
+            let verified=tokio::time::timeout(Duration::from_secs(180),async {
+                loop {
+                    match receiver.status(manifest.id()).await {
+                        Ok(s) if matches!(s.state,CanonicalProofUploadState::Verified|CanonicalProofUploadState::Rejected)=>return Ok::<_,Error>(s),
+                        Ok(_)=>{},Err(e) if e.to_string().contains("upload not found")=>{},Err(e)=>return Err(e),
+                    }
+                    if receiver.task.is_finished(){return Err("receiver stopped before automatic proof completion".into());}
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }).await??;
             let receipts=receiver.node.chain_store.get_receipts(&c.blocks[0].hash())?.ok_or("receiver receipts absent")?;
             ensure(verified.state==CanonicalProofUploadState::Verified&&receiver.node.chain_store.get_head_hash()?==Some(c.blocks[0].hash())&&receiver.node.chain_store.get_finalized_number()?==Some(1)&&verified.result.as_ref().is_some_and(|v|v["proved_commit_signatures"]==2)&&provider.node.chain_store.get_receipts(&c.blocks[0].hash())?==Some(receipts),"produced proof did not reach true atomic canonical/finality endpoint")?;
             balances(&receiver.node,&c,1)?;
-            println!("{}",json!({"nodeQuorumProducerToFreshPeerComplete":true,"status":status,"actualTCPNoise":true,"head":1,"finalized":1,"provedCommitSignatures":2,"independentNativeReceiptsEqual":true,"balancesNonceFeesChecked":true,"sourceNativeRowsUnchanged":production_native_rows(&provider.node)?==before,"manualProofUpload":false,"newAuthoritySigningOrProving":false}));Ok::<_,Error>(())
+            println!("{}",json!({"nodeQuorumProducerToFreshPeerComplete":true,"status":status,"actualTCPNoise":true,"head":1,"finalized":1,"provedCommitSignatures":2,"independentNativeReceiptsEqual":true,"balancesNonceFeesChecked":true,"sourceNativeRowsUnchanged":production_native_rows(&provider.node)?==before,"manualProofUpload":false,"automaticDiscovery":mode!="producer-live","coldWaitingResumed":resume,"noOperatorProofCalls":mode!="producer-live","newAuthoritySigningOrProving":false}));Ok::<_,Error>(())
         }.await;
         receiver.stop().await?;transfer
     }.await;

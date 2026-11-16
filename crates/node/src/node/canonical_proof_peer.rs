@@ -323,6 +323,7 @@ impl<S: KvStore + 'static> Node<S> {
         match message {
             NetworkMessage::CanonicalProofManifestRequest {
                 version,
+                artifact_version,
                 block_hash,
                 nonce,
             } => {
@@ -330,7 +331,14 @@ impl<S: KvStore + 'static> Node<S> {
                     let s = self.canonical_proof_peer.lock();
                     s.running && s.discovery_peers.contains(peer)
                 };
-                if !allowed || version != 1 || nonce == 0 {
+                if !allowed
+                    || version != 1
+                    || !matches!(
+                        artifact_version,
+                        1 | shell_core::COMMIT_QUORUM_ARTIFACT_VERSION
+                    )
+                    || nonce == 0
+                {
                     return None;
                 }
                 let manifest = self
@@ -339,7 +347,7 @@ impl<S: KvStore + 'static> Node<S> {
                     .ok()?
                     .into_iter()
                     .find(|m| {
-                        m.version == 1
+                        m.version == artifact_version
                             && m.block_hash == block_hash
                             && self.validate_proof_upload_source(m).is_ok()
                     });

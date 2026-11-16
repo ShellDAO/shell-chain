@@ -249,7 +249,7 @@ enum Commands {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
         canonical_proof_admission: bool,
 
-        /// Require full QC proofs for certified peer sync; explicit operator manifest fetch.
+        /// Discover and require full QC proofs for certified peer sync (default off).
         #[arg(long)]
         canonical_quorum_admission: bool,
 

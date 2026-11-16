@@ -23,6 +23,13 @@ pub const MAX_CONTROL_MESSAGE_SIZE: usize = 64 * 1024;
 /// Maximum number of blocks accepted in a single sync response.
 pub const MAX_RESPONSE_BLOCKS: usize = 128;
 
+fn sender_artifact_version() -> u8 {
+    1
+}
+fn is_sender_artifact_version(version: &u8) -> bool {
+    *version == 1
+}
+
 /// Unique identifier for a network peer.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PeerId(pub String);
@@ -96,6 +103,12 @@ pub enum NetworkMessage {
     /// Off-chain artifacts use the dedicated peer-authenticated protocol only.
     CanonicalProofManifestRequest {
         version: u8,
+        /// Missing on legacy sender requests; never infer a quorum role from transport version.
+        #[serde(
+            default = "sender_artifact_version",
+            skip_serializing_if = "is_sender_artifact_version"
+        )]
+        artifact_version: u8,
         block_hash: ShellHash,
         nonce: u64,
     },
@@ -348,8 +361,17 @@ pub fn serialize_checked(msg: &NetworkMessage, limit: usize) -> Result<Vec<u8>, 
 impl NetworkMessage {
     fn validate_semantics(&self) -> Result<(), NetworkError> {
         match self {
-            Self::CanonicalProofManifestRequest { version, nonce, .. }
-                if *version != 1 || *nonce == 0 =>
+            Self::CanonicalProofManifestRequest {
+                version,
+                artifact_version,
+                nonce,
+                ..
+            } if *version != 1
+                || !matches!(
+                    *artifact_version,
+                    1 | shell_core::COMMIT_QUORUM_ARTIFACT_VERSION
+                )
+                || *nonce == 0 =>
             {
                 Err(NetworkError::Serialization(
                     "canonical manifest request version/nonce".into(),
@@ -1332,6 +1354,7 @@ mod tests {
         for message in [
             NetworkMessage::CanonicalProofManifestRequest {
                 version: 1,
+                artifact_version: 1,
                 block_hash: manifest.block_hash,
                 nonce: 7,
             },
@@ -1360,6 +1383,7 @@ mod tests {
         for message in [
             NetworkMessage::CanonicalProofManifestRequest {
                 version: 1,
+                artifact_version: 1,
                 block_hash: manifest.block_hash,
                 nonce: 0,
             },
@@ -1379,6 +1403,36 @@ mod tests {
             let bytes = serde_json::to_vec(&message).unwrap();
             assert!(serialize_checked(&message, MAX_MESSAGE_SIZE).is_err());
             assert!(deserialize_checked(&bytes, MAX_MESSAGE_SIZE).is_err());
+        }
+    }
+    #[test]
+    fn canonical_manifest_roles_preserve_legacy_sender_and_reject_unknown_roles() {
+        for role in [1, shell_core::COMMIT_QUORUM_ARTIFACT_VERSION, 0, 3] {
+            let request = NetworkMessage::CanonicalProofManifestRequest {
+                version: 1,
+                artifact_version: role,
+                block_hash: ShellHash::from([7; 32]),
+                nonce: 19,
+            };
+            let raw = serde_json::to_vec(&request).unwrap();
+            if matches!(role, 1 | shell_core::COMMIT_QUORUM_ARTIFACT_VERSION) {
+                let checked = serialize_checked(&request, MAX_MESSAGE_SIZE).unwrap();
+                assert!(serialized_message_requires_canonical_proof_transport(
+                    &checked
+                ));
+                match deserialize_checked(&checked, MAX_MESSAGE_SIZE).unwrap() {
+                    NetworkMessage::CanonicalProofManifestRequest {
+                        artifact_version, ..
+                    } => assert_eq!(artifact_version, role),
+                    other => panic!("unexpected variant: {other:?}"),
+                }
+                if role == 1 {
+                    assert!(!String::from_utf8(raw).unwrap().contains("artifact_version"));
+                }
+            } else {
+                assert!(serialize_checked(&request, MAX_MESSAGE_SIZE).is_err());
+                assert!(deserialize_checked(&raw, MAX_MESSAGE_SIZE).is_err());
+            }
         }
     }
     #[test]
