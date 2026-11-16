@@ -248,6 +248,10 @@ enum Commands {
         /// Automatically consume complete sender proofs for eligible ordinary peer blocks.
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
         canonical_proof_admission: bool,
+
+        /// Require full QC proofs for certified peer sync; explicit operator manifest fetch.
+        #[arg(long)]
+        canonical_quorum_admission: bool,
         /// Pause automatic proving after this many new components in this process.
         #[arg(long)]
         canonical_proof_component_budget: Option<std::num::NonZeroUsize>,
@@ -715,6 +719,7 @@ async fn main() {
             enable_stark_aggregation,
             canonical_proof_production,
             canonical_proof_admission,
+            canonical_quorum_admission,
             canonical_proof_component_budget,
             l2_stark_mode,
             consensus_engine,
@@ -780,6 +785,12 @@ async fn main() {
                 "canonical_proof_admission",
                 canonical_proof_admission,
                 file_config.consensus.canonical_proof_admission,
+            );
+            let effective_canonical_quorum_admission = config_or_cli(
+                run_matches,
+                "canonical_quorum_admission",
+                canonical_quorum_admission,
+                file_config.consensus.canonical_quorum_admission,
             );
             let effective_canonical_proof_budget = canonical_proof_component_budget
                 .or(file_config.consensus.canonical_proof_component_budget);
@@ -913,6 +924,7 @@ async fn main() {
                 enable_stark_aggregation: effective_stark_aggregation,
                 canonical_proof_production: effective_canonical_proof_production,
                 canonical_proof_admission: effective_canonical_proof_admission,
+                canonical_quorum_admission: effective_canonical_quorum_admission,
                 canonical_proof_component_budget: effective_canonical_proof_budget,
                 l2_stark_mode,
                 consensus_engine: effective_consensus_engine,

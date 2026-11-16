@@ -25,6 +25,9 @@ impl<S: KvStore + 'static> Node<S> {
             return Err("canonical proof chain/genesis identity mismatch".into());
         }
         if manifest.version == shell_core::COMMIT_QUORUM_ARTIFACT_VERSION {
+            if self.pending_manifest_source(manifest)? {
+                return Ok(());
+            }
             return self.validate_quorum_upload_source(manifest, &config);
         }
         if self.pending_manifest_source(manifest)? {
@@ -192,6 +195,7 @@ impl<S: KvStore + 'static> CanonicalProofControl for Node<S> {
         manifest: CanonicalProofManifest,
     ) -> Result<CanonicalProofUploadStatus, String> {
         self.validate_proof_upload_source(&manifest)?;
+        self.bind_quorum_manifest(&manifest)?;
         self.canonical_proof_uploads
             .begin(manifest)
             .map_err(|e| e.to_string())

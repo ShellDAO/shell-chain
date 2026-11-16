@@ -70,6 +70,7 @@ pub struct ConsensusSection {
     pub enable_stark_aggregation: Option<bool>,
     pub canonical_proof_production: Option<bool>,
     pub canonical_proof_admission: Option<bool>,
+    pub canonical_quorum_admission: Option<bool>,
     pub canonical_proof_component_budget: Option<std::num::NonZeroUsize>,
 }
 

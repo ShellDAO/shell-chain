@@ -358,3 +358,71 @@ This operation serves historical verification against the trusted current
 authority context. Fresh full-quorum AIR admission, automatic quorum discovery
 or production, successor quorum AIR, historical validator/penalty provenance,
 network activation and public artifact acceptance remain separate work.
+
+## Fresh certified sync with explicit quorum proofs
+
+The local `canonical_quorum_admission` option, exposed as
+`--canonical-quorum-admission` and `[consensus].canonical_quorum_admission`,
+selects a separate certified-sync follower profile in the current source.
+Build the CLI with dedicated transport (`cargo build --locked -p shell-cli --features libp2p`);
+startup refuses this option when that transport is absent.
+It defaults to false. The
+existing sender option, sender manifest-one discovery, ordinary default behavior
+and wire QC remain unchanged. No activation height or on-chain carrier is added.
+
+For an exact next child at the existing block-commitment activation boundary,
+the normal requested `BlockResponse` supplies the body and original QC. The
+node retains them as bounded untrusted inputs before canonical execution. An
+uncertified gossip block cannot bypass that requirement in this mode. The
+operator explicitly uploads or fetches the exact version-two manifest through
+the existing authenticated proof methods. Quorum artifacts do not participate
+in automatic sender discovery.
+
+The existing admission queue and worker lifetime are reused: at most two
+retained candidates, a 2 MiB body, a 64 KiB QC and one active verification worker.
+The original body bytes and QC hash bind the record. A worker checks the
+complete signature/weight graph against independently selected parent, header,
+keys and current authority weights. Only the serialized canonical event loop
+receives that opaque in-memory tuple, rechecks context and executes the single
+atomic state/block/receipt/QC/signer/finality batch. The exclusive offline API
+uses the same verification and commit functions. Shutdown retains the source
+and pauses unfinished verification; recovery requires full verification again.
+Stored upload results and pending statuses remain informational.
+
+Using the timed controls and full proof above, first prepare an owned provider
+at finalized height three, then run a separate receiver:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- receive-one timed-two-signer-quorum timed-two-signer-proof.cbor quorum-provider
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- follow-peer timed-two-signer-quorum timed-two-signer-proof.cbor quorum-provider
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- live-pause timed-two-signer-quorum timed-two-signer-proof.cbor quorum-receiver quorum-provider/db
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- live-import timed-two-signer-quorum timed-two-signer-proof.cbor quorum-receiver quorum-provider/db
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- live-cold timed-two-signer-quorum timed-two-signer-proof.cbor quorum-receiver quorum-provider/db
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- live-history3 timed-two-signer-quorum timed-two-signer-proof.cbor quorum-receiver quorum-provider/db
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- live-default timed-two-signer-quorum timed-two-signer-proof.cbor native-receiver quorum-provider/db
+```
+
+The commands use self-created timed controls and test funding, preserve the
+original proof, and exit nonzero on failed operations or assertions. They start
+real loopback TCP/Noise peers and authenticated RPC listeners. `live-pause`
+retains the received source at genesis without proof bytes; `live-import`
+cold-resumes it, rejects a correct-hash damaged weight graph and wrong role or
+chain, fetches the genuine proof from the independent provider and checks
+canonical height/finality one, receipts, balance, nonce and fees. `live-cold`
+performs another full cryptographic historical recheck without Native writeback.
+`live-history3` disables the quorum option for the already signed successors,
+follows them through ordinary Native QC verification, then rechecks the first
+block against current height three and compares all canonical rows with the
+independent provider. This does not prove successor QC AIR. `live-default`
+checks the existing Native sync path from genesis with the option disabled.
+Provider and receiver directories must be owned, closed stores between commands.
+No original authority signing or new proof generation is required by these
+continuation commands.
+
+This bounded local profile does not provide automatic quorum production or
+discovery, an unbounded retained queue, full successor QC AIR, historical
+validator/penalty/selector provenance, network activation or public artifact
+acceptance. Existing fork/reorganization paths retain Native certificate
+verification; this option is not a chain-wide full-PQ verification switch.
+Sender and proposer authorization in this path remain Native. The
+first-block example must not be interpreted as a full-PQ chain acceptance.

@@ -42,13 +42,19 @@ pub(super) struct AdmissionRecord {
     pub peer: String,
     pub state: AdmissionState,
     pub manifest: Option<CanonicalProofManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quorum_certificate_hash: Option<ShellHash>,
     attempts: u8,
     hash_retries: u8,
     error: Option<String>,
 }
 enum VerifiedCandidate {
     Fresh(VerifiedCanonicalSignatureBatch),
-    Canonical(CanonicalProofReplay),
+    Canonical(CanonicalProofReplay, Option<usize>),
+    Quorum(
+        shell_stark_prover::commit_quorum::VerifiedCommitQuorum,
+        Box<shell_storage::ChainConfig>,
+    ),
 }
 struct Worker {
     record: AdmissionRecord,
@@ -89,14 +95,15 @@ impl<S: KvStore + 'static> Node<S> {
                     return Err("live admission record limit".into());
                 }
                 let r: AdmissionRecord = serde_json::from_slice(&b).map_err(|e| e.to_string())?;
-                if r.version != 1
+                if !matches!(r.version, 1 | 2)
+                    || (r.version == 2) != r.quorum_certificate_hash.is_some()
                     || r.block != hash
                     || r.peer.is_empty()
                     || r.peer.len() > 128
                     || r.attempts > 2
                     || r.hash_retries > 1
                     || r.manifest.as_ref().is_some_and(|m| {
-                        m.version != 1 || m.block_hash != hash || m.validate().is_err()
+                        m.version != r.version || m.block_hash != hash || m.validate().is_err()
                     })
                 {
                     return Err("live admission record corrupt".into());
@@ -325,6 +332,7 @@ impl<S: KvStore + 'static> Node<S> {
             peer: peer.0.clone(),
             state: AdmissionState::Waiting,
             manifest: None,
+            quorum_certificate_hash: None,
             attempts: 0,
             hash_retries: 0,
             error: None,
@@ -344,13 +352,137 @@ impl<S: KvStore + 'static> Node<S> {
         self.store.flush().map_err(|e| e.to_string())?;
         Ok(true)
     }
+    fn admission_certificate(&self, r: &AdmissionRecord) -> Result<Vec<u8>, String> {
+        let bytes = self
+            .store
+            .get(&key(b"quorum/", Some(r.block)))
+            .map_err(|e| e.to_string())?
+            .ok_or("pending quorum certificate absent")?;
+        if bytes.len() > 64 * 1024
+            || Some(shell_primitives::blake3_hash(&bytes)) != r.quorum_certificate_hash
+        {
+            return Err("pending quorum certificate hash/size mismatch".into());
+        }
+        Ok(bytes)
+    }
+    pub(super) fn stage_live_quorum_candidate(
+        &self,
+        peer: &PeerId,
+        block: &Block,
+        certificate: Option<&[u8]>,
+    ) -> Result<bool, String> {
+        if !self.config.canonical_quorum_admission {
+            return Ok(false);
+        }
+        let head = self
+            .chain_store
+            .get_head_block()
+            .map_err(|e| e.to_string())?
+            .ok_or("native parent absent")?;
+        let config = self
+            .chain_store
+            .get_chain_config()
+            .map_err(|e| e.to_string())?
+            .ok_or("native configuration absent")?;
+        if block.header.parent_hash != head.hash()
+            || head.number().checked_add(1) != Some(block.number())
+            || config
+                .block_commitment_height
+                .is_none_or(|h| block.number() < h)
+        {
+            return Ok(false);
+        }
+        let cert = certificate.ok_or("quorum proof admission requires certified sync body")?;
+        if cert.len() > 64 * 1024 || peer.0.is_empty() || peer.0.len() > 128 {
+            return Err("quorum candidate certificate/peer limit".into());
+        }
+        self.live_quorum_context(head.hash(), block, cert)
+            .map_err(|e| e.to_string())?;
+        if let Some(old) = self.admission_record(block.hash())? {
+            if old.version != 2
+                || self.admission_body(&old)? != *block
+                || self.admission_certificate(&old)? != cert
+            {
+                return Err("immutable quorum candidate conflict".into());
+            }
+            return Ok(true);
+        }
+        let mut ids = self.admission_ids()?;
+        if ids.len() >= MAX_JOBS
+            || ids.iter().any(|h| {
+                self.admission_record(*h).ok().flatten().is_some_and(|r| {
+                    !matches!(r.state, AdmissionState::Complete | AdmissionState::Failed)
+                })
+            })
+        {
+            return Err("live admission retained candidate limit".into());
+        }
+        let body = shell_stark_prover::production_store::bounded_json(block, MAX_BODY)
+            .map_err(|e| e.to_string())?;
+        let record = AdmissionRecord {
+            version: 2,
+            block: block.hash(),
+            number: block.number(),
+            parent: head.hash(),
+            source_hash: shell_primitives::blake3_hash(&body),
+            peer: peer.0.clone(),
+            state: AdmissionState::Waiting,
+            manifest: None,
+            quorum_certificate_hash: Some(shell_primitives::blake3_hash(cert)),
+            attempts: 0,
+            hash_retries: 0,
+            error: None,
+        };
+        ids.push(record.block);
+        let mut batch = WriteBatch::new();
+        batch.put(key(b"body/", Some(record.block)), body);
+        batch.put(key(b"quorum/", Some(record.block)), cert.to_vec());
+        batch.put(
+            key(b"record/", Some(record.block)),
+            serde_json::to_vec(&record).map_err(|e| e.to_string())?,
+        );
+        batch.put(
+            key(b"jobs", None),
+            serde_json::to_vec(&ids).map_err(|e| e.to_string())?,
+        );
+        self.store.write_batch(batch).map_err(|e| e.to_string())?;
+        self.store.flush().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+    pub(super) fn bind_quorum_manifest(&self, m: &CanonicalProofManifest) -> Result<(), String> {
+        if m.version != shell_core::COMMIT_QUORUM_ARTIFACT_VERSION {
+            return Ok(());
+        }
+        let Some(mut r) = self.admission_record(m.block_hash)? else {
+            return Ok(());
+        };
+        if r.version != 2 || r.state == AdmissionState::Complete {
+            return Ok(());
+        }
+        if !self.config.canonical_quorum_admission {
+            return Err("quorum admission disabled".into());
+        }
+        if r.state == AdmissionState::Verifying && self.live_admission.lock().worker.is_some() {
+            if r.manifest.as_ref() == Some(m) {
+                return Ok(());
+            }
+            return Err("quorum candidate verification busy".into());
+        }
+        r.manifest = Some(m.clone());
+        r.state = AdmissionState::Pulling;
+        r.error = None;
+        self.save_admission(&r)
+    }
     fn pending_admission(&self) -> Result<Option<AdmissionRecord>, String> {
-        if !self.config.canonical_proof_admission {
+        if !self.config.canonical_proof_admission && !self.config.canonical_quorum_admission {
             return Ok(None);
         }
         for id in self.admission_ids()? {
             if let Some(r) = self.admission_record(id)? {
-                if !matches!(r.state, AdmissionState::Complete | AdmissionState::Failed) {
+                if ((r.version == 1 && self.config.canonical_proof_admission)
+                    || (r.version == 2 && self.config.canonical_quorum_admission))
+                    && !matches!(r.state, AdmissionState::Complete | AdmissionState::Failed)
+                {
                     return Ok(Some(r));
                 }
             }
@@ -361,12 +493,30 @@ impl<S: KvStore + 'static> Node<S> {
         &self,
         m: &CanonicalProofManifest,
     ) -> Result<bool, String> {
-        if !self.config.canonical_proof_admission {
+        if !self.config.canonical_proof_admission && !self.config.canonical_quorum_admission {
             return Ok(false);
         }
         let Some(r) = self.admission_record(m.block_hash)? else {
             return Ok(false);
         };
+        if r.version == 2 && m.version == 2 && self.config.canonical_quorum_admission {
+            if self
+                .chain_store
+                .get_block_hash_by_number(r.number)
+                .map_err(|e| e.to_string())?
+                == Some(r.block)
+            {
+                return Ok(false);
+            }
+            let body = self.admission_body(&r)?;
+            let cert = self.admission_certificate(&r)?;
+            self.live_quorum_context(r.parent, &body, &cert)
+                .map_err(|e| e.to_string())?;
+            return Ok(true);
+        }
+        if !self.config.canonical_proof_admission || r.version != 1 || m.version != 1 {
+            return Ok(false);
+        }
         if r.state == AdmissionState::Complete || r.manifest.as_ref() != Some(m) {
             return Ok(false);
         }
@@ -395,11 +545,13 @@ impl<S: KvStore + 'static> Node<S> {
         Ok(true)
     }
     pub(super) fn has_live_manifest(&self, id: ShellHash) -> bool {
-        self.config.canonical_proof_admission
+        (self.config.canonical_proof_admission || self.config.canonical_quorum_admission)
             && self.admission_ids().is_ok_and(|ids| {
                 ids.into_iter().any(|h| {
                     self.admission_record(h).ok().flatten().is_some_and(|r| {
-                        r.state != AdmissionState::Complete
+                        ((r.version == 1 && self.config.canonical_proof_admission)
+                            || (r.version == 2 && self.config.canonical_quorum_admission))
+                            && r.state != AdmissionState::Complete
                             && r.manifest.as_ref().is_some_and(|m| m.id() == id)
                     })
                 })
@@ -511,6 +663,11 @@ impl<S: KvStore + 'static> Node<S> {
             return Ok(());
         }
         let body = self.admission_body(&r)?;
+        let certificate = if r.version == 2 {
+            Some(self.admission_certificate(&r)?)
+        } else {
+            None
+        };
         let (status, claimed) = self
             .canonical_proof_uploads
             .claim(&id, true)
@@ -536,6 +693,34 @@ impl<S: KvStore + 'static> Node<S> {
                         .canonical_proof_uploads
                         .payload(&id)
                         .map_err(|e| e.to_string())?;
+                    if let Some(cert) = &certificate {
+                        let proof = shell_stark_prover::commit_quorum::payload::decode(&payload)?;
+                        if node
+                            .chain_store
+                            .get_block_hash_by_number(body.number())
+                            .map_err(|e| e.to_string())?
+                            == Some(hash)
+                        {
+                            let tip = node
+                                .chain_store
+                                .get_head_hash()
+                                .map_err(|e| e.to_string())?
+                                .ok_or("native tip absent")?;
+                            return node
+                                .replay_canonical_block_with_commit_proof(tip, hash, cert, &proof)
+                                .map(|v| {
+                                    VerifiedCandidate::Canonical(
+                                        v.execution,
+                                        Some(v.proved_commit_signatures),
+                                    )
+                                })
+                                .map_err(|e| e.to_string());
+                        }
+                        return node
+                            .verify_live_quorum_candidate(parent, &body, cert, &proof)
+                            .map(|(v, c)| VerifiedCandidate::Quorum(v, Box::new(c)))
+                            .map_err(|e| e.to_string());
+                    }
                     let proof: CanonicalSignatureBatchProof =
                         shell_stark_prover::compact_canonical::decode_payload(&payload)
                             .map_err(|e| format!("candidate proof decode: {e}"))?;
@@ -552,7 +737,7 @@ impl<S: KvStore + 'static> Node<S> {
                             .ok_or("native tip absent")?;
                         return node
                             .replay_canonical_transactions_with_proof(tip, hash, &proof)
-                            .map(VerifiedCandidate::Canonical)
+                            .map(|v| VerifiedCandidate::Canonical(v, None))
                             .map_err(|e| e.to_string());
                     }
                     node.verify_live_candidate_signatures(parent, &body, &proof)
@@ -569,6 +754,33 @@ impl<S: KvStore + 'static> Node<S> {
             result: rx,
             handle,
         });
+        Ok(())
+    }
+    pub(super) fn start_ready_quorum_candidate(self: &Arc<Self>) -> Result<(), String> {
+        if !self.config.canonical_quorum_admission {
+            return Ok(());
+        }
+        let Some(r) = self.pending_admission()? else {
+            return Ok(());
+        };
+        if r.version != 2 {
+            return Ok(());
+        }
+        let Some(m) = r.manifest else {
+            return Ok(());
+        };
+        let status = self
+            .canonical_proof_uploads
+            .status(&m.id())
+            .map_err(|e| e.to_string())?;
+        if matches!(
+            status.state,
+            shell_storage::CanonicalProofUploadState::Ready
+                | shell_storage::CanonicalProofUploadState::Verified
+                | shell_storage::CanonicalProofUploadState::Verifying
+        ) {
+            self.start_live_candidate_verification(m.id())?;
+        }
         Ok(())
     }
     /// The only live canonical mutation point: invoke from Node.run, never a worker.
@@ -588,14 +800,27 @@ impl<S: KvStore + 'static> Node<S> {
         let (worker, result) = pair?;
         let mut r = worker.record;
         let id = r.manifest.as_ref()?.id();
-        let new_commit = matches!(&result, Ok(VerifiedCandidate::Fresh(_)));
+        let new_commit = matches!(
+            &result,
+            Ok(VerifiedCandidate::Fresh(_) | VerifiedCandidate::Quorum(_, _))
+        );
+        let mut quorum_count = None;
         let result = result.and_then(|verified| {
             let block = self.admission_body(&r)?;
             match verified {
                 VerifiedCandidate::Fresh(v) => self
                     .commit_live_verified_candidate(r.parent, block, &v)
                     .map_err(|e| e.to_string()),
-                VerifiedCandidate::Canonical(replay) => {
+                VerifiedCandidate::Quorum(v, config) => {
+                    let cert = self.admission_certificate(&r)?;
+                    let replay = self
+                        .commit_live_verified_quorum(r.parent, block, &cert, &v, &config)
+                        .map_err(|e| e.to_string())?;
+                    quorum_count = Some(replay.proved_commit_signatures);
+                    Ok(replay.execution)
+                }
+                VerifiedCandidate::Canonical(replay, count) => {
+                    quorum_count = count;
                     if self
                         .chain_store
                         .get_block_hash_by_number(r.number)
@@ -630,7 +855,17 @@ impl<S: KvStore + 'static> Node<S> {
                 r.error = Some(e.chars().take(2048).collect());
             }
         }
-        let receipt = result.and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()));
+        let receipt = result.and_then(|v| {
+            if let Some(count) = quorum_count {
+                serde_json::to_value(CanonicalQuorumReplay {
+                    execution: v,
+                    proved_commit_signatures: count,
+                })
+            } else {
+                serde_json::to_value(v)
+            }
+            .map_err(|e| e.to_string())
+        });
         if let Err(e) = self.canonical_proof_uploads.complete(&id, receipt) {
             r.state = AdmissionState::Paused;
             r.error = Some(format!(
@@ -674,7 +909,9 @@ impl<S: KvStore + 'static> Node<S> {
                 (r.state == AdmissionState::Failed && r.attempts < 2).then_some(r)
             })
         })?;
-        if r.state == AdmissionState::Verifying && self.live_admission.lock().worker.is_some() {
+        if r.version != 1
+            || (r.state == AdmissionState::Verifying && self.live_admission.lock().worker.is_some())
+        {
             return None;
         }
         let mut runtime = self.live_admission.lock();
@@ -708,7 +945,7 @@ impl<S: KvStore + 'static> Node<S> {
             .unwrap_or_default();
         let mut actions = vec![];
         for m in manifests {
-            // Quorum artifacts are explicit read-only fetches, never sender candidates.
+            // Quorum artifacts use explicit operator fetches, never sender discovery.
             if m.version != 1 || self.validate_proof_upload_source(&m).is_err() {
                 continue;
             }
@@ -775,6 +1012,7 @@ mod tests {
             peer: peer.0.clone(),
             state: AdmissionState::Waiting,
             manifest: None,
+            quorum_certificate_hash: None,
             attempts: 0,
             hash_retries: 0,
             error: None,
@@ -819,5 +1057,44 @@ mod tests {
             .scan_prefix(shell_storage::CANONICAL_PROOF_CACHE_PREFIX)
             .unwrap()
             .is_empty());
+    }
+    #[test]
+    fn disabled_quorum_role_cannot_inherit_sender_permission() {
+        let db = Arc::new(MemoryDb::new());
+        let mut node =
+            super::super::tests::setup_node_with_store(Address::from([1; 32]), db.clone());
+        node.config.canonical_proof_admission = true;
+        assert!(!node.config.canonical_quorum_admission);
+        let block = ShellHash::from([7; 32]);
+        let manifest = CanonicalProofManifest {
+            version: 2,
+            chain_id: node.config.chain_id,
+            genesis_hash: ShellHash::from([1; 32]),
+            block_hash: block,
+            total_bytes: 1,
+            payload_hash: ShellHash::ZERO,
+        };
+        let record = AdmissionRecord {
+            version: 2,
+            block,
+            number: 1,
+            parent: ShellHash::ZERO,
+            source_hash: ShellHash::ZERO,
+            peer: "peer".into(),
+            state: AdmissionState::Waiting,
+            manifest: Some(manifest.clone()),
+            quorum_certificate_hash: Some(ShellHash::ZERO),
+            attempts: 0,
+            hash_retries: 0,
+            error: None,
+        };
+        node.save_admission(&record).unwrap();
+        let before = db.scan_all().unwrap();
+        assert!(!node.pending_manifest_source(&manifest).unwrap());
+        assert!(node
+            .bind_quorum_manifest(&manifest)
+            .unwrap_err()
+            .contains("disabled"));
+        assert_eq!(db.scan_all().unwrap(), before);
     }
 }

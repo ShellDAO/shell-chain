@@ -529,7 +529,9 @@ impl<S: KvStore + 'static> Node<S> {
         })?;
         *AlgorithmRegistry::global_mut() = registry;
         *self.runtime_signer.write() = Some(Arc::clone(&signer));
-        if self.config.canonical_proof_admission && !network.supports_canonical_proof_transfer() {
+        if (self.config.canonical_proof_admission || self.config.canonical_quorum_admission)
+            && !network.supports_canonical_proof_transfer()
+        {
             return Err(NodeError::Startup(
                 "canonical proof admission requires dedicated peer transport".into(),
             ));
@@ -868,7 +870,10 @@ impl<S: KvStore + 'static> Node<S> {
                     }
                 }
                 _=canonical_proof_timer.tick()=>{
-                    let completed = if self.config.canonical_proof_admission {
+                    if self.config.canonical_quorum_admission {
+                        if let Err(error)=proof_admission_work(||self.start_ready_quorum_candidate()){warn!(%error,"quorum upload worker not started; retained candidate");}
+                    }
+                    let completed = if self.config.canonical_proof_admission || self.config.canonical_quorum_admission {
                         proof_admission_work(||self.finish_live_candidate())
                     } else { None };
                     if let Some((result,new_commit))=completed{
@@ -878,7 +883,8 @@ impl<S: KvStore + 'static> Node<S> {
                         self.metrics.blocks_imported.inc();self.metrics.block_height.set(num as i64);
                         self.metrics.update_finality(num,self.finality.read().last_finalized_number());
                         self.consensus.write().note_block_progress(Self::wall_clock_millis());
-                        if early_commit_certificate.finalize_imported(&self){*finalized_number.write()=self.finality.read().last_finalized_number();}
+                        early_commit_certificate.finalize_imported(&self);
+                        *finalized_number.write()=self.finality.read().last_finalized_number();
                         self.slash_timed_out_challenges(num);
                         if let Some(header)=self.chain_store.get_header_by_hash(&result.block)?{
                             let _=block_event_tx.send(BlockEvent::NewBlock{header,receipts:result.receipts,removed:false});
@@ -1334,6 +1340,9 @@ impl<S: KvStore + 'static> Node<S> {
                         Some(NetworkEvent::MessageReceived { peer, message }) => {
                             match message {
                                 NetworkMessage::NewBlock(block) => {
+                                    match if self.config.canonical_quorum_admission { proof_admission_work(||self.stage_live_quorum_candidate(&peer,&block,None)) } else {Ok(false)} {
+                                        Ok(true)=>continue,Ok(false)=>{},Err(error)=>{warn!(%error,"fresh quorum candidate refused; no native fallback");continue;}
+                                    }
                                     match if self.config.canonical_proof_admission { proof_admission_work(||self.stage_live_candidate(&peer,&block)) } else { Ok(false) }{
                                         Ok(true)=>{continue;},Ok(false)=>{},Err(error)=>{warn!(%error,"fresh proof candidate refused; no native fallback");continue;}
                                     }
@@ -1671,6 +1680,9 @@ impl<S: KvStore + 'static> Node<S> {
                                     let certs: HashMap<ShellHash, Vec<u8>> =
                                         commit_certificates.into_iter().collect();
                                     for block in blocks {
+                                        match if self.config.canonical_quorum_admission { proof_admission_work(||self.stage_live_quorum_candidate(&peer,&block,certs.get(&block.hash()).map(Vec::as_slice))) } else {Ok(false)} {
+                                            Ok(true)=>break,Ok(false)=>{},Err(error)=>{warn!(%error,"fresh quorum candidate refused; no native fallback");break;}
+                                        }
                                         match if self.config.canonical_proof_admission { proof_admission_work(||self.stage_live_candidate(&peer,&block)) } else { Ok(false) }{
                                             Ok(true)=>{
                                                 // Proof verification defers native import. Keep the

@@ -108,6 +108,7 @@ impl<S: KvStore + 'static> Node<S> {
             return Err("canonical proof transfer busy".into());
         }
         self.validate_proof_upload_source(&manifest)?;
+        self.bind_quorum_manifest(&manifest)?;
         let mut upload = self
             .canonical_proof_uploads
             .begin(manifest)

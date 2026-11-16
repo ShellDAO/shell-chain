@@ -1983,6 +1983,23 @@ impl<S: KvStore + 'static> Node<S> {
         cert: &[u8],
         proof: &shell_stark_prover::commit_quorum::CommitQuorumProof,
     ) -> Result<CanonicalQuorumReplay, NodeError> {
+        let (verified, config) =
+            self.verify_live_quorum_candidate(expected_parent, &block, cert, proof)?;
+        self.commit_live_verified_quorum(expected_parent, block, cert, &verified, &config)
+    }
+
+    pub(super) fn live_quorum_context(
+        &self,
+        expected_parent: ShellHash,
+        block: &Block,
+        cert: &[u8],
+    ) -> Result<
+        (
+            shell_storage::ChainConfig,
+            shell_stark_prover::commit_quorum::CommitQuorumSource,
+        ),
+        NodeError,
+    > {
         let head = self
             .chain_store
             .get_head_block()?
@@ -2016,8 +2033,6 @@ impl<S: KvStore + 'static> Node<S> {
                 "quorum import configuration changed before snapshot".into(),
             ));
         }
-        let registry = load_algorithm_registry(&view.world_state()?)
-            .map_err(|e| NodeError::Startup(format!("quorum import registry: {e}")))?;
         let source = self
             .commit_quorum_source_for_header(
                 &block.header,
@@ -2025,13 +2040,68 @@ impl<S: KvStore + 'static> Node<S> {
                 &self.consensus.read().validator_weights(),
             )
             .map_err(NodeError::Startup)?;
+        let registry = load_algorithm_registry(&view.world_state()?)
+            .map_err(|e| NodeError::Startup(format!("quorum source registry: {e}")))?;
+        with_algorithm_registry_override(&registry, || {
+            source.validate().map_err(NodeError::Startup)?;
+            self.chain_store.verify_block_body_commitment(block)?;
+            self.verify_import_consensus(block, &head, true)?;
+            self.verify_import_economics(block, &head)?;
+            self.verify_incoming_witness_root(block)?;
+            self.verify_import_sig_aggregate_proof(block)?;
+            Ok::<_, NodeError>(())
+        })?;
+        Ok((config, source))
+    }
+
+    /// CPU workers return a new opaque exact-source tuple; persisted receipts are not authority.
+    pub(super) fn verify_live_quorum_candidate(
+        &self,
+        parent: ShellHash,
+        block: &Block,
+        cert: &[u8],
+        proof: &shell_stark_prover::commit_quorum::CommitQuorumProof,
+    ) -> Result<
+        (
+            shell_stark_prover::commit_quorum::VerifiedCommitQuorum,
+            shell_storage::ChainConfig,
+        ),
+        NodeError,
+    > {
+        let (config, source) = self.live_quorum_context(parent, block, cert)?;
+        let view = self.chain_store.canonical_parent_view(parent, parent)?;
+        let registry = load_algorithm_registry(&view.world_state()?)
+            .map_err(|e| NodeError::Startup(format!("quorum import registry: {e}")))?;
         let verified = with_algorithm_registry_override(&registry, || {
             shell_stark_prover::commit_quorum::verify_commit_quorum(proof, &source)
         })
         .map_err(|e| NodeError::Startup(format!("fresh quorum proof: {e}")))?;
+        Ok((verified, config))
+    }
+
+    /// Called only by the serialized canonical loop (or the exclusive offline API).
+    pub(super) fn commit_live_verified_quorum(
+        &self,
+        expected_parent: ShellHash,
+        block: Block,
+        cert: &[u8],
+        verified: &shell_stark_prover::commit_quorum::VerifiedCommitQuorum,
+        expected_config: &shell_storage::ChainConfig,
+    ) -> Result<CanonicalQuorumReplay, NodeError> {
+        let (config, source) = self.live_quorum_context(expected_parent, &block, cert)?;
+        if &config != expected_config || !verified.matches_source(&source) {
+            return Err(NodeError::Startup(
+                "quorum worker context changed before handoff".into(),
+            ));
+        }
+        let view = self
+            .chain_store
+            .canonical_parent_view(expected_parent, expected_parent)?;
+        let registry = load_algorithm_registry(&view.world_state()?)
+            .map_err(|e| NodeError::Startup(format!("quorum import registry: {e}")))?;
         let hash = block.hash();
         with_algorithm_registry_override(&registry, || {
-            self.import_block_inner(block, true, None, Some((cert, &verified, &config)))
+            self.import_block_inner(block, true, None, Some((cert, verified, &config)))
         })?;
         let imported = self
             .chain_store

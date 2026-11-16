@@ -897,3 +897,15 @@ automatic discovery remain unchanged. See the
 for the typed payload, partial-upload recovery and refusal checks. This
 read-only service does not activate full-quorum live admission or establish
 historical authority/penalty provenance.
+
+Fresh certified sync can separately opt into `canonical_quorum_admission`
+(`--canonical-quorum-admission`). It defaults to false and does not change the
+sender admission option or the consensus certificate wire format. At the existing
+block-commitment boundary, an exact next-child body and attached QC from a
+requested sync response are retained as untrusted local inputs. Explicit
+authenticated manifest-two upload or fetch verifies complete QC signature and
+weight AIR in a worker. Only the serialized node loop may hand its newly verified
+opaque tuple to the existing single-batch canonical/finality importer. No cached
+verification flag authorizes a fresh child. See the
+[quorum ADR](adr/commit-quorum-proof.md#fresh-certified-sync-with-explicit-quorum-proofs)
+for the bounded profile, runnable example and remaining limitations.
