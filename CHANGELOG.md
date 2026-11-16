@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add real-peer partial-transfer and verification-worker shutdown recovery checks for automatic full-QC admission, including retained byte/generation checks, fresh peer/nonce binding and mandatory cold reverification before canonical commit.
+
 - Connect default-off full-QC admission to typed dedicated-peer manifest discovery, automatic bounded transfer and cold waiting-source continuation; preserve legacy sender requests and independent artifact permissions.
 
 

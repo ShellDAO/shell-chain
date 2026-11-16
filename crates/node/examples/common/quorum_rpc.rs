@@ -655,6 +655,265 @@ fn production_native_rows<S: KvStore + 'static>(n: &Node<S>) -> Result<Rows, Err
         })
         .collect())
 }
+
+fn recovery_native_digest(n: &Node<RocksDbStore>) -> Result<ShellHash, Error> {
+    let rows: Rows = n
+        .store
+        .scan_all()?
+        .into_iter()
+        .filter(|(key, _)| !key.starts_with(b"local/"))
+        .collect();
+    Ok(blake3_hash(&serde_json::to_vec(&rows)?))
+}
+
+fn recovery_genesis_balances(n: &Node<RocksDbStore>, c: &Control) -> Result<(), Error> {
+    let state = n.world_state.read();
+    let sender = state
+        .get_account(&c.sender)?
+        .ok_or("genesis sender missing")?;
+    let recipient = state.get_account(&c.recipient)?;
+    ensure(
+        sender.nonce == 0
+            && sender.balance == U256::from(INITIAL)
+            && recipient.is_none_or(|account| account.balance.is_zero() && account.nonce == 0),
+        "genesis nonce/value/fee balance mismatch",
+    )
+}
+
+fn recovery_chunks(
+    cache: &shell_storage::CanonicalProofUploadStore<RocksDbStore>,
+    upload: &CanonicalProofUploadStatus,
+) -> Result<Vec<ShellHash>, Error> {
+    (0..upload.next_chunk)
+        .map(|index| Ok(blake3_hash(&cache.chunk(&upload.proof_id, index)?)))
+        .collect()
+}
+
+/// Observe real persisted progress and stop through Node.shutdown; never inject bytes.
+async fn automatic_recovery(
+    provider: &Live,
+    c: &Control,
+    root: &Path,
+    manifest: &CanonicalProofManifest,
+    mode: &str,
+) -> Result<(), Error> {
+    let recover = mode == "producer-auto-recover";
+    let checkpoint_path = root.join("recovery.json");
+    let saved: Option<Value> = if recover {
+        Some(serde_json::from_slice(&std::fs::read(&checkpoint_path)?)?)
+    } else {
+        std::fs::create_dir(root)?;
+        None
+    };
+    let initial_digest;
+    {
+        let initial = node(&root.join("db"), c, !recover)?;
+        ensure(
+            initial.chain_store.get_head_hash()? == Some(c.genesis.hash())
+                && initial.chain_store.get_finalized_number()?.unwrap_or(0) == 0
+                && initial
+                    .chain_store
+                    .get_receipts(&c.blocks[0].hash())?
+                    .is_none(),
+            "recovery receiver must retain genesis Native state",
+        )?;
+        recovery_genesis_balances(&initial, c)?;
+        initial_digest = recovery_native_digest(&initial)?;
+        if let Some(saved) = &saved {
+            ensure(
+                matches!(
+                    saved["mode"].as_str(),
+                    Some("producer-auto-partial" | "producer-auto-worker")
+                ) && saved["nativeDigest"] == serde_json::to_value(initial_digest)?
+                    && saved["manifest"] == serde_json::to_value(manifest)?,
+                "cold recovery source or Native identity changed",
+            )?;
+            let cache = shell_storage::CanonicalProofUploadStore::new(initial.store.clone());
+            let upload = cache.status(&manifest.id())?;
+            let fetch = cache
+                .fetch_status(&manifest.id(), None)?
+                .ok_or("retained fetch absent")?;
+            ensure(
+                saved["upload"] == serde_json::to_value(&upload)?
+                    && saved["fetch"] == serde_json::to_value(&fetch)?
+                    && saved["chunkDigests"]
+                        == serde_json::to_value(recovery_chunks(&cache, &upload)?)?
+                    && fetch.peer != provider.peer(),
+                "cold recovery cache, generation, nonce or peer identity changed",
+            )?;
+        } else {
+            ensure(
+                initial
+                    .store
+                    .scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?
+                    .is_empty(),
+                "new recovery receiver already has proof bytes",
+            )?;
+        }
+    }
+    let receiver =
+        Live::start_mode(&root.join("db"), c, vec![provider.dial()], true, false).await?;
+    let outcome = async {
+        wait_pending(&receiver, c).await?;
+        let upload = tokio::time::timeout(Duration::from_secs(180), async {
+            loop {
+                match receiver.status(manifest.id()).await {
+                    Ok(s) => {
+                        let reached = match mode {
+                            "producer-auto-partial" => {
+                                s.state == CanonicalProofUploadState::Uploading
+                                    && s.next_chunk >= 3
+                                    && s.received_bytes < manifest.total_bytes
+                            }
+                            "producer-auto-worker" => {
+                                s.state == CanonicalProofUploadState::Verifying
+                                    && s.verification_attempts > 0
+                            }
+                            _ => matches!(
+                                s.state,
+                                CanonicalProofUploadState::Verified
+                                    | CanonicalProofUploadState::Rejected
+                            ),
+                        };
+                        if reached {
+                            if !recover {
+                                receiver.node.shutdown();
+                            }
+                            return Ok::<_, Error>(s);
+                        }
+                        ensure(
+                            !matches!(
+                                s.state,
+                                CanonicalProofUploadState::Verified
+                                    | CanonicalProofUploadState::Rejected
+                            ),
+                            "recovery observation missed the requested interruption",
+                        )?;
+                    }
+                    Err(e) if e.to_string().contains("upload not found") => {}
+                    Err(e) => return Err(e),
+                }
+                ensure(
+                    !receiver.task.is_finished(),
+                    "receiver stopped before requested recovery observation",
+                )?;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await??;
+        if recover {
+            ensure(
+                upload.state == CanonicalProofUploadState::Verified
+                    && upload
+                        .result
+                        .as_ref()
+                        .is_some_and(|v| v["proved_commit_signatures"] == 2)
+                    && receiver.node.chain_store.get_head_hash()? == Some(c.blocks[0].hash())
+                    && receiver.node.chain_store.get_finalized_number()? == Some(1)
+                    && receiver
+                        .node
+                        .chain_store
+                        .get_receipts(&c.blocks[0].hash())?
+                        == provider
+                            .node
+                            .chain_store
+                            .get_receipts(&c.blocks[0].hash())?,
+                "recovered proof did not reach independent atomic canonical/finality endpoint",
+            )?;
+            balances(&receiver.node, c, 1)?;
+        }
+        Ok::<_, Error>(upload)
+    }
+    .await;
+    // Always close the actors before opening their physical store, including refusals.
+    receiver.stop().await?;
+    let observed = outcome?;
+    let reopened = node(&root.join("db"), c, false)?;
+    let cache = shell_storage::CanonicalProofUploadStore::new(reopened.store.clone());
+    let upload = cache.status(&manifest.id())?;
+    let fetch = cache
+        .fetch_status(&manifest.id(), None)?
+        .ok_or("durable fetch absent")?;
+    let chunks = recovery_chunks(&cache, &upload)?;
+    if let Some(saved) = saved {
+        let old_upload: CanonicalProofUploadStatus =
+            serde_json::from_value(saved["upload"].clone())?;
+        let old_fetch: shell_storage::CanonicalProofFetchStatus =
+            serde_json::from_value(saved["fetch"].clone())?;
+        let old_chunks: Vec<ShellHash> = serde_json::from_value(saved["chunkDigests"].clone())?;
+        let partial = saved["mode"] == "producer-auto-partial";
+        ensure(
+            upload.generation == old_upload.generation
+                && chunks.starts_with(&old_chunks)
+                && (!partial
+                    || (fetch.peer == provider.peer()
+                        && fetch.peer != old_fetch.peer
+                        && fetch.nonce > old_fetch.nonce))
+                && fetch.generation == old_fetch.generation
+                && upload.verification_attempts > old_upload.verification_attempts
+                && reopened.chain_store.get_head_hash()? == Some(c.blocks[0].hash())
+                && reopened.chain_store.get_finalized_number()? == Some(1)
+                && reopened.chain_store.get_receipts(&c.blocks[0].hash())?
+                    == provider
+                        .node
+                        .chain_store
+                        .get_receipts(&c.blocks[0].hash())?,
+            "cold recovery lost retained chunks, peer/nonce binding or full recheck",
+        )?;
+        balances(&reopened, c, 1)?;
+        println!(
+            "{}",
+            json!({"automaticQuorumRecoveryComplete":true,"interruptedMode":saved["mode"],"head":1,"finalized":1,"provedCommitSignatures":2,"independentReceiptsBalancesNonceFeesChecked":true,"retainedChunkDigestsEqual":true,"retainedChunks":old_chunks.len(),"sameGeneration":true,"recoveryByteTransferRequired":partial,"differentAuthenticatedPeer":fetch.peer!=old_fetch.peer,"nonceIncreased":fetch.nonce>old_fetch.nonce,"verificationAttempts":upload.verification_attempts,"noOperatorProofCalls":true,"physicalColdReopen":true})
+        );
+    } else {
+        ensure(
+            recovery_native_digest(&reopened)? == initial_digest
+                && reopened.chain_store.get_head_hash()? == Some(c.genesis.hash())
+                && reopened.chain_store.get_finalized_number()?.unwrap_or(0) == 0
+                && reopened
+                    .chain_store
+                    .get_receipts(&c.blocks[0].hash())?
+                    .is_none()
+                && upload.result.is_none()
+                && fetch.state == shell_storage::CanonicalProofFetchState::Paused,
+            "interruption published canonical state or retained an active fetch",
+        )?;
+        recovery_genesis_balances(&reopened, c)?;
+        ensure(
+            match mode {
+                "producer-auto-partial" => {
+                    upload.state == CanonicalProofUploadState::Uploading
+                        && upload.next_chunk >= observed.next_chunk
+                        && upload.received_bytes < manifest.total_bytes
+                        && upload.verification_attempts == 0
+                }
+                "producer-auto-worker" => {
+                    upload.state == CanonicalProofUploadState::Ready
+                        && upload.received_bytes == manifest.total_bytes
+                        && upload.verification_attempts == observed.verification_attempts
+                        && upload
+                            .error
+                            .as_ref()
+                            .is_some_and(|e| e.contains("full recheck required"))
+                }
+                _ => false,
+            },
+            "durable interruption state inconsistent",
+        )?;
+        ensure(
+            !checkpoint_path.exists(),
+            "recovery checkpoint already exists",
+        )?;
+        let checkpoint = json!({"mode":mode,"manifest":manifest,"nativeDigest":initial_digest,"upload":upload,"fetch":fetch,"chunkDigests":chunks});
+        std::fs::write(checkpoint_path, serde_json::to_vec_pretty(&checkpoint)?)?;
+        println!(
+            "{}",
+            json!({"automaticQuorumInterrupted":true,"mode":mode,"head":0,"finalized":0,"canonicalRowsUnchanged":true,"noChildReceipts":true,"noCachedAuthorization":true,"receivedBytes":upload.received_bytes,"nextChunk":upload.next_chunk,"verificationAttempts":upload.verification_attempts,"noOperatorProofCalls":true,"actualTCPNoise":true,"gracefulNodeShutdown":true,"physicalColdReopen":true})
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn seed_producer(
     controls: &Path,
     job_root: &Path,
@@ -872,6 +1131,11 @@ async fn exercise_producer(
         let expected=frame(proof_file)?;ensure(manifest==super::quorum_rpc::manifest(&c,&expected),"produced payload identity differs from original genuine graph")?;
         if mode=="producer-cold"{
             println!("{}",json!({"coldNodeQuorumProducerReverified":true,"NativeRowsUnchanged":true,"status":status,"readyBytesNotNativeAuthorization":true}));return Ok(());
+        }
+        if matches!(mode,"producer-auto-partial"|"producer-auto-worker"|"producer-auto-recover") {
+            automatic_recovery(&provider,&c,receiver_root,&manifest,mode).await?;
+            ensure(production_native_rows(&provider.node)?==before,"recovery changed provider Native rows")?;
+            return Ok(());
         }
         ensure(matches!(mode,"producer-live"|"producer-auto"|"producer-auto-resume"),"unknown producer mode")?;
         let resume=mode=="producer-auto-resume";

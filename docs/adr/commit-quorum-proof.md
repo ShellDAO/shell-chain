@@ -550,3 +550,36 @@ it is never uploaded or handed to the receiver as a manifest. Unexpected failure
 exit nonzero; retain all partial inputs and stores. These controlled flows do
 not qualify successor/fork QC AIR, historical authority provenance, all-host
 fresh proof generation, public artifacts or network activation.
+
+
+To exercise real partial-byte recovery and a verification worker interrupted by
+normal node shutdown, use separate new receivers and a separate process for each
+recovery command:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-auto-partial timed-two-signer-quorum producer-native/db partial-proof-receiver timed-two-signer-proof.cbor
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-auto-recover timed-two-signer-quorum producer-native/db partial-proof-receiver timed-two-signer-proof.cbor
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-auto-worker timed-two-signer-quorum producer-native/db interrupted-worker-receiver timed-two-signer-proof.cbor
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-auto-recover timed-two-signer-quorum producer-native/db interrupted-worker-receiver timed-two-signer-proof.cbor
+```
+
+The partial command observes at least three chunks received through the ordinary
+automatic peer pull, then calls `Node.shutdown`. It requires an incomplete cache,
+unchanged canonical rows, genesis finality and no child receipts after closing
+and physically reopening the store. Its recovery preserves every retained chunk
+hash and the upload generation, binds a higher nonce to a different authenticated
+provider peer, and requires full verification before atomic block/finality one.
+The worker command observes an actual CPU verification attempt, requests normal
+shutdown and waits for the worker without committing its result. The retained
+complete bytes must be ready for a new attempt; their cached state cannot
+replace verification. Recovery must increase the verification-attempt count and
+match the independent provider's receipts, balances, nonce and fees. Complete
+cached bytes can be reverified locally without a new byte transfer.
+
+Both commands retain a `recovery.json` checkpoint containing public manifest,
+progress and chunk digests beside the receiver store. Keep that file and store
+together. No proof mutation RPC, injected payload, operating-system signal or new
+authority signature is used. An unexpected observation or changed checkpoint
+exits nonzero and preserves all partial data. These checks cover graceful
+shutdown; abrupt process loss and backend failure during a live import require
+separate acceptance.
