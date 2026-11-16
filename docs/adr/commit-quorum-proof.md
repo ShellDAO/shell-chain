@@ -426,3 +426,78 @@ acceptance. Existing fork/reorganization paths retain Native certificate
 verification; this option is not a chain-wide full-PQ verification switch.
 Sender and proposer authorization in this path remain Native. The
 first-block example must not be interpreted as a full-PQ chain acceptance.
+
+## Node-owned quorum proof production
+
+The local `canonical_quorum_production` option, CLI
+`--canonical-quorum-production` and `[consensus].canonical_quorum_production`
+default to false. It requires a prover role and respects the existing readiness
+and `canonical_proof_component_budget` gates. Sender and quorum production
+options cannot be enabled in the same node process; run separate workers for
+those roles. A CLI build that serves dedicated peer transfer needs its
+`libp2p` feature. This source option does not change consensus carriers, activation
+heights or penalty policy.
+
+The controller selects finalized canonical blocks in activation order, derives
+their original stored QCs and current trusted authority/key/weight context, and
+captures immutable source descriptors. It uses the existing bounded checkpoint
+owner in a disjoint quorum namespace: two retained jobs, a 256 MiB checkpoint
+quota, immutable component writes, compression and full verification on reuse.
+Native and sender keys cannot cross the namespace adapter. The controller
+checks cancellation at durable component boundaries and records actual progress
+even when a budget or readiness change pauses work. Completed jobs are queued
+for full rechecking on process restart.
+
+After complete verification and repeated canonical/context checks, the node
+encodes the real version-two payload and writes the existing bounded chunk
+cache. `admin_quorumProofProduction` returns progress and its manifest. Cache
+state is `ready`, indicating byte availability; it does not provide a Native
+execution receipt or an import authorization token. An independently running
+receiver must still perform full verification and canonical execution. Automatic
+quorum discovery is separate; explicit authenticated manifest fetch is supported.
+
+An operator may recover an already complete, separately owned quorum job through
+`Node::recover_quorum_production_job` while the node is offline. The node selects
+the source from the expected canonical block and verifies the entire donor
+before writing its own descriptor or checkpoints. Donor stores containing
+Native keys or conflicting sources refuse. Original donor logical rows remain
+unchanged. Recovery alone does not publish an artifact: the node worker must
+verify the copied checkpoints again before availability.
+
+Using the self-created controls, complete proof and separate job from the
+earlier commands, prepare a new owned first-block provider and receiver:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- receive-one timed-two-signer-quorum timed-two-signer-proof.cbor producer-native
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-seed timed-two-signer-quorum timed-two-signer-job producer-native/db
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-disabled timed-two-signer-quorum producer-native/db unused-receiver timed-two-signer-proof.cbor
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-live timed-two-signer-quorum producer-native/db produced-proof-receiver timed-two-signer-proof.cbor
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-cold timed-two-signer-quorum producer-native/db produced-proof-receiver timed-two-signer-proof.cbor
+```
+
+The example checks checkpoint-boundary cancellation, a correctly hashed damaged
+donor, wrong source and foreign Native keys before valid recovery. It then
+starts the actual node producer with the existing component budget, checks
+107 reverified components and zero new proving, obtains the node-produced
+manifest and transfers its bytes through real TCP/Noise peers. No client proof
+upload supplies the provider artifact. The fresh receiver must commit/finalize
+block one and match independent receipts, balance, nonce and fees. A separate
+process verifies the complete node-owned graph again. Temporary loopback RPC
+listeners use authentication and non-authority runtime signers. Commands exit
+nonzero on failed operations or assertions; preserve failed stores for diagnosis.
+
+`producer-disabled` checks that the seeded job stays paused without publishing
+bytes. The destructive fault modes require separate closed database copies:
+`producer-corrupt` damages a checkpoint in a seeded copy before publication,
+while `producer-manifest` changes the role of a completed copy's persisted
+manifest. Both require refusal and unchanged Native state; retain each failed
+copy and keep the original provider intact. Checkpoint cancellation through the
+offline API is covered; live readiness loss and power-loss interruption remain
+separate acceptance cases.
+
+This complete-job recovery flow reuses the existing genuine graph to avoid
+repeating input-equivalent mathematics. It does not qualify fresh-from-zero
+full generation on every host, automatic discovery, successor/fork QC AIR,
+historical validator/penalty/selector provenance, an unbounded job archive,
+network activation or public artifacts. Sender and proposer authorization
+remain Native in this profile, and the full-PQ parent promise remains open.

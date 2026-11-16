@@ -10,6 +10,9 @@ pub trait CanonicalProofControl: Send + Sync {
         block: shell_primitives::ShellHash,
     ) -> Result<Option<serde_json::Value>, String>;
     fn production(&self, block: ShellHash) -> Result<Option<serde_json::Value>, String>;
+    fn quorum_production(&self, _block: ShellHash) -> Result<Option<serde_json::Value>, String> {
+        Ok(None)
+    }
     fn fetch(
         &self,
         peer: String,

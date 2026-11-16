@@ -133,7 +133,26 @@ pub fn prove_commit_quorum_persistent<S: KvStore>(
     source: &CommitQuorumSource,
     limit: Option<NonZeroUsize>,
 ) -> Result<(CommitQuorumProof, ProductionProgress), ProductionError> {
-    commit_quorum_persistent(store, source, limit, false, None)
+    commit_quorum_persistent(store, source, limit, false, None, None, None)
+}
+
+/// Node lifecycle cancellation is checked at the same durable component boundaries.
+pub fn prove_commit_quorum_persistent_interruptible<S: KvStore>(
+    store: &mut S,
+    source: &CommitQuorumSource,
+    limit: Option<NonZeroUsize>,
+    interrupt: &dyn Fn() -> bool,
+    progress: &mut ProductionProgress,
+) -> Result<(CommitQuorumProof, ProductionProgress), ProductionError> {
+    commit_quorum_persistent(
+        store,
+        source,
+        limit,
+        false,
+        None,
+        Some(interrupt),
+        Some(progress),
+    )
 }
 
 /// Reverify all original certificates without initializing a job or invoking
@@ -142,7 +161,7 @@ pub fn reverify_commit_quorum_persistent<S: KvStore>(
     store: &mut S,
     source: &CommitQuorumSource,
 ) -> Result<(CommitQuorumProof, ProductionProgress), ProductionError> {
-    commit_quorum_persistent(store, source, None, true, None)
+    commit_quorum_persistent(store, source, None, true, None, None, None)
 }
 
 /// Reverify a complete, independently pinned donor before opening destination
@@ -170,7 +189,7 @@ pub fn prove_commit_quorum_persistent_reusing<S: KvStore, D: KvStore>(
             .map(Some)
             .ok_or_else(|| "missing input-matched donor checkpoint".to_string())
     };
-    commit_quorum_persistent(store, source, limit, false, Some(&reuse))
+    commit_quorum_persistent(store, source, limit, false, Some(&reuse), None, None)
 }
 
 fn donor_component_name(
@@ -197,6 +216,8 @@ fn commit_quorum_persistent<S: KvStore>(
     limit: Option<NonZeroUsize>,
     read_only: bool,
     reuse: Option<&crate::production_store::ComponentReuse<'_>>,
+    interrupt: Option<&dyn Fn() -> bool>,
+    observed: Option<&mut ProductionProgress>,
 ) -> Result<(CommitQuorumProof, ProductionProgress), ProductionError> {
     source.validate()?;
     // Validate the strict public arithmetic and native signatures before opening
@@ -253,29 +274,38 @@ fn commit_quorum_persistent<S: KvStore>(
     if let Some(reuse) = reuse {
         job = job.with_reuse(reuse);
     }
-    let weight = job.checkpoint(
-        "commit-weight",
-        || prove_quorum_weight(&source.context),
-        |p| verify_quorum_weight(p, &source.context).map(|_| ()),
-    )?;
-    let mut signatures = Vec::with_capacity(source.signatures.len());
-    for (i, (entry, raw)) in source.signatures.iter().zip(legacy).enumerate() {
-        signatures.push(crate::canonical_producer::prove_signature(
-            &mut job,
-            &format!("commit-signer-{i}"),
-            &entry.public_key,
-            source.context.block_hash.as_bytes(),
-            &entry.signature.data,
-            raw,
-        )?);
+    if let Some(interrupt) = interrupt {
+        job = job.with_interrupt(interrupt);
     }
-    let proof = CommitQuorumProof {
-        version: 1,
-        weight,
-        signatures,
-    };
-    verify_commit_quorum(&proof, source)?;
-    Ok((proof, job.progress()))
+    let result = (|| -> Result<CommitQuorumProof, ProductionError> {
+        let weight = job.checkpoint(
+            "commit-weight",
+            || prove_quorum_weight(&source.context),
+            |p| verify_quorum_weight(p, &source.context).map(|_| ()),
+        )?;
+        let mut signatures = Vec::with_capacity(source.signatures.len());
+        for (i, (entry, raw)) in source.signatures.iter().zip(legacy).enumerate() {
+            signatures.push(crate::canonical_producer::prove_signature(
+                &mut job,
+                &format!("commit-signer-{i}"),
+                &entry.public_key,
+                source.context.block_hash.as_bytes(),
+                &entry.signature.data,
+                raw,
+            )?);
+        }
+        let proof = CommitQuorumProof {
+            version: 1,
+            weight,
+            signatures,
+        };
+        verify_commit_quorum(&proof, source)?;
+        Ok(proof)
+    })();
+    if let Some(observed) = observed {
+        *observed = job.progress();
+    }
+    result.map(|proof| (proof, job.progress()))
 }
 
 #[cfg(test)]

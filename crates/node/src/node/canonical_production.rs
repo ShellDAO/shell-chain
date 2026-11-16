@@ -102,7 +102,7 @@ impl<S: KvStore> CanonicalProductionStore<S> {
             lock: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
-    fn ids(&self) -> Result<Vec<ShellHash>, StorageError> {
+    pub(super) fn ids(&self) -> Result<Vec<ShellHash>, StorageError> {
         let ids: Vec<ShellHash> = self
             .store
             .get(&key(b"jobs"))?
@@ -273,7 +273,10 @@ impl<S: KvStore> CanonicalProductionStore<S> {
         }
         Ok(())
     }
-    fn status(&self, hash: ShellHash) -> Result<Option<CanonicalProductionStatus>, StorageError> {
+    pub(super) fn status(
+        &self,
+        hash: ShellHash,
+    ) -> Result<Option<CanonicalProductionStatus>, StorageError> {
         self.store
             .get(&record_key(hash))?
             .map(|b| {
@@ -292,7 +295,7 @@ impl<S: KvStore> CanonicalProductionStore<S> {
             })
             .transpose()
     }
-    fn save(&self, status: &CanonicalProductionStatus) -> Result<(), StorageError> {
+    pub(super) fn save(&self, status: &CanonicalProductionStatus) -> Result<(), StorageError> {
         let mut guard = self.lock.lock();
         self.write_locked(
             vec![(record_key(status.block_hash), encode(status)?)],
@@ -300,7 +303,10 @@ impl<S: KvStore> CanonicalProductionStore<S> {
             MAX_BYTES,
         )
     }
-    fn source(&self, status: &CanonicalProductionStatus) -> Result<Vec<u8>, StorageError> {
+    pub(super) fn source(
+        &self,
+        status: &CanonicalProductionStatus,
+    ) -> Result<Vec<u8>, StorageError> {
         let bytes = self
             .store
             .get(&source_key(status.block_hash))?
@@ -311,9 +317,26 @@ impl<S: KvStore> CanonicalProductionStore<S> {
         Ok(bytes)
     }
     fn insert(&self, source: &CanonicalProductionSource) -> Result<(), StorageError> {
+        self.insert_source(
+            source.block().hash(),
+            source.block().number(),
+            source.identity(),
+        )
+    }
+    pub(super) fn insert_source(
+        &self,
+        hash: ShellHash,
+        number: u64,
+        identity: &[u8],
+    ) -> Result<(), StorageError> {
+        if identity.len() > 4 * 1024 * 1024 {
+            return Err(error("production source size limit"));
+        }
         let mut guard = self.lock.lock();
-        let hash = source.block().hash();
-        if self.status(hash)?.is_some() {
+        if let Some(status) = self.status(hash)? {
+            if status.block_number != number || self.source(&status)? != identity {
+                return Err(error("immutable production source conflict"));
+            }
             return Ok(());
         }
         let mut ids = self.ids()?;
@@ -326,8 +349,8 @@ impl<S: KvStore> CanonicalProductionStore<S> {
         let status = CanonicalProductionStatus {
             version: 1,
             block_hash: hash,
-            block_number: source.block().number(),
-            source_hash: blake3_hash(source.identity()),
+            block_number: number,
+            source_hash: blake3_hash(identity),
             state: CanonicalProductionState::Queued,
             components: 0,
             checkpoint_bytes: 0,
@@ -341,13 +364,13 @@ impl<S: KvStore> CanonicalProductionStore<S> {
             vec![
                 (key(b"jobs"), encode(&ids)?),
                 (record_key(hash), encode(&status)?),
-                (source_key(hash), source.identity().to_vec()),
+                (source_key(hash), identity.to_vec()),
             ],
             &mut guard,
             DATA_CEILING,
         )
     }
-    fn job(&self, hash: ShellHash) -> ProductionJob<S> {
+    pub(super) fn job(&self, hash: ShellHash) -> ProductionJob<S> {
         ProductionJob {
             store: self.store.clone(),
             lock: self.lock.clone(),
@@ -357,7 +380,7 @@ impl<S: KvStore> CanonicalProductionStore<S> {
     }
 }
 /// Scoped job KV reuses the mathematical producer's atomic checkpoint format.
-struct ProductionJob<S: KvStore> {
+pub(super) struct ProductionJob<S: KvStore> {
     store: Arc<S>,
     lock: Arc<parking_lot::Mutex<Option<u64>>>,
     block: ShellHash,
@@ -1060,6 +1083,12 @@ pub(super) struct CanonicalProductionHandle {
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 impl CanonicalProductionHandle {
+    pub(super) fn new(cancel: Arc<AtomicBool>, handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            cancel,
+            handle: Some(handle),
+        }
+    }
     pub(super) async fn shutdown(mut self) {
         self.cancel.store(true, Ordering::Release);
         if let Some(handle) = self.handle.take() {

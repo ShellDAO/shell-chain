@@ -291,6 +291,7 @@ struct NodeTaskLifecycle {
     tasks: tokio::task::JoinSet<()>,
     prover_service: Option<ProverServiceHandle>,
     canonical_production: Option<super::canonical_production::CanonicalProductionHandle>,
+    quorum_production: Option<super::canonical_production::CanonicalProductionHandle>,
 }
 
 impl NodeTaskLifecycle {
@@ -299,6 +300,7 @@ impl NodeTaskLifecycle {
             tasks: tokio::task::JoinSet::new(),
             prover_service: None,
             canonical_production: None,
+            quorum_production: None,
         }
     }
 
@@ -314,6 +316,9 @@ impl NodeTaskLifecycle {
     }
 
     async fn shutdown(mut self) {
+        if let Some(handle) = self.quorum_production.take() {
+            handle.shutdown().await;
+        }
         if let Some(handle) = self.canonical_production.take() {
             handle.shutdown().await;
         }
@@ -491,13 +496,16 @@ impl<S: KvStore + 'static> Node<S> {
         use shell_rpc::{start_rpc_server_with_proof_control, BlockEvent};
         use tokio::time::{interval, Duration};
 
-        if self.config.canonical_proof_production && !self.config.node_role.runs_prover() {
+        if (self.config.canonical_proof_production || self.config.canonical_quorum_production)
+            && !self.config.node_role.runs_prover()
+        {
             return Err(NodeError::Startup(
                 "canonical proof production requires a prover role".into(),
             ));
         }
         if self.config.canonical_proof_component_budget.is_some()
             && !self.config.canonical_proof_production
+            && !self.config.canonical_quorum_production
         {
             return Err(NodeError::Startup(
                 "canonical proof component budget requires production mode".into(),
@@ -534,6 +542,11 @@ impl<S: KvStore + 'static> Node<S> {
         {
             return Err(NodeError::Startup(
                 "canonical proof admission requires dedicated peer transport".into(),
+            ));
+        }
+        if self.config.canonical_quorum_production && self.config.canonical_proof_production {
+            return Err(NodeError::Startup(
+                "sender and quorum proof production require separate worker processes".into(),
             ));
         }
         let mut network = NetworkInterface::new(network);
@@ -721,6 +734,7 @@ impl<S: KvStore + 'static> Node<S> {
         let (prover_readiness_tx, prover_readiness_rx) = tokio::sync::watch::channel(false);
 
         task_lifecycle.canonical_production = self.start_canonical_production()?;
+        task_lifecycle.quorum_production = self.start_quorum_production()?;
 
         // H3: Start background prover service if this node is configured to run proving.
         if self.config.node_role.runs_prover() {

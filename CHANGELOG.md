@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add opt-in node-owned complete QC proof production, source-bound checkpoint recovery, cold reverification and typed artifact availability in an isolated bounded store.
+
 - Add a separate, default-off full-quorum admission mode for fresh certified peer sync: bounded durable pending sources, explicit version-two proof transfer, CPU verification and serialized atomic canonical/finality commit.
 
 - Add full commit-signature/weight proof artifacts to authenticated historical proof RPC and explicit peer fetch. Off-chain manifest version 2 and a bounded CBOR role domain preserve sender manifest version 1 and its automatic admission. Reconstruct quorum inputs from canonical Native headers/certificates and trusted keys/weights, run full AIR plus read-only Native replay, and retain partial uploads and results for cold recheck.

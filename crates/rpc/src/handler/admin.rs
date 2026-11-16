@@ -14,6 +14,14 @@ impl<S: KvStore + 'static> AdminApiServer for RpcHandler<S> {
             .admission(block)
             .map_err(proof_error)
     }
+    async fn quorum_proof_production(
+        &self,
+        block: ShellHash,
+    ) -> Result<Option<serde_json::Value>, ErrorObjectOwned> {
+        self.canonical_proof_backend()?
+            .quorum_production(block)
+            .map_err(proof_error)
+    }
     async fn canonical_proof_production(
         &self,
         block: ShellHash,

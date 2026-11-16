@@ -246,6 +246,8 @@ pub struct NodeConfig {
     pub canonical_proof_admission: bool,
     /// Require complete QC AIR for fresh certified peer children; explicit manifest2 fetch.
     pub canonical_quorum_admission: bool,
+    /// Produce full QC graphs in a disjoint bounded local store; default off.
+    pub canonical_quorum_production: bool,
     /// Maximum newly generated components per node process; None runs to completion.
     pub canonical_proof_component_budget: Option<std::num::NonZeroUsize>,
     /// Maximum concurrent CPU proof jobs; results are handed off in source order.
@@ -317,6 +319,7 @@ impl NodeConfig {
             canonical_proof_production: false,
             canonical_proof_admission: false,
             canonical_quorum_admission: false,
+            canonical_quorum_production: false,
             canonical_proof_component_budget: None,
             prover_max_concurrent_proofs: 1,
             prover_priority: crate::ProvingPriority::Sequential,

@@ -74,8 +74,22 @@ impl Live {
         quorum: bool,
         initialize: bool,
     ) -> Result<Self, Error> {
+        Self::start_production(path, c, boot_nodes, quorum, initialize, false).await
+    }
+    async fn start_production(
+        path: &Path,
+        c: &Control,
+        boot_nodes: Vec<String>,
+        quorum: bool,
+        initialize: bool,
+        production: bool,
+    ) -> Result<Self, Error> {
         let mut node = node(path, c, initialize)?;
         node.config.canonical_quorum_admission = quorum;
+        node.config.canonical_quorum_production = production;
+        if production {
+            node.config.canonical_proof_component_budget = std::num::NonZeroUsize::new(1);
+        }
         let socket = std::net::TcpListener::bind("127.0.0.1:0")?;
         let address = socket.local_addr()?;
         drop(socket);
@@ -629,4 +643,250 @@ pub(super) fn run_live(
         .enable_all()
         .build()?
         .block_on(exercise_live(controls, proof, root, source, mode))
+}
+
+fn production_native_rows<S: KvStore + 'static>(n: &Node<S>) -> Result<Rows, Error> {
+    Ok(n.store
+        .scan_all()?
+        .into_iter()
+        .filter(|(k, _)| {
+            !k.starts_with(b"local/quorum-production/v1/")
+                && !k.starts_with(CANONICAL_PROOF_CACHE_PREFIX)
+        })
+        .collect())
+}
+pub(super) fn seed_producer(
+    controls: &Path,
+    job_root: &Path,
+    provider_db: &Path,
+) -> Result<(), Error> {
+    use shell_stark_prover::{
+        commit_quorum::prove_commit_quorum_persistent_interruptible,
+        production_store::{ProductionError, ProductionProgress},
+    };
+    use shell_storage::MemoryDb;
+    let c: Control = read(&controls.join("control.cbor"))?;
+    let source: CommitQuorumSource = read(&job_root.join("source.cbor"))?;
+    let mut provider = node(provider_db, &c, false)?;
+    let before = provider.store.scan_all()?;
+    ensure(
+        !provider.config.canonical_quorum_production,
+        "producer defaults enabled",
+    )?;
+    let stores = RocksDbStore::open_all(job_root.join("db"), None)?;
+    let mut donor = stores.chain;
+    let original = donor.scan_all()?;
+    let mut progress = ProductionProgress {
+        components: 0,
+        checkpoint_bytes: 0,
+        newly_proved: 0,
+        reused: 0,
+    };
+    ensure(
+        matches!(
+            prove_commit_quorum_persistent_interruptible(
+                &mut donor,
+                &source,
+                std::num::NonZeroUsize::new(1),
+                &|| true,
+                &mut progress
+            ),
+            Err(ProductionError::Paused)
+        ) && progress.newly_proved == 0
+            && progress.reused == 0
+            && donor.scan_all()? == original,
+        "cancelled quorum attempt proved or changed checkpoints",
+    )?;
+    let malformed = MemoryDb::new();
+    for (k, v) in &original {
+        malformed.put(k, v)?;
+    }
+    let key = b"production/component/commit-weight";
+    let mut bytes = malformed.get(key)?.ok_or("weight checkpoint missing")?;
+    bytes.push(0);
+    malformed.put(key, &bytes)?;
+    let mut index: Value =
+        serde_json::from_slice(&malformed.get(b"production/index")?.ok_or("index absent")?)?;
+    index["components"]["commit-weight"]["bytes"] = json!(bytes.len());
+    index["components"]["commit-weight"]["hash"] = serde_json::to_value(blake3_hash(&bytes))?;
+    malformed.put(b"production/index", &serde_json::to_vec(&index)?)?;
+    let mut malformed = malformed;
+    let rejected = provider
+        .recover_quorum_production_job(c.blocks[0].hash(), &mut malformed)
+        .err()
+        .ok_or("damaged correct-hash donor accepted")?;
+    ensure(
+        provider.store.scan_all()? == before,
+        "invalid donor wrote node rows",
+    )?;
+    let foreign = provider
+        .recover_quorum_production_job(ShellHash::ZERO, &mut donor)
+        .err()
+        .ok_or("foreign source accepted")?;
+    ensure(
+        provider.store.scan_all()? == before,
+        "foreign source wrote node rows",
+    )?;
+    let native_donor = MemoryDb::new();
+    for (k, v) in &original {
+        native_donor.put(k, v)?;
+    }
+    native_donor.put(b"HEAD", b"forbidden native key")?;
+    let mut native_donor = native_donor;
+    let namespace = provider
+        .recover_quorum_production_job(c.blocks[0].hash(), &mut native_donor)
+        .err()
+        .ok_or("native donor namespace accepted")?;
+    ensure(
+        provider.store.scan_all()? == before,
+        "foreign namespace wrote node rows",
+    )?;
+    let recovered = provider.recover_quorum_production_job(c.blocks[0].hash(), &mut donor)?;
+    ensure(
+        recovered.components == 107
+            && recovered.newly_proved == 0
+            && recovered.reused == 107
+            && donor.scan_all()? == original,
+        "recovery changed original graph or proved new components",
+    )?;
+    ensure(
+        production_native_rows(&provider)? == before
+            && provider
+                .store
+                .scan_prefix(b"local/canonical-production/v1/")?
+                .is_empty()
+            && provider
+                .canonical_production_status(c.blocks[0].hash())?
+                .is_none(),
+        "quorum recovery touched Native or sender production",
+    )?;
+    provider.store.flush()?;
+    println!(
+        "{}",
+        json!({"nodeOwnedQuorumRecovered":true,"progress":recovered,"cancelledBeforeProving":true,"correctHashDamagedDonorRefusal":rejected,"foreignSourceRefusal":foreign,"NativeNamespaceRefusal":namespace,"NativeRowsUnchanged":true,"senderNamespaceUnchanged":true,"donorLogicalRowsUnchanged":true,"newAuthoritySigningOrProving":false,"status":provider.quorum_production_status(c.blocks[0].hash())?})
+    );
+    Ok(())
+}
+async fn wait_production(live: &Live, hash: ShellHash) -> Result<Value, Error> {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let v = live
+                .call("admin_quorumProofProduction", json!([hash]))
+                .await?;
+            if v["status"]["state"] == "complete" || v["status"]["state"] == "failed" {
+                return Ok::<_, Error>(v);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await?
+}
+async fn exercise_producer(
+    controls: &Path,
+    provider_db: &Path,
+    receiver_root: &Path,
+    proof_file: &Path,
+    mode: &str,
+) -> Result<(), Error> {
+    let c: Control = read(&controls.join("control.cbor"))?;
+    if mode == "producer-manifest" {
+        let n = node(provider_db, &c, false)?;
+        let key = [
+            b"local/quorum-production/v1/record/".as_slice(),
+            c.blocks[0].hash().as_bytes(),
+        ]
+        .concat();
+        let old = n
+            .store
+            .get(&key)?
+            .ok_or("completed quorum metadata absent")?;
+        let mut v: Value = serde_json::from_slice(&old)?;
+        ensure(
+            v["manifest"]["version"] == 2,
+            "manifest fault requires completed producer",
+        )?;
+        v["manifest"]["version"] = json!(1);
+        let bad = serde_json::to_vec(&v)?;
+        ensure(
+            old.len() == bad.len(),
+            "manifest fault must retain quota width",
+        )?;
+        n.store.put(&key, &bad)?;
+        n.store.flush()?;
+    }
+    if mode == "producer-corrupt" {
+        let n = node(provider_db, &c, false)?;
+        let key = [
+            b"local/quorum-production/v1/certificates/".as_slice(),
+            c.blocks[0].hash().as_bytes(),
+            b"/production/component/commit-weight",
+        ]
+        .concat();
+        let mut bytes = n.store.get(&key)?.ok_or("owned weight checkpoint absent")?;
+        *bytes.last_mut().ok_or("weight checkpoint empty")? ^= 1;
+        n.store.put(&key, &bytes)?;
+        n.store.flush()?;
+    }
+    let provider = Live::start_production(
+        provider_db,
+        &c,
+        vec![],
+        false,
+        false,
+        mode != "producer-disabled",
+    )
+    .await?;
+    let before = production_native_rows(&provider.node)?;
+    let outcome=async{
+        if mode=="producer-disabled" {
+            let status=provider.call("admin_quorumProofProduction",json!([c.blocks[0].hash()])).await?;
+            ensure(status["status"]["state"]=="paused"&&status["status"]["manifest"].is_null()&&provider.node.store.scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?.is_empty()&&production_native_rows(&provider.node)?==before,"disabled producer resumed or published")?;
+            println!("{}",json!({"quorumProducerDefaultDisabled":true,"NativeRowsUnchanged":true,"proofCacheEmpty":true,"status":status}));return Ok::<_,Error>(());
+        }
+        if mode=="producer-manifest" {
+            let key=[b"local/quorum-production/v1/record/".as_slice(),c.blocks[0].hash().as_bytes()].concat();
+            tokio::time::timeout(Duration::from_secs(90),async{loop{let v:Value=serde_json::from_slice(&provider.node.store.get(&key)?.ok_or("metadata absent")?)?;if v["state"]=="failed"{return Ok::<_,Error>(());}tokio::time::sleep(Duration::from_millis(100)).await;}}).await??;
+            ensure(provider.call("admin_quorumProofProduction",json!([c.blocks[0].hash()])).await.is_err()&&production_native_rows(&provider.node)?==before,"wrong-role completed metadata accepted or changed Native")?;
+            println!("{}",json!({"wrongRoleProducerMetadataRejected":true,"NativeRowsUnchanged":true,"noCachedAuthorization":true}));return Ok(());
+        }
+        let status=wait_production(&provider,c.blocks[0].hash()).await?;
+        if mode=="producer-corrupt" {
+            ensure(status["status"]["state"]=="failed"&&status["status"]["error"].is_string()&&production_native_rows(&provider.node)?==before&&provider.node.store.scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?.is_empty(),"corrupt owned job healed, wrote Native, or published bytes")?;
+            println!("{}",json!({"damagedOwnedGraphRejected":true,"NativeRowsUnchanged":true,"proofCacheEmpty":true,"status":status}));return Ok::<_,Error>(());
+        }
+        ensure(status["status"]["state"]=="complete"&&status["status"]["components"]==107&&status["status"]["newlyProved"]==0&&status["status"]["reused"]==107&&status["artifactVersion"]==2&&status["nativeExecutionVerified"]==false,"actual quorum producer did not fully reverify existing graph")?;
+        let manifest:CanonicalProofManifest=serde_json::from_value(status["status"]["manifest"].clone())?;
+        ensure(manifest.version==2&&manifest.total_bytes==30524873&&provider.status(manifest.id()).await?.state==CanonicalProofUploadState::Ready&&production_native_rows(&provider.node)?==before,"producer availability or Native state incorrect")?;
+        let expected=frame(proof_file)?;ensure(manifest==super::quorum_rpc::manifest(&c,&expected),"produced payload identity differs from original genuine graph")?;
+        if mode=="producer-cold"{
+            println!("{}",json!({"coldNodeQuorumProducerReverified":true,"NativeRowsUnchanged":true,"status":status,"readyBytesNotNativeAuthorization":true}));return Ok(());
+        }
+        ensure(mode=="producer-live","unknown producer mode")?;std::fs::create_dir(receiver_root)?;
+        let receiver=Live::start_mode(&receiver_root.join("db"),&c,vec![provider.dial()],true,true).await?;
+        let transfer=async{
+            wait_pending(&receiver,&c).await?;ensure(receiver.node.chain_store.get_head_hash()?==Some(c.genesis.hash()),"receiver imported before produced proof")?;
+            receiver.connected(&provider.peer(),&manifest).await?;receiver.call("admin_fetchCanonicalProof",json!([provider.peer(),manifest])).await?;
+            let verified=wait_upload(&receiver,manifest.id()).await?;
+            let receipts=receiver.node.chain_store.get_receipts(&c.blocks[0].hash())?.ok_or("receiver receipts absent")?;
+            ensure(verified.state==CanonicalProofUploadState::Verified&&receiver.node.chain_store.get_head_hash()?==Some(c.blocks[0].hash())&&receiver.node.chain_store.get_finalized_number()?==Some(1)&&verified.result.as_ref().is_some_and(|v|v["proved_commit_signatures"]==2)&&provider.node.chain_store.get_receipts(&c.blocks[0].hash())?==Some(receipts),"produced proof did not reach true atomic canonical/finality endpoint")?;
+            balances(&receiver.node,&c,1)?;
+            println!("{}",json!({"nodeQuorumProducerToFreshPeerComplete":true,"status":status,"actualTCPNoise":true,"head":1,"finalized":1,"provedCommitSignatures":2,"independentNativeReceiptsEqual":true,"balancesNonceFeesChecked":true,"sourceNativeRowsUnchanged":production_native_rows(&provider.node)?==before,"manualProofUpload":false,"newAuthoritySigningOrProving":false}));Ok::<_,Error>(())
+        }.await;
+        receiver.stop().await?;transfer
+    }.await;
+    provider.stop().await?;
+    outcome
+}
+pub(super) fn run_producer(
+    controls: &Path,
+    provider: &Path,
+    receiver: &Path,
+    proof: &Path,
+    mode: &str,
+) -> Result<(), Error> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?
+        .block_on(exercise_producer(controls, provider, receiver, proof, mode))
 }

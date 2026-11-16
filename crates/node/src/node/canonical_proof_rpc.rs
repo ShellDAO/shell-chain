@@ -158,6 +158,9 @@ impl<S: KvStore + 'static> CanonicalProofControl for Node<S> {
     fn admission(&self, block: ShellHash) -> Result<Option<serde_json::Value>, String> {
         self.canonical_admission_status(block)
     }
+    fn quorum_production(&self, block: ShellHash) -> Result<Option<serde_json::Value>, String> {
+        self.quorum_production_status(block)
+    }
     fn production(&self, block: ShellHash) -> Result<Option<serde_json::Value>, String> {
         self.canonical_production_status(block)
     }

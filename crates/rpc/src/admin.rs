@@ -60,6 +60,11 @@ pub trait AdminApi {
         &self,
         block: shell_primitives::ShellHash,
     ) -> Result<Option<serde_json::Value>, jsonrpsee::types::ErrorObjectOwned>;
+    #[method(name = "quorumProofProduction")]
+    async fn quorum_proof_production(
+        &self,
+        block: shell_primitives::ShellHash,
+    ) -> Result<Option<serde_json::Value>, jsonrpsee::types::ErrorObjectOwned>;
     #[method(name = "canonicalProofProduction")]
     async fn canonical_proof_production(
         &self,

@@ -252,6 +252,10 @@ enum Commands {
         /// Require full QC proofs for certified peer sync; explicit operator manifest fetch.
         #[arg(long)]
         canonical_quorum_admission: bool,
+
+        /// Produce complete QC proofs from finalized native sources (prover role).
+        #[arg(long)]
+        canonical_quorum_production: bool,
         /// Pause automatic proving after this many new components in this process.
         #[arg(long)]
         canonical_proof_component_budget: Option<std::num::NonZeroUsize>,
@@ -720,6 +724,7 @@ async fn main() {
             canonical_proof_production,
             canonical_proof_admission,
             canonical_quorum_admission,
+            canonical_quorum_production,
             canonical_proof_component_budget,
             l2_stark_mode,
             consensus_engine,
@@ -791,6 +796,12 @@ async fn main() {
                 "canonical_quorum_admission",
                 canonical_quorum_admission,
                 file_config.consensus.canonical_quorum_admission,
+            );
+            let effective_canonical_quorum_production = config_or_cli(
+                run_matches,
+                "canonical_quorum_production",
+                canonical_quorum_production,
+                file_config.consensus.canonical_quorum_production,
             );
             let effective_canonical_proof_budget = canonical_proof_component_budget
                 .or(file_config.consensus.canonical_proof_component_budget);
@@ -925,6 +936,7 @@ async fn main() {
                 canonical_proof_production: effective_canonical_proof_production,
                 canonical_proof_admission: effective_canonical_proof_admission,
                 canonical_quorum_admission: effective_canonical_quorum_admission,
+                canonical_quorum_production: effective_canonical_quorum_production,
                 canonical_proof_component_budget: effective_canonical_proof_budget,
                 l2_stark_mode,
                 consensus_engine: effective_consensus_engine,

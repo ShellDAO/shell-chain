@@ -85,6 +85,7 @@ pub struct RunArgs {
     pub canonical_proof_production: bool,
     pub canonical_proof_admission: bool,
     pub canonical_quorum_admission: bool,
+    pub canonical_quorum_production: bool,
     pub canonical_proof_component_budget: Option<std::num::NonZeroUsize>,
     pub prover_max_concurrent_proofs: usize,
     pub prover_priority: shell_node::ProvingPriority,
@@ -311,12 +312,17 @@ pub async fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         .node_role
         .parse::<shell_node::NodeRole>()
         .map_err(|e| format!("invalid --node-role: {e}"))?;
-    if args.canonical_proof_production && !proof_role.runs_prover() {
+    if (args.canonical_proof_production || args.canonical_quorum_production)
+        && !proof_role.runs_prover()
+    {
         return Err("canonical proof production requires a prover role".into());
     }
-    if args.canonical_proof_component_budget.is_some() && !args.canonical_proof_production {
+    if args.canonical_proof_component_budget.is_some()
+        && !args.canonical_proof_production
+        && !args.canonical_quorum_production
+    {
         return Err(
-            "canonical proof component budget requires --canonical-proof-production".into(),
+            "canonical proof component budget requires a canonical proof production mode".into(),
         );
     }
     let _: NetworkType = args.network.parse()?;
@@ -1007,6 +1013,7 @@ async fn run_with_store<S: KvStore + 'static>(
         canonical_proof_production: args.canonical_proof_production,
         canonical_proof_admission: args.canonical_proof_admission,
         canonical_quorum_admission: args.canonical_quorum_admission,
+        canonical_quorum_production: args.canonical_quorum_production,
         canonical_proof_component_budget: args.canonical_proof_component_budget,
         prover_max_concurrent_proofs: args.prover_max_concurrent_proofs,
         prover_priority: args.prover_priority,
@@ -1236,6 +1243,7 @@ mod tests {
             canonical_proof_production: false,
             canonical_proof_admission: false,
             canonical_quorum_admission: false,
+            canonical_quorum_production: false,
             canonical_proof_component_budget: None,
             prover_max_concurrent_proofs: 1,
             prover_priority: shell_node::ProvingPriority::Sequential,

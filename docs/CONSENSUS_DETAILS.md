@@ -909,3 +909,17 @@ opaque tuple to the existing single-batch canonical/finality importer. No cached
 verification flag authorizes a fresh child. See the
 [quorum ADR](adr/commit-quorum-proof.md#fresh-certified-sync-with-explicit-quorum-proofs)
 for the bounded profile, runnable example and remaining limitations.
+
+The source also provides separate `canonical_quorum_production`
+(`--canonical-quorum-production`, default false) for prover roles. Finalized
+canonical headers and stored QCs select each job independently of its proof.
+The existing checkpoint owner, quota, compression and immutable writer are
+reused through a disjoint local namespace. A worker verifies every full
+signature/weight component, rechecks current canonical authority context, and
+publishes a manifest-two payload as byte availability.
+`admin_quorumProofProduction` exposes source-bound progress and the manifest;
+its status does not authorize Native execution. Sender and quorum production
+require separate worker processes, preventing accidental concurrent expensive
+full-graph generation. The existing per-process component budget and readiness
+gates apply. See the [quorum ADR](adr/commit-quorum-proof.md#node-owned-quorum-proof-production)
+for complete-job recovery and the bounded acceptance scope.

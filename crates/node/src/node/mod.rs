@@ -13,6 +13,7 @@ mod dev_rpc;
 mod event_loop;
 mod invariants;
 mod p2p_handlers;
+mod quorum_production;
 mod readiness;
 pub(crate) mod stark_sources;
 mod system_rewards;
@@ -246,6 +247,8 @@ pub struct Node<S: KvStore + 'static> {
     pub chain_store: Arc<ChainStore<S>>,
     canonical_proof_uploads: Arc<shell_storage::CanonicalProofUploadStore<S>>,
     canonical_production: Arc<canonical_production::CanonicalProductionStore<S>>,
+    quorum_production:
+        Arc<canonical_production::CanonicalProductionStore<quorum_production::QuorumNamespace<S>>>,
     canonical_proof_peer: parking_lot::Mutex<canonical_proof_peer::CanonicalProofPeerState>,
     live_admission: parking_lot::Mutex<canonical_admission::LiveAdmissionRuntime>,
     legacy_replay: parking_lot::Mutex<Option<block_importer::LegacyReplay<S>>>,
@@ -1011,6 +1014,9 @@ impl<S: KvStore + 'static> Node<S> {
 
         let canonical_proof_uploads =
             Arc::new(shell_storage::CanonicalProofUploadStore::new(store.clone()));
+        let quorum_production = Arc::new(canonical_production::CanonicalProductionStore::new(
+            Arc::new(quorum_production::QuorumNamespace::new(store.clone())),
+        ));
         let canonical_production = Arc::new(canonical_production::CanonicalProductionStore::new(
             store.clone(),
         ));
@@ -1020,6 +1026,7 @@ impl<S: KvStore + 'static> Node<S> {
             chain_store,
             canonical_proof_uploads,
             canonical_production,
+            quorum_production,
             canonical_proof_peer: parking_lot::Mutex::new(Default::default()),
             live_admission: parking_lot::Mutex::new(Default::default()),
             legacy_replay: parking_lot::Mutex::new(None),
