@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Preserve untrusted full-proof bytes and pause live admission after a typed native database commit failure; require backend repair and complete cold reverification instead of rejecting a valid proof or repeatedly retrying the failed backend. Add real-peer final-batch rollback and recovery checks.
+
 - Add real-peer partial-transfer and verification-worker shutdown recovery checks for automatic full-QC admission, including retained byte/generation checks, fresh peer/nonce binding and mandatory cold reverification before canonical commit.
 
 - Connect default-off full-QC admission to typed dedicated-peer manifest discovery, automatic bounded transfer and cold waiting-source continuation; preserve legacy sender requests and independent artifact permissions.

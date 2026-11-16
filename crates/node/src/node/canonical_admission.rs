@@ -65,9 +65,21 @@ struct Worker {
 #[derive(Default)]
 pub(super) struct LiveAdmissionRuntime {
     worker: Option<Worker>,
+    // A backend failure requires operator repair and a new verifier after restart.
+    native_commit_paused: bool,
     discovery: Option<(ShellHash, u64, PeerId, Instant)>,
     discovery_cursor: usize,
     advertised: std::collections::HashSet<(String, ShellHash)>,
+}
+fn native_commit_result<T>(
+    result: Result<T, NodeError>,
+    storage_failed: &mut bool,
+) -> Result<T, String> {
+    *storage_failed |= matches!(
+        &result,
+        Err(NodeError::Storage(shell_storage::StorageError::Database(_)))
+    );
+    result.map_err(|e| e.to_string())
 }
 impl<S: KvStore + 'static> Node<S> {
     fn admission_ids(&self) -> Result<Vec<ShellHash>, String> {
@@ -474,6 +486,9 @@ impl<S: KvStore + 'static> Node<S> {
         self.save_admission(&r)
     }
     fn pending_admission(&self) -> Result<Option<AdmissionRecord>, String> {
+        if self.live_admission.lock().native_commit_paused {
+            return Ok(None);
+        }
         if !self.config.canonical_proof_admission && !self.config.canonical_quorum_admission {
             return Ok(None);
         }
@@ -564,6 +579,9 @@ impl<S: KvStore + 'static> Node<S> {
         nonce: u64,
         manifest: Option<CanonicalProofManifest>,
     ) -> Result<(), String> {
+        if self.live_admission.lock().native_commit_paused {
+            return Ok(());
+        }
         if !self.config.canonical_proof_admission && !self.config.canonical_quorum_admission {
             return Ok(());
         }
@@ -817,17 +835,20 @@ impl<S: KvStore + 'static> Node<S> {
             Ok(VerifiedCandidate::Fresh(_) | VerifiedCandidate::Quorum(_, _))
         );
         let mut quorum_count = None;
+        let mut native_storage_failed = false;
         let result = result.and_then(|verified| {
             let block = self.admission_body(&r)?;
             match verified {
-                VerifiedCandidate::Fresh(v) => self
-                    .commit_live_verified_candidate(r.parent, block, &v)
-                    .map_err(|e| e.to_string()),
+                VerifiedCandidate::Fresh(v) => native_commit_result(
+                    self.commit_live_verified_candidate(r.parent, block, &v),
+                    &mut native_storage_failed,
+                ),
                 VerifiedCandidate::Quorum(v, config) => {
                     let cert = self.admission_certificate(&r)?;
-                    let replay = self
-                        .commit_live_verified_quorum(r.parent, block, &cert, &v, &config)
-                        .map_err(|e| e.to_string())?;
+                    let replay = native_commit_result(
+                        self.commit_live_verified_quorum(r.parent, block, &cert, &v, &config),
+                        &mut native_storage_failed,
+                    )?;
                     quorum_count = Some(replay.proved_commit_signatures);
                     Ok(replay.execution)
                 }
@@ -851,6 +872,35 @@ impl<S: KvStore + 'static> Node<S> {
                 }
             }
         });
+        if native_storage_failed {
+            // This is a typed backend error after a verified tuple, never worker text.
+            // Keep bytes untrusted and do not spin a verifier against a failed backend.
+            self.live_admission.lock().native_commit_paused = true;
+            r.state = AdmissionState::Paused;
+            r.error = Some(
+                format!(
+                    "native storage commit failed; repair backend and restart for full recheck: {}",
+                    result
+                        .as_ref()
+                        .err()
+                        .map(String::as_str)
+                        .unwrap_or("unknown")
+                )
+                .chars()
+                .take(2048)
+                .collect(),
+            );
+            if let Err(error) = self
+                .canonical_proof_uploads
+                .pause_claim(&id, worker.attempt)
+            {
+                warn!(%error,"native commit failure: proof claim retained for cold recovery");
+            }
+            if let Err(error) = self.save_admission(&r) {
+                warn!(%error,"native commit pause not persisted; raw source retained");
+            }
+            return None;
+        }
         let success = result.as_ref().ok().cloned();
         match &result {
             Ok(_) => {
@@ -912,7 +962,7 @@ impl<S: KvStore + 'static> Node<S> {
         &self,
         peers: &[PeerId],
     ) -> Option<(PeerId, shell_network::NetworkMessage)> {
-        if peers.is_empty() {
+        if peers.is_empty() || self.live_admission.lock().native_commit_paused {
             return None;
         }
         let r = self.pending_admission().ok().flatten().or_else(|| {
@@ -999,6 +1049,68 @@ impl<S: KvStore + 'static> Node<S> {
 mod tests {
     use super::*;
     use shell_storage::MemoryDb;
+    #[tokio::test]
+    async fn worker_error_text_cannot_impersonate_native_storage_failure() {
+        let db = Arc::new(MemoryDb::new());
+        let mut node = super::super::tests::setup_node_with_store(Address::from([1; 32]), db);
+        node.config.canonical_proof_admission = true;
+        let block = ShellHash::from([7; 32]);
+        let manifest = CanonicalProofManifest {
+            version: 1,
+            chain_id: node.config.chain_id,
+            genesis_hash: ShellHash::from([1; 32]),
+            block_hash: block,
+            total_bytes: 1,
+            payload_hash: shell_primitives::blake3_hash(b"x"),
+        };
+        let id = manifest.id();
+        node.canonical_proof_uploads
+            .begin(manifest.clone())
+            .unwrap();
+        node.canonical_proof_uploads.append(&id, 0, b"x").unwrap();
+        let (status, claimed) = node.canonical_proof_uploads.claim(&id, true).unwrap();
+        assert!(claimed);
+        let record = AdmissionRecord {
+            version: 1,
+            block,
+            number: 1,
+            parent: ShellHash::ZERO,
+            source_hash: ShellHash::ZERO,
+            peer: "provider".into(),
+            state: AdmissionState::Verifying,
+            manifest: Some(manifest),
+            quorum_certificate_hash: None,
+            attempts: 1,
+            hash_retries: 0,
+            error: None,
+        };
+        node.save_admission(&record).unwrap();
+        let (tx, rx) = mpsc::channel();
+        assert!(tx
+            .send(Err(
+                "storage error: database error: forged worker message".to_string()
+            ))
+            .is_ok());
+        let handle = tokio::spawn(async {});
+        node.live_admission.lock().worker = Some(Worker {
+            record,
+            attempt: status.verification_attempts,
+            result: rx,
+            handle,
+        });
+        assert!(node.finish_live_candidate().is_none());
+        assert!(!node.live_admission.lock().native_commit_paused);
+        assert_eq!(
+            node.admission_record(block).unwrap().unwrap().state,
+            AdmissionState::Failed
+        );
+        let status = node.canonical_proof_uploads.status(&id).unwrap();
+        assert_eq!(
+            status.state,
+            shell_storage::CanonicalProofUploadState::Rejected
+        );
+        assert!(status.result.is_none());
+    }
     #[test]
     fn manifest_wrong_peer_nonce_and_network_do_not_allocate_proof_bytes() {
         let db = Arc::new(MemoryDb::new());

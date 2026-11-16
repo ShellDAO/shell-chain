@@ -9,6 +9,8 @@ use shell_storage::{
     CANONICAL_PROOF_CACHE_PREFIX,
 };
 use std::{net::SocketAddr, time::Duration};
+#[path = "quorum_fault.rs"]
+mod batch_fault;
 
 async fn request(
     address: SocketAddr,
@@ -49,8 +51,8 @@ async fn request(
     })
     .await?
 }
-struct Live {
-    node: Arc<Node<RocksDbStore>>,
+struct Live<S: KvStore + 'static = RocksDbStore> {
+    node: Arc<Node<S>>,
     task: tokio::task::JoinHandle<Result<(), shell_node::NodeError>>,
     address: SocketAddr,
     token: String,
@@ -84,7 +86,24 @@ impl Live {
         initialize: bool,
         production: bool,
     ) -> Result<Self, Error> {
-        let mut node = node(path, c, initialize)?;
+        Self::start_on_node(
+            node(path, c, initialize)?,
+            c,
+            boot_nodes,
+            quorum,
+            production,
+        )
+        .await
+    }
+}
+impl<S: KvStore + 'static> Live<S> {
+    async fn start_on_node(
+        mut node: Node<S>,
+        c: &Control,
+        boot_nodes: Vec<String>,
+        quorum: bool,
+        production: bool,
+    ) -> Result<Self, Error> {
         node.config.canonical_quorum_admission = quorum;
         node.config.canonical_quorum_production = production;
         if production {
@@ -488,7 +507,7 @@ fn canonical_rows(live: &Live) -> Result<Rows, Error> {
         .filter(|(k, _)| !k.starts_with(b"local/canonical-admission/v1/"))
         .collect())
 }
-async fn wait_pending(live: &Live, c: &Control) -> Result<Value, Error> {
+async fn wait_pending<S: KvStore + 'static>(live: &Live<S>, c: &Control) -> Result<Value, Error> {
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let value = live
@@ -656,7 +675,7 @@ fn production_native_rows<S: KvStore + 'static>(n: &Node<S>) -> Result<Rows, Err
         .collect())
 }
 
-fn recovery_native_digest(n: &Node<RocksDbStore>) -> Result<ShellHash, Error> {
+fn recovery_native_digest<S: KvStore + 'static>(n: &Node<S>) -> Result<ShellHash, Error> {
     let rows: Rows = n
         .store
         .scan_all()?
@@ -666,7 +685,7 @@ fn recovery_native_digest(n: &Node<RocksDbStore>) -> Result<ShellHash, Error> {
     Ok(blake3_hash(&serde_json::to_vec(&rows)?))
 }
 
-fn recovery_genesis_balances(n: &Node<RocksDbStore>, c: &Control) -> Result<(), Error> {
+fn recovery_genesis_balances<S: KvStore + 'static>(n: &Node<S>, c: &Control) -> Result<(), Error> {
     let state = n.world_state.read();
     let sender = state
         .get_account(&c.sender)?
@@ -723,7 +742,11 @@ async fn automatic_recovery(
             ensure(
                 matches!(
                     saved["mode"].as_str(),
-                    Some("producer-auto-partial" | "producer-auto-worker")
+                    Some(
+                        "producer-auto-partial"
+                            | "producer-auto-worker"
+                            | "producer-auto-batch-fault"
+                    )
                 ) && saved["nativeDigest"] == serde_json::to_value(initial_digest)?
                     && saved["manifest"] == serde_json::to_value(manifest)?,
                 "cold recovery source or Native identity changed",
@@ -1131,6 +1154,16 @@ async fn exercise_producer(
         let expected=frame(proof_file)?;ensure(manifest==super::quorum_rpc::manifest(&c,&expected),"produced payload identity differs from original genuine graph")?;
         if mode=="producer-cold"{
             println!("{}",json!({"coldNodeQuorumProducerReverified":true,"NativeRowsUnchanged":true,"status":status,"readyBytesNotNativeAuthorization":true}));return Ok(());
+        }
+        if mode=="producer-auto-batch-fault" {
+            batch_fault::exercise(&provider,&c,receiver_root,&manifest).await?;
+            ensure(production_native_rows(&provider.node)?==before,"fault flow changed provider Native rows")?;
+            return Ok(());
+        }
+        if mode=="producer-auto-batch-recover" {
+            automatic_recovery(&provider,&c,receiver_root,&manifest,"producer-auto-recover").await?;
+            ensure(production_native_rows(&provider.node)?==before,"batch recovery changed provider Native rows")?;
+            return Ok(());
         }
         if matches!(mode,"producer-auto-partial"|"producer-auto-worker"|"producer-auto-recover") {
             automatic_recovery(&provider,&c,receiver_root,&manifest,mode).await?;

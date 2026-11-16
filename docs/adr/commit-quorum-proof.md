@@ -583,3 +583,40 @@ authority signature is used. An unexpected observation or changed checkpoint
 exits nonzero and preserves all partial data. These checks cover graceful
 shutdown; abrupt process loss and backend failure during a live import require
 separate acceptance.
+
+
+## Live backend commit failure and cold recovery
+
+A database error returned by the native commit of a newly verified sender or
+full-QC tuple is distinct from a cryptographic worker rejection. Keep the raw
+proof ready without an execution receipt, pause the candidate and stop automatic
+admission/discovery retries in that node process. After repairing the backend,
+a normal restart reconstructs the retained source and performs complete proof
+verification again before canonical mutation. Stored status or error text cannot
+supply authority: a worker error that merely says "database error" remains a
+proof rejection. Other proof failures and previously rejected objects keep their
+existing rejection semantics; rejected historical generations are retained.
+
+With the complete provider prepared above, run the following commands as
+separate processes with a new receiver directory:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-auto-batch-fault timed-two-signer-quorum producer-native/db batch-failure-receiver timed-two-signer-proof.cbor
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-auto-batch-recover timed-two-signer-quorum producer-native/db batch-failure-receiver timed-two-signer-proof.cbor
+```
+
+The first command uses ordinary automatic TCP/Noise transfer and full CPU
+verification. A RocksDB wrapper rejects exactly one batch containing `HEAD`,
+`FINALIZED` and the original certificate, while allowing proof-cache writes.
+It checks every canonical row, in-memory finality, funded balances and absent
+child receipts at genesis; a two-second observation must not start another
+verification after the one-shot fault is disarmed. It then closes and physically
+reopens the store, preserving all complete proof chunks and a `recovery.json`
+checkpoint. The recovery command uses the normal backend, reopens that exact
+cache and independently checks a new full verification attempt, atomic
+canonical/finality one, receipts, balances, nonce and fees after physical reopen.
+Neither business flow uploads, fetches or verifies through an operator proof RPC.
+Unexpected failures exit nonzero and preserve the stores. This injected batch
+rejection covers the native handoff and rollback path; it does not qualify
+power-loss durability, persistent backend damage, protocol activation or public
+binary/package delivery.
