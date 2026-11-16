@@ -46,6 +46,8 @@ pub(super) struct AdmissionRecord {
     quorum_certificate_hash: Option<ShellHash>,
     attempts: u8,
     hash_retries: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    explicit_recheck: Option<ShellHash>,
     error: Option<String>,
 }
 enum VerifiedCandidate {
@@ -347,6 +349,7 @@ impl<S: KvStore + 'static> Node<S> {
             quorum_certificate_hash: None,
             attempts: 0,
             hash_retries: 0,
+            explicit_recheck: None,
             error: None,
         };
         ids.push(r.block);
@@ -443,6 +446,7 @@ impl<S: KvStore + 'static> Node<S> {
             quorum_certificate_hash: Some(shell_primitives::blake3_hash(cert)),
             attempts: 0,
             hash_retries: 0,
+            explicit_recheck: None,
             error: None,
         };
         ids.push(record.block);
@@ -593,7 +597,8 @@ impl<S: KvStore + 'static> Node<S> {
         {
             return Ok(());
         }
-        if r.state == AdmissionState::Complete
+        if r.explicit_recheck.is_some()
+            || r.state == AdmissionState::Complete
             || (r.state == AdmissionState::Verifying && self.live_admission.lock().worker.is_some())
         {
             return Ok(());
@@ -706,6 +711,7 @@ impl<S: KvStore + 'static> Node<S> {
             return Ok(());
         }
         r.state = AdmissionState::Verifying;
+        r.explicit_recheck = None;
         if let Err(e) = self.save_admission(&r) {
             let _ = self
                 .canonical_proof_uploads
@@ -786,6 +792,79 @@ impl<S: KvStore + 'static> Node<S> {
         });
         Ok(())
     }
+    /// Persist an authenticated operator request; only Node.run may own its verifier.
+    pub(super) fn request_live_quorum_recheck(
+        &self,
+        id: ShellHash,
+    ) -> Result<shell_storage::CanonicalProofUploadStatus, String> {
+        if !self.config.canonical_quorum_admission {
+            return Err("quorum admission disabled".into());
+        }
+        {
+            let runtime = self.live_admission.lock();
+            if runtime.native_commit_paused {
+                return Err("repair backend and restart before live recheck".into());
+            }
+            if let Some(worker) = &runtime.worker {
+                if worker
+                    .record
+                    .manifest
+                    .as_ref()
+                    .is_some_and(|m| m.id() == id)
+                {
+                    return self
+                        .canonical_proof_uploads
+                        .status(&id)
+                        .map_err(|e| e.to_string());
+                }
+                return Err("live candidate verification busy".into());
+            }
+        }
+        let status = self
+            .canonical_proof_uploads
+            .status(&id)
+            .map_err(|e| e.to_string())?;
+        let mut record =
+            self.admission_ids()?
+                .into_iter()
+                .find_map(|block| {
+                    self.admission_record(block).ok().flatten().filter(|r| {
+                        r.version == 2 && r.manifest.as_ref().is_some_and(|m| m.id() == id)
+                    })
+                })
+                .ok_or("live quorum candidate absent")?;
+        if record.explicit_recheck == Some(id) {
+            return Ok(status);
+        }
+        if record.state != AdmissionState::Failed
+            || status.state != shell_storage::CanonicalProofUploadState::Rejected
+        {
+            return Err("explicit live recheck requires a rejected quorum candidate".into());
+        }
+        if self.pending_admission()?.is_some() {
+            return Err("another live candidate is pending".into());
+        }
+        self.validate_proof_upload_source(&status.manifest)?;
+        // Intact bytes are rechecked in the same generation, never replaced or trusted.
+        self.canonical_proof_uploads
+            .payload(&id)
+            .map_err(|e| e.to_string())?;
+        let runtime = self.live_admission.lock();
+        if runtime.native_commit_paused || runtime.worker.is_some() {
+            return Err("live candidate verification busy or backend paused".into());
+        }
+        let current = self
+            .admission_record(record.block)?
+            .ok_or("live quorum candidate disappeared")?;
+        if current.state != AdmissionState::Failed || current.manifest != record.manifest {
+            return Err("live quorum candidate changed before recheck request".into());
+        }
+        record.explicit_recheck = Some(id);
+        record.state = AdmissionState::Paused;
+        record.error = None;
+        self.save_admission(&record)?;
+        Ok(status)
+    }
     pub(super) fn start_ready_quorum_candidate(self: &Arc<Self>) -> Result<(), String> {
         if !self.config.canonical_quorum_admission {
             return Ok(());
@@ -803,12 +882,15 @@ impl<S: KvStore + 'static> Node<S> {
             .canonical_proof_uploads
             .status(&m.id())
             .map_err(|e| e.to_string())?;
-        if matches!(
-            status.state,
-            shell_storage::CanonicalProofUploadState::Ready
-                | shell_storage::CanonicalProofUploadState::Verified
-                | shell_storage::CanonicalProofUploadState::Verifying
-        ) {
+        if (status.state == shell_storage::CanonicalProofUploadState::Rejected
+            && r.explicit_recheck == Some(m.id()))
+            || matches!(
+                status.state,
+                shell_storage::CanonicalProofUploadState::Ready
+                    | shell_storage::CanonicalProofUploadState::Verified
+                    | shell_storage::CanonicalProofUploadState::Verifying
+            )
+        {
             self.start_live_candidate_verification(m.id())?;
         }
         Ok(())
@@ -977,6 +1059,7 @@ impl<S: KvStore + 'static> Node<S> {
         })?;
         if (r.version == 1 && !self.config.canonical_proof_admission)
             || (r.version == 2 && !self.config.canonical_quorum_admission)
+            || r.explicit_recheck.is_some()
             || (r.state == AdmissionState::Verifying && self.live_admission.lock().worker.is_some())
         {
             return None;
@@ -1049,6 +1132,85 @@ impl<S: KvStore + 'static> Node<S> {
 mod tests {
     use super::*;
     use shell_storage::MemoryDb;
+    #[test]
+    fn explicit_recheck_keeps_disabled_paused_or_untrusted_source_rejected() {
+        let db = Arc::new(MemoryDb::new());
+        let mut node =
+            super::super::tests::setup_node_with_store(Address::from([1; 32]), db.clone());
+        let block = ShellHash::from([7; 32]);
+        let manifest = CanonicalProofManifest {
+            version: 2,
+            chain_id: node.config.chain_id,
+            genesis_hash: ShellHash::from([1; 32]),
+            block_hash: block,
+            total_bytes: 1,
+            payload_hash: shell_primitives::blake3_hash(b"x"),
+        };
+        let id = manifest.id();
+        node.canonical_proof_uploads
+            .begin(manifest.clone())
+            .unwrap();
+        node.canonical_proof_uploads.append(&id, 0, b"x").unwrap();
+        assert!(node.canonical_proof_uploads.claim(&id, true).unwrap().1);
+        node.canonical_proof_uploads
+            .complete(&id, Err("previous rejection".into()))
+            .unwrap();
+        let record = AdmissionRecord {
+            version: 2,
+            block,
+            number: 1,
+            parent: ShellHash::ZERO,
+            source_hash: ShellHash::ZERO,
+            peer: "provider".into(),
+            state: AdmissionState::Failed,
+            manifest: Some(manifest),
+            quorum_certificate_hash: Some(ShellHash::from([8; 32])),
+            attempts: 1,
+            hash_retries: 0,
+            explicit_recheck: None,
+            error: Some("previous rejection".into()),
+        };
+        node.save_admission(&record).unwrap();
+        db.put(
+            &key(b"jobs", None),
+            &serde_json::to_vec(&vec![block]).unwrap(),
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&record).unwrap();
+        assert!(encoded.get("explicitRecheck").is_none());
+        assert!(serde_json::from_value::<AdmissionRecord>(encoded)
+            .unwrap()
+            .explicit_recheck
+            .is_none());
+        let before = db.scan_all().unwrap();
+        assert!(node
+            .request_live_quorum_recheck(id)
+            .unwrap_err()
+            .contains("disabled"));
+        node.config.canonical_quorum_admission = true;
+        node.live_admission.lock().native_commit_paused = true;
+        assert!(node
+            .request_live_quorum_recheck(id)
+            .unwrap_err()
+            .contains("repair backend"));
+        node.live_admission.lock().native_commit_paused = false;
+        assert!(node.request_live_quorum_recheck(id).is_err());
+        assert_eq!(db.scan_all().unwrap(), before);
+        assert_eq!(
+            node.admission_record(block).unwrap().unwrap().state,
+            AdmissionState::Failed
+        );
+        assert!(node
+            .admission_record(block)
+            .unwrap()
+            .unwrap()
+            .explicit_recheck
+            .is_none());
+        assert_eq!(
+            node.canonical_proof_uploads.status(&id).unwrap().state,
+            shell_storage::CanonicalProofUploadState::Rejected
+        );
+    }
     #[tokio::test]
     async fn worker_error_text_cannot_impersonate_native_storage_failure() {
         let db = Arc::new(MemoryDb::new());
@@ -1082,6 +1244,7 @@ mod tests {
             quorum_certificate_hash: None,
             attempts: 1,
             hash_retries: 0,
+            explicit_recheck: None,
             error: None,
         };
         node.save_admission(&record).unwrap();
@@ -1145,6 +1308,7 @@ mod tests {
             quorum_certificate_hash: None,
             attempts: 0,
             hash_retries: 0,
+            explicit_recheck: None,
             error: None,
         };
         node.save_admission(&r).unwrap();
@@ -1215,6 +1379,7 @@ mod tests {
             quorum_certificate_hash: Some(ShellHash::ZERO),
             attempts: 0,
             hash_retries: 0,
+            explicit_recheck: None,
             error: None,
         };
         node.save_admission(&r).unwrap();
@@ -1305,6 +1470,7 @@ mod tests {
             quorum_certificate_hash: Some(ShellHash::ZERO),
             attempts: 0,
             hash_retries: 0,
+            explicit_recheck: None,
             error: None,
         };
         node.save_admission(&record).unwrap();

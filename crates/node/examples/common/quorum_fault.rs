@@ -2,11 +2,107 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 
+/// Recheck retained intact rejection through the authenticated operator entry.
+pub(super) async fn explicit_recheck(
+    controls: &Path,
+    proof: &Path,
+    root: &Path,
+    reference: &Path,
+) -> Result<(), Error> {
+    let c: Control = read(&controls.join("control.cbor"))?;
+    let m = manifest(&c, &frame(proof)?);
+    let reference = node(reference, &c, false)?;
+    ensure(
+        reference.chain_store.get_head_hash()? == Some(c.blocks[0].hash())
+            && reference.chain_store.get_finalized_number()? == Some(1),
+        "independent first-block reference required",
+    )?;
+    let reference_before = recovery_native_digest(&reference)?;
+    let (old, old_chunks, native_before) = {
+        let initial = node(&root.join("db"), &c, false)?;
+        let cache = shell_storage::CanonicalProofUploadStore::new(initial.store.clone());
+        let old = cache.status(&m.id())?;
+        ensure(
+            old.state == CanonicalProofUploadState::Rejected
+                && old.manifest == m
+                && cache.payload(&m.id())? == frame(proof)?
+                && initial.chain_store.get_head_hash()? == Some(c.genesis.hash())
+                && initial.chain_store.get_finalized_number()?.unwrap_or(0) == 0,
+            "intact rejected source at genesis required",
+        )?;
+        recovery_genesis_balances(&initial, &c)?;
+        let chunks = recovery_chunks(&cache, &old)?;
+        (old, chunks, recovery_native_digest(&initial)?)
+    };
+    let receiver = Live::start_mode(&root.join("db"), &c, vec![], true, false).await?;
+    let outcome = async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        ensure(receiver.status(m.id()).await? == old
+            && recovery_native_digest(&receiver.node)? == native_before,
+            "rejected object retried without explicit authorization")?;
+        let (http, _) = request(receiver.address, None, "admin_verifyCanonicalProof", json!([m.id(),true])).await?;
+        ensure(http == 401, "explicit recheck did not require bearer authorization")?;
+        ensure(receiver.call("admin_verifyCanonicalProof",json!([m.id(),false])).await.is_err()
+            && receiver.status(m.id()).await? == old
+            && recovery_native_digest(&receiver.node)? == native_before,
+            "non-explicit recheck changed rejection or Native state")?;
+        let queued = receiver.call("admin_verifyCanonicalProof",json!([m.id(),true])).await;
+        println!("{}",json!({"explicitIntactRecheckRequested":true,"accepted":queued.is_ok(),"error":queued.as_ref().err().map(|e|e.to_string()),"headBefore":0,"generation":old.generation,"attemptsBefore":old.verification_attempts,"operatorProofRPC":true,"noPeerFetch":true,"noAutomaticMigration":true}));
+        queued?;
+        let intent=receiver.call("admin_canonicalProofAdmission",json!([c.blocks[0].hash()])).await?;
+        ensure(intent["status"]["explicitRecheck"]==serde_json::to_value(m.id())?
+            || intent["status"]["state"]=="verifying",
+            "operator recheck intent was not durably queued or consumed by event loop")?;
+        let checked = tokio::time::timeout(Duration::from_secs(180),async {
+            loop {
+                let status=receiver.status(m.id()).await?;
+                if status.verification_attempts>old.verification_attempts
+                    && matches!(status.state,CanonicalProofUploadState::Verified|CanonicalProofUploadState::Rejected) {
+                    return Ok::<_,Error>(status);
+                }
+                ensure(!receiver.task.is_finished(),"receiver stopped before explicit canonical recheck")?;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await??;
+        ensure(checked.state==CanonicalProofUploadState::Verified
+            && checked.result.as_ref().is_some_and(|v|v["proved_commit_signatures"]==2)
+            && receiver.node.chain_store.get_head_hash()?==Some(c.blocks[0].hash())
+            && receiver.node.chain_store.get_finalized_number()?==Some(1)
+            && receiver.node.chain_store.get_receipts(&c.blocks[0].hash())?==reference.chain_store.get_receipts(&c.blocks[0].hash())?,
+            "explicit recheck did not reach independent atomic canonical endpoint")?;
+        balances(&receiver.node,&c,1)?;
+        Ok::<_,Error>(())
+    }.await;
+    receiver.stop().await?;
+    outcome?;
+    let reopened = node(&root.join("db"), &c, false)?;
+    let cache = shell_storage::CanonicalProofUploadStore::new(reopened.store.clone());
+    let checked = cache.status(&m.id())?;
+    ensure(
+        checked.generation == old.generation
+            && checked.verification_attempts > old.verification_attempts
+            && recovery_chunks(&cache, &checked)? == old_chunks
+            && reopened.chain_store.get_head_hash()? == Some(c.blocks[0].hash())
+            && reopened.chain_store.get_finalized_number()? == Some(1)
+            && reopened.chain_store.get_receipts(&c.blocks[0].hash())?
+                == reference.chain_store.get_receipts(&c.blocks[0].hash())?
+            && recovery_native_digest(&reference)? == reference_before,
+        "cold explicit recheck changed bytes/generation or lost persisted independent result",
+    )?;
+    balances(&reopened, &c, 1)?;
+    println!(
+        "{}",
+        json!({"explicitIntactRejectedRecheckComplete":true,"head":1,"finalized":1,"sameGeneration":true,"allOriginalChunkDigestsEqual":true,"retainedChunks":old_chunks.len(),"verificationAttempts":checked.verification_attempts,"provedCommitSignatures":2,"persistedIndependentReceiptsBalancesNonceFeesEqual":true,"unauthenticatedAndNonExplicitRefused":true,"noPeerFetch":true,"operatorProofRPC":true,"canonicalEventLoopOwned":true,"physicalColdReopen":true})
+    );
+    Ok(())
+}
+
 pub(super) async fn exercise(
     provider: &Live,
     c: &Control,
     root: &Path,
     manifest: &CanonicalProofManifest,
+    state_error: bool,
 ) -> Result<(), Error> {
     std::fs::create_dir(root)?;
     let store = Arc::new(FailingBatch {
@@ -16,6 +112,7 @@ pub(super) async fn exercise(
         complete_tuple: AtomicBool::new(false),
         certificate: c.certificates[0].clone(),
         canonical_only: true,
+        state_error,
     });
     let initial = node_on_store(store.clone(), c, true)?;
     let digest = recovery_native_digest(&initial)?;
@@ -71,6 +168,18 @@ pub(super) async fn exercise(
         root.join("recovery.json"),
         serde_json::to_vec_pretty(&checkpoint)?,
     )?;
+    if state_error {
+        ensure(
+            upload.state == CanonicalProofUploadState::Rejected
+                && admission["status"]["state"] == "failed",
+            "non-database state failure did not retain intact rejected candidate",
+        )?;
+        println!(
+            "{}",
+            json!({"intactRejectedCandidatePrepared":true,"head":0,"finalized":0,"completeCryptographicVerificationBeforeBackendFailure":true,"verificationAttempts":1,"chunks":upload.next_chunk,"generation":upload.generation,"noCachedAuthorization":true,"physicalColdReopen":true})
+        );
+        return Ok(());
+    }
     ensure(
         upload.state == CanonicalProofUploadState::Ready
             && admission["status"]["state"] == "paused",

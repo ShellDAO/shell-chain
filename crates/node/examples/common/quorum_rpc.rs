@@ -1155,8 +1155,8 @@ async fn exercise_producer(
         if mode=="producer-cold"{
             println!("{}",json!({"coldNodeQuorumProducerReverified":true,"NativeRowsUnchanged":true,"status":status,"readyBytesNotNativeAuthorization":true}));return Ok(());
         }
-        if mode=="producer-auto-batch-fault" {
-            batch_fault::exercise(&provider,&c,receiver_root,&manifest).await?;
+        if matches!(mode,"producer-auto-batch-fault"|"producer-intact-rejection") {
+            batch_fault::exercise(&provider,&c,receiver_root,&manifest,mode=="producer-intact-rejection").await?;
             ensure(production_native_rows(&provider.node)?==before,"fault flow changed provider Native rows")?;
             return Ok(());
         }
@@ -1219,4 +1219,19 @@ pub(super) fn run_producer(
         .enable_all()
         .build()?
         .block_on(exercise_producer(controls, provider, receiver, proof, mode))
+}
+
+pub(super) fn run_explicit_recheck(
+    controls: &Path,
+    proof: &Path,
+    root: &Path,
+    reference: &Path,
+) -> Result<(), Error> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?
+        .block_on(batch_fault::explicit_recheck(
+            controls, proof, root, reference,
+        ))
 }

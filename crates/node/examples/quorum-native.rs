@@ -588,6 +588,7 @@ struct FailingBatch {
     complete_tuple: std::sync::atomic::AtomicBool,
     certificate: Vec<u8>,
     canonical_only: bool,
+    state_error: bool,
 }
 impl KvStore for FailingBatch {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, shell_storage::StorageError> {
@@ -634,9 +635,11 @@ impl KvStore for FailingBatch {
             if (!self.canonical_only || complete_tuple) && self.armed.swap(false, SeqCst) {
                 self.attempted.store(true, SeqCst);
                 self.complete_tuple.store(complete_tuple, SeqCst);
-                return Err(shell_storage::StorageError::Database(
-                    "injected canonical batch failure".into(),
-                ));
+                return Err(if self.state_error {
+                    shell_storage::StorageError::State("injected canonical state failure".into())
+                } else {
+                    shell_storage::StorageError::Database("injected canonical batch failure".into())
+                });
             }
         }
         self.inner.write_batch(batch)
@@ -674,6 +677,7 @@ fn receive(
         complete_tuple: AtomicBool::new(false),
         certificate: c.certificates[0].clone(),
         canonical_only: false,
+        state_error: false,
     });
     let mut receiver = node_on_store(store.clone(), &c, fresh)?;
     let normal = node(&root.join("control-db"), &c, fresh)?;
@@ -1348,8 +1352,9 @@ fn follow(controls: &Path, proof_file: &Path, root: &Path) -> Result<(), Error> 
 fn main() -> Result<(), Error> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("live-explicit-recheck") if args.len()==5 => quorum_rpc::run_explicit_recheck(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3]),Path::new(&args[4])),
         Some("producer-seed") if args.len()==4 => quorum_rpc::seed_producer(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3])),
-        Some("producer-live"|"producer-cold"|"producer-corrupt"|"producer-disabled"|"producer-manifest"|"producer-auto"|"producer-auto-wait"|"producer-auto-resume"|"producer-auto-partial"|"producer-auto-worker"|"producer-auto-recover"|"producer-auto-batch-fault"|"producer-auto-batch-recover") if args.len()==5 => quorum_rpc::run_producer(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3]),Path::new(&args[4]),&args[0]),
+        Some("producer-live"|"producer-cold"|"producer-corrupt"|"producer-disabled"|"producer-manifest"|"producer-auto"|"producer-auto-wait"|"producer-auto-resume"|"producer-auto-partial"|"producer-auto-worker"|"producer-auto-recover"|"producer-auto-batch-fault"|"producer-auto-batch-recover"|"producer-intact-rejection") if args.len()==5 => quorum_rpc::run_producer(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3]),Path::new(&args[4]),&args[0]),
         Some("live-pause"|"live-import"|"live-cold"|"live-default"|"live-history3") if args.len()==5 => quorum_rpc::run_live(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3]),Path::new(&args[4]),&args[0]),
         Some("follow-peer") if args.len()==4 => follow(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3])),
         Some("follow-verify") if args.len()==4 => follow_verify(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3])),
@@ -1363,6 +1368,6 @@ fn main() -> Result<(), Error> {
         Some("inspect-follow") if args.len() == 2 => inspect_follow(Path::new(&args[1])),
         Some("inspect") if args.len() == 2 => inspect(Path::new(&args[1])),
         Some("verify") if args.len() == 3 => verify(Path::new(&args[1]), Path::new(&args[2])),
-        _ => Err("usage: quorum-native producer-seed <controls> <completed-job-root> <owned-provider-db> | producer-live|producer-cold|producer-corrupt|producer-disabled|producer-manifest|producer-auto|producer-auto-wait|producer-auto-resume|producer-auto-partial|producer-auto-worker|producer-auto-recover|producer-auto-batch-fault|producer-auto-batch-recover <controls> <owned-provider-db> <new-receiver-root> <full-proof.cbor> | live-pause|live-import|live-cold|live-history3|live-default <controls> <proof> <receiver-root> <owned-provider-db> | rpc-pause <controls> <proof> <existing-native-root> | rpc-verify <controls> <proof> <existing-native-root> | rpc-recheck <controls> <proof> <existing-native-root> | prepare-certified <new-timed-controls> | inspect-follow <two-signer-controls> | follow-peer <two-signer-controls> <full-proof.cbor> <existing-first-block-directory> | follow-verify <two-signer-controls> <full-proof.cbor> <existing-follow-directory> | co-sign-input <original-controls> <new-messages.json> | augment <original-controls> <sdk-signatures.json> <new-two-signer-controls> | receive-one <two-signer-controls> <full-proof.cbor> <new-import-directory> | receive-one-verify <two-signer-controls> <full-proof.cbor> <existing-import-directory> | prepare <new-control-directory> | inspect <control-directory> | verify <control-directory> <full-quorum-proof.cbor> | receive <original-controls> <full-proof.cbor> <new-import-directory> | receive-resume <original-controls> <full-proof.cbor> <original-genesis-import-directory> | receive-verify <original-controls> <full-proof.cbor> <existing-import-directory>".into()),
+        _ => Err("usage: quorum-native live-explicit-recheck <controls> <proof> <retained-rejected-receiver-root> <independent-first-block-db> | producer-seed <controls> <completed-job-root> <owned-provider-db> | producer-live|producer-cold|producer-corrupt|producer-disabled|producer-manifest|producer-auto|producer-auto-wait|producer-auto-resume|producer-auto-partial|producer-auto-worker|producer-auto-recover|producer-auto-batch-fault|producer-auto-batch-recover|producer-intact-rejection <controls> <owned-provider-db> <new-receiver-root> <full-proof.cbor> | live-pause|live-import|live-cold|live-history3|live-default <controls> <proof> <receiver-root> <owned-provider-db> | rpc-pause <controls> <proof> <existing-native-root> | rpc-verify <controls> <proof> <existing-native-root> | rpc-recheck <controls> <proof> <existing-native-root> | prepare-certified <new-timed-controls> | inspect-follow <two-signer-controls> | follow-peer <two-signer-controls> <full-proof.cbor> <existing-first-block-directory> | follow-verify <two-signer-controls> <full-proof.cbor> <existing-follow-directory> | co-sign-input <original-controls> <new-messages.json> | augment <original-controls> <sdk-signatures.json> <new-two-signer-controls> | receive-one <two-signer-controls> <full-proof.cbor> <new-import-directory> | receive-one-verify <two-signer-controls> <full-proof.cbor> <existing-import-directory> | prepare <new-control-directory> | inspect <control-directory> | verify <control-directory> <full-quorum-proof.cbor> | receive <original-controls> <full-proof.cbor> <new-import-directory> | receive-resume <original-controls> <full-proof.cbor> <original-genesis-import-directory> | receive-verify <original-controls> <full-proof.cbor> <existing-import-directory>".into()),
     }
 }

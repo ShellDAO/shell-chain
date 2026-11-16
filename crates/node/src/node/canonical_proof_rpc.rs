@@ -254,6 +254,9 @@ impl<S: KvStore + 'static> CanonicalProofControl for Node<S> {
                 .manifest,
         )?;
         if self.has_live_manifest(id) {
+            if recheck {
+                return self.request_live_quorum_recheck(id);
+            }
             return Err("live candidate verification belongs to the canonical event loop".into());
         }
         let runtime = tokio::runtime::Handle::try_current()

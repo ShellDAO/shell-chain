@@ -620,3 +620,48 @@ Unexpected failures exit nonzero and preserve the stores. This injected batch
 rejection covers the native handoff and rollback path; it does not qualify
 power-loss durability, persistent backend damage, protocol activation or public
 binary/package delivery.
+
+
+## Explicit recheck of an intact rejected candidate
+
+An intact rejected full-QC candidate is different from a corrupted byte cache.
+`admin_fetchCanonicalProof` does not replace intact content or allocate a new
+generation; the explicit verification entry is `admin_verifyCanonicalProof`
+with `[proofId, true]`. For an enabled full-QC live candidate, that authenticated
+request validates retained source and payload identity and durably queues the
+specific proof ID. It does not start an RPC-owned verifier or import a block.
+`Node.run` consumes the request, reconstructs current context, claims a new full
+verification attempt and clears the intent before handing a verified tuple to
+the serialized canonical importer. Generation and raw chunks remain unchanged.
+
+The immediate response reports actual cached status, which may still be
+`rejected` while the intent is queued. Inspect `admin_canonicalProofAdmission`
+for `explicitRecheck` or verification in progress, then wait for a higher
+verification-attempt count and a verified result plus canonical receipts and
+finality. Neither HTTP success nor the queued flag authorizes execution.
+Unauthenticated requests and `recheck=false` cannot request this transition.
+Disabled admission, a backend-paused process, an unrelated busy candidate,
+corrupted bytes or an untrusted source refuse without reviving the candidate.
+Unrequested rejected candidates stay rejected. Existing records omit the new
+optional intent field and deserialize with no request.
+
+For a runnable controlled case using the complete provider and generated
+accounts/proof from the earlier commands:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-intact-rejection timed-two-signer-quorum producer-native/db rejected-proof-receiver timed-two-signer-proof.cbor
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- live-explicit-recheck timed-two-signer-quorum timed-two-signer-proof.cbor rejected-proof-receiver producer-native/db
+```
+
+The preparation runs genuine complete verification over normal peer transfer,
+then rejects exactly the final canonical batch with a one-shot non-database
+`State` error. Its valid proof remains intact and rejected under the existing
+hard-failure policy; no rejection metadata is forged. The recheck uses the
+existing authenticated verification RPC after the backend fault has been
+removed. It verifies bearer and non-explicit refusals, requires a new complete
+verification attempt before atomic block/finality one, preserves all original
+chunk digests and checks receipts, balances, nonce and fees against the
+independent first-block source after physical reopen. This operator recovery is
+labelled explicitly and does not claim automatic migration, new-generation
+fetch, public deployment or activation. Unexpected failures exit nonzero and
+retain all stores.
