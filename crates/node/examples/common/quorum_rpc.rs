@@ -1250,3 +1250,18 @@ pub(super) fn run_explicit_recheck(
             controls, proof, root, reference,
         ))
 }
+
+pub(super) fn run_cold_intent_recheck(
+    controls: &Path,
+    proof: &Path,
+    root: &Path,
+    reference: &Path,
+) -> Result<(), Error> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?
+        .block_on(batch_fault::cold_intent_recheck(
+            controls, proof, root, reference,
+        ))
+}

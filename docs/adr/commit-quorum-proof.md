@@ -689,3 +689,31 @@ intent. Both attempts must report a weight AIR verification error rather than a
 layout, context/range or payload-hash refusal. This checks binding to public
 weight inputs; it does not claim that later proof components were verified. It performs no new original signing
 or proof generation. Failures exit nonzero and retain the stores.
+
+
+To check orderly persistence before the event loop consumes an explicit request,
+prepare a separate intact rejection using the existing provider, then run:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-intact-rejection timed-two-signer-quorum producer-native/db cold-intent-receiver timed-two-signer-proof.cbor
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- live-cold-intent-recheck timed-two-signer-quorum timed-two-signer-proof.cbor cold-intent-receiver producer-native/db
+```
+
+The second command first runs the retained rejection without a request and
+requires it to stay rejected. It then starts the real authenticated HTTP proof
+control without `Node.run`, checks bearer and non-explicit refusals, and queues
+`[proofId, true]`. A duplicate request must leave every stored row unchanged.
+During this controlled RPC-only phase, the proof remains rejected with its old
+verification count; the durable admission record alone carries the exact ID.
+The server stops normally and the store is flushed and dropped. A physical cold
+reopen must preserve that record, generation, every proof chunk and genesis
+state, with no new verification or child receipts.
+
+A new `Node.run` then consumes the retained request and performs complete proof
+verification before canonical import. The command compares persisted receipts,
+balances, nonce, fees and finalized height one with the independent Native
+reference. Another live restart must not start a third attempt. It uses generated
+test controls and the existing complete proof, performs no new authority signing
+or proving, and exits nonzero on failure while retaining the stores. The RPC-only
+phase makes the consumption boundary deterministic; it does not suspend a running
+event loop or qualify power-loss durability, process crashes or network activation.
