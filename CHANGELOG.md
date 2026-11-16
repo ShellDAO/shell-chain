@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add a real peer/RPC regression proving that a correctly hashed but cryptographically altered quorum payload remains rejected after an explicit retry and cold reopen, with unchanged canonical state.
 - Connect authenticated explicit recheck of intact rejected full-QC candidates to a durable proof-bound request consumed by the canonical event loop. Preserve generation and bytes, keep automatic retries off, and require complete reverification before Native commit.
 
 - Preserve untrusted full-proof bytes and pause live admission after a typed native database commit failure; require backend repair and complete cold reverification instead of rejecting a valid proof or repeatedly retrying the failed backend. Add real-peer final-batch rollback and recovery checks.

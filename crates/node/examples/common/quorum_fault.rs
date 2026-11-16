@@ -2,6 +2,132 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 
+/// An explicit retry must not launder an intact but cryptographically invalid proof.
+pub(super) async fn invalid_recheck(
+    receiver: &Live,
+    c: &Control,
+    manifest: &CanonicalProofManifest,
+    payload: &[u8],
+    root: &Path,
+) -> Result<(), Error> {
+    let old = receiver.status(manifest.id()).await?;
+    let native_before = recovery_native_digest(&receiver.node)?;
+    let cache = shell_storage::CanonicalProofUploadStore::new(receiver.node.store.clone());
+    ensure(
+        old.state == CanonicalProofUploadState::Rejected
+            && old.verification_attempts == 1
+            && old.result.is_none()
+            && old
+                .error
+                .as_ref()
+                .is_some_and(|e| e.contains("quorum weight verification:"))
+            && cache.payload(&manifest.id())? == payload
+            && blake3_hash(payload) == manifest.payload_hash,
+        "initial refusal was not an intact correctly hashed cryptographic rejection",
+    )?;
+    let chunks = recovery_chunks(&cache, &old)?;
+    let checkpoint = json!({"manifest":manifest,"nativeDigest":native_before,"firstStatus":old,"chunkDigests":chunks});
+    std::fs::write(
+        root.join("invalid-recheck.json"),
+        serde_json::to_vec_pretty(&checkpoint)?,
+    )?;
+    let (http, _) = request(
+        receiver.address,
+        None,
+        "admin_verifyCanonicalProof",
+        json!([manifest.id(), true]),
+    )
+    .await?;
+    ensure(
+        http == 401
+            && receiver
+                .call("admin_verifyCanonicalProof", json!([manifest.id(), false]))
+                .await
+                .is_err()
+            && receiver.status(manifest.id()).await? == old,
+        "unauthenticated or non-explicit request altered rejected proof",
+    )?;
+    receiver
+        .call("admin_verifyCanonicalProof", json!([manifest.id(), true]))
+        .await?;
+    let checked = tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            let status = receiver.status(manifest.id()).await?;
+            if status.verification_attempts > old.verification_attempts
+                && matches!(
+                    status.state,
+                    CanonicalProofUploadState::Rejected | CanonicalProofUploadState::Verified
+                )
+            {
+                return Ok::<_, Error>(status);
+            }
+            ensure(
+                !receiver.task.is_finished(),
+                "receiver stopped before invalid proof recheck",
+            )?;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let stable = receiver.status(manifest.id()).await?;
+    let admission = receiver
+        .call("admin_canonicalProofAdmission", json!([c.blocks[0].hash()]))
+        .await?;
+    ensure(checked.state==CanonicalProofUploadState::Rejected && stable==checked
+        && checked.verification_attempts==2 && checked.generation==old.generation
+        && checked.result.is_none() && checked.error.as_ref().is_some_and(|e|e.contains("quorum weight verification:"))
+        && recovery_chunks(&cache,&checked)?==chunks
+        && recovery_native_digest(&receiver.node)?==native_before
+        && receiver.node.chain_store.get_head_hash()?==Some(c.genesis.hash())
+        && receiver.node.chain_store.get_finalized_number()?.unwrap_or(0)==0
+        && receiver.node.finality.read().last_finalized_number()==0
+        && receiver.node.chain_store.get_receipts(&c.blocks[0].hash())?.is_none()
+        && admission["status"]["state"]=="failed" && admission["status"]["explicitRecheck"].is_null()
+        && admission["nativeCanonical"]==false && admission["statusIsAuthorization"]==false,
+        "explicit retry accepted invalid crypto, wrote partial Native state or repeated automatically")?;
+    recovery_genesis_balances(&receiver.node, c)?;
+    println!(
+        "{}",
+        json!({"invalidCryptoExplicitRecheckRejected":true,"initialError":old.error,"recheckError":checked.error,"payloadHashCorrect":true,"completeProofBytes":payload.len(),"sameGeneration":true,"allChunkHashesEqual":true,"verificationAttempts":2,"initialAndExplicitAttemptRejected":true,"weightAIRVerifierReachedBothAttempts":true,"originalWeightStarkBytesPreserved":true,"intentConsumed":true,"noAutomaticThirdAttempt":true,"canonicalRowsUnchanged":true,"head":0,"finalized":0,"inMemoryFinality":0,"noChildReceipts":true,"balancesNonceFeesUnchanged":true,"unauthenticatedAndNonExplicitRefused":true,"operatorProofRPC":true,"actualTCPNoiseBodyAndQC":true,"noNewOriginalSigningOrProving":true})
+    );
+    Ok(())
+}
+
+pub(super) fn invalid_cold(c: &Control, root: &Path) -> Result<(), Error> {
+    let saved: Value = serde_json::from_slice(&std::fs::read(root.join("invalid-recheck.json"))?)?;
+    let manifest: CanonicalProofManifest = serde_json::from_value(saved["manifest"].clone())?;
+    let first: CanonicalProofUploadStatus = serde_json::from_value(saved["firstStatus"].clone())?;
+    let chunks: Vec<ShellHash> = serde_json::from_value(saved["chunkDigests"].clone())?;
+    let n = node(&root.join("db"), c, false)?;
+    let cache = shell_storage::CanonicalProofUploadStore::new(n.store.clone());
+    let status = cache.status(&manifest.id())?;
+    let admission = n
+        .canonical_admission_status(c.blocks[0].hash())?
+        .ok_or("cold pending source absent")?;
+    ensure(
+        status.state == CanonicalProofUploadState::Rejected
+            && status.verification_attempts == 2
+            && status.generation == first.generation
+            && status.result.is_none()
+            && recovery_chunks(&cache, &status)? == chunks
+            && saved["nativeDigest"] == serde_json::to_value(recovery_native_digest(&n)?)?
+            && blake3_hash(&cache.payload(&manifest.id())?) == manifest.payload_hash
+            && n.chain_store.get_head_hash()? == Some(c.genesis.hash())
+            && n.chain_store.get_finalized_number()?.unwrap_or(0) == 0
+            && n.chain_store.get_receipts(&c.blocks[0].hash())?.is_none()
+            && admission["status"]["state"] == "failed"
+            && admission["status"]["explicitRecheck"].is_null(),
+        "physical cold reopen lost cryptographic refusal or changed Native state",
+    )?;
+    recovery_genesis_balances(&n, c)?;
+    println!(
+        "{}",
+        json!({"invalidCryptoRecheckColdRefusal":true,"error":status.error,"head":0,"finalized":0,"canonicalRowsUnchanged":true,"sameGeneration":true,"allOriginalChunksPreserved":true,"payloadHashCorrect":true,"verificationAttempts":2,"noChildReceipts":true,"intentConsumed":true,"physicalColdReopen":true})
+    );
+    Ok(())
+}
+
 /// Recheck retained intact rejection through the authenticated operator entry.
 pub(super) async fn explicit_recheck(
     controls: &Path,

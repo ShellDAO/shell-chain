@@ -665,3 +665,27 @@ independent first-block source after physical reopen. This operator recovery is
 labelled explicitly and does not claim automatic migration, new-generation
 fetch, public deployment or activation. Unexpected failures exit nonzero and
 retain all stores.
+
+
+To check that an explicit retry cannot authorize invalid cryptography, create a
+separate Native first-block provider without a proof-availability cache, then run:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- receive-one timed-two-signer-quorum timed-two-signer-proof.cbor invalid-proof-provider
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- live-invalid-recheck timed-two-signer-quorum timed-two-signer-proof.cbor invalid-proof-receiver invalid-proof-provider/db
+```
+
+This entry copies the complete genuine proof and decreases its claimed final
+cumulative total weight by one within the allowed nonzero range. Context, trace
+layout and serialized STARK proof bytes remain intact; the manifest hash is
+computed for the altered complete payload. Body and certificate
+sync use TCP/Noise; complete proof upload and the explicit retry use authenticated
+operator HTTP RPC. Both verification attempts must reject while retaining the
+same generation and chunk hashes. A two-second observation must not start a
+third attempt. Canonical rows, genesis balances, nonce, fees and in-memory
+finality must stay unchanged, with no child receipts. After both nodes stop, a
+physical cold reopen checks the persisted second refusal and consumed retry
+intent. Both attempts must report a weight AIR verification error rather than a
+layout, context/range or payload-hash refusal. This checks binding to public
+weight inputs; it does not claim that later proof components were verified. It performs no new original signing
+or proof generation. Failures exit nonzero and retain the stores.
