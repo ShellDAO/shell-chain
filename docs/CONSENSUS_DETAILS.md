@@ -834,11 +834,21 @@ It combines them with the original primary certificates without changing block
 headers. A primary weight of 2 alone is exactly two thirds of total weight 3 and
 must refuse; both signers' full signature graphs plus the weight proof are
 required. `receive-one` checks atomic block-1 import, persistence, refusal and
-cold reopening under this trusted current authority configuration. It does not
-establish mixed-authority successor sync or history after a later state change:
-the original single-authority block 2 has a different weighted proposer under
-this configuration and needs the actual certified sync path. No proposer check
-is disabled to treat an ordinary import as certified.
+cold reopening under this trusted current authority configuration. A quorum does
+not override historical view timing: an original single-authority successor
+with only one second of spacing can predate its legal rotated proposer view.
+`inspect-follow` preserves and rejects that input. For a complete follow check,
+`prepare-certified` creates distinct new controls using real elapsed view
+timeouts before successor production; their new keys and hashes need a new
+proof job. `follow-peer` resumes both first-block stores through real TCP/Noise
+responses bounded by each actual request and `Node.run`, importing the natively
+certified successors and finality 3. It tests stale nonce, insufficient quorum
+and changed signatures only after real event-loop dispatch completes.
+After graceful shutdown, `follow-verify` checks both Native stores and read-only
+full first-block quorum replay against changed state at block 3. The selector
+and earliest-view timestamp rule remain enforced. Successor quorum signatures
+and historical selector provenance are not proved in AIR by this flow. See the
+[runnable example](adr/commit-quorum-proof.md) for prerequisites and commands.
 
 The bounded development profile supports at most sixteen lattice signers,
 including ML-DSA-65, genuine PQClean Dilithium3 and its existing SDK FIPS

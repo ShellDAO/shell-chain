@@ -190,7 +190,19 @@ separate genesis databases for omitted and future activation heights. A partial
 receiver beyond this precise genesis state refuses; preserve it for diagnosis.
 
 For a two-authority development check, retain the original primary controls and
-completed job, then export the same three block hashes for an installed SDK:
+completed job, then export the same three block hashes for an installed SDK.
+The development checks use Rust 1.94.1, the default allocator and this build
+configuration; debug assertions and overflow checks remain enabled. Other
+compiler/resource profiles and published artifacts need separate verification.
+
+```sh
+export CARGO_PROFILE_DEV_OPT_LEVEL=1
+export CARGO_PROFILE_DEV_DEBUG=0
+export CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=true
+export CARGO_PROFILE_DEV_OVERFLOW_CHECKS=true
+export CARGO_INCREMENTAL=0
+export CARGO_BUILD_JOBS=2
+```
 
 ```sh
 cargo run --locked -p shell-node --features rocksdb --example quorum-native -- co-sign-input native-quorum quorum-messages.json
@@ -233,15 +245,61 @@ without the donor. The donor's logical rows remain unchanged; RocksDB may
 maintain logs on open. Copy a closed donor job first if its original directory
 must remain byte-for-byte unchanged, retaining and checking both copies.
 
-`receive-one` deliberately ends at the first genuine block and finality 1,
-checking independent Native row equality, both signature graphs, strict quorum,
-activation/refusal boundaries and backend-batch rollback; the second command
-reopens that same first-block state. All three genuine co-signatures remain
-available. Mixed-authority successor sync and historical replay after a later
-state change remain required acceptance work: ordinary import of the original
-single-authority block 2 does not supply the certified-view provenance required
-by the new weighted proposer schedule. This check does not disable the selector
-or claim the earlier single-authority three-block test covers that combination.
+`receive-one` ends at the first genuine block and finality 1, checking
+independent Native row equality, both signature graphs, strict quorum,
+activation/refusal boundaries and backend-batch rollback; `receive-one-verify`
+reopens that same first-block state. Run it before advancing the stores.
+
+The original single-authority controls may have only one second between
+blocks. Under the new weighted authority context, block 2 can belong to a
+rotated proposer whose earliest legal view starts after the existing ten-second
+timeout. Even both genuine quorum signatures cannot authorize an earlier
+header. `inspect-follow` reports that rejection without opening a Native store;
+retain those inputs and their first-block proof as refusal evidence. Do not
+change their headers, recreate the dropped keys or reduce the timeout.
+
+For the full peer and later-state history check, create distinct timed controls.
+`prepare-certified` waits the real view timeout between producing each new
+successor, then drops its new temporary sender and primary keys after all three
+signed controls are saved. The original controls and proof remain unchanged.
+The new keys and block hashes require a new independently pinned proof job:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- prepare-certified timed-primary-quorum
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- co-sign-input timed-primary-quorum timed-quorum-messages.json
+node tests/e2e/sdk-quorum-cosign.mjs timed-quorum-messages.json timed-sdk-signatures.json sdk-package-directory
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- augment timed-primary-quorum timed-sdk-signatures.json timed-two-signer-quorum
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- inspect-follow timed-two-signer-quorum
+cargo run --locked -p shell-stark-prover --example commit-quorum -- prove timed-two-signer-quorum/source.cbor timed-two-signer-job timed-two-signer-proof.cbor 1
+# Paused is an expected nonzero exit; preserve this new job and its inputs.
+cargo run --locked -p shell-stark-prover --example commit-quorum -- prove timed-two-signer-quorum/source.cbor timed-two-signer-job timed-two-signer-proof.cbor
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- receive-one timed-two-signer-quorum timed-two-signer-proof.cbor timed-two-signer-import
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- follow-peer timed-two-signer-quorum timed-two-signer-proof.cbor timed-two-signer-import
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- follow-verify timed-two-signer-quorum timed-two-signer-proof.cbor timed-two-signer-import
+```
+
+`follow-peer` resumes both finalized first-block stores through `Node.run` and
+real loopback TCP/Noise peers. The peers cap each response at the requested
+block count and answer actual requests with the new timed blocks and both
+genuine certificate signatures. A transparent transport observer waits until
+the real node event loop has finished dispatching each response before the
+example checks its resulting state; retries may retain the same request nonce. The normal sync path
+verifies each quorum before using historical view validation, imports blocks 2
+and 3, and persists their certificates and finality 3. The receiver first
+rejects a stale nonce, a primary-only exact two-thirds certificate and a changed
+SDK signature without changing its first-block rows. An independent reference
+follows the same certified data; the example checks all Native rows, receipts,
+nonce, transferred value and fees. It shuts down the event loops gracefully
+before reopening either store. `follow-verify` cold-reopens the completed stores
+and replays the full first-block quorum proof against current block 3 without
+writing historical state back. Nonzero exit means the flow or an assertion
+failed; preserve all state for diagnosis.
+
+The peer example retains the weighted selector and verifies successor quorum
+signatures natively; it does not prove those successor signatures or selector
+provenance in AIR. The throwaway runtime signer is outside the authority set,
+cannot produce blocks and never replaces either signing identity. Discovery
+and external bootnodes are disabled; no authority keys are persisted.
 
 Current registry and address/key matching remain Native context predicates.
 This does not establish historical penalty provenance or the selector in AIR,

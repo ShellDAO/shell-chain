@@ -157,7 +157,7 @@ fn balances<S: KvStore + 'static>(node: &Node<S>, c: &Control, count: usize) -> 
         "Native nonce/value/fee balance mismatch",
     )
 }
-fn prepare(root: &Path) -> Result<(), Error> {
+fn prepare(root: &Path, certified_spacing: bool) -> Result<(), Error> {
     std::fs::create_dir(root)?;
     let authority = MlDsaSigner::generate();
     let sender = DilithiumSigner::generate();
@@ -224,6 +224,13 @@ fn prepare(root: &Path) -> Result<(), Error> {
             )?;
         }
         provider.handle_incoming_tx(signed, &MultiVerifier)?;
+        if certified_spacing && nonce > 0 {
+            // Build new controls at real elapsed times. A later co-signed
+            // certificate cannot authorize a rotated proposer before timeout.
+            std::thread::sleep(std::time::Duration::from_millis(
+                shell_consensus::VIEW_CHANGE_TIMEOUT_MS,
+            ));
+        }
         let block = provider.produce_block(&authority, 1)?;
         ensure(
             block.transactions.len() == 1 && block.header.gas_used == 21_000,
@@ -1022,16 +1029,332 @@ fn augment(controls: &Path, signed: &Path, output: &Path) -> Result<(), Error> {
     );
     Ok(())
 }
+fn inspect_follow(controls: &Path) -> Result<(), Error> {
+    let c: Control = read(&controls.join("control.cbor"))?;
+    ensure(
+        c.co_authority.is_some() && c.blocks.len() == 3,
+        "two-authority controls required",
+    )?;
+    let (authorities, weights) = authority_weights(&c);
+    let mut config = WPoaConfig::with_weights(PoaConfig::new(authorities, 1), weights);
+    config.chain_id = 1337;
+    let engine = WPoaEngine::new(config, Arc::new(MultiVerifier));
+    let mut parent = &c.genesis;
+    let mut rows = Vec::new();
+    let mut valid = true;
+    for block in &c.blocks {
+        let result = engine.verify_header_for_finalized_import(&block.header, &parent.header);
+        valid &= result.is_ok();
+        rows.push(serde_json::json!({"block":block.number(),"parentTimestamp":parent.header.timestamp,"timestamp":block.header.timestamp,"elapsed":block.header.timestamp.saturating_sub(parent.header.timestamp),"headerAccepted":result.is_ok(),"rejection":result.err().map(|e|e.to_string())}));
+        parent = block;
+    }
+    println!(
+        "{}",
+        serde_json::json!({"certifiedHeaderTiming":rows,"viewTimeoutMs":shell_consensus::VIEW_CHANGE_TIMEOUT_MS,"allAccepted":valid})
+    );
+    ensure(valid,"retained header predates its legal proposer view; keep it as refusal evidence and prepare new timed controls")
+}
+
+fn response_hash(message: &shell_network::NetworkMessage) -> Option<shell_primitives::ShellHash> {
+    matches!(message, shell_network::NetworkMessage::BlockResponse { .. })
+        .then(|| blake3_hash(&serde_json::to_vec(message).expect("network message serialization")))
+}
+
+/// Observe completion of real event-loop dispatch without changing any message.
+struct ObservedNetwork {
+    inner: shell_network::Libp2pNetwork,
+    handled: Arc<parking_lot::Mutex<Option<shell_primitives::ShellHash>>>,
+    pending: Option<shell_primitives::ShellHash>,
+}
+#[async_trait::async_trait]
+impl shell_network::NetworkService for ObservedNetwork {
+    async fn broadcast(
+        &self,
+        message: shell_network::NetworkMessage,
+    ) -> Result<(), shell_network::NetworkError> {
+        self.inner.broadcast(message).await
+    }
+    async fn send_to_peer(
+        &self,
+        peer: &shell_network::PeerId,
+        message: shell_network::NetworkMessage,
+    ) -> Result<(), shell_network::NetworkError> {
+        self.inner.send_to_peer(peer, message).await
+    }
+    async fn next_event(&mut self) -> Option<shell_network::NetworkEvent> {
+        // Node.run polls again only after the previous handler has completed.
+        // A queued send or transport acknowledgement alone is insufficient.
+        if let Some(hash) = self.pending.take() {
+            *self.handled.lock() = Some(hash);
+        }
+        let event = self.inner.next_event().await;
+        if let Some(shell_network::NetworkEvent::MessageReceived { message, .. }) = &event {
+            self.pending = response_hash(message);
+        }
+        event
+    }
+    async fn peer_count(&self) -> usize {
+        self.inner.peer_count().await
+    }
+    fn peer_count_handle(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.inner.peer_count_handle()
+    }
+    fn local_node_info_handle(&self) -> Arc<std::sync::RwLock<shell_network::LocalNodeInfo>> {
+        self.inner.local_node_info_handle()
+    }
+    fn supports_canonical_proof_transfer(&self) -> bool {
+        self.inner.supports_canonical_proof_transfer()
+    }
+    async fn shutdown(&self) -> Result<(), shell_network::NetworkError> {
+        self.inner.shutdown().await
+    }
+}
+
+/// Resume an existing first-block import through the ordinary certified sync path.
+async fn follow_peer(path: &Path, c: &Control, refusals: bool) -> Result<serde_json::Value, Error> {
+    use shell_network::{
+        Libp2pNetwork, NetworkConfig, NetworkEvent, NetworkMessage, NetworkService,
+    };
+    use std::time::Duration;
+    let mut n = node(path, c, false)?;
+    ensure(
+        n.chain_store.get_head_hash()? == Some(c.blocks[0].hash())
+            && n.chain_store.get_finalized_number()? == Some(1),
+        "peer follow requires the retained finalized first block",
+    )?;
+    let before = n.store.scan_all()?;
+    let config = NetworkConfig {
+        listen_addr: "127.0.0.1:0".parse()?,
+        enable_mdns: false,
+        enable_kademlia: false,
+        enable_relay: false,
+        enable_relay_server: false,
+        enable_dcutr: false,
+        enable_autonat: false,
+        identity_key_path: None,
+        ..Default::default()
+    };
+    let mut provider = Libp2pNetwork::new(&config).await?;
+    let info = provider.local_node_info_handle();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while info.read().unwrap().listen_addresses.is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "provider listener timeout")?;
+    let dial = {
+        let info = info.read().unwrap();
+        format!("{}/p2p/{}", info.listen_addresses[0], info.peer_id)
+    };
+    let receiver_config = NetworkConfig {
+        boot_nodes: vec![dial],
+        ..config
+    };
+    let inner = Libp2pNetwork::new(&receiver_config).await?;
+    let peers = inner.peer_count_handle();
+    let handled = Arc::new(parking_lot::Mutex::new(None));
+    let mut network = ObservedNetwork {
+        inner,
+        handled: handled.clone(),
+        pending: None,
+    };
+    n.config.node_role = shell_node::NodeRole::Prover;
+    n.config.proposer_address = None;
+    n.config.rpc_enabled = false;
+    n.config.metrics.enabled = false;
+    n.config.network = receiver_config;
+    let signer = Arc::new(DilithiumSigner::generate());
+    let address = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+    ensure(
+        !authority_weights(c).0.contains(&address),
+        "runtime signer must not be an authority",
+    )?;
+    let n = Arc::new(n);
+    let runner = n.clone();
+    let task = tokio::spawn(async move { runner.run(signer, &mut network).await });
+    // The sender is a real loopback peer serving retained signed data. It never
+    // imports into the receiver or calls a private finalized-import method.
+    let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+        let mut phase = 0usize;
+        let mut requests = Vec::new();
+        let mut responses=Vec::new();
+        loop {
+            if n.chain_store.get_finalized_number()? == Some(3) {
+                ensure(n.chain_store.get_head_hash()? == Some(c.blocks[2].hash()), "certified peer head mismatch")?;
+                ensure(!refusals || phase >= 4, "peer refusals not exercised")?;
+                ensure(peers.load(std::sync::atomic::Ordering::SeqCst) > 0, "peer disconnected before import")?;
+                return Ok::<_, Error>(serde_json::json!({"requests":requests,"responses":responses,"refusalStages":if refusals {3} else {0},"actualTCPNoise":true,"head":3,"finalized":3}));
+            }
+            ensure(!task.is_finished(), "Node.run exited before certified follow")?;
+            tokio::select! {
+                event = provider.next_event() => {
+                    let Some(NetworkEvent::MessageReceived { peer, message: NetworkMessage::BlockRequest {start_number, count, nonce} }) = event else { continue };
+                    requests.push(serde_json::json!({"start":start_number,"count":count,"nonce":nonce,"phase":phase}));
+                    eprintln!("certified peer request start={start_number} count={count} nonce={nonce} phase={phase} head={:?} finality={:?}",n.chain_store.get_head_block()?.map(|b|b.number()),n.chain_store.get_finalized_number()?);
+                    if !(2..=3).contains(&start_number) { continue }
+                    ensure(count>0,"empty block request")?;
+                    if refusals && phase <= 3 {
+                        ensure(start_number==2 && n.store.scan_all()? == before
+                            && n.chain_store.get_head_hash()? == Some(c.blocks[0].hash())
+                            && n.finality.read().last_finalized_number() == 1,
+                            "stale or invalid certificate changed retained Native state")?;
+                    }
+                    let start=(start_number-1) as usize;
+                    let end=(start+count.min(c.blocks.len() as u64)as usize).min(c.blocks.len());
+                    let blocks=c.blocks[start..end].to_vec();
+                    let mut certificates: Vec<_> = c.blocks[start..end].iter().zip(&c.certificates[start..end]).map(|(b, cert)|(b.hash(),cert.clone())).collect();
+                    let response_nonce = if refusals && phase == 0 {nonce.checked_add(1).ok_or("nonce overflow")?} else {nonce};
+                    if refusals && (phase == 1 || phase == 2) {
+                        let mut signatures: HashMap<String, shell_crypto::PQSignature> = serde_json::from_slice(&certificates[0].1)?;
+                        let co = c.co_authority.as_ref().ok_or("two-authority controls required")?.0.to_string();
+                        if phase == 1 {signatures.remove(&co);} else {signatures.get_mut(&co).ok_or("SDK signature absent")?.data[0] ^= 1;}
+                        certificates[0].1 = serde_json::to_vec(&signatures)?;
+                    }
+                    let block_count=blocks.len();
+                    let response=NetworkMessage::BlockResponse {blocks,commit_certificates:certificates,nonce:response_nonce};
+                    let hash=response_hash(&response).ok_or("response hash absent")?;
+                    provider.send_to_peer(&peer,response).await?;
+                    tokio::time::timeout(Duration::from_secs(10),async {
+                        loop {
+                            let complete=*handled.lock()==Some(hash);
+                            if complete {break;}
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }).await.map_err(|_| "Node response dispatch did not complete")?;
+                    if refusals && phase<3 {
+                        ensure(n.store.scan_all()?==before && n.chain_store.get_head_hash()?==Some(c.blocks[0].hash()) && n.finality.read().last_finalized_number()==1,"dispatched invalid response changed Native state")?;
+                    }
+                    ensure(block_count as u64<=count,"response exceeds requested range")?;
+                    responses.push(serde_json::json!({"start":start_number,"requestedCount":count,"blockCount":block_count,"requestNonce":nonce,"responseNonce":response_nonce,"hash":hash,"dispatchComplete":true,"phase":phase,"head":n.chain_store.get_head_block()?.map(|b|b.number()),"finalized":n.chain_store.get_finalized_number()?}));
+                    phase += 1;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+    }).await;
+    eprintln!(
+        "certified peer outcome complete={} head={:?} finality={:?}",
+        outcome.is_ok(),
+        n.chain_store.get_head_block()?.map(|b| b.number()),
+        n.chain_store.get_finalized_number()?
+    );
+    // Always use the node's graceful shutdown, including on a failed assertion.
+    n.shutdown();
+    let stopped = tokio::time::timeout(Duration::from_secs(30), task).await;
+    let provider_stopped = provider.shutdown().await;
+    stopped.map_err(|_| "Node shutdown timeout")???;
+    provider_stopped?;
+    let result = outcome.map_err(|_| "certified peer follow timeout")??;
+    balances(&n, c, 3)?;
+    n.store.flush()?;
+    Ok(result)
+}
+fn follow_verify(controls: &Path, proof_file: &Path, root: &Path) -> Result<(), Error> {
+    let c: Control = read(&controls.join("control.cbor"))?;
+    let source: CommitQuorumSource = read(&controls.join("source.cbor"))?;
+    let proof: CommitQuorumProof = read(proof_file)?;
+    ensure(
+        c.co_authority.is_some() && c.blocks.len() == 3 && c.certificates.len() == 3,
+        "complete two-authority controls required",
+    )?;
+    let mut receiver = node(&root.join("db"), &c, false)?;
+    let normal = node(&root.join("control-db"), &c, false)?;
+    for n in [&receiver, &normal] {
+        balances(n, &c, 3)?;
+        ensure(
+            n.chain_store.get_head_hash()? == Some(c.blocks[2].hash())
+                && n.chain_store.get_finalized_number()? == Some(3)
+                && n.finality.read().last_finalized_number() == 3,
+            "cold certified follow head/finality mismatch",
+        )?;
+        for (block, cert) in c.blocks.iter().zip(&c.certificates) {
+            ensure(
+                n.chain_store.get_commit_certificate(&block.hash())? == Some(cert.clone())
+                    && n.chain_store.get_block_by_hash(&block.hash())? == Some(block.clone())
+                    && n.chain_store.get_receipts(&block.hash())?.is_some(),
+                "cold signed block/certificate/receipts missing",
+            )?;
+        }
+    }
+    ensure(
+        receiver.store.scan_all()? == normal.store.scan_all()?,
+        "independent certified Native rows differ",
+    )?;
+    let before = receiver.store.scan_all()?;
+    let reference_before = normal.store.scan_all()?;
+    let result = receiver.replay_canonical_block_with_commit_proof(
+        c.blocks[2].hash(),
+        c.blocks[0].hash(),
+        &c.certificates[0],
+        &proof,
+    )?;
+    ensure(
+        result
+            == normal.replay_canonical_block_with_commit_proof(
+                c.blocks[2].hash(),
+                c.blocks[0].hash(),
+                &c.certificates[0],
+                &proof,
+            )?
+            && result.proved_commit_signatures == source.signatures.len(),
+        "historical first-block quorum replay mismatch",
+    )?;
+    ensure(
+        receiver
+            .import_block_with_commit_proof(
+                c.genesis.hash(),
+                c.blocks[0].clone(),
+                &c.certificates[0],
+                &proof,
+            )
+            .is_err()
+            && receiver.store.scan_all()? == before
+            && normal.store.scan_all()? == reference_before,
+        "cold historical query/duplicate wrote rows",
+    )?;
+    println!(
+        "{}",
+        serde_json::json!({"coldAfterState3":true,"firstBlockFullQuorumSignatures":source.signatures.len(),"successorQuorumCryptoNative":true,"independentNativeRowsEqual":true,"currentHeight":3,"finalized":3,"historicalRowsUnchanged":true,"newSigningOrProofGeneration":false})
+    );
+    Ok(())
+}
+fn follow(controls: &Path, proof_file: &Path, root: &Path) -> Result<(), Error> {
+    inspect_follow(controls)?;
+    let c: Control = read(&controls.join("control.cbor"))?;
+    ensure(
+        c.co_authority.is_some() && c.blocks.len() == 3 && c.certificates.len() == 3,
+        "complete two-authority controls required",
+    )?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let observed = runtime.block_on(async {
+        let receiver = follow_peer(&root.join("db"), &c, true).await?;
+        let reference = follow_peer(&root.join("control-db"), &c, false).await?;
+        Ok::<_, Error>(serde_json::json!({"receiver":receiver,"reference":reference}))
+    })?;
+    drop(runtime);
+    follow_verify(controls, proof_file, root)?;
+    println!("{observed}");
+    Ok(())
+}
+
 fn main() -> Result<(), Error> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("follow-peer") if args.len()==4 => follow(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3])),
+        Some("follow-verify") if args.len()==4 => follow_verify(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3])),
         Some("co-sign-input") if args.len()==3 => co_sign_input(Path::new(&args[1]),Path::new(&args[2])),
         Some("augment") if args.len()==4 => augment(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3])),
 
         Some("receive" | "receive-resume" | "receive-verify" | "receive-one" | "receive-one-verify") if args.len() == 4 => receive(Path::new(&args[1]), Path::new(&args[2]), Path::new(&args[3]), args[0] == "receive" || args[0] == "receive-one", args[0] == "receive-resume", if args[0].starts_with("receive-one") {1} else {3}),
-        Some("prepare") if args.len() == 2 => prepare(Path::new(&args[1])),
+        Some("prepare") if args.len() == 2 => prepare(Path::new(&args[1]),false),
+        Some("prepare-certified") if args.len() == 2 => prepare(Path::new(&args[1]),true),
+        Some("inspect-follow") if args.len() == 2 => inspect_follow(Path::new(&args[1])),
         Some("inspect") if args.len() == 2 => inspect(Path::new(&args[1])),
         Some("verify") if args.len() == 3 => verify(Path::new(&args[1]), Path::new(&args[2])),
-        _ => Err("usage: quorum-native co-sign-input <original-controls> <new-messages.json> | augment <original-controls> <sdk-signatures.json> <new-two-signer-controls> | receive-one <two-signer-controls> <full-proof.cbor> <new-import-directory> | receive-one-verify <two-signer-controls> <full-proof.cbor> <existing-import-directory> | prepare <new-control-directory> | inspect <control-directory> | verify <control-directory> <full-quorum-proof.cbor> | receive <original-controls> <full-proof.cbor> <new-import-directory> | receive-resume <original-controls> <full-proof.cbor> <original-genesis-import-directory> | receive-verify <original-controls> <full-proof.cbor> <existing-import-directory>".into()),
+        _ => Err("usage: quorum-native prepare-certified <new-timed-controls> | inspect-follow <two-signer-controls> | follow-peer <two-signer-controls> <full-proof.cbor> <existing-first-block-directory> | follow-verify <two-signer-controls> <full-proof.cbor> <existing-follow-directory> | co-sign-input <original-controls> <new-messages.json> | augment <original-controls> <sdk-signatures.json> <new-two-signer-controls> | receive-one <two-signer-controls> <full-proof.cbor> <new-import-directory> | receive-one-verify <two-signer-controls> <full-proof.cbor> <existing-import-directory> | prepare <new-control-directory> | inspect <control-directory> | verify <control-directory> <full-quorum-proof.cbor> | receive <original-controls> <full-proof.cbor> <new-import-directory> | receive-resume <original-controls> <full-proof.cbor> <original-genesis-import-directory> | receive-verify <original-controls> <full-proof.cbor> <existing-import-directory>".into()),
     }
 }
