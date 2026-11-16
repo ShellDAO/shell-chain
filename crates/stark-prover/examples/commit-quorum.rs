@@ -178,3 +178,62 @@ mod tests {
         assert!(!path.exists());
     }
 }
+
+#[cfg(test)]
+mod quorum_payload_boundaries {
+    use shell_primitives::ShellHash;
+    use shell_stark_prover::{
+        commit_quorum::{payload, CommitQuorumProof},
+        weighted_quorum::{QuorumWeightContext, QuorumWeightProof},
+    };
+    fn untrusted_fixture() -> CommitQuorumProof {
+        // Codec data only: empty signer/context lists cannot authenticate a quorum.
+        CommitQuorumProof {
+            version: 1,
+            weight: QuorumWeightProof {
+                version: 1,
+                context: QuorumWeightContext {
+                    chain_id: 1337,
+                    parent_hash: ShellHash::ZERO,
+                    block_hash: ShellHash::ZERO,
+                    block_number: 1,
+                    authorities: vec![],
+                    signers: vec![],
+                },
+                prefixes: vec![[0, 0]],
+                proof_bytes: vec![1, 2],
+            },
+            signatures: vec![],
+        }
+    }
+    #[test]
+    fn exact_budget_domain_trailer_and_noncanonical_map() {
+        let proof = untrusted_fixture();
+        let encoded = payload::encode(&proof, 4096).unwrap();
+        assert!(payload::decode(&encoded).is_ok());
+        assert_eq!(payload::encode(&proof, encoded.len()).unwrap(), encoded);
+        assert!(payload::encode(&proof, encoded.len() - 1).is_err());
+        let mut bad = encoded.clone();
+        bad.push(0);
+        assert!(payload::decode(&bad).is_err());
+        let mut bad = encoded.clone();
+        bad[1] ^= 1;
+        assert!(payload::decode(&bad).is_err());
+        let prefix = b"\0commit-quorum/cbor/v1/";
+        let mut bad = encoded.clone();
+        assert_eq!(bad[prefix.len()], 0xa3);
+        bad[prefix.len()] = 0xbf;
+        bad.push(0xff);
+        assert!(payload::decode(&bad).unwrap_err().contains("noncanonical"));
+    }
+    #[test]
+    fn declared_signer_count_refuses_before_elements_or_allocation() {
+        let mut encoded = payload::encode(&untrusted_fixture(), 4096).unwrap();
+        assert_eq!(encoded.pop(), Some(0x80));
+        encoded.push(0x9b);
+        encoded.extend(u64::MAX.to_be_bytes());
+        assert!(payload::decode(&encoded)
+            .unwrap_err()
+            .contains("count limit"));
+    }
+}

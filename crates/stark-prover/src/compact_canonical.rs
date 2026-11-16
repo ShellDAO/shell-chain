@@ -50,7 +50,7 @@ impl Write for Bounded {
         Ok(())
     }
 }
-fn cbor<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, String> {
+pub(crate) fn cbor<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, String> {
     let mut out = Bounded {
         bytes: Vec::new(),
         limit,
@@ -58,7 +58,7 @@ fn cbor<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, String> {
     ciborium::ser::into_writer(value, &mut out).map_err(|e| e.to_string())?;
     Ok(out.bytes)
 }
-fn uncbor<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+pub(crate) fn uncbor<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
     let mut reader = Cursor::new(bytes);
     let value = ciborium::de::from_reader_with_recursion_limit(&mut reader, MAX_DEPTH)
         .map_err(|e| e.to_string())?;
@@ -235,7 +235,7 @@ struct Frame {
     #[serde(deserialize_with = "bounded_certificates")]
     certificates: Vec<Certificate>,
 }
-fn bounded_vec<'de, D, T, const MAX: usize>(d: D) -> Result<Vec<T>, D::Error>
+pub(crate) fn bounded_vec<'de, D, T, const MAX: usize>(d: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,

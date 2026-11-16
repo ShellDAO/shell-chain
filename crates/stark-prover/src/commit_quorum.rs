@@ -14,6 +14,8 @@ use shell_crypto::{CryptoError, PQSignature, SignatureType, Verifier};
 use shell_storage::KvStore;
 use std::num::NonZeroUsize;
 
+pub mod payload;
+
 pub const MAX_COMMIT_PROOF_SIGNERS: usize = 16;
 
 /// Expected inputs selected independently of the proof. The address/key binding
@@ -25,7 +27,8 @@ pub struct CommitQuorumSource {
     pub signatures: Vec<BlockSignerEvidence>,
 }
 impl CommitQuorumSource {
-    fn validate(&self) -> Result<(), String> {
+    /// Check bounded shape and Native address/key tags, without authenticating signatures.
+    pub fn validate(&self) -> Result<(), String> {
         self.context.validate()?;
         if self.signatures.is_empty()
             || self.signatures.len() > MAX_COMMIT_PROOF_SIGNERS
@@ -56,6 +59,7 @@ impl CommitQuorumSource {
 pub struct CommitQuorumProof {
     pub version: u8,
     pub weight: QuorumWeightProof,
+    #[serde(deserialize_with = "payload::deserialize_signatures")]
     pub signatures: Vec<Mldsa65VerificationProof>,
 }
 

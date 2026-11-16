@@ -24,6 +24,9 @@ impl<S: KvStore + 'static> Node<S> {
         {
             return Err("canonical proof chain/genesis identity mismatch".into());
         }
+        if manifest.version == shell_core::COMMIT_QUORUM_ARTIFACT_VERSION {
+            return self.validate_quorum_upload_source(manifest, &config);
+        }
         if self.pending_manifest_source(manifest)? {
             return Ok(());
         }
@@ -63,6 +66,43 @@ impl<S: KvStore + 'static> Node<S> {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+    fn validate_quorum_upload_source(
+        &self,
+        manifest: &CanonicalProofManifest,
+        config: &shell_storage::ChainConfig,
+    ) -> Result<(), String> {
+        let block = self
+            .chain_store
+            .get_block_by_hash(&manifest.block_hash)
+            .map_err(|e| e.to_string())?
+            .ok_or("quorum artifact canonical block unavailable")?;
+        if self
+            .chain_store
+            .get_block_hash_by_number(block.number())
+            .map_err(|e| e.to_string())?
+            != Some(manifest.block_hash)
+            || block.hash() != manifest.block_hash
+            || config
+                .block_commitment_height
+                .is_none_or(|height| block.number() < height)
+            || block
+                .system_transactions
+                .iter()
+                .any(|tx| tx.kind != SystemTxKind::BlockGasReward)
+        {
+            return Err("quorum artifact canonical profile inactive or unsupported".into());
+        }
+        self.chain_store
+            .verify_block_body_commitment(&block)
+            .map_err(|e| e.to_string())?;
+        let certificate = self
+            .chain_store
+            .get_commit_certificate(&manifest.block_hash)
+            .map_err(|e| e.to_string())?
+            .ok_or("quorum artifact stored certificate unavailable")?;
+        self.commit_quorum_source(block.number(), manifest.block_hash, &certificate)?
+            .validate()
+    }
     fn verify_uploaded_canonical_proof(&self, id: ShellHash) -> Result<serde_json::Value, String> {
         let status = self
             .canonical_proof_uploads
@@ -73,6 +113,29 @@ impl<S: KvStore + 'static> Node<S> {
             .canonical_proof_uploads
             .payload(&id)
             .map_err(|e| e.to_string())?;
+        if status.manifest.version == shell_core::COMMIT_QUORUM_ARTIFACT_VERSION {
+            let proof = shell_stark_prover::commit_quorum::payload::decode(&payload)?;
+            let tip = self
+                .chain_store
+                .get_head_hash()
+                .map_err(|e| e.to_string())?
+                .ok_or("quorum artifact current tip unavailable")?;
+            let certificate = self
+                .chain_store
+                .get_commit_certificate(&status.manifest.block_hash)
+                .map_err(|e| e.to_string())?
+                .ok_or("quorum artifact stored certificate unavailable")?;
+            let result = self
+                .replay_canonical_block_with_commit_proof(
+                    tip,
+                    status.manifest.block_hash,
+                    &certificate,
+                    &proof,
+                )
+                .map_err(|e| e.to_string())?;
+            self.validate_proof_upload_source(&status.manifest)?;
+            return serde_json::to_value(result).map_err(|e| e.to_string());
+        }
         let proof: shell_stark_prover::canonical_batch::CanonicalSignatureBatchProof =
             shell_stark_prover::compact_canonical::decode_payload(&payload)
                 .map_err(|e| format!("canonical proof payload decode: {e}"))?;

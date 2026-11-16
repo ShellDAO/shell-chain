@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Add full commit-signature/weight proof artifacts to authenticated historical proof RPC and explicit peer fetch. Off-chain manifest version 2 and a bounded CBOR role domain preserve sender manifest version 1 and its automatic admission. Reconstruct quorum inputs from canonical Native headers/certificates and trusted keys/weights, run full AIR plus read-only Native replay, and retain partial uploads and results for cold recheck.
+
 - Add a retained two-authority certified sync example over real TCP/Noise peers and the node event loop. Diagnose retained headers that predate their legal proposer view; create distinct timed controls without changing the timeout. Resume first-block state, refuse stale or invalid quorum responses, import and finalize genuine timed successors, then cold-check full first-block quorum replay against state at block 3. Successor signatures remain natively verified; no selector or quorum threshold is weakened.
 
 - Reuse verified commit-signer components across independently pinned quorum jobs when the exact key, address, signature, transcript and raw message match, including changed signer positions. Reprove changed weight context, recheck every borrowed component and keep incomplete or invalid donors from triggering repair. Add a source SDK co-signing entry and a bounded two-authority first-block atomic import check; multi-authority certified successor transport and later-state history remain separate acceptance.

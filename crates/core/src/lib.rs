@@ -1,6 +1,7 @@
 mod canonical_proof_artifact;
 pub use canonical_proof_artifact::{
-    CanonicalProofManifest, CANONICAL_PROOF_CHUNK_BYTES, MAX_CANONICAL_PROOF_BYTES,
+    CanonicalProofManifest, CANONICAL_PROOF_CHUNK_BYTES, COMMIT_QUORUM_ARTIFACT_VERSION,
+    MAX_CANONICAL_PROOF_BYTES,
 };
 mod account;
 mod block;

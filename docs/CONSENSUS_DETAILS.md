@@ -884,3 +884,16 @@ all execution receipts before sealing. Import and historical replay reject
 inconsistent body or receipt roots before canonical publication. An omitted
 schedule preserves legacy behavior; this implementation does not select a public
 network activation height.
+
+
+Full commit-quorum historical proofs also use authenticated proof-availability
+RPC with off-chain manifest version 2. The node selects a canonical stored
+header and certificate, verifies complete signature/weight AIR, and reexecutes
+at the frozen parent without changing current Native state. Uploads, results
+and explicit dedicated-peer transfers use the existing bounded proof cache;
+process-cold rechecks perform crypto again. Sender manifest version 1 and its
+automatic discovery remain unchanged. See the
+[full-quorum RPC example](adr/commit-quorum-proof.md#authenticated-historical-rpc-and-explicit-peer-fetch)
+for the typed payload, partial-upload recovery and refusal checks. This
+read-only service does not activate full-quorum live admission or establish
+historical authority/penalty provenance.

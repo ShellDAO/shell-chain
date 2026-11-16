@@ -95,9 +95,9 @@ impl<S: KvStore + 'static> Node<S> {
                     || r.peer.len() > 128
                     || r.attempts > 2
                     || r.hash_retries > 1
-                    || r.manifest
-                        .as_ref()
-                        .is_some_and(|m| m.block_hash != hash || m.validate().is_err())
+                    || r.manifest.as_ref().is_some_and(|m| {
+                        m.version != 1 || m.block_hash != hash || m.validate().is_err()
+                    })
                 {
                     return Err("live admission record corrupt".into());
                 }
@@ -443,6 +443,9 @@ impl<S: KvStore + 'static> Node<S> {
             return Ok(());
         };
         m.validate()?;
+        if m.version != 1 {
+            return Err("sender admission requires a signature-batch manifest".into());
+        }
         if m.block_hash != r.block {
             return Err("candidate manifest block mismatch".into());
         }
@@ -705,7 +708,8 @@ impl<S: KvStore + 'static> Node<S> {
             .unwrap_or_default();
         let mut actions = vec![];
         for m in manifests {
-            if self.validate_proof_upload_source(&m).is_err() {
+            // Quorum artifacts are explicit read-only fetches, never sender candidates.
+            if m.version != 1 || self.validate_proof_upload_source(&m).is_err() {
                 continue;
             }
             let mut runtime = self.live_admission.lock();

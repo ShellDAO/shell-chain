@@ -338,7 +338,9 @@ impl<S: KvStore + 'static> Node<S> {
                     .ok()?
                     .into_iter()
                     .find(|m| {
-                        m.block_hash == block_hash && self.validate_proof_upload_source(m).is_ok()
+                        m.version == 1
+                            && m.block_hash == block_hash
+                            && self.validate_proof_upload_source(m).is_ok()
                     });
                 Some(ProofPeerAction {
                     peer: peer.clone(),

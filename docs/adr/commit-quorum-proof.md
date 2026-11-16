@@ -305,3 +305,56 @@ Current registry and address/key matching remain Native context predicates.
 This does not establish historical penalty provenance or the selector in AIR,
 add a consensus carrier, activate a network schedule, or replace the ordinary
 wire certificate. Public release and broader profiles require separate checks.
+
+## Authenticated historical RPC and explicit peer fetch
+
+For the completed timed two-authority stores above, the node accepts an
+off-chain `CanonicalProofManifest` with `version: 2`. Its block hash selects an
+already canonical stored block and certificate; chain ID and genesis must match
+the node. The node derives the expected keys, current trusted weights and
+historical parent independently of the payload. The existing block-commitment
+activation boundary applies. Sender manifests keep version 1 and their exact
+identities; automatic sender discovery and fresh sender admission select only
+that role.
+
+The payload uses the `\0commit-quorum/cbor/v1/` domain and lossless CBOR for the
+existing version-one mathematical proof. Decoding enforces the shared 256 MiB
+artifact limit, 64 nesting levels, sixteen signer slots, exact canonical bytes
+and no trailing data. Availability encoding grants no authorization. Every
+explicit recheck runs complete commit-signature/weight AIR and Native historical
+execution, returning the source block's receipts, state root and proved signer
+count. Chunk and result writes stay in the bounded local proof cache; canonical
+Native state and finality remain unchanged.
+
+The existing authenticated operator methods are `admin_beginCanonicalProof`,
+`admin_appendCanonicalProof`, `admin_verifyCanonicalProof`,
+`admin_canonicalProofStatus` and `admin_fetchCanonicalProof`. Explicit fetch uses
+the existing dedicated TCP/Noise chunk protocol and an exact version-two
+manifest. Version-two objects are kept out of automatic sender discovery.
+The shared chunk size is 256 KiB; a verification receipt remains informational,
+and `recheck: true` requests full cryptographic verification again.
+
+Use the same controls, proof and finalized third-block stores from the previous
+commands. These commands add proof-cache records to those owned stores:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- rpc-pause timed-two-signer-quorum timed-two-signer-proof.cbor timed-two-signer-import
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- rpc-verify timed-two-signer-quorum timed-two-signer-proof.cbor timed-two-signer-import
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- rpc-recheck timed-two-signer-quorum timed-two-signer-proof.cbor timed-two-signer-import
+```
+
+The example creates temporary authenticated loopback RPC listeners and
+non-authority runtime signers, preserving the original signing identities and
+proof. It stops after three uploaded chunks, cold-resumes that exact upload,
+checks authorization/source/size refusals, rejects a correct-hash damaged weight
+proof and a sender-role relabeling, and transfers the genuine quorum artifact
+to the independent third-block store over real peers. A final process-cold
+recheck verifies both caches and compares returned data with independently
+persisted Native receipts while checking all canonical rows for writeback.
+Nonzero exit means a failed operation or assertion; keep every store and public
+input for diagnosis. No new signature or proof generation is required.
+
+This operation serves historical verification against the trusted current
+authority context. Fresh full-quorum AIR admission, automatic quorum discovery
+or production, successor quorum AIR, historical validator/penalty provenance,
+network activation and public artifact acceptance remain separate work.
