@@ -582,6 +582,67 @@ async fn exercise_live(
     let proved_signatures = if slh { 1_u64 } else { 2 };
     let tip_number = if slh { 1_u64 } else { 3 };
     let tip = c.blocks.last().ok_or("control tip absent")?.hash();
+    if slh && matches!(mode, "live-batch-fault" | "live-batch-recover") {
+        let provider = Live::start_mode(source, &c, vec![], false, false).await?;
+        let provider_before = recovery_native_digest(&provider.node)?;
+        let outcome = async {
+            let payload = frame(proof_file)?;
+            let m = manifest(&c, &payload);
+            ensure(
+                provider.node.chain_store.get_head_hash()? == Some(tip)
+                    && provider.node.chain_store.get_finalized_number()? == Some(1),
+                "independent Native1 provider required",
+            )?;
+            if mode == "live-batch-fault" {
+                ensure(
+                    provider
+                        .node
+                        .store
+                        .scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?
+                        .is_empty(),
+                    "SLH batch fault needs a proof-empty provider, such as prepare-slh control-db",
+                )?;
+                upload_all(&provider, &m, &payload).await?;
+                let checked = provider.verify(m.id()).await?;
+                ensure(
+                    checked.state == CanonicalProofUploadState::Verified
+                        && checked
+                            .result
+                            .as_ref()
+                            .is_some_and(|v| v["proved_commit_signatures"] == 1),
+                    "provider original SLH verification failed",
+                )?;
+                batch_fault::exercise(&provider, &c, root, &m, false).await?;
+            } else {
+                let cache =
+                    shell_storage::CanonicalProofUploadStore::new(provider.node.store.clone());
+                ensure(
+                    cache.payload(&m.id())? == payload,
+                    "recovery provider payload changed",
+                )?;
+                automatic_recovery(&provider, &c, root, &m, "producer-auto-recover").await?;
+                let reopened = node(&root.join("db"), &c, false)?;
+                ensure(
+                    recovery_native_digest(&reopened)? == provider_before,
+                    "recovered SLH canonical rows differ from independent Native",
+                )?;
+            }
+            ensure(
+                recovery_native_digest(&provider.node)? == provider_before,
+                "SLH batch flow changed independent provider Native rows",
+            )?;
+            println!(
+                "{}",
+                json!({"SLHFinalBatchFlow":mode,"provedCommitSignatures":1,
+                "manualProviderArtifactSupply":true,"noReceiverOperatorProofCalls":true,
+                "providerNativeRowsUnchanged":true,"newAuthoritySigningOrProving":false})
+            );
+            Ok::<_, Error>(())
+        }
+        .await;
+        provider.stop().await?;
+        return outcome;
+    }
     if matches!(mode, "live-pause" | "live-default" | "live-invalid-recheck") {
         std::fs::create_dir(root)?;
     }
@@ -787,6 +848,12 @@ async fn automatic_recovery(
     mode: &str,
 ) -> Result<(), Error> {
     let recover = mode == "producer-auto-recover";
+    let slh = c.co_authority.is_none() && c.authority_key.len() == 64;
+    let proved_signatures = if c.co_authority.is_some() {
+        2_u64
+    } else {
+        1_u64
+    };
     let checkpoint_path = root.join("recovery.json");
     let saved: Option<Value> = if recover {
         Some(serde_json::from_slice(&std::fs::read(&checkpoint_path)?)?)
@@ -900,7 +967,7 @@ async fn automatic_recovery(
                     && upload
                         .result
                         .as_ref()
-                        .is_some_and(|v| v["proved_commit_signatures"] == 2)
+                        .is_some_and(|v| v["proved_commit_signatures"] == proved_signatures)
                     && receiver.node.chain_store.get_head_hash()? == Some(c.blocks[0].hash())
                     && receiver.node.chain_store.get_finalized_number()? == Some(1)
                     && receiver
@@ -956,7 +1023,7 @@ async fn automatic_recovery(
         balances(&reopened, c, 1)?;
         println!(
             "{}",
-            json!({"automaticQuorumRecoveryComplete":true,"interruptedMode":saved["mode"],"head":1,"finalized":1,"provedCommitSignatures":2,"independentReceiptsBalancesNonceFeesChecked":true,"retainedChunkDigestsEqual":true,"retainedChunks":old_chunks.len(),"sameGeneration":true,"recoveryByteTransferRequired":partial,"differentAuthenticatedPeer":fetch.peer!=old_fetch.peer,"nonceIncreased":fetch.nonce>old_fetch.nonce,"verificationAttempts":upload.verification_attempts,"noOperatorProofCalls":true,"physicalColdReopen":true})
+            json!({"automaticQuorumRecoveryComplete":true,"interruptedMode":saved["mode"],"head":1,"finalized":1,"provedCommitSignatures":proved_signatures,"independentReceiptsBalancesNonceFeesChecked":true,"retainedChunkDigestsEqual":true,"retainedChunks":old_chunks.len(),"sameGeneration":true,"recoveryByteTransferRequired":partial,"differentAuthenticatedPeer":fetch.peer!=old_fetch.peer,"nonceIncreased":fetch.nonce>old_fetch.nonce,"verificationAttempts":upload.verification_attempts,"noOperatorProofCalls":!slh,"noReceiverOperatorProofCalls":true,"physicalColdReopen":true})
         );
     } else {
         ensure(
@@ -1001,7 +1068,7 @@ async fn automatic_recovery(
         std::fs::write(checkpoint_path, serde_json::to_vec_pretty(&checkpoint)?)?;
         println!(
             "{}",
-            json!({"automaticQuorumInterrupted":true,"mode":mode,"head":0,"finalized":0,"canonicalRowsUnchanged":true,"noChildReceipts":true,"noCachedAuthorization":true,"receivedBytes":upload.received_bytes,"nextChunk":upload.next_chunk,"verificationAttempts":upload.verification_attempts,"noOperatorProofCalls":true,"actualTCPNoise":true,"gracefulNodeShutdown":true,"physicalColdReopen":true})
+            json!({"automaticQuorumInterrupted":true,"mode":mode,"head":0,"finalized":0,"canonicalRowsUnchanged":true,"noChildReceipts":true,"noCachedAuthorization":true,"receivedBytes":upload.received_bytes,"nextChunk":upload.next_chunk,"verificationAttempts":upload.verification_attempts,"noOperatorProofCalls":!slh,"noReceiverOperatorProofCalls":true,"actualTCPNoise":true,"gracefulNodeShutdown":true,"physicalColdReopen":true})
         );
     }
     Ok(())

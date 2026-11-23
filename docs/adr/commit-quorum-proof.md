@@ -809,7 +809,7 @@ verification attempt and unchanged canonical rows. The default mode reaches
 height one through ordinary Native sync with no proof-cache allocation or
 pending proof admission. Any failed assertion exits nonzero; retain the affected
 directories for diagnosis. These checks cover the single-block test conditions;
-full-SLH backend rollback and mixed or multi-block combinations remain open.
+Persistent full-SLH backend errors and mixed or multi-block combinations remain open; the controlled one-shot final-batch check below is separately qualified.
 
 
 To test a damaged SLH AIR with the same complete original proof, use the
@@ -830,4 +830,34 @@ verification, with no automatic third attempt or canonical, in-memory finality,
 account, fee or receipt changes. After graceful shutdown, a physical cold reopen
 must preserve the same rejected generation, every chunk and the genesis state.
 This single-layer witness-tamper check has passed locally; other SLH components,
-backend rollback, later-height and mixed combinations remain separately open.
+persistent backend errors, later-height and mixed combinations remain separately open.
+
+
+A one-shot database failure at the final canonical batch can be tested with the
+same complete SLH proof. Use an empty proof cache on an independent Native1
+provider and new directories, with the preparation nodes stopped:
+
+```sh
+mkdir slh-quorum-batch-provider-db && cp -R slh-quorum-controls/control-db/. slh-quorum-batch-provider-db/
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- slh-live-batch-fault slh-quorum-controls slh-quorum-proof.cbor slh-quorum-batch slh-quorum-batch-provider-db
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- slh-live-batch-recover slh-quorum-controls slh-quorum-proof.cbor slh-quorum-batch slh-quorum-batch-provider-db
+```
+
+The provider receives and historically verifies the original artifact through
+authenticated RPC. The receiver automatically obtains the body, quorum
+certificate and complete proof over TCP/Noise, without receiver upload, fetch or
+verify requests. The fault mode injects one typed database error only when the
+real serialized batch contains HEAD, FINALIZED and the original certificate.
+Success requires no canonical rows, account or fee changes, no child receipts,
+in-memory finality zero, Ready proof bytes with no authorization result, a
+paused admission and no retry in that live process.
+
+After orderly shutdown, the recovery mode checks the retained manifest, full
+chunk hashes, generation and first attempt before starting the receiver again.
+A new complete verification attempt must precede atomic head/finality one;
+physical cold rows, receipts, balances, nonce and fees must equal the independent
+ordinary Native1 provider. These modes have passed for the original single-SLH
+block. The provider artifact is manually supplied; this does not qualify
+node-owned full-SLH proof generation. Persistent backend failures, abrupt power
+loss, other profiles, later-height history and public-network activation remain
+open.

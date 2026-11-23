@@ -857,10 +857,13 @@ extension has also completed a local one-authority, one-block full-signature AIR
 flow: a 247,550,826-byte payload, authenticated partial upload and restart,
 TCP/Noise proof transfer, atomic Native import matching independent persisted
 state and receipts, and a new full recheck after cold startup. Live candidate
-storage accepts the bounded JSON encoding of an SLH quorum certificate. A
+storage accepts the bounded JSON encoding of an SLH quorum certificate. A controlled
+one-shot final canonical batch error has also rolled back without Native or
+in-memory finality changes; an orderly cold restart fully reverified the same
+proof before committing independent Native1 state and receipts. A
 separate default-off check follows ordinary Native sync without allocating a
-proof upload. Mixed-signer capacity, later-height SLH history, full-SLH backend
-rollback, historical authority and penalty provenance, proposer selection and
+proof upload. Mixed-signer capacity, later-height SLH history, persistent full-SLH backend
+errors or abrupt-loss recovery, historical authority and penalty provenance, proposer selection and
 public-release acceptance remain open. Ordinary certificate formats and network
 activation rules remain unchanged. See the
 [design decision](adr/commit-quorum-proof.md) for prerequisites and commands.

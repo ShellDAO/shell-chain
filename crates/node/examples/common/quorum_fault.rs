@@ -521,7 +521,7 @@ pub(super) async fn exercise(
             && receiver.node.finality.read().last_finalized_number() == 0
             && receiver.node.chain_store.get_receipts(&c.blocks[0].hash())?.is_none(), "final-batch rejection left partial durable or in-memory canonical state")?;
         recovery_genesis_balances(&receiver.node, c)?;
-        println!("{}",json!({"observedLiveFinalBatchFailure":true,"completeCanonicalTupleRejected":true,"canonicalRowsUnchanged":true,"head":0,"finalized":0,"inMemoryFinality":0,"noChildReceipts":true,"uploadState":upload.state,"admission":admission,"verificationAttempts":upload.verification_attempts,"noOperatorProofCalls":true,"actualTCPNoise":true}));
+        println!("{}",json!({"observedLiveFinalBatchFailure":true,"completeCanonicalTupleRejected":true,"canonicalRowsUnchanged":true,"head":0,"finalized":0,"inMemoryFinality":0,"noChildReceipts":true,"uploadState":upload.state,"admission":admission,"verificationAttempts":upload.verification_attempts,"noOperatorProofCalls":c.co_authority.is_some(),"noReceiverOperatorProofCalls":true,"actualTCPNoise":true}));
         Ok::<_, Error>((upload, admission))
     }.await;
     receiver.stop().await?;
@@ -565,7 +565,7 @@ pub(super) async fn exercise(
     )?;
     println!(
         "{}",
-        json!({"liveFinalBatchRollbackRecoverable":true,"head":0,"finalized":0,"canonicalRowsUnchanged":true,"physicalColdReopen":true,"verificationAttempts":1,"noOperatorProofCalls":true,"cachedStatusIsAuthorization":false})
+        json!({"liveFinalBatchRollbackRecoverable":true,"head":0,"finalized":0,"canonicalRowsUnchanged":true,"physicalColdReopen":true,"verificationAttempts":1,"noOperatorProofCalls":c.co_authority.is_some(),"noReceiverOperatorProofCalls":true,"cachedStatusIsAuthorization":false})
     );
     Ok(())
 }
