@@ -779,6 +779,39 @@ cargo run --locked -p shell-stark-prover --example commit-quorum -- verify-wire 
 cargo run --locked -p shell-node --features rocksdb --example quorum-native -- accept-slh slh-quorum-controls slh-quorum-proof.cbor slh-quorum-import
 ```
 
+To measure new node-owned production, create fresh SLH controls and copy their
+closed independent Native1 database to a new provider directory:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- prepare-slh fresh-slh-controls
+test ! -e fresh-slh-provider-db
+cp -R fresh-slh-controls/control-db fresh-slh-provider-db
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-step fresh-slh-controls fresh-slh-provider-db fresh-slh-receiver 2
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-step fresh-slh-controls fresh-slh-provider-db fresh-slh-receiver 2
+```
+
+Stop if preparation or the copy fails. `producer-step` accepts a new-component
+budget from one through sixteen. It starts the actual node worker with that
+budget, captures the finalized canonical source, and persists each newly proved
+certificate in the node-owned namespace. A budget pause must retain prior
+checkpoint bytes, leave Native and sender rows unchanged, expose no proof bytes,
+and survive physical cold reopen. The checkpoint byte counter includes the
+logical source and indexed certificates; physical rows may use compression or
+references. The example checks that logical bound against the pinned source and
+index, and preserves prior physical bytes. Repeat the same command to resume from those
+checkpoints; preserve the controls and provider directory. The receiver and its
+sibling `fresh-slh-receiver.proof.cbor` remain absent during partial production.
+A paused step is partial progress, and does not establish a complete SLH graph.
+
+When the full graph finishes within the existing resource bounds, the command
+exports the actual node-produced proof and continues through `producer-auto`.
+The provider rechecks its complete graph, and a fresh real peer must discover,
+fetch and verify the proof, commit/finalize block one and match independent cold
+Native state. Each controlled step waits at most one hour; failed or timed-out
+steps exit nonzero and retain their stores. This entry supports incremental
+measurements; complete fresh-source and host coverage require actual end-to-end
+results, separately from reuse of a previously complete job.
+
 The existing `producer-seed`, `producer-disabled`, `producer-auto` and
 `producer-cold` commands also accept a completed SLH job. Keep the original
 job and signed controls, and copy the closed independent Native database to a

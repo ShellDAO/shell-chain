@@ -107,7 +107,10 @@ impl<S: KvStore + 'static> Live<S> {
         node.config.canonical_quorum_admission = quorum;
         node.config.canonical_quorum_production = production;
         if production {
-            node.config.canonical_proof_component_budget = std::num::NonZeroUsize::new(1);
+            node.config.canonical_proof_component_budget = node
+                .config
+                .canonical_proof_component_budget
+                .or(std::num::NonZeroUsize::new(1));
         }
         let socket = std::net::TcpListener::bind("127.0.0.1:0")?;
         let address = socket.local_addr()?;
@@ -1387,6 +1390,268 @@ async fn exercise_producer(
     provider.stop().await?;
     outcome
 }
+
+async fn exercise_producer_step(
+    controls: &Path,
+    provider_db: &Path,
+    receiver_root: &Path,
+    budget: usize,
+) -> Result<(), Error> {
+    ensure(
+        (1..=16).contains(&budget),
+        "step budget must be between 1 and 16",
+    )?;
+    let c: Control = read(&controls.join("control.cbor"))?;
+    ensure(
+        c.co_authority.is_none()
+            && c.authority_key.len() == 64
+            && c.blocks.len() == 1
+            && c.certificates.len() == 1,
+        "step requires one-block SLH controls",
+    )?;
+    let mut artifact = receiver_root.as_os_str().to_os_string();
+    artifact.push(".proof.cbor");
+    let artifact = std::path::PathBuf::from(artifact);
+    ensure(
+        !receiver_root.exists() && !artifact.exists(),
+        "step receiver/output already exists",
+    )?;
+    let block = c.blocks[0].hash();
+    let prefix = [
+        b"local/quorum-production/v1/certificates/".as_slice(),
+        block.as_bytes(),
+        b"/production/component/",
+    ]
+    .concat();
+    let (mut n, prior, before, old_rows) = {
+        let n = node(provider_db, &c, false)?;
+        ensure(
+            n.chain_store.get_head_hash()? == Some(block)
+                && n.chain_store.get_finalized_number()? == Some(1),
+            "step needs finalized Native1 provider",
+        )?;
+        ensure(
+            !n.config.canonical_quorum_production,
+            "production defaults enabled",
+        )?;
+        let prior = n.quorum_production_status(block)?;
+        ensure(
+            prior
+                .as_ref()
+                .is_none_or(|s| s["status"]["state"] == "paused"),
+            "step requires an absent or paused job; retain failed/completed jobs for diagnosis",
+        )?;
+        if prior.is_none() {
+            ensure(
+                n.store
+                    .scan_prefix(b"local/quorum-production/v1/")?
+                    .is_empty()
+                    && n.store
+                        .scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?
+                        .is_empty(),
+                "fresh step already has production or proof bytes",
+            )?;
+        }
+        ensure(
+            n.store
+                .scan_prefix(b"local/canonical-production/v1/")?
+                .is_empty(),
+            "step provider has sender production rows",
+        )?;
+        let reference = node(&controls.join("control-db"), &c, false)?;
+        ensure(
+            recovery_native_digest(&n)? == recovery_native_digest(&reference)?,
+            "step provider differs from independent Native1 reference",
+        )?;
+        let before = production_native_rows(&n)?;
+        let rows = n.store.scan_prefix(&prefix)?;
+        (n, prior, before, rows)
+    };
+    let previous_components = prior
+        .as_ref()
+        .and_then(|s| s["status"]["components"].as_u64())
+        .unwrap_or(0);
+    ensure(
+        old_rows.len() as u64 == previous_components,
+        "prior component count differs from owned rows",
+    )?;
+    n.config.canonical_proof_component_budget = std::num::NonZeroUsize::new(budget);
+    let provider = Live::start_on_node(n, &c, vec![], false, true).await?;
+    let outcome = async {
+        let mut started = false;
+        let status = tokio::time::timeout(Duration::from_secs(3600), async {
+            loop {
+                if provider.task.is_finished() {
+                    return Err::<Value, Error>("step node stopped".into());
+                }
+                if provider.node.quorum_production_status(block)?.is_some() {
+                    let v = provider
+                        .call("admin_quorumProofProduction", json!([block]))
+                        .await?;
+                    let state = v["status"]["state"].as_str().unwrap_or("");
+                    started |= matches!(state, "queued" | "proving");
+                    let advanced = v["status"]["components"]
+                        .as_u64()
+                        .is_some_and(|n| n > previous_components);
+                    if state == "failed"
+                        || state == "complete"
+                        || (state == "paused" && (started || advanced))
+                    {
+                        return Ok(v);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await??;
+        let state = status["status"]["state"]
+            .as_str()
+            .ok_or("step state absent")?;
+        ensure(
+            matches!(state, "paused" | "complete"),
+            &format!("step failed: {status}"),
+        )?;
+        let count = status["status"]["components"]
+            .as_u64()
+            .ok_or("step count absent")?;
+        let newly = status["status"]["newlyProved"]
+            .as_u64()
+            .ok_or("step new count absent")?;
+        let reused = status["status"]["reused"]
+            .as_u64()
+            .ok_or("step reuse count absent")?;
+        ensure(
+            newly <= budget as u64
+                && count == previous_components + newly
+                && reused >= previous_components,
+            "step budget/progress/reuse mismatch",
+        )?;
+        let rows = provider.node.store.scan_prefix(&prefix)?;
+        ensure(
+            rows.len() as u64 == count && old_rows.iter().all(|r| rows.contains(r)),
+            "step removed or changed prior checkpoint bytes",
+        )?;
+        let job_prefix = prefix
+            .strip_suffix(b"component/")
+            .ok_or("step prefix shape")?;
+        let index: Value = serde_json::from_slice(
+            &provider
+                .node
+                .store
+                .get(&[job_prefix, b"index"].concat())?
+                .ok_or("step index absent")?,
+        )?;
+        let source = provider
+            .node
+            .store
+            .get(&[job_prefix, b"source"].concat())?
+            .ok_or("step source absent")?;
+        let entries = index["components"]
+            .as_object()
+            .ok_or("step index components absent")?;
+        let logical_bytes = entries
+            .values()
+            .try_fold(
+                index["source_bytes"]
+                    .as_u64()
+                    .ok_or("step source bytes absent")?,
+                |total, entry| total.checked_add(entry["bytes"].as_u64()?),
+            )
+            .ok_or("step logical size overflow")?;
+        ensure(
+            index["source_bytes"] == source.len() as u64
+                && index["source_hash"] == serde_json::to_value(blake3_hash(&source))?
+                && entries.len() as u64 == count
+                && logical_bytes
+                    == status["status"]["checkpointBytes"]
+                        .as_u64()
+                        .ok_or("step bytes absent")?
+                && logical_bytes
+                    <= shell_stark_prover::production_store::MAX_CHECKPOINT_BYTES as u64,
+            "step source/index/logical byte binding mismatch",
+        )?;
+        ensure(
+            production_native_rows(&provider.node)? == before,
+            "step changed Native/sender rows",
+        )?;
+        let payload = if state == "paused" {
+            ensure(
+                newly > 0
+                    && status["status"]["manifest"].is_null()
+                    && provider
+                        .node
+                        .store
+                        .scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?
+                        .is_empty(),
+                "paused step made no progress or exposed proof bytes",
+            )?;
+            None
+        } else {
+            let m: CanonicalProofManifest =
+                serde_json::from_value(status["status"]["manifest"].clone())?;
+            let cache = shell_storage::CanonicalProofUploadStore::new(provider.node.store.clone());
+            let bytes = cache.payload(&m.id())?;
+            ensure(
+                m == manifest(&c, &bytes)
+                    && cache.status(&m.id())?.state == CanonicalProofUploadState::Ready
+                    && status["nativeExecutionVerified"] == false,
+                "step completion is not bounded source-bound availability",
+            )?;
+            Some(bytes)
+        };
+        Ok::<_, Error>((status, rows, payload))
+    }
+    .await;
+    provider.stop().await?;
+    let (status, rows, payload) = outcome?;
+    {
+        let reopened = node(provider_db, &c, false)?;
+        ensure(
+            reopened.quorum_production_status(block)? == Some(status.clone())
+                && reopened.store.scan_prefix(&prefix)? == rows
+                && production_native_rows(&reopened)? == before,
+            "step cold metadata/checkpoints/Native mismatch",
+        )?;
+    }
+    println!(
+        "{}",
+        json!({"nodeOwnedQuorumProductionStep":true,"fromZero":prior.is_none(),
+        "componentBudget":budget,"previousComponents":previous_components,"status":status,
+        "priorCheckpointsUnchanged":true,"NativeRowsUnchanged":true,"physicalColdReopen":true,
+        "partialProductionOnly":payload.is_none(),"newAuthoritySigning":false})
+    );
+    if let Some(bytes) = payload {
+        let proof = shell_stark_prover::commit_quorum::payload::decode(&bytes)?;
+        write(&artifact, &proof)?;
+        exercise_producer(
+            controls,
+            provider_db,
+            receiver_root,
+            &artifact,
+            "producer-auto",
+        )
+        .await?;
+        println!(
+            "{}",
+            json!({"nodeOwnedCompleteStepToFreshPeer":true,"proofFile":artifact,
+            "head":1,"finalized":1,"independentColdNativeRowsChecked":true})
+        );
+    }
+    Ok(())
+}
+pub(super) fn run_producer_step(
+    controls: &Path,
+    provider: &Path,
+    receiver: &Path,
+    budget: usize,
+) -> Result<(), Error> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?
+        .block_on(exercise_producer_step(controls, provider, receiver, budget))
+}
+
 pub(super) fn run_producer(
     controls: &Path,
     provider: &Path,
