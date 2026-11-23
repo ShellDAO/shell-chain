@@ -14,6 +14,11 @@ use std::{
 const PREFIX: &[u8] = b"local/canonical-admission/v1/";
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const MAX_JOBS: usize = 2;
+// Certificate signatures use JSON byte arrays (at most four bytes per octet).
+// Include keys, algorithm tags and separators for every supported signer.
+const MAX_QUORUM_CERTIFICATE_BYTES: usize =
+    shell_stark_prover::commit_quorum::MAX_COMMIT_PROOF_SIGNERS
+        * (4 * shell_stark_prover::slh_fors::SLH_SHA2_256F_SIGNATURE_BYTES + 256);
 fn key(part: &[u8], hash: Option<ShellHash>) -> Vec<u8> {
     let mut k = [PREFIX, part].concat();
     if let Some(h) = hash {
@@ -373,7 +378,7 @@ impl<S: KvStore + 'static> Node<S> {
             .get(&key(b"quorum/", Some(r.block)))
             .map_err(|e| e.to_string())?
             .ok_or("pending quorum certificate absent")?;
-        if bytes.len() > 64 * 1024
+        if bytes.len() > MAX_QUORUM_CERTIFICATE_BYTES
             || Some(shell_primitives::blake3_hash(&bytes)) != r.quorum_certificate_hash
         {
             return Err("pending quorum certificate hash/size mismatch".into());
@@ -408,7 +413,7 @@ impl<S: KvStore + 'static> Node<S> {
             return Ok(false);
         }
         let cert = certificate.ok_or("quorum proof admission requires certified sync body")?;
-        if cert.len() > 64 * 1024 || peer.0.is_empty() || peer.0.len() > 128 {
+        if cert.len() > MAX_QUORUM_CERTIFICATE_BYTES || peer.0.is_empty() || peer.0.len() > 128 {
             return Err("quorum candidate certificate/peer limit".into());
         }
         self.live_quorum_context(head.hash(), block, cert)
@@ -1132,6 +1137,53 @@ impl<S: KvStore + 'static> Node<S> {
 mod tests {
     use super::*;
     use shell_storage::MemoryDb;
+    #[test]
+    fn retained_quorum_certificate_supports_slh_and_refuses_oversize_or_changed_bytes() {
+        let db = Arc::new(MemoryDb::new());
+        let node = super::super::tests::setup_node_with_store(Address::from([1; 32]), db.clone());
+        // This tests durable byte integrity, not signature authorization. The live
+        // SLH example separately verifies genuine signed controls before staging.
+        let signature = shell_crypto::PQSignature::new(
+            shell_crypto::SignatureType::SphincsSha2256f,
+            vec![255; shell_stark_prover::slh_fors::SLH_SHA2_256F_SIGNATURE_BYTES],
+        );
+        let signers = (0..shell_stark_prover::commit_quorum::MAX_COMMIT_PROOF_SIGNERS)
+            .map(|i| (Address::from([i as u8; 32]), signature.clone()))
+            .collect();
+        let certificate = Node::<MemoryDb>::encode_commit_certificate(&signers).unwrap();
+        assert!(certificate.len() > 64 * 1024);
+        let block = ShellHash::from([7; 32]);
+        let mut record = AdmissionRecord {
+            version: 2,
+            block,
+            number: 1,
+            parent: ShellHash::ZERO,
+            source_hash: ShellHash::ZERO,
+            peer: "provider".into(),
+            state: AdmissionState::Waiting,
+            manifest: None,
+            quorum_certificate_hash: Some(shell_primitives::blake3_hash(&certificate)),
+            attempts: 0,
+            hash_retries: 0,
+            explicit_recheck: None,
+            error: None,
+        };
+        let storage_key = key(b"quorum/", Some(block));
+        db.put(&storage_key, &certificate).unwrap();
+        let before = db.scan_all().unwrap();
+        assert_eq!(node.admission_certificate(&record).unwrap(), certificate);
+        assert_eq!(db.scan_all().unwrap(), before);
+        let mut altered = certificate;
+        altered[0] ^= 1;
+        db.put(&storage_key, &altered).unwrap();
+        assert!(node.admission_certificate(&record).is_err());
+        let oversized = vec![0; MAX_QUORUM_CERTIFICATE_BYTES + 1];
+        record.quorum_certificate_hash = Some(shell_primitives::blake3_hash(&oversized));
+        db.put(&storage_key, &oversized).unwrap();
+        let before = db.scan_all().unwrap();
+        assert!(node.admission_certificate(&record).is_err());
+        assert_eq!(db.scan_all().unwrap(), before);
+    }
     #[test]
     fn explicit_recheck_keeps_disabled_paused_or_untrusted_source_rejected() {
         let db = Arc::new(MemoryDb::new());

@@ -562,11 +562,26 @@ async fn exercise_live(
     source: &Path,
     mode: &str,
 ) -> Result<(), Error> {
+    let slh = mode.starts_with("slh-");
+    let mode = mode.strip_prefix("slh-").unwrap_or(mode);
     let c: Control = read(&controls.join("control.cbor"))?;
-    ensure(
-        c.co_authority.is_some() && c.blocks.len() == 3,
-        "genuine two-authority controls required",
-    )?;
+    if slh {
+        ensure(
+            c.co_authority.is_none()
+                && c.blocks.len() == 1
+                && c.certificates.len() == 1
+                && c.authority_key.len() == 64,
+            "original one-authority one-block SLH controls required",
+        )?;
+    } else {
+        ensure(
+            c.co_authority.is_some() && c.blocks.len() == 3,
+            "genuine two-authority controls required",
+        )?;
+    }
+    let proved_signatures = if slh { 1_u64 } else { 2 };
+    let tip_number = if slh { 1_u64 } else { 3 };
+    let tip = c.blocks.last().ok_or("control tip absent")?.hash();
     if matches!(mode, "live-pause" | "live-default" | "live-invalid-recheck") {
         std::fs::create_dir(root)?;
     }
@@ -584,7 +599,7 @@ async fn exercise_live(
         let outcome=async{
             ensure(receiver.node.chain_store.get_head_hash()?==Some(c.blocks[0].hash())&&receiver.node.chain_store.get_finalized_number()?==Some(1),"cold imported child absent")?;
             let payload=frame(proof_file)?;let m=manifest(&c,&payload);let old=receiver.status(m.id()).await?;let checked=receiver.verify(m.id()).await?;
-            ensure(checked.state==CanonicalProofUploadState::Verified&&checked.verification_attempts>old.verification_attempts&&checked.result.as_ref().is_some_and(|v|v["proved_commit_signatures"]==2),"cold quorum recheck reused cached authority")?;
+            ensure(checked.state==CanonicalProofUploadState::Verified&&checked.verification_attempts>old.verification_attempts&&checked.result.as_ref().is_some_and(|v|v["proved_commit_signatures"]==proved_signatures),"cold quorum recheck reused cached authority")?;
             ensure(canonical_rows(&receiver)?==before,"cold quorum replay wrote Native state")?;
             println!("{}",json!({"coldLiveQuorumRecheck":true,"verificationAttempts":checked.verification_attempts,"NativeRowsUnchanged":true,"currentHeight":1,"finalized":1,"newSigningOrProving":false}));Ok::<_,Error>(())
         }.await;
@@ -600,26 +615,47 @@ async fn exercise_live(
     };
     let outcome=async{
         if mode=="live-history3" {
-            tokio::time::timeout(Duration::from_secs(60),async{loop{if receiver.node.chain_store.get_head_block()?.ok_or("receiver head absent")?.number()==3{return Ok::<_,Error>(());}tokio::time::sleep(Duration::from_millis(100)).await;}}).await??;
+            tokio::time::timeout(Duration::from_secs(60),async{loop{if receiver.node.chain_store.get_head_block()?.ok_or("receiver head absent")?.number()==tip_number{return Ok::<_,Error>(());}tokio::time::sleep(Duration::from_millis(100)).await;}}).await??;
             let snapshot=canonical_rows(&receiver)?;let payload=frame(proof_file)?;let m=manifest(&c,&payload);let prior=receiver.status(m.id()).await?;let checked=receiver.verify(m.id()).await?;
-            ensure(checked.state==CanonicalProofUploadState::Verified&&checked.verification_attempts>prior.verification_attempts&&checked.result.as_ref().is_some_and(|v|v["execution"]["tip"]==serde_json::to_value(c.blocks[2].hash()).unwrap()&&v["proved_commit_signatures"]==2),"after3 full quorum history not reverified")?;
-            balances(&receiver.node,&c,3)?;
+            ensure(checked.state==CanonicalProofUploadState::Verified&&checked.verification_attempts>prior.verification_attempts&&checked.result.as_ref().is_some_and(|v|v["execution"]["tip"]==serde_json::to_value(tip).unwrap()&&v["proved_commit_signatures"]==proved_signatures),"after3 full quorum history not reverified")?;
+            balances(&receiver.node,&c,tip_number as usize)?;
             ensure(canonical_rows(&receiver)?==snapshot&&canonical_rows(&provider)?==snapshot,"after3 historical writeback or independent Native row mismatch")?;
             println!("{}",json!({"freshLiveFirstThenNativeFollow3":true,"currentHeight":3,"finalized":receiver.node.chain_store.get_finalized_number()?,"firstBlockFullAIRSigners":2,"successorQuorumCryptoNative":true,"historyRowsUnchanged":true,"independentNativeRowsEqual":true,"verificationAttempts":checked.verification_attempts,"newSigningOrProving":false}));return Ok::<_,Error>(());
         }
         if mode=="live-default" {
-            tokio::time::timeout(Duration::from_secs(60),async{loop{if receiver.node.chain_store.get_head_block()?.ok_or("receiver head absent")?.number()==3{return Ok::<_,Error>(());}tokio::time::sleep(Duration::from_millis(100)).await;}}).await??;
+            tokio::time::timeout(Duration::from_secs(60),async{loop{if receiver.node.chain_store.get_head_block()?.ok_or("receiver head absent")?.number()==tip_number{return Ok::<_,Error>(());}tokio::time::sleep(Duration::from_millis(100)).await;}}).await??;
             ensure(receiver.node.store.scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?.is_empty()&&receiver.node.canonical_admission_status(c.blocks[0].hash())?.is_none(),"default node entered quorum proof path")?;
-            println!("{}",json!({"defaultQuorumAdmissionDisabled":true,"head":3,"proofCacheEmpty":true,"pendingAbsent":true}));return Ok::<_,Error>(());
+            println!("{}",json!({"defaultQuorumAdmissionDisabled":true,"head":tip_number,"fullSLH":slh,"proofCacheEmpty":true,"pendingAbsent":true}));return Ok::<_,Error>(());
         }
         let pending=wait_pending(&receiver,&c).await?;
         ensure(receiver.node.chain_store.get_head_block()?.ok_or("receiver head absent")?.number()==0&&canonical_rows(&receiver)?==before,"Native changed before full QC proof")?;
         if mode=="live-pause" {
             ensure(pending["status"]["state"]=="waiting"&&receiver.node.store.scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?.is_empty(),"pause requires untrusted source and no proof")?;
-            println!("{}",json!({"durableQuorumCandidate":true,"head":0,"NativeRowsUnchanged":true,"proofCacheEmpty":true,"pending":pending,"actualTCPNoiseBodyAndQC":true}));return Ok(());
+            if slh {
+                let payload = frame(proof_file)?;
+                let m = manifest(&c, &payload);
+                let (status, _) = request(receiver.address, None, "admin_beginCanonicalProof", json!([m])).await?;
+                ensure(status == 401, "SLH operator authorization absent")?;
+                metadata_refusals(&receiver, &m, &c).await?;
+                let partial = receiver.upload(&m, &payload, true).await?;
+                ensure(partial.next_chunk == 3 && partial.state == CanonicalProofUploadState::Uploading
+                    && receiver.node.chain_store.get_head_block()?.ok_or("receiver head absent")?.number() == 0
+                    && canonical_rows(&receiver)? == before,
+                    "SLH partial upload changed Native state or missed durable pause")?;
+                println!("{}",json!({"durableQuorumCandidate":true,"fullSLH":true,"head":0,"NativeRowsUnchanged":true,"pending":pending,"actualTCPNoiseBodyAndQC":true,"partialUpload":partial}));
+            } else {
+                println!("{}",json!({"durableQuorumCandidate":true,"head":0,"NativeRowsUnchanged":true,"proofCacheEmpty":true,"pending":pending,"actualTCPNoiseBodyAndQC":true}));
+            }
+            return Ok(());
         }
         ensure(matches!(mode,"live-import"|"live-invalid-recheck"),"unknown live mode")?;
         let payload=frame(proof_file)?;let m=manifest(&c,&payload);
+        if slh {
+            let partial = receiver.status(m.id()).await?;
+            ensure(partial.state == CanonicalProofUploadState::Uploading && partial.next_chunk == 3
+                && partial.received_bytes == 3 * shell_storage::CANONICAL_PROOF_CHUNK_BYTES as u64,
+                "SLH import requires the retained three-chunk pause")?;
+        }
         let(status,_)=request(receiver.address,None,"admin_beginCanonicalProof",json!([m])).await?;ensure(status==401,"fresh quorum operator auth absent")?;
         let mut sender=m.clone();sender.version=1;
         ensure(receiver.call("admin_beginCanonicalProof",json!([sender])).await.is_err(),"sender role attached to quorum pending source")?;
@@ -643,16 +679,20 @@ async fn exercise_live(
         }
         upload_all(&provider,&m,&payload).await?;
         let checked=provider.verify(m.id()).await?;
-        ensure(checked.state==CanonicalProofUploadState::Verified&&checked.result.as_ref().is_some_and(|v|v["execution"]["tip"]==serde_json::to_value(c.blocks[2].hash()).unwrap()),"provider historical proof verification failed")?;
+        ensure(checked.state==CanonicalProofUploadState::Verified&&checked.result.as_ref().is_some_and(|v|v["execution"]["tip"]==serde_json::to_value(tip).unwrap()),"provider historical proof verification failed")?;
         receiver.connected(&provider.peer(),&m).await?;
         match receiver.call("admin_fetchCanonicalProof",json!([provider.peer(),m])).await {Ok(_)=>{},Err(e) if e.to_string().contains("busy")=>{},Err(e)=>return Err(e),}
         let verified=wait_upload(&receiver,m.id()).await?;
         let value=verified.result.as_ref().ok_or("fresh quorum receipt absent")?;
         let stored=receiver.node.chain_store.get_receipts(&c.blocks[0].hash())?.ok_or("fresh receipts missing")?;
-        ensure(verified.state==CanonicalProofUploadState::Verified&&receiver.node.chain_store.get_head_hash()?==Some(c.blocks[0].hash())&&receiver.node.chain_store.get_finalized_number()?==Some(1)&&value["proved_commit_signatures"]==2&&value["execution"]["state_root"]==serde_json::to_value(c.blocks[0].header.state_root)?&&value["execution"]["receipts"]==serde_json::to_value(&stored)?&&provider.node.chain_store.get_receipts(&c.blocks[0].hash())?==Some(stored),"fresh quorum head/finality/proof/independent receipts mismatch")?;
+        ensure(verified.state==CanonicalProofUploadState::Verified&&receiver.node.chain_store.get_head_hash()?==Some(c.blocks[0].hash())&&receiver.node.chain_store.get_finalized_number()?==Some(1)&&value["proved_commit_signatures"]==proved_signatures&&value["execution"]["state_root"]==serde_json::to_value(c.blocks[0].header.state_root)?&&value["execution"]["receipts"]==serde_json::to_value(&stored)?&&provider.node.chain_store.get_receipts(&c.blocks[0].hash())?==Some(stored),"fresh quorum head/finality/proof/independent receipts mismatch")?;
         balances(&receiver.node,&c,1)?;
+        if slh {
+            ensure(canonical_rows(&receiver)? == canonical_rows(&provider)?,
+                "full SLH live import differs from independent Native rows")?;
+        }
         let fetch=tokio::time::timeout(Duration::from_secs(15),async{loop{let v=receiver.call("admin_canonicalProofFetchStatus",json!([m.id()])).await?;if v["state"]=="complete"{return Ok::<_,Error>(v);}tokio::time::sleep(Duration::from_millis(100)).await;}}).await??;
-        println!("{}",json!({"freshLiveQuorumImported":true,"actualTCPNoiseBodyAndProof":true,"resumedPendingSource":true,"damagedWeightRejectedBeforeMutation":true,"wrongRoleAndChainRejected":true,"head":1,"finalized":1,"provedCommitSignatures":2,"independentReceiptsEqual":true,"balancesNonceFeesChecked":true,"fetch":fetch,"result":value,"newAuthoritySigningOrProving":false}));
+        println!("{}",json!({"freshLiveQuorumImported":true,"actualTCPNoiseBodyAndProof":true,"resumedPendingSource":true,"damagedWeightRejectedBeforeMutation":true,"wrongRoleAndChainRejected":true,"head":1,"finalized":1,"provedCommitSignatures":proved_signatures,"fullSLH":slh,"independentReceiptsEqual":true,"balancesNonceFeesChecked":true,"fetch":fetch,"result":value,"newAuthoritySigningOrProving":false}));
         Ok::<_,Error>(())
     }.await;
     let a = provider.stop().await;

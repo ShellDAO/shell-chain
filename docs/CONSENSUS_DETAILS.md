@@ -852,11 +852,18 @@ and historical selector provenance are not proved in AIR by this flow. See the
 
 The bounded development profile supports at most sixteen lattice signers,
 including ML-DSA-65, genuine PQClean Dilithium3 and its existing SDK FIPS
-transcript. Existing checkpoint quotas still apply. SLH quorum signatures,
-historical authority and penalty provenance, proposer selection, network
-transport and public release acceptance remain separate work. Ordinary
-certificate formats and network activation rules remain unchanged. See the
-[design decision](adr/commit-quorum-proof.md) for the executable source check.
+transcript. Existing checkpoint quotas still apply. The experimental SHA2-256f
+extension has also completed a local one-authority, one-block full-signature AIR
+flow: a 247,550,826-byte payload, authenticated partial upload and restart,
+TCP/Noise proof transfer, atomic Native import matching independent persisted
+state and receipts, and a new full recheck after cold startup. Live candidate
+storage accepts the bounded JSON encoding of an SLH quorum certificate. A
+separate default-off check follows ordinary Native sync without allocating a
+proof upload. Mixed-signer capacity, later-height SLH history, full-SLH backend
+rollback, historical authority and penalty provenance, proposer selection and
+public-release acceptance remain open. Ordinary certificate formats and network
+activation rules remain unchanged. See the
+[design decision](adr/commit-quorum-proof.md) for prerequisites and commands.
 
 ### Validator activity observations
 

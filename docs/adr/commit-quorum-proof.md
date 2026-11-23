@@ -726,10 +726,15 @@ combines strict weight AIR with the existing complete FORS and seventeen-layer
 XMSS/WOTS graph for each SLH signer. The explicit wide-WOTS profile retains the
 original security options and all layers. Native signature checks select valid
 production inputs; they never replace missing AIR certificates during proof
-verification. This source-only extension remains experimental: complete SLH
-output, its availability size and positive end-to-end Native acceptance are
-still pending validation. It does not change the current accumulator protocol,
-network activation or default-off admission/production settings.
+verification. This development extension remains experimental. A local run with
+one SLH authority and one block completed all seventeen layers, bounded wire
+verification, atomic Native import, authenticated RPC and TCP/Noise transfer,
+and a full recheck after restart. The artifact occupied 247,550,803 bytes; its
+version-two availability payload occupied 247,550,826 bytes (945 chunks of at
+most 256 KiB), within the existing 256 MiB cap. Public-release acceptance, network
+activation, mixed-signer capacity and later-height SLH history remain open.
+The current accumulator protocol and default-off admission/production settings
+remain unchanged.
 
 Lattice-only sources keep their original job binding, version-one proof and
 byte-identical `commit-quorum/cbor/v1` payload. Sources containing SLH use a
@@ -738,7 +743,9 @@ and SLH certificates in separate bounded lists; independently expected signer
 order and algorithm select each certificate. Counts, complete inputs and every
 signature graph must match before any proof-backed verifier is returned. The
 shared 256 MiB availability cap and maximum sixteen signers remain unchanged;
-a complete artifact must actually fit before availability can be claimed.
+each complete artifact must fit before availability can be claimed. Live quorum
+candidate storage bounds JSON certificates by the supported signer count and
+largest signature encoding, including SHA2-256f, on both receipt and restart.
 The public Rust proof struct adds an optional `slh_signatures` list. Existing
 Rust struct literals need `slh_signatures: Vec::new()`; its empty value is omitted
 from legacy serialization.
@@ -776,4 +783,30 @@ The import entry requires full AIR verification before the atomic canonical
 write and compares cold persisted rows, receipts, balances, nonce, fees and
 finalized height with the independent Native control. Invalid or cross-profile
 proofs must leave genesis rows/finality unchanged with no child receipts. The
-positive SLH endpoint remains open until this complete sequence succeeds.
+local single-authority sequence above has passed with the original signed
+controls and complete proof, without generating replacement signatures.
+
+Continue with real loopback nodes and the same signed controls. Run these modes
+in order; `slh-live-import` requires the three chunks retained by
+`slh-live-pause`, and `slh-live-cold` reopens the imported receiver:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- slh-live-pause slh-quorum-controls slh-quorum-proof.cbor slh-quorum-live slh-quorum-controls/provider-db
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- slh-live-import slh-quorum-controls slh-quorum-proof.cbor slh-quorum-live slh-quorum-controls/provider-db
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- slh-live-cold slh-quorum-controls slh-quorum-proof.cbor slh-quorum-live slh-quorum-controls/provider-db
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- slh-live-default slh-quorum-controls slh-quorum-proof.cbor slh-quorum-default slh-quorum-controls/provider-db
+```
+
+The pause mode receives the real body and quorum certificate over TCP/Noise,
+rejects unauthenticated operator requests and invalid metadata, and retains
+three authenticated chunks while Native stays at genesis. The import mode
+reopens that partial upload, rejects a damaged proof carrying its own correct
+payload hash without changing Native state, and fetches the valid proof from
+the independent provider. Success requires head/finalized height one, the full
+commit-signature AIR result, and persisted rows, receipts, balances, nonce and
+fees matching ordinary Native execution. The cold mode requires a new full
+verification attempt and unchanged canonical rows. The default mode reaches
+height one through ordinary Native sync with no proof-cache allocation or
+pending proof admission. Any failed assertion exits nonzero; retain the affected
+directories for diagnosis. These checks cover the single-block test conditions;
+full-SLH backend rollback and mixed or multi-block combinations remain open.
