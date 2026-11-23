@@ -1126,6 +1126,11 @@ pub(super) fn seed_producer(
     malformed.put(key, &bytes)?;
     let mut index: Value =
         serde_json::from_slice(&malformed.get(b"production/index")?.ok_or("index absent")?)?;
+    let expected_components = index["components"]
+        .as_object()
+        .ok_or("component index absent")?
+        .len();
+    ensure(expected_components > 0, "completed donor has no components")?;
     index["components"]["commit-weight"]["bytes"] = json!(bytes.len());
     index["components"]["commit-weight"]["hash"] = serde_json::to_value(blake3_hash(&bytes))?;
     malformed.put(b"production/index", &serde_json::to_vec(&index)?)?;
@@ -1162,9 +1167,9 @@ pub(super) fn seed_producer(
     )?;
     let recovered = provider.recover_quorum_production_job(c.blocks[0].hash(), &mut donor)?;
     ensure(
-        recovered.components == 107
+        recovered.components == expected_components
             && recovered.newly_proved == 0
-            && recovered.reused == 107
+            && recovered.reused >= expected_components
             && donor.scan_all()? == original,
         "recovery changed original graph or proved new components",
     )?;
@@ -1186,13 +1191,20 @@ pub(super) fn seed_producer(
     );
     Ok(())
 }
-async fn wait_production(live: &Live, hash: ShellHash) -> Result<Value, Error> {
-    tokio::time::timeout(Duration::from_secs(90), async {
+async fn wait_production(live: &Live, hash: ShellHash, was_complete: bool) -> Result<Value, Error> {
+    tokio::time::timeout(Duration::from_secs(300), async {
+        // RPC can start before cold startup requeues the persisted complete record.
+        let mut rechecking = !was_complete;
         loop {
             let v = live
                 .call("admin_quorumProofProduction", json!([hash]))
                 .await?;
-            if v["status"]["state"] == "complete" || v["status"]["state"] == "failed" {
+            if matches!(v["status"]["state"].as_str(), Some("queued" | "proving")) {
+                rechecking = true;
+            }
+            if v["status"]["state"] == "failed"
+                || (rechecking && v["status"]["state"] == "complete")
+            {
                 return Ok::<_, Error>(v);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1246,6 +1258,28 @@ async fn exercise_producer(
         n.store.put(&key, &bytes)?;
         n.store.flush()?;
     }
+    let (expected_components, was_complete, before) = {
+        let offline = node(provider_db, &c, false)?;
+        let status = if mode == "producer-manifest" {
+            None
+        } else {
+            offline.quorum_production_status(c.blocks[0].hash())?
+        };
+        (
+            status
+                .as_ref()
+                .and_then(|s| s["status"]["components"].as_u64()),
+            status
+                .as_ref()
+                .is_some_and(|s| s["status"]["state"] == "complete"),
+            production_native_rows(&offline)?,
+        )
+    };
+    ensure(
+        mode != "producer-cold" || was_complete,
+        "cold producer requires a previously complete job",
+    )?;
+    let proved_signatures = 1 + usize::from(c.co_authority.is_some());
     let provider = Live::start_production(
         provider_db,
         &c,
@@ -1255,7 +1289,6 @@ async fn exercise_producer(
         !matches!(mode, "producer-disabled" | "producer-auto-wait"),
     )
     .await?;
-    let before = production_native_rows(&provider.node)?;
     let outcome=async{
         if mode=="producer-disabled" {
             let status=provider.call("admin_quorumProofProduction",json!([c.blocks[0].hash()])).await?;
@@ -1280,17 +1313,20 @@ async fn exercise_producer(
             }.await;
             receiver.stop().await?;return outcome;
         }
-        let status=wait_production(&provider,c.blocks[0].hash()).await?;
+        let status=wait_production(&provider,c.blocks[0].hash(),was_complete).await?;
         if mode=="producer-corrupt" {
             ensure(status["status"]["state"]=="failed"&&status["status"]["error"].is_string()&&production_native_rows(&provider.node)?==before&&provider.node.store.scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?.is_empty(),"corrupt owned job healed, wrote Native, or published bytes")?;
             println!("{}",json!({"damagedOwnedGraphRejected":true,"NativeRowsUnchanged":true,"proofCacheEmpty":true,"status":status}));return Ok::<_,Error>(());
         }
-        ensure(status["status"]["state"]=="complete"&&status["status"]["components"]==107&&status["status"]["newlyProved"]==0&&status["status"]["reused"]==107&&status["artifactVersion"]==2&&status["nativeExecutionVerified"]==false,"actual quorum producer did not fully reverify existing graph")?;
+        let expected_components=expected_components.filter(|n|*n>0).ok_or("seeded component count absent")?;
+        ensure(status["status"]["state"]=="complete"&&status["status"]["components"]==expected_components&&status["status"]["newlyProved"]==0&&status["status"]["reused"].as_u64().is_some_and(|n|n>=expected_components)&&status["artifactVersion"]==2&&status["nativeExecutionVerified"]==false,"actual quorum producer did not fully reverify existing graph")?;
         let manifest:CanonicalProofManifest=serde_json::from_value(status["status"]["manifest"].clone())?;
-        ensure(manifest.version==2&&manifest.total_bytes==30524873&&provider.status(manifest.id()).await?.state==CanonicalProofUploadState::Ready&&production_native_rows(&provider.node)?==before,"producer availability or Native state incorrect")?;
+        ensure(manifest.version==2&&provider.status(manifest.id()).await?.state==CanonicalProofUploadState::Ready&&production_native_rows(&provider.node)?==before,"producer availability or Native state incorrect")?;
         let expected=frame(proof_file)?;ensure(manifest==super::quorum_rpc::manifest(&c,&expected),"produced payload identity differs from original genuine graph")?;
+        let cache=shell_storage::CanonicalProofUploadStore::new(provider.node.store.clone());
+        ensure(cache.payload(&manifest.id())?==expected,"node-produced bytes differ from complete original proof")?;
         if mode=="producer-cold"{
-            println!("{}",json!({"coldNodeQuorumProducerReverified":true,"NativeRowsUnchanged":true,"status":status,"readyBytesNotNativeAuthorization":true}));return Ok(());
+            println!("{}",json!({"coldNodeQuorumProducerReverified":true,"observedColdRecheck":was_complete,"NativeRowsUnchanged":true,"status":status,"readyBytesNotNativeAuthorization":true}));return Ok(());
         }
         if matches!(mode,"producer-auto-batch-fault"|"producer-intact-rejection") {
             batch_fault::exercise(&provider,&c,receiver_root,&manifest,mode=="producer-intact-rejection").await?;
@@ -1335,11 +1371,18 @@ async fn exercise_producer(
                 }
             }).await??;
             let receipts=receiver.node.chain_store.get_receipts(&c.blocks[0].hash())?.ok_or("receiver receipts absent")?;
-            ensure(verified.state==CanonicalProofUploadState::Verified&&receiver.node.chain_store.get_head_hash()?==Some(c.blocks[0].hash())&&receiver.node.chain_store.get_finalized_number()?==Some(1)&&verified.result.as_ref().is_some_and(|v|v["proved_commit_signatures"]==2)&&provider.node.chain_store.get_receipts(&c.blocks[0].hash())?==Some(receipts),"produced proof did not reach true atomic canonical/finality endpoint")?;
+            ensure(verified.state==CanonicalProofUploadState::Verified&&receiver.node.chain_store.get_head_hash()?==Some(c.blocks[0].hash())&&receiver.node.chain_store.get_finalized_number()?==Some(1)&&verified.result.as_ref().is_some_and(|v|v["proved_commit_signatures"]==proved_signatures)&&provider.node.chain_store.get_receipts(&c.blocks[0].hash())?==Some(receipts),"produced proof did not reach true atomic canonical/finality endpoint")?;
             balances(&receiver.node,&c,1)?;
-            println!("{}",json!({"nodeQuorumProducerToFreshPeerComplete":true,"status":status,"actualTCPNoise":true,"head":1,"finalized":1,"provedCommitSignatures":2,"independentNativeReceiptsEqual":true,"balancesNonceFeesChecked":true,"sourceNativeRowsUnchanged":production_native_rows(&provider.node)?==before,"manualProofUpload":false,"automaticDiscovery":mode!="producer-live","coldWaitingResumed":resume,"noOperatorProofCalls":mode!="producer-live","newAuthoritySigningOrProving":false}));Ok::<_,Error>(())
+            println!("{}",json!({"nodeQuorumProducerToFreshPeerComplete":true,"status":status,"actualTCPNoise":true,"head":1,"finalized":1,"provedCommitSignatures":proved_signatures,"independentNativeReceiptsEqual":true,"balancesNonceFeesChecked":true,"sourceNativeRowsUnchanged":production_native_rows(&provider.node)?==before,"manualProofUpload":false,"automaticDiscovery":mode!="producer-live","coldWaitingResumed":resume,"noOperatorProofCalls":mode!="producer-live","newAuthoritySigningOrProving":false}));Ok::<_,Error>(())
         }.await;
-        receiver.stop().await?;transfer
+        receiver.stop().await?;
+        transfer?;
+        let reopened=node(&receiver_root.join("db"),&c,false)?;
+        ensure(reopened.chain_store.get_head_hash()?==Some(c.blocks[0].hash())&&reopened.chain_store.get_finalized_number()?==Some(1)&&recovery_native_digest(&reopened)?==recovery_native_digest(&provider.node)?,"cold produced-proof Native rows differ from independent reference")?;
+        balances(&reopened,&c,1)?;
+        ensure(production_native_rows(&provider.node)?==before,"producer changed Native during automatic import")?;
+        println!("{}",json!({"coldProducedProofCanonicalRowsEqual":true,"head":1,"finalized":1,"independentNativeReference":true,"balancesNonceFeesChecked":true,"sourceNativeRowsUnchanged":true}));
+        Ok(())
     }.await;
     provider.stop().await?;
     outcome

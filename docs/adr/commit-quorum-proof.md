@@ -779,6 +779,46 @@ cargo run --locked -p shell-stark-prover --example commit-quorum -- verify-wire 
 cargo run --locked -p shell-node --features rocksdb --example quorum-native -- accept-slh slh-quorum-controls slh-quorum-proof.cbor slh-quorum-import
 ```
 
+The existing `producer-seed`, `producer-disabled`, `producer-auto` and
+`producer-cold` commands also accept a completed SLH job. Keep the original
+job and signed controls, and copy the closed independent Native database to a
+new provider directory before recovery:
+
+```sh
+test ! -e slh-quorum-producer-db
+cp -R slh-quorum-controls/control-db slh-quorum-producer-db
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-seed slh-quorum-controls slh-quorum-job slh-quorum-producer-db
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-disabled slh-quorum-controls slh-quorum-producer-db unused-receiver slh-quorum-proof.cbor
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-auto slh-quorum-controls slh-quorum-producer-db slh-produced-receiver slh-quorum-proof.cbor
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-cold slh-quorum-controls slh-quorum-producer-db slh-produced-receiver slh-quorum-proof.cbor
+```
+
+Stop if the destination already exists or the copy fails. Run these commands
+only after `verify` succeeds for the complete job. Recovery verifies the
+whole donor and its source before copying checkpoints into the node's separate
+quorum namespace. The example derives the unique component count from that
+verified job rather than assuming the two-authority lattice graph's count.
+Shared SLH seed-prefix certificates can be reverified more than once, so the
+reuse counter can exceed the unique checkpoint count. Cancellation, damaged
+correct-hash donors, foreign sources and Native keys must still refuse without
+changing destination rows.
+
+The disabled node must retain a paused job and empty proof cache. When enabled,
+the actual node worker must reverify every component with zero new proving and
+produce exactly the original complete payload, including its bytes and
+manifest. Availability is still `ready`, without Native authorization. A fresh
+peer discovers and fetches those bytes automatically over TCP/Noise, verifies
+the full proof and commits/finalizes block one. Its cold canonical rows,
+receipts, balances, nonce and fees must match the independent Native provider.
+`producer-cold` requires a previously complete job, starts another process and
+waits to observe `queued` or `proving` before accepting a new `complete` result.
+RPC can start before the cold worker requeues persisted metadata; the old
+`complete` result alone cannot establish that this process reverified the graph.
+The example waits at most five minutes for production and exits nonzero on a
+timeout, retaining the affected stores. These commands qualify recovery of an
+already complete job; fresh-from-zero production and other host/resource
+combinations require their own measurements.
+
 The import entry requires full AIR verification before the atomic canonical
 write and compares cold persisted rows, receipts, balances, nonce, fees and
 finalized height with the independent Native control. Invalid or cross-profile
