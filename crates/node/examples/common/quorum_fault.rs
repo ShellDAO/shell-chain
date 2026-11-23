@@ -253,6 +253,7 @@ pub(super) async fn invalid_recheck(
     manifest: &CanonicalProofManifest,
     payload: &[u8],
     root: &Path,
+    expected_verifier_error: &str,
 ) -> Result<(), Error> {
     let old = receiver.status(manifest.id()).await?;
     let native_before = recovery_native_digest(&receiver.node)?;
@@ -264,13 +265,13 @@ pub(super) async fn invalid_recheck(
             && old
                 .error
                 .as_ref()
-                .is_some_and(|e| e.contains("quorum weight verification:"))
+                .is_some_and(|e| e.contains(expected_verifier_error))
             && cache.payload(&manifest.id())? == payload
             && blake3_hash(payload) == manifest.payload_hash,
         "initial refusal was not an intact correctly hashed cryptographic rejection",
     )?;
     let chunks = recovery_chunks(&cache, &old)?;
-    let checkpoint = json!({"manifest":manifest,"nativeDigest":native_before,"firstStatus":old,"chunkDigests":chunks});
+    let checkpoint = json!({"manifest":manifest,"nativeDigest":native_before,"firstStatus":old,"chunkDigests":chunks,"expectedVerifierError":expected_verifier_error});
     std::fs::write(
         root.join("invalid-recheck.json"),
         serde_json::to_vec_pretty(&checkpoint)?,
@@ -320,7 +321,7 @@ pub(super) async fn invalid_recheck(
         .await?;
     ensure(checked.state==CanonicalProofUploadState::Rejected && stable==checked
         && checked.verification_attempts==2 && checked.generation==old.generation
-        && checked.result.is_none() && checked.error.as_ref().is_some_and(|e|e.contains("quorum weight verification:"))
+        && checked.result.is_none() && checked.error.as_ref().is_some_and(|e|e.contains(expected_verifier_error))
         && recovery_chunks(&cache,&checked)?==chunks
         && recovery_native_digest(&receiver.node)?==native_before
         && receiver.node.chain_store.get_head_hash()?==Some(c.genesis.hash())
@@ -333,7 +334,7 @@ pub(super) async fn invalid_recheck(
     recovery_genesis_balances(&receiver.node, c)?;
     println!(
         "{}",
-        json!({"invalidCryptoExplicitRecheckRejected":true,"initialError":old.error,"recheckError":checked.error,"payloadHashCorrect":true,"completeProofBytes":payload.len(),"sameGeneration":true,"allChunkHashesEqual":true,"verificationAttempts":2,"initialAndExplicitAttemptRejected":true,"weightAIRVerifierReachedBothAttempts":true,"originalWeightStarkBytesPreserved":true,"intentConsumed":true,"noAutomaticThirdAttempt":true,"canonicalRowsUnchanged":true,"head":0,"finalized":0,"inMemoryFinality":0,"noChildReceipts":true,"balancesNonceFeesUnchanged":true,"unauthenticatedAndNonExplicitRefused":true,"operatorProofRPC":true,"actualTCPNoiseBodyAndQC":true,"noNewOriginalSigningOrProving":true})
+        json!({"invalidCryptoExplicitRecheckRejected":true,"initialError":old.error,"recheckError":checked.error,"payloadHashCorrect":true,"completeProofBytes":payload.len(),"sameGeneration":true,"allChunkHashesEqual":true,"verificationAttempts":2,"initialAndExplicitAttemptRejected":true,"weightAIRVerifierReachedBothAttempts":expected_verifier_error=="quorum weight verification:","SLHAIRVerifierReachedBothAttempts":expected_verifier_error=="SHA2 compression verification:","originalWeightStarkBytesPreserved":true,"intentConsumed":true,"noAutomaticThirdAttempt":true,"canonicalRowsUnchanged":true,"head":0,"finalized":0,"inMemoryFinality":0,"noChildReceipts":true,"balancesNonceFeesUnchanged":true,"unauthenticatedAndNonExplicitRefused":true,"operatorProofRPC":true,"actualTCPNoiseBodyAndQC":true,"noNewOriginalSigningOrProving":true})
     );
     Ok(())
 }
@@ -343,6 +344,9 @@ pub(super) fn invalid_cold(c: &Control, root: &Path) -> Result<(), Error> {
     let manifest: CanonicalProofManifest = serde_json::from_value(saved["manifest"].clone())?;
     let first: CanonicalProofUploadStatus = serde_json::from_value(saved["firstStatus"].clone())?;
     let chunks: Vec<ShellHash> = serde_json::from_value(saved["chunkDigests"].clone())?;
+    let expected_verifier_error = saved["expectedVerifierError"]
+        .as_str()
+        .unwrap_or("quorum weight verification:");
     let n = node(&root.join("db"), c, false)?;
     let cache = shell_storage::CanonicalProofUploadStore::new(n.store.clone());
     let status = cache.status(&manifest.id())?;
@@ -354,6 +358,10 @@ pub(super) fn invalid_cold(c: &Control, root: &Path) -> Result<(), Error> {
             && status.verification_attempts == 2
             && status.generation == first.generation
             && status.result.is_none()
+            && status
+                .error
+                .as_ref()
+                .is_some_and(|e| e.contains(expected_verifier_error))
             && recovery_chunks(&cache, &status)? == chunks
             && saved["nativeDigest"] == serde_json::to_value(recovery_native_digest(&n)?)?
             && blake3_hash(&cache.payload(&manifest.id())?) == manifest.payload_hash

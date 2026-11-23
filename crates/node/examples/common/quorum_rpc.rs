@@ -650,7 +650,7 @@ async fn exercise_live(
         }
         ensure(matches!(mode,"live-import"|"live-invalid-recheck"),"unknown live mode")?;
         let payload=frame(proof_file)?;let m=manifest(&c,&payload);
-        if slh {
+        if slh && mode == "live-import" {
             let partial = receiver.status(m.id()).await?;
             ensure(partial.state == CanonicalProofUploadState::Uploading && partial.next_chunk == 3
                 && partial.received_bytes == 3 * shell_storage::CANONICAL_PROOF_CHUNK_BYTES as u64,
@@ -663,18 +663,33 @@ async fn exercise_live(
         ensure(receiver.call("admin_beginCanonicalProof",json!([foreign])).await.is_err(),"foreign manifest attached to quorum source")?;
         let mut damaged:CommitQuorumProof=read(proof_file)?;
         if mode=="live-invalid-recheck" {
-            // Preserve serialized STARK layout and proof bytes; falsify one
-            // public cumulative weight so rejection must reach the AIR verifier.
-            let last=damaged.weight.prefixes.last_mut().ok_or("weight prefix absent")?;
-            ensure(last[0]>1,"weight total must allow a bounded nonzero alteration")?;
-            last[0]-=1;
+            // Preserve STARK layout and bytes; change a public AIR witness word
+            // so rejection must reach the cryptographic verifier.
+            if slh {
+                let weight = serde_json::to_vec(&damaged.weight)?;
+                let signature = damaged.slh_signatures.last_mut().ok_or("SLH proof absent")?;
+                ensure(signature.layers.len() == 17, "complete SLH layers required")?;
+                let prefix = &mut signature.layers.last_mut().ok_or("last SLH layer absent")?.prefix;
+                let original_stark = prefix.proof_bytes.clone();
+                let operation = prefix.operations.first_mut().ok_or("SLH prefix operation absent")?;
+                *operation ^= 1;
+                ensure(prefix.proof_bytes == original_stark && serde_json::to_vec(&damaged.weight)? == weight,
+                    "SLH mutation changed STARK bytes or quorum weight")?;
+                println!("{}", json!({"SLHLastLayerPublicOperationAltered":true,"layer":16,
+                    "weightUnchanged":true,"originalStarkBytesPreserved":true,
+                    "versionsCountsAndLayoutPreserved":true,"newSigningOrProving":false}));
+            } else {
+                let last=damaged.weight.prefixes.last_mut().ok_or("weight prefix absent")?;
+                ensure(last[0]>1,"weight total must allow a bounded nonzero alteration")?;
+                last[0]-=1;
+            }
         } else { damaged.weight.proof_bytes[0]^=1; }
         let bad=shell_stark_prover::commit_quorum::payload::encode(&damaged,shell_core::MAX_CANONICAL_PROOF_BYTES as usize)?;let bad_manifest=manifest(&c,&bad);
         upload_all(&receiver,&bad_manifest,&bad).await?;
         let rejected=wait_upload(&receiver,bad_manifest.id()).await?;
         ensure(rejected.state==CanonicalProofUploadState::Rejected&&rejected.result.is_none()&&receiver.node.chain_store.get_head_block()?.ok_or("receiver head absent")?.number()==0&&canonical_rows(&receiver)?==before,"damaged quorum graph changed Native head/state")?;
         if mode=="live-invalid-recheck" {
-            batch_fault::invalid_recheck(&receiver,&c,&bad_manifest,&bad,root).await?;
+            batch_fault::invalid_recheck(&receiver,&c,&bad_manifest,&bad,root,if slh {"SHA2 compression verification:"} else {"quorum weight verification:"}).await?;
             return Ok(());
         }
         upload_all(&provider,&m,&payload).await?;

@@ -810,3 +810,24 @@ height one through ordinary Native sync with no proof-cache allocation or
 pending proof admission. Any failed assertion exits nonzero; retain the affected
 directories for diagnosis. These checks cover the single-block test conditions;
 full-SLH backend rollback and mixed or multi-block combinations remain open.
+
+
+To test a damaged SLH AIR with the same complete original proof, use the
+independent ordinary Native reference from preparation. Its proof cache must
+be empty; a provider already serving the valid proof can legitimately complete
+admission before the negative upload arrives.
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- slh-live-invalid-recheck slh-quorum-controls slh-quorum-proof.cbor slh-quorum-invalid slh-quorum-controls/control-db
+```
+
+This mode changes one public operation in the final XMSS layer's seed-prefix
+certificate while retaining its original STARK bytes and the entire quorum
+weight proof. It encodes a complete payload with its own correct hash and uses
+authenticated RPC after real TCP/Noise body and certificate sync. Both the first
+attempt and an explicitly authenticated second attempt must fail at SHA2 AIR
+verification, with no automatic third attempt or canonical, in-memory finality,
+account, fee or receipt changes. After graceful shutdown, a physical cold reopen
+must preserve the same rejected generation, every chunk and the genesis state.
+This single-layer witness-tamper check has passed locally; other SLH components,
+backend rollback, later-height and mixed combinations remain separately open.
