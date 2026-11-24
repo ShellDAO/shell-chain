@@ -734,7 +734,11 @@ async fn exercise_live(
     if slh
         && matches!(
             mode,
-            "live-batch-fault" | "live-batch-recover" | "live-persistent-batch-fault"
+            "live-batch-fault"
+                | "live-batch-recover"
+                | "live-persistent-batch-fault"
+                | "live-crash-worker"
+                | "live-crash-recover"
         )
     {
         let provider = Live::start_mode(source, &c, vec![], false, false).await?;
@@ -747,7 +751,10 @@ async fn exercise_live(
                     && provider.node.chain_store.get_finalized_number()? == Some(1),
                 "independent Native1 provider required",
             )?;
-            if matches!(mode, "live-batch-fault" | "live-persistent-batch-fault") {
+            if matches!(
+                mode,
+                "live-batch-fault" | "live-persistent-batch-fault" | "live-crash-worker"
+            ) {
                 ensure(
                     provider
                         .node
@@ -766,7 +773,10 @@ async fn exercise_live(
                             .is_some_and(|v| v["proved_commit_signatures"] == 1),
                     "provider original SLH verification failed",
                 )?;
-                if mode == "live-persistent-batch-fault" {
+                if mode == "live-crash-worker" {
+                    automatic_recovery(&provider, &c, root, &m, "producer-auto-crash-worker")
+                        .await?;
+                } else if mode == "live-persistent-batch-fault" {
                     batch_fault::persistent_failure(Some(&provider), &c, root, &m, false).await?;
                 } else {
                     batch_fault::exercise(&provider, &c, root, &m, false).await?;
@@ -998,7 +1008,7 @@ fn recovery_chunks<S: KvStore>(
         .collect()
 }
 
-/// Observe real persisted progress and stop through Node.shutdown; never inject bytes.
+/// Observe actual worker progress; the crash mode waits for its parent to kill it.
 async fn automatic_recovery(
     provider: &Live,
     c: &Control,
@@ -1041,6 +1051,7 @@ async fn automatic_recovery(
                     Some(
                         "producer-auto-partial"
                             | "producer-auto-worker"
+                            | "producer-auto-crash-worker"
                             | "producer-auto-batch-fault"
                     )
                 ) && saved["nativeDigest"] == serde_json::to_value(initial_digest)?
@@ -1084,7 +1095,7 @@ async fn automatic_recovery(
                                     && s.next_chunk >= 3
                                     && s.received_bytes < manifest.total_bytes
                             }
-                            "producer-auto-worker" => {
+                            "producer-auto-worker" | "producer-auto-crash-worker" => {
                                 s.state == CanonicalProofUploadState::Verifying
                                     && s.verification_attempts > 0
                             }
@@ -1095,7 +1106,7 @@ async fn automatic_recovery(
                             ),
                         };
                         if reached {
-                            if !recover {
+                            if !recover && mode != "producer-auto-crash-worker" {
                                 receiver.node.shutdown();
                             }
                             return Ok::<_, Error>(s);
@@ -1144,6 +1155,57 @@ async fn automatic_recovery(
         Ok::<_, Error>(upload)
     }
     .await;
+    if mode == "producer-auto-crash-worker" {
+        let observed = outcome?;
+        let cache = shell_storage::CanonicalProofUploadStore::new(receiver.node.store.clone());
+        let chunks = recovery_chunks(&cache, &observed)?;
+        let upload = cache.status(&manifest.id())?;
+        let fetch = cache
+            .fetch_status(&manifest.id(), None)?
+            .ok_or("crash fetch absent")?;
+        ensure(
+            upload == observed
+                && upload.state == CanonicalProofUploadState::Verifying
+                && upload.verification_attempts == 1
+                && upload.result.is_none()
+                && upload.received_bytes == manifest.total_bytes
+                && recovery_native_digest(&receiver.node)? == initial_digest
+                && receiver.node.chain_store.get_head_hash()? == Some(c.genesis.hash())
+                && receiver
+                    .node
+                    .chain_store
+                    .get_finalized_number()?
+                    .unwrap_or(0)
+                    == 0
+                && receiver.node.finality.read().last_finalized_number() == 0
+                && receiver
+                    .node
+                    .chain_store
+                    .get_receipts(&c.blocks[0].hash())?
+                    .is_none(),
+            "crash observation missed active verification before Native publication",
+        )?;
+        recovery_genesis_balances(&receiver.node, c)?;
+        let checkpoint = json!({"mode":mode,"manifest":manifest,"nativeDigest":initial_digest,
+            "upload":upload,"fetch":fetch,"chunkDigests":chunks});
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&checkpoint_path)?;
+        serde_json::to_writer_pretty(&file, &checkpoint)?;
+        file.sync_all()?;
+        // Sync only the observation file. The database follows its normal durability path.
+        println!(
+            "{}",
+            json!({"processCrashReady":true,"pid":std::process::id(),
+            "verificationAttempts":upload.verification_attempts,"head":0,"finalized":0,
+            "actualTCPNoise":true,"allChunksRetained":true,"noReceiverOperatorProofCalls":true,
+            "gracefulNodeShutdown":false,"newSigningOrProving":false})
+        );
+        std::io::Write::flush(&mut std::io::stdout())?;
+        // Do not stop the actors or close their databases before the external SIGKILL.
+        return std::future::pending::<Result<(), Error>>().await;
+    }
     // Always close the actors before opening their physical store, including refusals.
     receiver.stop().await?;
     let observed = outcome?;

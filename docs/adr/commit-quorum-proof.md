@@ -1088,3 +1088,55 @@ This controlled final-batch adapter and orderly process-restart sequence does
 not establish physical device failure, simultaneous metadata-write failure,
 process kill, power loss, or other algorithms and host profiles. Reproducing this
 case requires all three processes to reach their stated endpoints.
+
+### Abrupt receiver worker loss
+
+The separate POSIX process-loss regression uses Python 3.9 or later and the
+complete proof and temporary-account controls from the full-SLH workflow above.
+It generates no new signatures or mathematical certificates. Use a separate
+copy of the closed Native1 reference; the original controls and proof are inputs.
+Build the example with the measured development profile, retaining its default
+debug assertions, overflow checks and allocator:
+
+```sh
+CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 \
+  cargo build --locked -p shell-node --features rocksdb --example quorum-native
+test ! -e slh-crash-provider-db || exit 1
+cp -R slh-quorum-controls/control-db slh-crash-provider-db || exit "$?"
+python3 tests/e2e/quorum-worker-crash.py \
+  --binary target/debug/examples/quorum-native \
+  --controls slh-quorum-controls --proof slh-quorum-proof.cbor \
+  --receiver slh-crash-receiver --provider-db slh-crash-provider-db
+```
+
+The receiver and its adjacent driver receipt/log paths must be unused. Keep all
+outputs on failure; do not run the driver again against the same receiver.
+The driver first starts `slh-live-crash-worker`. The provider verifies the full
+proof, and a fresh receiver obtains the body, quorum and complete payload over
+TCP/Noise without receiver proof-control calls. After observing the persisted
+`Verifying` claim, attempt one, unchanged Native genesis and no child receipts,
+the child syncs an observation file and flushes its progress line. It does not
+request node shutdown or add a database flush at this boundary. The parent
+sends SIGKILL only to that exact spawned child and requires its signal exit.
+The claim can include payload loading; no particular inner AIR operation or
+layer is asserted as the interruption point.
+
+`slh-live-crash-recover` starts a different OS process. Before starting the
+canonical event loop, it checks the same upload/fetch records, generation and
+chunk digests, no cached result, and Native state zero. Recovery must perform
+full attempt two before atomic Native import and finality one, matching the
+independent Native reference's canonical rows, receipts, balances, nonce and
+fees. A third process runs `slh-live-cold`, requiring another full verification
+attempt and historical replay without current-state writes. Success requires
+exit codes `[-9, 0, 0]`; a missing/foreign marker, timeout, early publication,
+changed retained inputs or failed revalidation exits nonzero.
+
+A local ARM64 run reused a complete 696-component proof and all 951 received
+chunks. The three OS processes returned `[-9, 0, 0]`, with verification attempts
+one, two and three respectively. Recovery and cold replay reached the independent
+Native1 endpoint without regenerating the proof or changing its source.
+
+This measures one active verification claim on a healthy local backend, with
+one static SLH authority. It does not establish power-loss or torn-write
+durability, every process-loss boundary, mixed-authority histories, other host
+profiles, public-release acceptance or network activation.
