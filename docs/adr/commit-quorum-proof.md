@@ -852,6 +852,57 @@ timeout, retaining the affected stores. These commands qualify recovery of an
 already complete job; fresh-from-zero production and other host/resource
 combinations require their own measurements.
 
+For a changed-state SLH historical query, prepare a new temporary authority
+with signed successors before discarding its keys:
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- prepare-slh-history slh-history-controls
+test ! -e slh-history-producer-db || exit 1
+cp -R slh-history-controls/control-db slh-history-producer-db || exit "$?"
+test ! -e slh-history-receiver || exit 1
+test ! -e slh-history-receiver.proof.cbor || exit 1
+while test ! -e slh-history-receiver.proof.cbor; do
+  cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-step slh-history-controls slh-history-producer-db slh-history-receiver 16 || exit "$?"
+done
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- slh-live-history3 slh-history-controls slh-history-receiver.proof.cbor slh-history-receiver slh-history-controls/history-provider-db
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- slh-live-history3 slh-history-controls slh-history-receiver.proof.cbor slh-history-receiver slh-history-controls/history-provider-db
+```
+
+Use unused destination paths in a local repository checkout and stop at the
+first failed command. The preparation
+command retains one-block `control.cbor`, its source, and independent Native1
+stores for production. It signs blocks two and three with the same temporary
+authority, advances a separate pair of Native stores, and writes
+`history-control.cbor` before dropping the signing keys. The first-block source
+captured at height three must equal the source captured at height one, without
+writing current Native rows. Existing single-block controls cannot supply new
+successor signatures after their keys have been discarded.
+
+The loop performs real bounded production for this new source; each pause must
+preserve earlier checkpoints and cold-reopen its state. It can take substantial
+time. Its terminal branch exports the node-produced first-block proof and
+automatically verifies/imports it on a fresh peer before the history commands
+run. Do not treat a partial batch as a complete proof.
+
+`slh-live-history3` first reimports any missing signed successors from a matching
+retained prefix, then authenticates and persists all three retained
+certificates on the independent Native3 provider and reference stores, advancing
+finality to three. Modified signatures on certificates two and three must refuse
+without changing any rows or in-memory finality. Persisting successor finality
+before starting the provider prevents normal startup recovery from rewinding an
+unfinalized suffix. It then disables quorum proof admission while the
+receiver follows the genuinely signed Native successors and finalizes height
+three. It then explicitly
+reverifies the cached first-block proof through authenticated historical RPC,
+checking its original root and receipts against the current canonical context.
+Current balances, nonce, fees and canonical rows must agree with the independent
+Native3 provider and remain unchanged by the historical query. The second
+invocation starts another process and must increase the verification-attempt
+counter. Only the first block has full SLH AIR in this sequence; successor
+signatures and certificates use ordinary cryptographic verification. This
+sequence does not establish mixed-authority capacity, abrupt-loss recovery,
+other host/profile combinations, public release or network activation.
+
 The import entry requires full AIR verification before the atomic canonical
 write and compares cold persisted rows, receipts, balances, nonce, fees and
 finalized height with the independent Native control. Invalid or cross-profile

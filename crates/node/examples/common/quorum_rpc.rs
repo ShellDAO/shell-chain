@@ -2,6 +2,7 @@
 use super::*;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use shell_crypto::Verifier;
 use shell_network::{Libp2pNetwork, LocalNodeInfo, NetworkConfig, NetworkService};
 use shell_primitives::ShellHash;
 use shell_storage::{
@@ -330,9 +331,11 @@ fn expected_result(live: &Live, c: &Control, s: &CanonicalProofUploadStatus) -> 
     )?;
     let result = s.result.as_ref().ok_or("verified result absent")?;
     let execution = &result["execution"];
+    let signatures = if c.co_authority.is_some() { 2 } else { 1 };
     ensure(
-        result["proved_commit_signatures"] == 2
-            && execution["tip"] == serde_json::to_value(c.blocks[2].hash())?
+        result["proved_commit_signatures"] == signatures
+            && execution["tip"]
+                == serde_json::to_value(c.blocks.last().ok_or("control tip absent")?.hash())?
             && execution["block"] == serde_json::to_value(c.blocks[0].hash())?
             && execution["parent"] == serde_json::to_value(c.genesis.hash())?
             && execution["state_root"] == serde_json::to_value(c.blocks[0].header.state_root)?
@@ -558,6 +561,137 @@ async fn wait_upload(live: &Live, id: ShellHash) -> Result<CanonicalProofUploadS
     })
     .await?
 }
+fn certify_slh_history(controls: &Path, source: &Path, c: &Control) -> Result<(), Error> {
+    let reference = controls.join("history-control-db");
+    ensure(
+        std::fs::canonicalize(source)? != std::fs::canonicalize(&reference)?,
+        "independent Native3 stores required",
+    )?;
+    let mut expected = None;
+    let mut certificate_checks = 0;
+    let mut tamper_refusals = 0;
+    let mut reimported = 0;
+    for path in [source, reference.as_path()] {
+        let n = node(path, c, false)?;
+        let head = n
+            .chain_store
+            .get_head_block()?
+            .ok_or("history head absent")?;
+        ensure(
+            (1..=3).contains(&head.number())
+                && head.hash() == c.blocks[head.number() as usize - 1].hash(),
+            "SLH history store must contain a matching signed prefix",
+        )?;
+        for (index, (block, certificate)) in c.blocks.iter().zip(&c.certificates).enumerate() {
+            let number = index as u64 + 1;
+            let hash = block.hash();
+            ensure(
+                block.number() == number,
+                "SLH history control height mismatch",
+            )?;
+            let signatures: HashMap<String, shell_crypto::PQSignature> =
+                serde_json::from_slice(certificate)?;
+            let signature = signatures
+                .get(&c.authority.to_string())
+                .ok_or("SLH authority signature absent")?;
+            ensure(
+                signatures.len() == 1
+                    && signature.sig_type == shell_crypto::SignatureType::SphincsSha2256f
+                    && MultiVerifier.verify(&c.authority_key, hash.as_bytes(), signature)?,
+                "retained SLH certificate signature failed",
+            )?;
+            certificate_checks += 1;
+            let head = n
+                .chain_store
+                .get_head_block()?
+                .ok_or("history head absent")?;
+            if head.number() < number {
+                ensure(
+                    head.number() + 1 == number && block.header.parent_hash == head.hash(),
+                    "signed history successor does not extend the retained prefix",
+                )?;
+                n.import_block(block.clone(), &MultiVerifier)?;
+                reimported += 1;
+            }
+            ensure(
+                n.chain_store.get_block_hash_by_number(number)? == Some(hash),
+                "SLH history control is not canonical",
+            )?;
+            if number > 1 {
+                let mut damaged = signature.clone();
+                damaged.data[0] ^= 1;
+                let bad = Node::<RocksDbStore>::encode_commit_certificate(&HashMap::from([(
+                    c.authority,
+                    damaged,
+                )]))?;
+                let before = n.store.scan_all()?;
+                let before_finality = {
+                    let f = n.finality.read();
+                    (f.last_finalized_number(), *f.last_finalized_hash())
+                };
+                let refused = !n.fast_finalize_with_certificate(number, hash, &bad);
+                let after_finality = {
+                    let f = n.finality.read();
+                    (f.last_finalized_number(), *f.last_finalized_hash())
+                };
+                ensure(
+                    refused && n.store.scan_all()? == before && after_finality == before_finality,
+                    "tampered successor certificate changed Native state",
+                )?;
+                balances(
+                    &n,
+                    c,
+                    n.chain_store
+                        .get_head_block()?
+                        .ok_or("history head absent")?
+                        .number() as usize,
+                )?;
+                tamper_refusals += 1;
+            }
+            let finalized = n.chain_store.get_finalized_number()?.unwrap_or(0);
+            let retained = n.chain_store.get_commit_certificate(&hash)?;
+            if number > finalized || retained.as_ref() != Some(certificate) {
+                ensure(
+                    n.fast_finalize_with_certificate(number, hash, certificate)
+                        == (number > finalized),
+                    "SLH successor certificate finalization failed",
+                )?;
+            }
+            ensure(
+                n.chain_store.get_commit_certificate(&hash)?.as_ref() == Some(certificate),
+                "SLH successor certificate bytes not persisted",
+            )?;
+        }
+        ensure(
+            n.chain_store.get_finalized_number()? == Some(3)
+                && n.finality.read().last_finalized_number() == 3
+                && *n.finality.read().last_finalized_hash() == c.blocks[2].hash(),
+            "SLH Native3 finality absent",
+        )?;
+        balances(&n, c, 3)?;
+        let before = n.store.scan_all()?;
+        ensure(
+            n.commit_quorum_source(1, c.blocks[0].hash(), &c.certificates[0])?
+                == read::<CommitQuorumSource>(&controls.join("source.cbor"))?
+                && n.store.scan_all()? == before,
+            "finalized Native3 historical source changed or wrote Native rows",
+        )?;
+        let digest = recovery_native_digest(&n)?;
+        if let Some(prior) = expected {
+            ensure(digest == prior, "independent certified Native3 rows differ")?;
+        }
+        expected = Some(digest);
+        n.store.flush()?;
+    }
+    println!(
+        "{}",
+        json!({"SLHHistoryCertificatesCertified":true,"certificateChecks":certificate_checks,"reimportedSignedBlocks":reimported,
+        "tamperedCertificateRefusals":tamper_refusals,"independentNative3Stores":2,
+        "finalized":3,"historicalSourceUnchanged":true,"newSigningOrProving":false})
+    );
+    Ok(())
+}
+
 async fn exercise_live(
     controls: &Path,
     proof_file: &Path,
@@ -567,14 +701,19 @@ async fn exercise_live(
 ) -> Result<(), Error> {
     let slh = mode.starts_with("slh-");
     let mode = mode.strip_prefix("slh-").unwrap_or(mode);
-    let c: Control = read(&controls.join("control.cbor"))?;
+    let c: Control = read(&controls.join(if slh && mode == "live-history3" {
+        "history-control.cbor"
+    } else {
+        "control.cbor"
+    }))?;
     if slh {
+        let blocks = if mode == "live-history3" { 3 } else { 1 };
         ensure(
             c.co_authority.is_none()
-                && c.blocks.len() == 1
-                && c.certificates.len() == 1
+                && c.blocks.len() == blocks
+                && c.certificates.len() == blocks
                 && c.authority_key.len() == 64,
-            "original one-authority one-block SLH controls required",
+            "one-authority SLH controls for the requested height required",
         )?;
     } else {
         ensure(
@@ -582,8 +721,11 @@ async fn exercise_live(
             "genuine two-authority controls required",
         )?;
     }
+    if slh && mode == "live-history3" {
+        certify_slh_history(controls, source, &c)?;
+    }
     let proved_signatures = if slh { 1_u64 } else { 2 };
-    let tip_number = if slh { 1_u64 } else { 3 };
+    let tip_number = c.blocks.len() as u64;
     let tip = c.blocks.last().ok_or("control tip absent")?.hash();
     if slh && matches!(mode, "live-batch-fault" | "live-batch-recover") {
         let provider = Live::start_mode(source, &c, vec![], false, false).await?;
@@ -679,12 +821,13 @@ async fn exercise_live(
     };
     let outcome=async{
         if mode=="live-history3" {
-            tokio::time::timeout(Duration::from_secs(60),async{loop{if receiver.node.chain_store.get_head_block()?.ok_or("receiver head absent")?.number()==tip_number{return Ok::<_,Error>(());}tokio::time::sleep(Duration::from_millis(100)).await;}}).await??;
+            tokio::time::timeout(Duration::from_secs(60),async{loop{if receiver.node.chain_store.get_head_block()?.ok_or("receiver head absent")?.number()==tip_number&&receiver.node.chain_store.get_finalized_number()?==provider.node.chain_store.get_finalized_number()?{return Ok::<_,Error>(());}tokio::time::sleep(Duration::from_millis(100)).await;}}).await??;
             let snapshot=canonical_rows(&receiver)?;let payload=frame(proof_file)?;let m=manifest(&c,&payload);let prior=receiver.status(m.id()).await?;let checked=receiver.verify(m.id()).await?;
-            ensure(checked.state==CanonicalProofUploadState::Verified&&checked.verification_attempts>prior.verification_attempts&&checked.result.as_ref().is_some_and(|v|v["execution"]["tip"]==serde_json::to_value(tip).unwrap()&&v["proved_commit_signatures"]==proved_signatures),"after3 full quorum history not reverified")?;
+            ensure(prior.state==CanonicalProofUploadState::Verified&&checked.verification_attempts>prior.verification_attempts,"after3 full quorum history not reverified")?;
+            expected_result(&receiver,&c,&checked)?;
             balances(&receiver.node,&c,tip_number as usize)?;
             ensure(canonical_rows(&receiver)?==snapshot&&canonical_rows(&provider)?==snapshot,"after3 historical writeback or independent Native row mismatch")?;
-            println!("{}",json!({"freshLiveFirstThenNativeFollow3":true,"currentHeight":3,"finalized":receiver.node.chain_store.get_finalized_number()?,"firstBlockFullAIRSigners":2,"successorQuorumCryptoNative":true,"historyRowsUnchanged":true,"independentNativeRowsEqual":true,"verificationAttempts":checked.verification_attempts,"newSigningOrProving":false}));return Ok::<_,Error>(());
+            println!("{}",json!({"freshLiveFirstThenNativeFollow3":true,"fullSLH":slh,"currentHeight":tip_number,"finalized":receiver.node.chain_store.get_finalized_number()?,"firstBlockFullAIRSigners":proved_signatures,"firstBlockRootReceiptsChecked":true,"successorQuorumCryptoNative":true,"historyRowsUnchanged":true,"independentNativeRowsEqual":true,"verificationAttempts":checked.verification_attempts,"newSigningOrProving":false}));return Ok::<_,Error>(());
         }
         if mode=="live-default" {
             tokio::time::timeout(Duration::from_secs(60),async{loop{if receiver.node.chain_store.get_head_block()?.ok_or("receiver head absent")?.number()==tip_number{return Ok::<_,Error>(());}tokio::time::sleep(Duration::from_millis(100)).await;}}).await??;

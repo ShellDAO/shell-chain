@@ -862,8 +862,16 @@ one-shot final canonical batch error has also rolled back without Native or
 in-memory finality changes; an orderly cold restart fully reverified the same
 proof before committing independent Native1 state and receipts. A
 separate default-off check follows ordinary Native sync without allocating a
-proof upload. Mixed-signer capacity, later-height SLH history, persistent full-SLH backend
-errors or abrupt-loss recovery, historical authority and penalty provenance, proposer selection and
+proof upload. The signed-successor example also preserves three genuinely signed
+blocks before dropping its temporary keys. After complete first-block SLH AIR
+production and automatic Native1 import, it authenticates and persists the
+retained successor certificates with tamper refusals on independent Native3
+stores. The receiver follows and finalizes height three, then repeats the
+first-block historical root/receipt verification through authenticated RPC and
+a cold process without writing current Native rows. Only the first block has
+full SLH AIR in this sequence. Mixed-signer capacity, unmeasured SLH history and
+activation combinations, persistent full-SLH backend errors or abrupt-loss
+recovery, historical authority and penalty provenance, proposer selection and
 public-release acceptance remain open. Ordinary certificate formats and network
 activation rules remain unchanged. See the
 [design decision](adr/commit-quorum-proof.md) for prerequisites and commands.
