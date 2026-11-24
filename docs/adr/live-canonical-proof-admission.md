@@ -73,6 +73,27 @@ native. It introduces no settlement reward, fee, consensus schedule or activatio
 change. The retained-body cap and large raw graphs limit throughput; there is no
 automatic eviction. Public release and network activation require separate
 acceptance. The live peer regression is linked from the STARK guide.
+
+Status queries can cross the native publication boundary: a canonical lookup
+may observe the old mapping before fresh-source preflight reads the new head.
+For both sender and quorum manifests, a failed fresh preflight checks the
+mapping again. Only the exact candidate becoming canonical allows the query
+to continue through validation of its actual canonical source. A different
+canonical block or a mismatched transaction-body commitment remains a refusal.
+Upload status and cached results never authorize execution.
+
+Run the deterministic source-read regressions with:
+
+```sh
+cargo test --locked -p shell-node --lib proof_status_survives_publication_between_source_reads -- --nocapture
+```
+
+The sender case uses genuine signed Native transfers and authenticated HTTP
+status requests, checking accounts, fees, receipts and unchanged rows. It runs
+the RPC server without the canonical event loop and never verifies its
+deliberately untrusted metadata payload as a proof; full AIR verification and
+peer admission have separate regressions.
+
 ## Sustained peer regression
 
 The same two real nodes continue after the first admitted child. Enable automatic

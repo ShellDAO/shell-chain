@@ -121,6 +121,149 @@ fn header_batch_source_attach(
     block
 }
 
+#[tokio::test]
+async fn sender_proof_status_survives_publication_between_source_reads() {
+    use http_body_util::BodyExt;
+    use shell_storage::{CanonicalProofManifest, CanonicalProofUploadState};
+    use std::sync::atomic::AtomicUsize;
+
+    async fn status_request(
+        address: std::net::SocketAddr,
+        bearer: Option<&str>,
+        id: ShellHash,
+    ) -> (hyper::StatusCode, serde_json::Value) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let (mut client, connection) =
+                hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                    .await.unwrap();
+            let connection = tokio::spawn(connection);
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"admin_canonicalProofStatus","params":[id]
+            })).unwrap();
+            let mut request = hyper::Request::builder().method("POST")
+                .uri(format!("http://{address}/"))
+                .header("Host", address.to_string())
+                .header("Content-Type", "application/json");
+            if let Some(token) = bearer {
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
+            let response = client.send_request(request.body(http_body_util::Full::new(
+                hyper::body::Bytes::from(payload),
+            )).unwrap()).await.unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            drop(client);
+            connection.await.unwrap().unwrap();
+            let value = if status == hyper::StatusCode::OK {
+                serde_json::from_slice(&bytes).unwrap()
+            } else { serde_json::Value::Null };
+            (status, value)
+        }).await.expect("sender status RPC timed out")
+    }
+
+    let db = Arc::new(FailingBatchDb::new());
+    let (mut node, _, block, sender, recipient) = header_batch_source_fixture(db.clone());
+    node.config.canonical_proof_admission = true;
+    let funded = node.world_state.read().get_account(&sender).unwrap().unwrap();
+    let peer = shell_network::PeerId("sender-status-provider".into());
+    assert!(node.stage_live_candidate(&peer, &block).unwrap());
+    let manifest = CanonicalProofManifest {
+        version:1,chain_id:1337,
+        genesis_hash:node.chain_store.get_head_hash().unwrap().unwrap(),
+        block_hash:block.hash(),total_bytes:1,
+        payload_hash:shell_primitives::blake3_hash(b"x"),
+    };
+    {
+        // Only the retained-source metadata is needed. The byte is never verified
+        // as a proof, and neither the network actor nor Node.run is started.
+        let network = node.activate_canonical_proof_network(true);
+        node.canonical_proof_peer_connected(peer.clone());
+        node.accept_live_manifest(&peer, block.hash(), 0, Some(manifest.clone())).unwrap();
+        node.canonical_proof_uploads.append(&manifest.id(), 0, b"x").unwrap();
+        drop(network);
+    }
+    // Actual ordinary Native import supplies the already-published canonical child.
+    // This test concerns its concurrent status read, not proof-backed authorization.
+    node.import_block(block.clone(), &MultiVerifier).unwrap();
+    let receipts = node.chain_store.get_receipts(&block.hash()).unwrap().unwrap();
+    let fees = block.transactions.iter().fold(U256::ZERO, |sum, tx| {
+        let receipt = receipts.iter().find(|r| r.tx_hash == tx.uncached_hash()).unwrap();
+        assert!(receipt.succeeded());
+        let price = tx.tx.max_fee_per_gas.min(block.header.base_fee_per_gas
+            .saturating_add(tx.tx.max_priority_fee_per_gas));
+        sum + U256::from(receipt.gas_used) * U256::from(price)
+    });
+    let account = node.world_state.read().get_account(&sender).unwrap().unwrap();
+    assert_eq!(account.nonce, funded.nonce + 2);
+    assert_eq!(account.balance, funded.balance - U256::from(2) - fees);
+    assert_eq!(node.world_state.read().get_account(&recipient).unwrap().unwrap().balance, U256::from(2));
+    assert_eq!(current_state_root(&node), block.header.state_root);
+    let expected = node.canonical_proof_uploads.status(&manifest.id()).unwrap();
+    assert_eq!(expected.state, CanonicalProofUploadState::Ready);
+    assert!(expected.result.is_none());
+    assert_eq!(expected.verification_attempts, 0);
+    let node = Arc::new(node);
+    let token = shell_primitives::blake3_hash(DilithiumSigner::generate().public_key()).to_string();
+    let (events, _) = tokio::sync::broadcast::channel(16);
+    let server = shell_rpc::start_rpc_server_with_proof_control(
+        shell_rpc::RpcConfig {
+            listen_addr:"127.0.0.1:0".parse().unwrap(),ws_addr:None,
+            api_namespaces:vec!["admin".into()],api_key:Some(token.clone()),
+            rate_limit_per_sec:None,..Default::default()
+        },
+        node.chain_store.clone(),node.world_state.clone(),node.tx_pool.clone(),
+        node.config.chain_id,None,events,None,None,Arc::new(RwLock::new(0)),
+        node.finality.clone(),Arc::new(AtomicUsize::new(0)),None,None,None,None,None,None,
+        Some(node.clone() as Arc<dyn shell_rpc::CanonicalProofControl>),
+    ).await.unwrap();
+    let snapshot = db.scan_all().unwrap();
+    let unauthorized = status_request(server.http_addr, None, manifest.id()).await;
+    let ordinary = status_request(server.http_addr, Some(&token), manifest.id()).await;
+    let initial_reads_unchanged = db.scan_all().unwrap() == snapshot;
+
+    node.chain_store.set_canonical(1, &ShellHash::from([9;32])).unwrap();
+    let different_rows = db.scan_all().unwrap();
+    db.stale_child_mapping.store(true, Ordering::SeqCst);
+    let different = status_request(server.http_addr, Some(&token), manifest.id()).await;
+    let different_read_unchanged = db.scan_all().unwrap() == different_rows;
+    node.chain_store.set_canonical(1, &block.hash()).unwrap();
+    // Model persisted corruption below the validating ChainStore write boundary.
+    let body_key = [b"b/".as_slice(), block.hash().as_bytes()].concat();
+    let original_body = db.get(&body_key).unwrap().unwrap();
+    assert_eq!(original_body[0], 2); // Current version-prefixed RLP storage.
+    let (mut stripped, _) = shell_core::StrippedBlock::split(&block);
+    stripped.transactions[0].tx.value += U256::from(1);
+    let mut changed = vec![original_body[0]];
+    alloy_rlp::Encodable::encode(&stripped, &mut changed);
+    db.put(&body_key, &changed).unwrap();
+    let changed_rows = db.scan_all().unwrap();
+    db.stale_child_mapping.store(true, Ordering::SeqCst);
+    let changed_body = status_request(server.http_addr, Some(&token), manifest.id()).await;
+    let changed_read_unchanged = db.scan_all().unwrap() == changed_rows;
+    db.put(&body_key, &original_body).unwrap();
+    db.stale_child_mapping.store(true, Ordering::SeqCst);
+    let crossing = status_request(server.http_addr, Some(&token), manifest.id()).await;
+    server.http_handle.stop().unwrap();
+    server.http_handle.clone().stopped().await;
+    println!("{}",serde_json::json!({"method":"admin_canonicalProofStatus",
+        "params":[manifest.id()],"publicationCrossingResponse":crossing.1,
+        "nativeTransfers":2,"proofVerificationStarted":false,"RPCOnlyFixture":true}));
+    assert_eq!(unauthorized.0, hyper::StatusCode::UNAUTHORIZED);
+    assert_eq!(ordinary.0, hyper::StatusCode::OK);
+    assert_eq!(ordinary.1["result"], serde_json::to_value(&expected).unwrap());
+    assert!(initial_reads_unchanged && different_read_unchanged && changed_read_unchanged);
+    assert!(different.1["error"]["message"].as_str().unwrap().contains("exact current canonical parent"));
+    assert!(changed_body.1["error"]["message"].as_str().unwrap()
+        .contains("block body commitment mismatch"));
+    assert_eq!(db.scan_all().unwrap(), snapshot);
+    assert_eq!(node.chain_store.get_head_hash().unwrap(), Some(block.hash()));
+    assert_eq!(node.chain_store.get_receipts(&block.hash()).unwrap().unwrap(), receipts);
+    assert_eq!(crossing.0, hyper::StatusCode::OK);
+    assert_eq!(crossing.1["result"], serde_json::to_value(&expected).unwrap(),
+        "publication changed the read-only sender status response");
+}
+
 #[test]
 fn header_batch_source_binding_rejects_foreign_claims_before_persistence() {
     for side_fork in [false, true] {

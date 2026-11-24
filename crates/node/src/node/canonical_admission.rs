@@ -576,8 +576,19 @@ impl<S: KvStore + 'static> Node<S> {
         {
             return Ok(false);
         }
-        self.validate_live_candidate_source(r.parent, &block)
-            .map_err(|e| e.to_string())?;
+        if let Err(error) = self.validate_live_candidate_source(r.parent, &block) {
+            // As with quorum candidates, publication can cross these source reads.
+            // Only the exact canonical child may fall through to canonical validation.
+            if self
+                .chain_store
+                .get_block_hash_by_number(r.number)
+                .map_err(|e| e.to_string())?
+                == Some(r.block)
+            {
+                return Ok(false);
+            }
+            return Err(error.to_string());
+        }
         Ok(true)
     }
     pub(super) fn has_live_manifest(&self, id: ShellHash) -> bool {

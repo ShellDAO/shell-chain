@@ -2125,6 +2125,14 @@ mod tests {
         fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
             self.inner.scan_prefix(prefix)
         }
+
+        fn snapshot_prefixes(
+            &self,
+            prefixes: &[&[u8]],
+            max_bytes: usize,
+        ) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>, StorageError> {
+            self.inner.snapshot_prefixes(prefixes, max_bytes)
+        }
     }
 
     #[test]
