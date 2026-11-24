@@ -732,7 +732,8 @@ verification, atomic Native import, authenticated RPC and TCP/Noise transfer,
 and a full recheck after restart. The artifact occupied 247,550,803 bytes; its
 version-two availability payload occupied 247,550,826 bytes (945 chunks of at
 most 256 KiB), within the existing 256 MiB cap. Public-release acceptance, network
-activation, mixed-signer capacity and later-height SLH history remain open.
+activation and combinations beyond the local mixed-signer and SLH history cases
+described below remain open.
 The current accumulator protocol and default-off admission/production settings
 remain unchanged.
 
@@ -851,6 +852,51 @@ The example waits at most five minutes for production and exits nonzero on a
 timeout, retaining the affected stores. These commands qualify recovery of an
 already complete job; fresh-from-zero production and other host/resource
 combinations require their own measurements.
+
+
+To exercise mixed production, `prepare-mixed` creates a new SLH authority,
+funded sender and independently generated ML-DSA-65 coauthority. It retains the
+original one-block SLH controls under `single-slh`, then imports that unchanged
+block into two new Native references with weights `[2, 1]`. The complete
+certificate includes both genuine block-hash signatures. Each reference rejects
+the primary-only certificate at exactly two thirds and a damaged co-signature
+without changing persistent rows or in-memory finality. It then finalizes the
+valid mixed certificate and captures the independently selected source. No
+private key is written to disk.
+
+```sh
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- prepare-mixed mixed-quorum-controls
+test ! -e mixed-quorum-provider-db || exit 1
+cp -R mixed-quorum-controls/control-db mixed-quorum-provider-db || exit "$?"
+test ! -e mixed-quorum-receiver || exit 1
+test ! -e mixed-quorum-receiver.proof.cbor || exit 1
+while test ! -e mixed-quorum-receiver.proof.cbor; do
+  cargo run --locked -p shell-node --features rocksdb --example quorum-native -- producer-step mixed-quorum-controls mixed-quorum-provider-db mixed-quorum-receiver 16 || exit "$?"
+done
+```
+
+A controlled local run of this two-authority case completed 756 components
+from an empty owned job. Its version-two availability payload occupied
+261,279,917 bytes, within the unchanged 256 MiB cap. A fresh peer automatically
+verified both signature graphs and committed Native state and finality one;
+cold canonical rows and receipts matched the independent Native reference.
+A separate process reverified all 756 retained components without new proving
+or Native writes. A changed proof version was refused before import. This
+qualifies one static `[2, 1]` authority layout on the local ARM64 development
+profile with optimization level one, debug assertions and overflow checks
+enabled; other profiles, signer layouts and network activation remain open.
+
+The same owned-job, durable component budget and cold-recheck rules apply.
+Partial progress proves only the completed components. A complete step must
+encode both full signature graphs under the existing 256 MiB cap, then deliver
+the node-produced payload to a fresh peer through automatic discovery and
+TCP/Noise. The receiver must report two proved commit signatures, execute the
+transfer and persist finality one; its cold canonical rows, receipts, balances,
+nonce and fees must match the independent Native provider. A byte-cap refusal
+is a failed complete workflow even if individual graphs are valid. This entry
+does not guarantee capacity for every signature, signer count or ordering; keep
+mixed full-graph acceptance open until the complete endpoint succeeds. It does
+not enable proof admission or production on a deployed network.
 
 For a changed-state SLH historical query, prepare a new temporary authority
 with signed successors before discarding its keys:

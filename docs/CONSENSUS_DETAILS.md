@@ -869,7 +869,14 @@ retained successor certificates with tamper refusals on independent Native3
 stores. The receiver follows and finalizes height three, then repeats the
 first-block historical root/receipt verification through authenticated RPC and
 a cold process without writing current Native rows. Only the first block has
-full SLH AIR in this sequence. Mixed-signer capacity, unmeasured SLH history and
+full SLH AIR in this sequence. The `prepare-mixed` entry creates separate
+SLH/ML-DSA controls with strict two-thirds and tampered-certificate refusals;
+`producer-step` can advance their owned job under the same fixed byte cap.
+A local static `[2, 1]` SLH/ML-DSA run completed both full graphs, a
+261,279,917-byte payload, automatic peer Native/finality one and a separate
+process recheck without new proving or Native writes. Preparing controls or
+pausing after partial production does not qualify that endpoint. Other mixed
+signer layouts, unmeasured SLH history and
 activation combinations, persistent full-SLH backend errors or abrupt-loss
 recovery, historical authority and penalty provenance, proposer selection and
 public-release acceptance remain open. Ordinary certificate formats and network

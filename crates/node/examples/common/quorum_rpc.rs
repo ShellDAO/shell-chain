@@ -1546,11 +1546,13 @@ async fn exercise_producer_step(
     )?;
     let c: Control = read(&controls.join("control.cbor"))?;
     ensure(
-        c.co_authority.is_none()
-            && c.authority_key.len() == 64
+        c.co_authority.as_ref().is_none_or(|(address, key)| {
+            shell_crypto::infer_signature_type_from_address(key, address)
+                == Some(shell_crypto::SignatureType::MlDsa65)
+        }) && c.authority_key.len() == 64
             && c.blocks.len() == 1
             && c.certificates.len() == 1,
-        "step requires one-block SLH controls",
+        "step requires one-block SLH controls with optional ML-DSA coauthority",
     )?;
     let mut artifact = receiver_root.as_os_str().to_os_string();
     artifact.push(".proof.cbor");
@@ -1761,7 +1763,8 @@ async fn exercise_producer_step(
         json!({"nodeOwnedQuorumProductionStep":true,"fromZero":prior.is_none(),
         "componentBudget":budget,"previousComponents":previous_components,"status":status,
         "priorCheckpointsUnchanged":true,"NativeRowsUnchanged":true,"physicalColdReopen":true,
-        "partialProductionOnly":payload.is_none(),"newAuthoritySigning":false})
+        "partialProductionOnly":payload.is_none(),"newAuthoritySigning":false,
+        "expectedCommitSignatures":1+usize::from(c.co_authority.is_some())})
     );
     if let Some(bytes) = payload {
         let proof = shell_stark_prover::commit_quorum::payload::decode(&bytes)?;
