@@ -979,7 +979,9 @@ verification attempt and unchanged canonical rows. The default mode reaches
 height one through ordinary Native sync with no proof-cache allocation or
 pending proof admission. Any failed assertion exits nonzero; retain the affected
 directories for diagnosis. These checks cover the single-block test conditions;
-Persistent full-SLH backend errors and mixed or multi-block combinations remain open; the controlled one-shot final-batch check below is separately qualified.
+Other persistent full-SLH backend errors and mixed or multi-block combinations
+remain open; the controlled one-shot and persistent final-batch checks below
+are separately qualified.
 
 
 To test a damaged SLH AIR with the same complete original proof, use the
@@ -1000,7 +1002,8 @@ verification, with no automatic third attempt or canonical, in-memory finality,
 account, fee or receipt changes. After graceful shutdown, a physical cold reopen
 must preserve the same rejected generation, every chunk and the genesis state.
 This single-layer witness-tamper check has passed locally; other SLH components,
-persistent backend errors, later-height and mixed combinations remain separately open.
+metadata and physical backend errors, later-height and mixed combinations remain
+separately open.
 
 
 A one-shot database failure at the final canonical batch can be tested with the
@@ -1028,6 +1031,60 @@ A new complete verification attempt must precede atomic head/finality one;
 physical cold rows, receipts, balances, nonce and fees must equal the independent
 ordinary Native1 provider. These modes have passed for the original single-SLH
 block. The provider artifact is manually supplied; this does not qualify
-node-owned full-SLH proof generation. Persistent backend failures, abrupt power
+node-owned full-SLH proof generation. Other persistent backend failures, abrupt power
 loss, other profiles, later-height history and public-network activation remain
 open.
+### Persistent final-batch refusal across process restarts
+
+The persistent variant reuses the complete SLH proof and its original signed
+one-block controls. Each fault invocation keeps a controlled `Database` error
+active for the complete canonical `HEAD`/`FINALIZED`/certificate batch. Other
+storage operations continue normally. It requires one failed native commit per
+process, no canonical or in-memory finality changes, and no child receipts.
+The upload remains `Ready` with no execution result; that status is not an
+authorization to commit. An unauthenticated retry returns 401, and authenticated
+hot retries must report that backend repair and restart are required.
+
+Close the control stores before copying. Run the commands as separate processes
+with a fresh receiver directory, using the previously completed proof:
+
+```sh
+test ! -e slh-persistent-provider-db || exit 1
+cp -R slh-quorum-controls/control-db slh-persistent-provider-db || exit "$?"
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- slh-live-persistent-batch-fault slh-quorum-controls slh-quorum-proof.cbor slh-persistent-receiver slh-persistent-provider-db || exit "$?"
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- slh-live-persistent-batch-cold slh-quorum-controls slh-quorum-proof.cbor slh-persistent-receiver slh-persistent-provider-db || exit "$?"
+cargo run --locked -p shell-node --features rocksdb --example quorum-native -- slh-live-batch-recover slh-quorum-controls slh-quorum-proof.cbor slh-persistent-receiver slh-persistent-provider-db || exit "$?"
+```
+
+The first process fetches and verifies the proof over real TCP/Noise before
+refusing its final canonical batch. The second reopens the same pending source,
+verifies the retained complete payload again and refuses the batch again. Both
+preserve the original generation, chunk hashes, balances, nonce and fees without
+new signing or proving. Each writes a separate `persistent-attempt-N.json`
+receipt while advancing the same recovery checkpoint. The final command uses
+the repaired normal RocksDB backend and must perform a new complete verification
+before committing Native state and finality one; cold rows and receipts must
+match the independent Native provider. An earlier failed attempt or cached
+`Ready` record is insufficient.
+
+The local single-SLH-authority run completed this sequence with 951 retained
+chunks: verification attempts one and two preserved Native state and finality
+zero, and attempt three reached independent Native state and finality one after
+backend repair. No new signature or proof generation was required.
+
+A status query may read the old canonical mapping immediately before the native
+batch publishes its new head. If fresh-source preflight then fails, the node
+checks the mapping again. Only the exact candidate becoming canonical allows
+validation to continue against the actual canonical body and stored certificate.
+A different canonical block or malformed stored certificate still fails; cached
+upload status grants no execution authority. Run the deterministic interleaving
+regression with:
+
+```sh
+cargo test --locked -p shell-node --lib quorum_proof_status_survives_publication_between_source_reads
+```
+
+This controlled final-batch adapter and orderly process-restart sequence does
+not establish physical device failure, simultaneous metadata-write failure,
+process kill, power loss, or other algorithms and host profiles. Reproducing this
+case requires all three processes to reach their stated endpoints.

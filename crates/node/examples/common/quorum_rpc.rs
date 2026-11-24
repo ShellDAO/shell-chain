@@ -727,7 +727,16 @@ async fn exercise_live(
     let proved_signatures = if slh { 1_u64 } else { 2 };
     let tip_number = c.blocks.len() as u64;
     let tip = c.blocks.last().ok_or("control tip absent")?.hash();
-    if slh && matches!(mode, "live-batch-fault" | "live-batch-recover") {
+    if slh && mode == "live-persistent-batch-cold" {
+        let m = manifest(&c, &frame(proof_file)?);
+        return batch_fault::persistent_failure(None, &c, root, &m, true).await;
+    }
+    if slh
+        && matches!(
+            mode,
+            "live-batch-fault" | "live-batch-recover" | "live-persistent-batch-fault"
+        )
+    {
         let provider = Live::start_mode(source, &c, vec![], false, false).await?;
         let provider_before = recovery_native_digest(&provider.node)?;
         let outcome = async {
@@ -738,7 +747,7 @@ async fn exercise_live(
                     && provider.node.chain_store.get_finalized_number()? == Some(1),
                 "independent Native1 provider required",
             )?;
-            if mode == "live-batch-fault" {
+            if matches!(mode, "live-batch-fault" | "live-persistent-batch-fault") {
                 ensure(
                     provider
                         .node
@@ -757,7 +766,11 @@ async fn exercise_live(
                             .is_some_and(|v| v["proved_commit_signatures"] == 1),
                     "provider original SLH verification failed",
                 )?;
-                batch_fault::exercise(&provider, &c, root, &m, false).await?;
+                if mode == "live-persistent-batch-fault" {
+                    batch_fault::persistent_failure(Some(&provider), &c, root, &m, false).await?;
+                } else {
+                    batch_fault::exercise(&provider, &c, root, &m, false).await?;
+                }
             } else {
                 let cache =
                     shell_storage::CanonicalProofUploadStore::new(provider.node.store.clone());
@@ -976,8 +989,8 @@ fn recovery_genesis_balances<S: KvStore + 'static>(n: &Node<S>, c: &Control) -> 
     )
 }
 
-fn recovery_chunks(
-    cache: &shell_storage::CanonicalProofUploadStore<RocksDbStore>,
+fn recovery_chunks<S: KvStore>(
+    cache: &shell_storage::CanonicalProofUploadStore<S>,
     upload: &CanonicalProofUploadStatus,
 ) -> Result<Vec<ShellHash>, Error> {
     (0..upload.next_chunk)

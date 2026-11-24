@@ -877,9 +877,15 @@ A local static `[2, 1]` SLH/ML-DSA run completed both full graphs, a
 process recheck without new proving or Native writes. Preparing controls or
 pausing after partial production does not qualify that endpoint. Other mixed
 signer layouts, unmeasured SLH history and
-activation combinations, persistent full-SLH backend errors or abrupt-loss
+activation combinations, other persistent full-SLH backend errors or abrupt-loss
 recovery, historical authority and penalty provenance, proposer selection and
-public-release acceptance remain open. Ordinary certificate formats and network
+public-release acceptance remain open. The local persistent final-batch example
+keeps the canonical `Database` refusal active over two process invocations,
+preserving `Ready` bytes, paused admission and Native state at zero. After backend
+repair, a third complete verification reaches independently checked Native state
+and finality one with the same 951 chunks. Status queries crossing that publication
+revalidate the actual canonical body and certificate. Other metadata and physical
+failure conditions remain separate. Ordinary certificate formats and network
 activation rules remain unchanged. See the
 [design decision](adr/commit-quorum-proof.md) for prerequisites and commands.
 

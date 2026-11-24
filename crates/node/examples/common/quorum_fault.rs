@@ -1,4 +1,4 @@
-//! A real Node.run peer import with one backend rejection of the canonical batch.
+//! Real Node.run peer import, canonical backend refusals and orderly recovery.
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 
@@ -491,6 +491,8 @@ pub(super) async fn exercise(
         certificate: c.certificates[0].clone(),
         canonical_only: true,
         state_error,
+        persistent: false,
+        rejections: std::sync::atomic::AtomicUsize::new(0),
     });
     let initial = node_on_store(store.clone(), c, true)?;
     let digest = recovery_native_digest(&initial)?;
@@ -566,6 +568,189 @@ pub(super) async fn exercise(
     println!(
         "{}",
         json!({"liveFinalBatchRollbackRecoverable":true,"head":0,"finalized":0,"canonicalRowsUnchanged":true,"physicalColdReopen":true,"verificationAttempts":1,"noOperatorProofCalls":c.co_authority.is_some(),"noReceiverOperatorProofCalls":true,"cachedStatusIsAuthorization":false})
+    );
+    Ok(())
+}
+
+/// Keep the canonical backend fault active across separate process invocations.
+pub(super) async fn persistent_failure(
+    provider: Option<&Live>,
+    c: &Control,
+    root: &Path,
+    manifest: &CanonicalProofManifest,
+    cold: bool,
+) -> Result<(), Error> {
+    let saved: Option<Value> = if cold {
+        Some(serde_json::from_slice(&std::fs::read(
+            root.join("recovery.json"),
+        )?)?)
+    } else {
+        std::fs::create_dir(root)?;
+        None
+    };
+    let store = Arc::new(FailingBatch {
+        inner: RocksDbStore::open_all(root.join("db"), None)?.state,
+        armed: AtomicBool::new(true),
+        attempted: AtomicBool::new(false),
+        complete_tuple: AtomicBool::new(false),
+        certificate: c.certificates[0].clone(),
+        canonical_only: true,
+        state_error: false,
+        persistent: true,
+        rejections: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let initial = node_on_store(store.clone(), c, !cold)?;
+    let digest = recovery_native_digest(&initial)?;
+    recovery_genesis_balances(&initial, c)?;
+    let target_attempt = if let Some(saved) = &saved {
+        let old: CanonicalProofUploadStatus = serde_json::from_value(saved["upload"].clone())?;
+        let cache = shell_storage::CanonicalProofUploadStore::new(store.clone());
+        ensure(
+            saved["persistentDatabaseFailure"] == true
+                && old.manifest == *manifest
+                && old.state == CanonicalProofUploadState::Ready
+                && old.result.is_none()
+                && cache.status(&manifest.id())? == old
+                && recovery_chunks(&cache, &old)?
+                    == serde_json::from_value::<Vec<ShellHash>>(saved["chunkDigests"].clone())?
+                && saved["nativeDigest"] == serde_json::to_value(digest)?
+                && initial.finality.read().last_finalized_number() == 0,
+            "persistent cold start lost original paused bytes or Native state",
+        )?;
+        old.verification_attempts
+            .checked_add(1)
+            .ok_or("attempt overflow")?
+    } else {
+        1
+    };
+    let boot = provider.map(|p| vec![p.dial()]).unwrap_or_default();
+    let receiver = Live::start_on_node(initial, c, boot, true, false).await?;
+    let outcome = async {
+        if !cold {
+            wait_pending(&receiver, c).await?;
+        }
+        let upload = tokio::time::timeout(Duration::from_secs(180), async {
+            loop {
+                match receiver.status(manifest.id()).await {
+                    Ok(s)
+                        if store.attempted.load(SeqCst)
+                            && s.verification_attempts == target_attempt
+                            && s.state == CanonicalProofUploadState::Ready =>
+                    {
+                        return Ok::<_, Error>(s)
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains("upload not found") => {}
+                    Err(e) => return Err(e),
+                }
+                ensure(
+                    !receiver.task.is_finished(),
+                    "persistent receiver stopped before batch failure",
+                )?;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+        let (http, _) = request(
+            receiver.address,
+            None,
+            "admin_verifyCanonicalProof",
+            json!([manifest.id(), true]),
+        )
+        .await?;
+        ensure(
+            http == 401,
+            "paused persistent recheck did not require bearer",
+        )?;
+        for _ in 0..2 {
+            let error = receiver
+                .call("admin_verifyCanonicalProof", json!([manifest.id(), true]))
+                .await
+                .err()
+                .ok_or("paused native commit accepted a hot recheck")?;
+            ensure(
+                error.to_string().contains("repair backend and restart"),
+                "persistent pause did not explain the required recovery boundary",
+            )?;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let admission = receiver
+            .call("admin_canonicalProofAdmission", json!([c.blocks[0].hash()]))
+            .await?;
+        ensure(
+            store.armed.load(SeqCst)
+                && store.complete_tuple.load(SeqCst)
+                && store.rejections.load(SeqCst) == 1
+                && receiver.status(manifest.id()).await? == upload
+                && upload.result.is_none()
+                && admission["status"]["state"] == "paused"
+                && admission["status"]["explicitRecheck"].is_null()
+                && recovery_native_digest(&receiver.node)? == digest
+                && receiver.node.chain_store.get_head_hash()? == Some(c.genesis.hash())
+                && receiver
+                    .node
+                    .chain_store
+                    .get_finalized_number()?
+                    .unwrap_or(0)
+                    == 0
+                && receiver.node.finality.read().last_finalized_number() == 0
+                && receiver
+                    .node
+                    .chain_store
+                    .get_receipts(&c.blocks[0].hash())?
+                    .is_none(),
+            "persistent final-batch refusal retried, lost pause or mutated canonical state",
+        )?;
+        recovery_genesis_balances(&receiver.node, c)?;
+        Ok::<_, Error>(upload)
+    }
+    .await;
+    receiver.stop().await?;
+    drop(store);
+    let upload = outcome?;
+    let reopened = node(&root.join("db"), c, false)?;
+    let cache = shell_storage::CanonicalProofUploadStore::new(reopened.store.clone());
+    let chunks = recovery_chunks(&cache, &upload)?;
+    let fetch = cache
+        .fetch_status(&manifest.id(), None)?
+        .ok_or("persistent fetch absent")?;
+    ensure(
+        cache.status(&manifest.id())? == upload
+            && recovery_native_digest(&reopened)? == digest
+            && blake3_hash(&cache.payload(&manifest.id())?) == manifest.payload_hash,
+        "physical reopen changed persistent refusal or retained payload",
+    )?;
+    if let Some(saved) = saved {
+        let old: CanonicalProofUploadStatus = serde_json::from_value(saved["upload"].clone())?;
+        ensure(
+            upload.generation == old.generation
+                && chunks
+                    == serde_json::from_value::<Vec<ShellHash>>(saved["chunkDigests"].clone())?,
+            "persistent restart changed original generation or chunks",
+        )?;
+    }
+    let checkpoint = json!({"mode":"producer-auto-batch-fault","manifest":manifest,
+        "nativeDigest":digest,"upload":upload,"fetch":fetch,"chunkDigests":chunks,
+        "persistentDatabaseFailure":true});
+    let attempt = root.join(format!("persistent-attempt-{target_attempt}.json"));
+    ensure(
+        !attempt.exists(),
+        "persistent attempt evidence already exists",
+    )?;
+    std::fs::write(attempt, serde_json::to_vec_pretty(&checkpoint)?)?;
+    std::fs::write(
+        root.join("recovery.json"),
+        serde_json::to_vec_pretty(&checkpoint)?,
+    )?;
+    println!(
+        "{}",
+        json!({"persistentFinalBatchPaused":true,"verificationAttempts":target_attempt,
+        "coldExistingPausedSource":cold,"rejectedBatchesThisProcess":1,"faultStillActive":true,
+        "noLiveRepeat":true,"unauthenticatedAndPausedHotRechecksRefused":true,
+        "head":0,"finalized":0,"inMemoryFinality":0,"noChildReceipts":true,
+        "NativeRowsBalancesNonceFeesUnchanged":true,"sameGenerationAndChunks":true,
+        "physicalColdReopen":true,"newSigningOrProving":false,
+        "orderlyProcessRestartOnly":true,"deviceOrPowerLossQualified":false})
     );
     Ok(())
 }

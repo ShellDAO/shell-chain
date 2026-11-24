@@ -2025,6 +2025,7 @@ mod tests {
         fail_next_batch: AtomicBool,
         fail_proof_batch: AtomicBool,
         fail_head_batch: AtomicBool,
+        stale_child_mapping: AtomicBool,
     }
 
     impl FailingBatchDb {
@@ -2037,6 +2038,7 @@ mod tests {
                 fail_next_batch: AtomicBool::new(false),
                 fail_proof_batch: AtomicBool::new(false),
                 fail_head_batch: AtomicBool::new(false),
+                stale_child_mapping: AtomicBool::new(false),
             }
         }
 
@@ -2065,6 +2067,13 @@ mod tests {
         fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
             if self.fail_next_get.swap(false, Ordering::SeqCst) {
                 return Err(StorageError::Database("injected get failure".into()));
+            }
+            // Model a canonical publication after this lookup returned the old view,
+            // but before the caller reads HEAD. All later reads see the real store.
+            if key == [b"n/".as_slice(), &1_u64.to_be_bytes()].concat()
+                && self.stale_child_mapping.swap(false, Ordering::SeqCst)
+            {
+                return Ok(None);
             }
             self.inner.get(key)
         }
@@ -22886,6 +22895,89 @@ mod tests {
                 .get_commit_certificate(&block_hash)
                 .unwrap()
                 .is_none());
+        }
+
+        #[test]
+        fn quorum_proof_status_survives_publication_between_source_reads() {
+            use shell_rpc::CanonicalProofControl;
+            use shell_storage::{CanonicalProofManifest, CanonicalProofUploadState};
+            let (mut node, signer, db) = setup_failing_wpoa_node();
+            node.config.canonical_quorum_admission = true;
+            let authority = node.config.proposer_address.unwrap();
+            node.register_authority_pubkey(authority, signer.public_key().to_vec());
+            let genesis = store_genesis_wpoa(&node);
+            let first = store_next_wpoa_block(&node, genesis);
+            let mut block = node.chain_store.get_block_by_hash(&first).unwrap().unwrap();
+            block.header.transactions_root = shell_core::block_body_root(&[], &[]).unwrap();
+            let hash = block.hash();
+            node.chain_store.put_block(&block).unwrap();
+            node.chain_store.set_canonical(1, &hash).unwrap();
+            node.chain_store.set_head(&hash).unwrap();
+            let config = serde_json::from_value(serde_json::json!({
+                "chain_id":1337,"genesis_hash":genesis,"block_commitment_height":1
+            }))
+            .unwrap();
+            node.chain_store.put_chain_config(&config).unwrap();
+            let cert = Node::<FailingBatchDb>::encode_commit_certificate(&HashMap::from([(
+                authority,
+                signer.sign(hash.as_bytes()).unwrap(),
+            )]))
+            .unwrap();
+            node.chain_store
+                .set_commit_certificate(&hash, &cert)
+                .unwrap();
+            let manifest = CanonicalProofManifest {
+                version: 2,
+                chain_id: 1337,
+                genesis_hash: genesis,
+                block_hash: hash,
+                total_bytes: 1,
+                payload_hash: shell_primitives::blake3_hash(b"x"),
+            };
+            let body = serde_json::to_vec(&block).unwrap();
+            let record = serde_json::json!({
+                "version":2,"block":hash,"number":1,"parent":genesis,
+                "sourceHash":shell_primitives::blake3_hash(&body),"peer":"provider",
+                "state":"paused","manifest":manifest,"quorumCertificateHash":shell_primitives::blake3_hash(&cert),
+                "attempts":1,"hashRetries":0,"error":null
+            });
+            let prefix = b"local/canonical-admission/v1/";
+            for (part, value) in [
+                (b"record/".as_slice(), serde_json::to_vec(&record).unwrap()),
+                (b"body/".as_slice(), body),
+                (b"quorum/".as_slice(), cert.clone()),
+            ] {
+                db.put(&[prefix.as_slice(), part, hash.as_bytes()].concat(), &value)
+                    .unwrap();
+            }
+            let id = manifest.id();
+            node.canonical_proof_uploads.begin(manifest).unwrap();
+            node.canonical_proof_uploads.append(&id, 0, b"x").unwrap();
+            let before = db.scan_all().unwrap();
+            db.stale_child_mapping.store(true, Ordering::SeqCst);
+            let status = CanonicalProofControl::status(&node, id).unwrap();
+            assert_eq!(status.state, CanonicalProofUploadState::Ready);
+            assert!(status.result.is_none());
+            assert_eq!(db.scan_all().unwrap(), before);
+
+            // A different canonical block cannot turn a fresh-source failure into success.
+            node.chain_store
+                .set_canonical(1, &ShellHash::from([9; 32]))
+                .unwrap();
+            db.stale_child_mapping.store(true, Ordering::SeqCst);
+            assert!(CanonicalProofControl::status(&node, id)
+                .unwrap_err()
+                .contains("parent/identity/profile mismatch"));
+            node.chain_store.set_canonical(1, &hash).unwrap();
+            // Falling through still checks the actual stored canonical certificate.
+            node.chain_store
+                .set_commit_certificate(&hash, &[0])
+                .unwrap();
+            db.stale_child_mapping.store(true, Ordering::SeqCst);
+            assert!(CanonicalProofControl::status(&node, id)
+                .unwrap_err()
+                .contains("invalid commit certificate"));
+            assert_eq!(node.canonical_proof_uploads.status(&id).unwrap(), status);
         }
 
         #[test]

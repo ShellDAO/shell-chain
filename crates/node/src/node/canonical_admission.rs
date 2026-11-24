@@ -534,8 +534,20 @@ impl<S: KvStore + 'static> Node<S> {
             }
             let body = self.admission_body(&r)?;
             let cert = self.admission_certificate(&r)?;
-            self.live_quorum_context(r.parent, &body, &cert)
-                .map_err(|e| e.to_string())?;
+            if let Err(error) = self.live_quorum_context(r.parent, &body, &cert) {
+                // Publication can finish between the canonical lookup and HEAD read.
+                // Fall through to validation of the actual canonical body/certificate;
+                // this pending record and its cached proof never authorize that path.
+                if self
+                    .chain_store
+                    .get_block_hash_by_number(r.number)
+                    .map_err(|e| e.to_string())?
+                    == Some(r.block)
+                {
+                    return Ok(false);
+                }
+                return Err(error.to_string());
+            }
             return Ok(true);
         }
         if !self.config.canonical_proof_admission || r.version != 1 || m.version != 1 {
