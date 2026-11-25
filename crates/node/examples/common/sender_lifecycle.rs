@@ -207,7 +207,41 @@ fn snapshot(c: &Control, root: &Path) -> Result<(), Error> {
     );
     Ok(())
 }
-async fn peer(c: &Control, root: &Path, receiver_directory: Option<&str>) -> Result<(), Error> {
+fn admission_snapshot(c: &Control, root: &Path) -> Result<(), Error> {
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(root.join("sender-admission-crash.json"))?)?;
+    let n = node(&root.join("receiver-db"), c, false)?;
+    let manifest: CanonicalProofManifest = serde_json::from_value(saved["manifest"].clone())?;
+    let cache = shell_storage::CanonicalProofUploadStore::new(n.store.clone());
+    let upload = cache.status(&manifest.id())?;
+    ensure(
+        manifest.version == 1
+            && manifest.block_hash == c.blocks[0].hash()
+            && upload.state == CanonicalProofUploadState::Verifying
+            && upload.verification_attempts == 1
+            && upload.result.is_none()
+            && upload.received_bytes == manifest.total_bytes
+            && serde_json::to_value(&upload)? == saved["upload"]
+            && serde_json::to_value(recovery_chunks(&cache, &upload)?)? == saved["chunkDigests"]
+            && serde_json::to_value(recovery_native_digest(&n)?)? == saved["nativeDigest"]
+            && n.chain_store.get_head_hash()? == Some(c.genesis.hash())
+            && n.chain_store.get_finalized_number()?.unwrap_or(0) == 0
+            && n.chain_store.get_receipts(&c.blocks[0].hash())?.is_none(),
+        "sender crash claim/chunks or genesis Native rows changed",
+    )?;
+    recovery_genesis_balances(&n, c)?;
+    println!(
+        "{}",
+        json!({"senderAdmissionCrashSnapshot":true,"verificationAttempts":1,"head":0,"finalized":0,"allChunksRetained":true,"NativeRowsUnchanged":true,"newProofMath":0})
+    );
+    Ok(())
+}
+async fn peer(
+    c: &Control,
+    root: &Path,
+    receiver_directory: Option<&str>,
+    crash: bool,
+) -> Result<(), Error> {
     let owner = node(&root.join("owner-db"), c, false)?;
     let before = recovery_native_digest(&owner)?;
     let reference = node(&root.join("reference3-db"), c, false)?;
@@ -225,10 +259,47 @@ async fn peer(c: &Control, root: &Path, receiver_directory: Option<&str>) -> Res
     let result=async {
         let path=root.join(receiver_directory.unwrap_or("receiver-db"));
         let fresh=!path.exists();
+        ensure(!crash || fresh,"crash requires a new receiver; refusing existing data")?;
         let mut n=node(&path,c,fresh)?;
+        let initial=recovery_native_digest(&n)?;
         n.config.canonical_proof_admission=true;
         let receiver=Live::start_on_node(n,c,vec![provider.dial()],false,false).await?;
         let result=async {
+            if crash {
+                let manifest=&manifests[0];
+                let cache=shell_storage::CanonicalProofUploadStore::new(receiver.node.store.clone());
+                let upload=tokio::time::timeout(Duration::from_secs(3600),async {
+                    loop {
+                        ensure(!receiver.task.is_finished(),"sender receiver stopped before crash claim")?;
+                        match cache.status(&manifest.id()) {
+                            Ok(s) if s.state==CanonicalProofUploadState::Verifying => return Ok::<_,Error>(s),
+                            Ok(s) => ensure(!matches!(s.state,CanonicalProofUploadState::Verified|CanonicalProofUploadState::Rejected),"sender verification completed before crash observation")?,
+                            Err(e) if e.to_string().contains("upload not found") => {},
+                            Err(e) => return Err(e.into()),
+                        }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                }).await??;
+                let chunks=recovery_chunks(&cache,&upload)?;
+                ensure(upload.verification_attempts==1 && upload.result.is_none()
+                    && upload.received_bytes==manifest.total_bytes
+                    && cache.status(&manifest.id())?==upload
+                    && recovery_native_digest(&receiver.node)?==initial
+                    && receiver.node.chain_store.get_head_hash()?==Some(c.genesis.hash())
+                    && receiver.node.chain_store.get_finalized_number()?.unwrap_or(0)==0
+                    && receiver.node.finality.read().last_finalized_number()==0
+                    && receiver.node.chain_store.get_receipts(&c.blocks[0].hash())?.is_none(),
+                    "sender crash boundary already published or changed")?;
+                recovery_genesis_balances(&receiver.node,c)?;
+                let checkpoint=json!({"manifest":manifest,"nativeDigest":initial,"upload":upload,"chunkDigests":chunks});
+                let file=std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("sender-admission-crash.json"))?;
+                serde_json::to_writer_pretty(&file,&checkpoint)?;
+                file.sync_all()?;
+                println!("{}",json!({"senderAdmissionCrashReady":true,"pid":std::process::id(),"verificationAttempts":1,"head":0,"finalized":0,"actualTCPNoise":true,"allChunksRetained":true,"gracefulNodeShutdown":false,"newProofMath":0}));
+                std::io::Write::flush(&mut std::io::stdout())?;
+                // The external controller signals only its own child; keep actors running.
+                return std::future::pending::<Result<(),Error>>().await;
+            }
             let mut two_since=None;
             tokio::time::timeout(Duration::from_secs(3600),async {
                 loop {
@@ -290,6 +361,7 @@ pub(super) fn run(args: &[String]) -> Result<(), Error> {
     match args[0].as_str() {
         "sender-history-init" => init(&c, root),
         "sender-history-snapshot" => snapshot(&c, root),
+        "sender-admission-snapshot" => admission_snapshot(&c, root),
         _ => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -298,7 +370,10 @@ pub(super) fn run(args: &[String]) -> Result<(), Error> {
                 match args[0].as_str() {
                     "sender-history-step" => step(&c, root, args[3].parse()?).await,
                     "sender-history-advance" => advance(&c, root).await,
-                    "sender-history-peer" => peer(&c, root, args.get(3).map(String::as_str)).await,
+                    "sender-history-peer" => {
+                        peer(&c, root, args.get(3).map(String::as_str), false).await
+                    }
+                    "sender-admission-crash" => peer(&c, root, None, true).await,
                     _ => Err("unknown sender lifecycle command".into()),
                 }
             }),

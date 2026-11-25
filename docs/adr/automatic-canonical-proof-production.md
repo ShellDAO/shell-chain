@@ -322,3 +322,40 @@ After repairing a failure, resume the same step or peer command. Do not repeat
 reported completion flag, or regenerate a completed graph. These commands cover
 this bounded local profile; other signer layouts, hosts, default build profiles,
 public release and network activation remain separate qualifications.
+
+### Sender admission process loss
+
+After all three sender jobs are complete and all database processes have stopped,
+reuse those original controls and graphs with the matching built example:
+
+```sh
+python3 tools/check-quorum-producer-crash.py --sender-admission \
+  target/debug/examples/quorum-native "$sender_case/controls" \
+  "$sender_case/runtime" "$sender_case/admission-crash"
+```
+
+The POSIX tool requires Python 3.11 or later and a new output directory. It checks
+the database locks and copies the closed owner and independent Native reference;
+it preserves the original runtime and never regenerates a graph. The sender mode
+omits the separate proof-file and component-marker arguments used by the quorum
+producer mode.
+
+A fresh receiver discovers the existing sender proofs over actual TCP/Noise.
+`sender-admission-crash` observes the first persisted `verifying` claim, complete
+chunk bytes, no verification result, and genesis Native state without receipts.
+It saves the observation and keeps the actors running. The Python controller
+sends SIGKILL only to that exact spawned child and requires its signal exit.
+`sender-admission-snapshot` in another process checks that the original claim,
+chunk digests, balances and genesis rows survived. Normal `sender-history-peer`
+then resumes that same receiver through complete verification, execution and
+finality 3; another process checks cold historical verification after state 3.
+Both compare receipts and current state with the independent Native reference
+without historical writeback. The owner, all checkpoints and payloads must remain
+unchanged, and any new proving causes failure.
+
+This exercises process loss at a persisted verification claim, which may include
+payload loading. It does not select an inner AIR instruction or establish machine
+power-loss, torn-write, every crash boundary or every signer/host combination.
+The sender producer schedules active incomplete jobs; this receiver experiment
+does not require or imply automatic startup revalidation of completed owner jobs.
+Every failed observation exits nonzero and retains the copied data and logs.
