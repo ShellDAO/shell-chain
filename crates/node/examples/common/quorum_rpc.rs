@@ -12,6 +12,20 @@ use shell_storage::{
 use std::{net::SocketAddr, time::Duration};
 #[path = "quorum_fault.rs"]
 mod batch_fault;
+#[path = "quorum_successor.rs"]
+mod successor;
+
+pub(super) fn run_successor(args: &[String]) -> Result<(), Error> {
+    if args[0] == "successor-source" {
+        successor::capture(
+            Path::new(&args[1]),
+            Path::new(&args[2]),
+            Path::new(&args[3]),
+        )
+    } else {
+        successor::run(args)
+    }
+}
 
 async fn request(
     address: SocketAddr,

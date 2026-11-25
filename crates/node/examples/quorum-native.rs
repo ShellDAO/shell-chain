@@ -1066,6 +1066,34 @@ fn co_sign_input(controls: &Path, output: &Path) -> Result<(), Error> {
     file.sync_all()?;
     Ok(())
 }
+fn prepare_successor(root: &Path) -> Result<(), Error> {
+    prepare(root, true, false, false, false)?;
+    let c: Control = read(&root.join("control.cbor"))?;
+    for path in [root.join("provider-db"), root.join("control-db")] {
+        let n = node(&path, &c, false)?;
+        for index in 1..3 {
+            ensure(
+                n.fast_finalize_with_certificate(
+                    index as u64 + 1,
+                    c.blocks[index].hash(),
+                    &c.certificates[index],
+                ),
+                "independent successor control finality failed",
+            )?;
+        }
+        n.store.flush()?;
+        ensure(
+            n.chain_store.get_finalized_number()? == Some(3),
+            "successor controls not finalized",
+        )?;
+    }
+    println!(
+        "{}",
+        serde_json::json!({"successorControlsPrepared":true,"genuineSignedBlocks":3,"independentNative3Stores":2,"privateKeysPersisted":false})
+    );
+    Ok(())
+}
+
 fn prepare_mixed(root: &Path) -> Result<(), Error> {
     std::fs::create_dir(root)?;
     // Produce a fresh, genuinely signed SLH block before adding the coauthority.
@@ -1649,6 +1677,9 @@ fn accept_slh(controls: &Path, proof_file: &Path, root: &Path) -> Result<(), Err
 fn main() -> Result<(), Error> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("prepare-successor") if args.len()==2 => prepare_successor(Path::new(&args[1])),
+        Some("successor-source") if args.len()==4 => quorum_rpc::run_successor(&args),
+        Some("successor-live"|"successor-cold") if args.len()==6 => quorum_rpc::run_successor(&args),
         Some("live-cold-intent-recheck") if args.len()==5 => quorum_rpc::run_cold_intent_recheck(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3]),Path::new(&args[4])),
         Some("live-explicit-recheck") if args.len()==5 => quorum_rpc::run_explicit_recheck(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3]),Path::new(&args[4])),
         Some("producer-step") if args.len()==5 => quorum_rpc::run_producer_step(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3]),args[4].parse()?),
@@ -1683,6 +1714,6 @@ fn main() -> Result<(), Error> {
         Some("inspect-follow") if args.len() == 2 => inspect_follow(Path::new(&args[1])),
         Some("inspect") if args.len() == 2 => inspect(Path::new(&args[1])),
         Some("verify") if args.len() == 3 => verify(Path::new(&args[1]), Path::new(&args[2])),
-        _ => Err("usage: quorum-native slh-live-crash-worker|slh-live-crash-recover|slh-live-persistent-batch-fault|slh-live-persistent-batch-cold <retained-slh-controls> <complete-proof.cbor> <receiver-root> <existing-Native1-provider-db> | prepare-mixed|prepare-mixed-history <new-control-directory> | prepare-slh-history <new-control-directory> | slh-live-history3|mixed-live-history3 <history-controls> <complete-first-proof.cbor> <existing-receiver-root> <existing-Native3-provider-db> | producer-step <slh-controls> <existing-Native1-provider-db> <new-receiver-root> <new-component-budget-1..16> | slh-live-pause|slh-live-import|slh-live-cold|slh-live-default|slh-live-invalid-recheck|slh-live-batch-fault|slh-live-batch-recover <original-slh-controls> <complete-proof.cbor> <receiver-root> <existing-Native-one-provider-db> | accept-slh <slh-controls> <complete-proof.cbor> <new-import-directory> | prepare-slh <new-control-directory> | inspect-slh <retained-slh-controls> | live-cold-intent-recheck <controls> <proof> <retained-rejected-root> <independent-first-block-db> | live-explicit-recheck <controls> <proof> <retained-rejected-receiver-root> <independent-first-block-db> | producer-seed <controls> <completed-job-root> <owned-provider-db> | producer-live|producer-cold|producer-corrupt|producer-disabled|producer-manifest|producer-auto|producer-auto-wait|producer-auto-resume|producer-auto-partial|producer-auto-worker|producer-auto-recover|producer-auto-batch-fault|producer-auto-batch-recover|producer-intact-rejection <controls> <owned-provider-db> <new-receiver-root> <full-proof.cbor> | live-pause|live-import|live-cold|live-history3|live-default|live-invalid-recheck <controls> <proof> <receiver-root> <owned-provider-db> | rpc-pause <controls> <proof> <existing-native-root> | rpc-verify <controls> <proof> <existing-native-root> | rpc-recheck <controls> <proof> <existing-native-root> | prepare-certified <new-timed-controls> | inspect-follow <two-signer-controls> | follow-peer <two-signer-controls> <full-proof.cbor> <existing-first-block-directory> | follow-verify <two-signer-controls> <full-proof.cbor> <existing-follow-directory> | co-sign-input <original-controls> <new-messages.json> | augment <original-controls> <sdk-signatures.json> <new-two-signer-controls> | receive-one <two-signer-controls> <full-proof.cbor> <new-import-directory> | receive-one-verify <two-signer-controls> <full-proof.cbor> <existing-import-directory> | prepare <new-control-directory> | inspect <control-directory> | verify <control-directory> <full-quorum-proof.cbor> | receive <original-controls> <full-proof.cbor> <new-import-directory> | receive-resume <original-controls> <full-proof.cbor> <original-genesis-import-directory> | receive-verify <original-controls> <full-proof.cbor> <existing-import-directory>".into()),
+        _ => Err("usage: quorum-native prepare-successor <new-controls> | successor-source <controls> <existing-Native3-provider-db> <new-source2.cbor> | successor-live|successor-cold <controls> <proof1.cbor> <proof2.cbor> <receiver-root> <existing-Native3-provider-db> | slh-live-crash-worker|slh-live-crash-recover|slh-live-persistent-batch-fault|slh-live-persistent-batch-cold <retained-slh-controls> <complete-proof.cbor> <receiver-root> <existing-Native1-provider-db> | prepare-mixed|prepare-mixed-history <new-control-directory> | prepare-slh-history <new-control-directory> | slh-live-history3|mixed-live-history3 <history-controls> <complete-first-proof.cbor> <existing-receiver-root> <existing-Native3-provider-db> | producer-step <slh-controls> <existing-Native1-provider-db> <new-receiver-root> <new-component-budget-1..16> | slh-live-pause|slh-live-import|slh-live-cold|slh-live-default|slh-live-invalid-recheck|slh-live-batch-fault|slh-live-batch-recover <original-slh-controls> <complete-proof.cbor> <receiver-root> <existing-Native-one-provider-db> | accept-slh <slh-controls> <complete-proof.cbor> <new-import-directory> | prepare-slh <new-control-directory> | inspect-slh <retained-slh-controls> | live-cold-intent-recheck <controls> <proof> <retained-rejected-root> <independent-first-block-db> | live-explicit-recheck <controls> <proof> <retained-rejected-receiver-root> <independent-first-block-db> | producer-seed <controls> <completed-job-root> <owned-provider-db> | producer-live|producer-cold|producer-corrupt|producer-disabled|producer-manifest|producer-auto|producer-auto-wait|producer-auto-resume|producer-auto-partial|producer-auto-worker|producer-auto-recover|producer-auto-batch-fault|producer-auto-batch-recover|producer-intact-rejection <controls> <owned-provider-db> <new-receiver-root> <full-proof.cbor> | live-pause|live-import|live-cold|live-history3|live-default|live-invalid-recheck <controls> <proof> <receiver-root> <owned-provider-db> | rpc-pause <controls> <proof> <existing-native-root> | rpc-verify <controls> <proof> <existing-native-root> | rpc-recheck <controls> <proof> <existing-native-root> | prepare-certified <new-timed-controls> | inspect-follow <two-signer-controls> | follow-peer <two-signer-controls> <full-proof.cbor> <existing-first-block-directory> | follow-verify <two-signer-controls> <full-proof.cbor> <existing-follow-directory> | co-sign-input <original-controls> <new-messages.json> | augment <original-controls> <sdk-signatures.json> <new-two-signer-controls> | receive-one <two-signer-controls> <full-proof.cbor> <new-import-directory> | receive-one-verify <two-signer-controls> <full-proof.cbor> <existing-import-directory> | prepare <new-control-directory> | inspect <control-directory> | verify <control-directory> <full-quorum-proof.cbor> | receive <original-controls> <full-proof.cbor> <new-import-directory> | receive-resume <original-controls> <full-proof.cbor> <original-genesis-import-directory> | receive-verify <original-controls> <full-proof.cbor> <existing-import-directory>".into()),
     }
 }

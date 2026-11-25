@@ -1160,7 +1160,7 @@ checks and allocator behavior:
 
 ```sh
 CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 \
-  cargo build --locked -p shell-node --features rocksdb --example quorum-native
+  cargo build --locked -p shell-node --features rocksdb --example quorum-native || exit "$?"
 target/debug/examples/quorum-native prepare-mixed-history mixed-history-controls || exit "$?"
 test ! -e mixed-history-producer-db || exit 1
 cp -R mixed-history-controls/control-db mixed-history-producer-db || exit "$?"
@@ -1203,3 +1203,56 @@ full commit-signature AIR; successors use ordinary genuine signatures and
 certificates. This covers one static `[2, 1]` local case. Dynamic historical
 committees or penalties, successor AIR, other host profiles, public release
 and network activation remain separate work.
+
+
+### Consecutive exact-child quorum admission
+
+`prepare-successor` creates temporary primary ML-DSA-65 authority and sender
+keys, three genuinely signed transfers and two independently executed Native3
+stores. Temporary private keys are dropped after signing all three blocks. The retained
+ordinary certificates finalize both independent stores before the entry returns. `successor-source` captures the second
+block's independent authority context without writing Native rows. Retained
+compatible two-authority controls can also supply the same entries; their first
+proof must match their original first block exactly.
+
+With the same Rust and RocksDB prerequisites, use unused paths and build both
+examples in the measured development profile:
+
+```sh
+CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -p shell-node --features rocksdb --example quorum-native || exit "$?"
+CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -p shell-stark-prover --example commit-quorum || exit "$?"
+target/debug/examples/quorum-native prepare-successor successor-controls || exit "$?"
+target/debug/examples/quorum-native successor-source successor-controls successor-controls/provider-db successor-source2.cbor || exit "$?"
+target/debug/examples/commit-quorum prove successor-controls/source.cbor successor-job1 successor-proof1.cbor || exit "$?"
+target/debug/examples/commit-quorum prove successor-source2.cbor successor-job2 successor-proof2.cbor || exit "$?"
+target/debug/examples/quorum-native successor-live successor-controls successor-proof1.cbor successor-proof2.cbor successor-receiver successor-controls/provider-db || exit "$?"
+target/debug/examples/quorum-native successor-cold successor-controls successor-proof1.cbor successor-proof2.cbor successor-receiver successor-controls/provider-db || exit "$?"
+```
+
+Each proof job is separate and source-bound. Preserve its checkpoints on a
+failure; retry that same source and job rather than regenerating its keys or
+signed blocks. An already complete first-block proof can be reused unchanged.
+Only the second block needs a new graph in that case.
+
+The live entry advertises the provider's first proof, starts a fresh TCP/Noise
+receiver with quorum admission enabled, and waits for atomic execution and
+finality one. It withholds the second proof until the second body and certificate
+are pending, and checks that no second-block receipts or Native state appear.
+Verifier preflight rejects wrong-block and damaged second-block proofs while the
+receiver remains at height one. After the provider
+publishes the genuine second proof, the receiver must automatically discover,
+fetch and fully verify it before executing and finalizing block two. No receiver
+upload, fetch or explicit verification command authorizes either fresh child.
+
+Both blocks' roots and receipts must match the independent provider, as must
+account balances, nonce and fees at its retained historical state two. The
+entry then explicitly reverifies each historical proof against current state
+two without writing it back. `successor-cold` reopens that receiver in a separate
+OS process and increases both verification-attempt counters again. A stored
+verified result never replaces these full checks.
+
+This is a bounded two-child static-context flow. The existing retained-candidate
+limit is unchanged, and the third block without a full quorum proof remains
+absent from the receiver within that two-candidate limit. It does not qualify an unbounded chain, fork or reorganization,
+dynamic authority or penalty provenance, sender/proposer AIR, node-owned
+successor proof production, public release or network activation.
