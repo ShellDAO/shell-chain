@@ -1392,3 +1392,49 @@ three-job publication, automatic peer execution/finality and hot/cold historical
 checks above. It neither deletes old jobs nor changes consensus, activation,
 defaults or resource limits. These commands qualify the stated failure boundary;
 other storage faults and process-loss boundaries need separate results.
+
+### ML-DSA primary with an SLH coauthority
+
+`prepare-mixed-reversed` creates new test accounts with an ML-DSA-65 primary
+authority of weight two and an SLH-DSA-SHA2-256f coauthority of weight one. It
+retains the signed primary controls under `single-mldsa`, then checks the
+original block and full mixed certificate in two independent Native1 stores.
+Preparation checks exact-two-thirds and damaged-cosignature refusals and drops
+the temporary signing keys. Inspect `primaryAlgorithm`, `coAlgorithm` and
+`sourceSignerAlgorithms` in its output: the source's actual signer ordering is
+recorded separately from primary/coauthority role labels.
+
+Build the example with the prerequisites above and use new paths:
+
+```sh
+CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -p shell-node --features rocksdb --example quorum-native || exit "$?"
+target/debug/examples/quorum-native prepare-mixed-reversed reversed-controls || exit "$?"
+test ! -e reversed-provider-db || exit 1
+cp -R reversed-controls/control-db reversed-provider-db || exit "$?"
+test ! -e reversed-receiver || exit 1
+test ! -e reversed-receiver.proof.cbor || exit 1
+while test ! -e reversed-receiver.proof.cbor; do
+  target/debug/examples/quorum-native producer-step reversed-controls reversed-provider-db reversed-receiver 16 || exit "$?"
+done
+target/debug/examples/quorum-native producer-cold reversed-controls reversed-provider-db reversed-receiver reversed-receiver.proof.cbor || exit "$?"
+target/debug/examples/quorum-native producer-recheck reversed-controls reversed-receiver reversed-receiver.proof.cbor || exit "$?"
+```
+
+The one-block step entry uses the Node's original canonical source, certificate,
+registered key and supported-algorithm validation. Its budget remains one through
+sixteen new components per process, with the same immutable-checkpoint,
+default-off and byte-limit checks. Preserve the controls and provider between
+steps. A pause qualifies only its completed components; full acceptance requires
+the actual produced artifact and automatic peer execution/finality endpoint.
+This run starts with an empty owned job and does not recover a seeded graph.
+
+`producer-cold` fully rechecks the completed provider graph in another process.
+`producer-recheck` opens the already canonical one-block receiver, compares its
+cold Native rows with the independent reference, checks unauthenticated request
+refusal, and requests a new full read-only proof replay. Verification attempts
+must increase while current Native rows, finality, balances and original payload
+remain unchanged. Wrong proof version, foreign block and reordered signer source
+are checked as verifier preflight refusals. The receiver remains at tip one;
+later-tip replay for this role layout, other signer layouts and host/resource
+profiles require their own results. These commands do not activate a network or
+guarantee that every mixed graph fits the existing resource bounds.

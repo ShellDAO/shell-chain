@@ -1675,13 +1675,8 @@ async fn exercise_producer_step(
     )?;
     let c: Control = read(&controls.join("control.cbor"))?;
     ensure(
-        c.co_authority.as_ref().is_none_or(|(address, key)| {
-            shell_crypto::infer_signature_type_from_address(key, address)
-                == Some(shell_crypto::SignatureType::MlDsa65)
-        }) && c.authority_key.len() == 64
-            && c.blocks.len() == 1
-            && c.certificates.len() == 1,
-        "step requires one-block SLH controls with optional ML-DSA coauthority",
+        c.blocks.len() == 1 && c.certificates.len() == 1,
+        "step requires one-block controls with one original certificate",
     )?;
     let mut artifact = receiver_root.as_os_str().to_os_string();
     artifact.push(".proof.cbor");
@@ -1913,6 +1908,105 @@ async fn exercise_producer_step(
         );
     }
     Ok(())
+}
+async fn exercise_producer_recheck(
+    controls: &Path,
+    receiver: &Path,
+    proof_file: &Path,
+) -> Result<(), Error> {
+    let c: Control = read(&controls.join("control.cbor"))?;
+    ensure(
+        c.blocks.len() == 1 && c.certificates.len() == 1,
+        "recheck requires one-block controls",
+    )?;
+    let path = receiver.join("db");
+    let offline = node(&path, &c, false)?;
+    ensure(
+        offline.chain_store.get_head_hash()? == Some(c.blocks[0].hash())
+            && offline.chain_store.get_finalized_number()? == Some(1),
+        "recheck requires canonical Native1",
+    )?;
+    let native = recovery_native_digest(&offline)?;
+    let reference = node(&controls.join("control-db"), &c, false)?;
+    ensure(
+        native == recovery_native_digest(&reference)?,
+        "cold receiver differs from independent Native1",
+    )?;
+    drop(reference);
+    let source = offline.commit_quorum_source(1, c.blocks[0].hash(), &c.certificates[0])?;
+    ensure(
+        source == read::<CommitQuorumSource>(&controls.join("source.cbor"))?,
+        "cold source identity differs",
+    )?;
+    let mut proof: CommitQuorumProof = read(proof_file)?;
+    let bytes = shell_stark_prover::commit_quorum::payload::encode(
+        &proof,
+        shell_core::MAX_CANONICAL_PROOF_BYTES as usize,
+    )?;
+    let m = manifest(&c, &bytes);
+    let cache = shell_storage::CanonicalProofUploadStore::new(offline.store.clone());
+    ensure(
+        cache.payload(&m.id())? == bytes,
+        "cold receiver payload differs from actual produced artifact",
+    )?;
+    drop(bytes);
+    let version = proof.version;
+    proof.version = if version == 1 { 2 } else { 1 };
+    ensure(
+        verify_commit_quorum(&proof, &source).is_err(),
+        "wrong proof profile accepted",
+    )?;
+    proof.version = version;
+    let mut wrong = source.clone();
+    wrong.context.block_hash = ShellHash::ZERO;
+    ensure(
+        verify_commit_quorum(&proof, &wrong).is_err(),
+        "foreign source block accepted",
+    )?;
+    let order_refusal = source.signatures.len() > 1;
+    if order_refusal {
+        wrong = source.clone();
+        wrong.signatures.swap(0, 1);
+        ensure(
+            verify_commit_quorum(&proof, &wrong).is_err(),
+            "wrong signer order accepted",
+        )?;
+    }
+    ensure(
+        recovery_native_digest(&offline)? == native,
+        "preflight refusals changed Native",
+    )?;
+    drop(proof);
+    drop(cache);
+    drop(offline);
+    let live = Live::start_mode(&path, &c, vec![], true, false).await?;
+    let outcome = async {
+        let old = live.status(m.id()).await?;
+        ensure(old.state == CanonicalProofUploadState::Verified, "prior actual peer verification absent")?;
+        let (http, _) = request(live.address, None, "admin_verifyCanonicalProof", json!([m.id(),true])).await?;
+        ensure(http == 401 && live.status(m.id()).await? == old, "unauthorized cold request changed proof authorization")?;
+        let checked = live.verify(m.id()).await?;
+        expected_result(&live, &c, &checked)?;
+        ensure(checked.verification_attempts == old.verification_attempts+1
+            && recovery_native_digest(&live.node)? == native
+            && live.node.chain_store.get_finalized_number()? == Some(1), "cold full recheck did not rerun or changed Native1")?;
+        balances(&live.node, &c, 1)?;
+        println!("{}",json!({"coldProducedQuorumFullHistoricalRecheck":true,"head":1,"finalized":1,"verificationAttempts":checked.verification_attempts,"provedCommitSignatures":1+usize::from(c.co_authority.is_some()),"sourceSignerAlgorithms":source.signatures.iter().map(|s|s.signature.sig_type).collect::<Vec<_>>(),"wrongVersionAndForeignSourcePreflightRefused":true,"signerOrderPreflightRefused":order_refusal,"unauthenticatedRequestRefused":true,"NativeRowsUnchanged":true,"independentNative1RowsEqual":true,"sameProducedPayload":true,"newProofMath":0}));
+        Ok::<_, Error>(())
+    }.await;
+    live.stop().await?;
+    outcome
+}
+pub(super) fn run_producer_recheck(
+    controls: &Path,
+    receiver: &Path,
+    proof: &Path,
+) -> Result<(), Error> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?
+        .block_on(exercise_producer_recheck(controls, receiver, proof))
 }
 pub(super) fn run_producer_step(
     controls: &Path,
