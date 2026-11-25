@@ -330,9 +330,6 @@ impl<S: KvStore + 'static> Node<S> {
             return Ok(true);
         }
         let mut ids = self.admission_ids()?;
-        if ids.len() >= MAX_JOBS {
-            return Err("live admission retained candidate limit".into());
-        }
         if ids.iter().any(|id| {
             self.admission_record(*id).ok().flatten().is_some_and(|r| {
                 !matches!(r.state, AdmissionState::Complete | AdmissionState::Failed)
@@ -340,6 +337,8 @@ impl<S: KvStore + 'static> Node<S> {
         }) {
             return Err("live candidate already pending".into());
         }
+        let mut batch = WriteBatch::new();
+        self.prepare_completed_admission_slot(&mut ids, &mut batch, 1)?;
         let body = shell_stark_prover::production_store::bounded_json(block, MAX_BODY)
             .map_err(|e| e.to_string())?;
         let r = AdmissionRecord {
@@ -358,7 +357,6 @@ impl<S: KvStore + 'static> Node<S> {
             error: None,
         };
         ids.push(r.block);
-        let mut batch = WriteBatch::new();
         batch.put(key(b"body/", Some(r.block)), body);
         batch.put(
             key(b"record/", Some(r.block)),
@@ -385,10 +383,11 @@ impl<S: KvStore + 'static> Node<S> {
         }
         Ok(bytes)
     }
-    fn prepare_quorum_admission_slot(
+    fn prepare_completed_admission_slot(
         &self,
         ids: &mut Vec<ShellHash>,
         batch: &mut WriteBatch,
+        version: u8,
     ) -> Result<(), String> {
         if ids.len() < MAX_JOBS {
             return Ok(());
@@ -403,7 +402,7 @@ impl<S: KvStore + 'static> Node<S> {
             let r = self
                 .admission_record(id)?
                 .ok_or("indexed admission record absent")?;
-            if r.version != 2
+            if r.version != version
                 || r.state != AdmissionState::Complete
                 || r.explicit_recheck.is_some()
                 || r.error.is_some()
@@ -421,7 +420,7 @@ impl<S: KvStore + 'static> Node<S> {
             let manifest = r
                 .manifest
                 .as_ref()
-                .ok_or("completed quorum manifest absent")?;
+                .ok_or("completed admission manifest absent")?;
             if manifest.chain_id != self.config.chain_id
                 || self
                     .chain_store
@@ -429,10 +428,17 @@ impl<S: KvStore + 'static> Node<S> {
                     .map_err(|e| e.to_string())?
                     != Some(manifest.genesis_hash)
             {
-                return Err("completed quorum manifest network mismatch".into());
+                return Err("completed admission manifest network mismatch".into());
             }
             let body = self.admission_body(&r)?;
-            let certificate = self.admission_certificate(&r)?;
+            let certificate = if version == 2 {
+                self.admission_certificate(&r)?
+            } else {
+                self.chain_store
+                    .get_commit_certificate(&id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("completed sender Native certificate absent")?
+            };
             if self
                 .chain_store
                 .get_block_by_hash(&id)
@@ -451,17 +457,19 @@ impl<S: KvStore + 'static> Node<S> {
                     .as_ref()
                     != Some(&certificate)
             {
-                return Err("completed quorum source differs from finalized Native data".into());
+                return Err("completed admission source differs from finalized Native data".into());
             }
             self.chain_store
                 .verify_block_body_commitment(&body)
                 .map_err(|e| e.to_string())?;
             let signatures = Self::decode_commit_certificate(&certificate)
-                .ok_or("completed quorum certificate encoding invalid")?;
+                .ok_or("completed admission certificate encoding invalid")?;
             if signatures.is_empty()
-                || signatures.len() > shell_stark_prover::commit_quorum::MAX_COMMIT_PROOF_SIGNERS
+                || (version == 2
+                    && signatures.len()
+                        > shell_stark_prover::commit_quorum::MAX_COMMIT_PROOF_SIGNERS)
             {
-                return Err("completed quorum certificate signer limit".into());
+                return Err("completed admission certificate signer limit".into());
             }
             let evidence = self
                 .chain_store
@@ -471,7 +479,7 @@ impl<S: KvStore + 'static> Node<S> {
                 let signer = evidence
                     .iter()
                     .find(|e| e.address == address)
-                    .ok_or("completed quorum signer evidence absent")?;
+                    .ok_or("completed admission signer evidence absent")?;
                 if signer.signature != signature
                     || shell_crypto::infer_signature_type_from_address(&signer.public_key, &address)
                         != Some(signature.sig_type)
@@ -479,8 +487,26 @@ impl<S: KvStore + 'static> Node<S> {
                         .verify(&signer.public_key, id.as_bytes(), &signature)
                         .map_err(|e| e.to_string())?
                 {
-                    return Err("completed quorum signer evidence changed".into());
+                    return Err("completed admission signer evidence changed".into());
                 }
+            }
+            if version == 1 {
+                let available = self
+                    .canonical_proof_uploads
+                    .status(&manifest.id())
+                    .map_err(|e| e.to_string())?;
+                if available.manifest != *manifest
+                    || !matches!(
+                        available.state,
+                        shell_storage::CanonicalProofUploadState::Ready
+                            | shell_storage::CanonicalProofUploadState::Verified
+                    )
+                {
+                    return Err("completed sender proof availability changed".into());
+                }
+                self.canonical_proof_uploads
+                    .payload(&manifest.id())
+                    .map_err(|e| e.to_string())?;
             }
             completed.push((r.number, id));
         }
@@ -491,8 +517,11 @@ impl<S: KvStore + 'static> Node<S> {
         // These are duplicate, untrusted intake rows. Native body/QC/receipts,
         // signer evidence and all proof availability bytes remain untouched.
         // The caller commits retirement with the new source and index atomically.
-        for part in [b"record/".as_slice(), b"body/", b"quorum/"] {
+        for part in [b"record/".as_slice(), b"body/"] {
             batch.delete(key(part, Some(oldest)));
+        }
+        if version == 2 {
+            batch.delete(key(b"quorum/", Some(oldest)));
         }
         ids.retain(|id| *id != oldest);
         Ok(())
@@ -548,7 +577,7 @@ impl<S: KvStore + 'static> Node<S> {
             return Err("live admission retained candidate limit".into());
         }
         let mut batch = WriteBatch::new();
-        self.prepare_quorum_admission_slot(&mut ids, &mut batch)?;
+        self.prepare_completed_admission_slot(&mut ids, &mut batch, 2)?;
         let body = shell_stark_prover::production_store::bounded_json(block, MAX_BODY)
             .map_err(|e| e.to_string())?;
         let record = AdmissionRecord {
@@ -1425,6 +1454,129 @@ pub(super) mod tests {
             Some(blocks[1].hash())
         );
         assert_eq!(node.chain_store.get_finalized_number().unwrap(), Some(2));
+    }
+
+    fn completed_sender_slot_fixture<S: KvStore + 'static>(db: Arc<S>) -> (Node<S>, Vec<Block>) {
+        let (mut node, blocks, _) = completed_quorum_fixture(db, true);
+        node.config.canonical_quorum_admission = false;
+        node.config.canonical_proof_admission = true;
+        for block in &blocks[..2] {
+            let mut r = node.admission_record(block.hash()).unwrap().unwrap();
+            r.version = 1;
+            r.quorum_certificate_hash = None;
+            let m = r.manifest.as_mut().unwrap();
+            m.version = 1;
+            let upload = node.canonical_proof_uploads.begin(m.clone()).unwrap();
+            node.canonical_proof_uploads
+                .append(&upload.proof_id, 0, b"x")
+                .unwrap();
+            node.save_admission(&r).unwrap();
+        }
+        // Slot-policy markers only: empty Native controls and byte availability
+        // are not sender AIR authorization. The example covers real transfers.
+        (node, blocks)
+    }
+    #[test]
+    fn completed_sender_slots_retire_only_duplicate_intake_and_keep_all_native_and_proof_rows() {
+        let db = Arc::new(MemoryDb::new());
+        let (node, blocks) = completed_sender_slot_fixture(db.clone());
+        let before = db.scan_all().unwrap();
+        let mut ids = vec![blocks[1].hash(), blocks[0].hash()];
+        let mut batch = WriteBatch::new();
+        node.prepare_completed_admission_slot(&mut ids, &mut batch, 1)
+            .unwrap();
+        assert_eq!(ids, vec![blocks[1].hash()]);
+        batch.put(key(b"jobs", None), serde_json::to_vec(&ids).unwrap());
+        node.store.write_batch(batch).unwrap();
+        for (k, value) in before {
+            if k != key(b"record/", Some(blocks[0].hash()))
+                && k != key(b"body/", Some(blocks[0].hash()))
+                && k != key(b"jobs", None)
+            {
+                assert_eq!(db.get(&k).unwrap(), Some(value));
+            }
+        }
+        assert!(node.admission_record(blocks[0].hash()).unwrap().is_none());
+        assert!(db
+            .get(&key(b"quorum/", Some(blocks[0].hash())))
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            node.chain_store.get_head_hash().unwrap(),
+            Some(blocks[1].hash())
+        );
+        assert_eq!(node.chain_store.get_finalized_number().unwrap(), Some(2));
+    }
+    #[test]
+    fn completed_sender_slots_refuse_unconsumed_unfinalized_wrong_role_and_corrupt_sources() {
+        for case in 0..11 {
+            let db = Arc::new(MemoryDb::new());
+            let (node, blocks) = completed_sender_slot_fixture(db.clone());
+            for block in &blocks[..2] {
+                let mut r = node.admission_record(block.hash()).unwrap().unwrap();
+                match case {
+                    0 => r.state = AdmissionState::Failed,
+                    1 => r.state = AdmissionState::Paused,
+                    2 => r.state = AdmissionState::Waiting,
+                    3 => r.explicit_recheck = Some(r.manifest.as_ref().unwrap().id()),
+                    4 => r.attempts = 0,
+                    5 => {
+                        r.version = 2;
+                        r.quorum_certificate_hash = Some(ShellHash::ZERO);
+                        r.manifest.as_mut().unwrap().version = 2;
+                    }
+                    6 => r.source_hash = ShellHash::ZERO,
+                    7 => r.manifest.as_mut().unwrap().chain_id += 1,
+                    8 => {
+                        r.manifest.as_mut().unwrap().payload_hash =
+                            shell_primitives::blake3_hash(b"unavailable")
+                    }
+                    9 => {
+                        let mut evidence =
+                            node.chain_store.get_block_signers(&block.hash()).unwrap();
+                        evidence[0].public_key[0] ^= 1;
+                        let cert = node
+                            .chain_store
+                            .get_commit_certificate(&block.hash())
+                            .unwrap()
+                            .unwrap();
+                        node.chain_store
+                            .set_commit_certificate_with_signers(&block.hash(), &cert, &evidence)
+                            .unwrap();
+                    }
+                    _ => node.chain_store.set_finalized_number(0).unwrap(),
+                }
+                node.save_admission(&r).unwrap();
+            }
+            let before = db.scan_all().unwrap();
+            let mut ids = node.admission_ids().unwrap();
+            let mut batch = WriteBatch::new();
+            assert!(
+                node.prepare_completed_admission_slot(&mut ids, &mut batch, 1)
+                    .is_err(),
+                "case {case}"
+            );
+            assert_eq!(db.scan_all().unwrap(), before);
+        }
+    }
+    #[test]
+    fn completed_sender_slots_atomic_batch_failure_preserves_original_intake_and_all_proofs() {
+        let db = Arc::new(super::super::tests::FailingBatchDb::new());
+        let (node, blocks) = completed_sender_slot_fixture(db.clone());
+        let before = db.scan_all().unwrap();
+        let mut ids = node.admission_ids().unwrap();
+        let mut batch = WriteBatch::new();
+        node.prepare_completed_admission_slot(&mut ids, &mut batch, 1)
+            .unwrap();
+        ids.push(blocks[2].hash());
+        batch.put(key(b"jobs", None), serde_json::to_vec(&ids).unwrap());
+        batch.put(
+            key(b"body/", Some(blocks[2].hash())),
+            serde_json::to_vec(&blocks[2]).unwrap(),
+        );
+        db.fail_next_batch();
+        assert!(node.store.write_batch(batch).is_err());
+        assert_eq!(db.scan_all().unwrap(), before);
     }
 
     #[test]

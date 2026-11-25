@@ -14,8 +14,13 @@ use std::{net::SocketAddr, time::Duration};
 mod batch_fault;
 #[path = "quorum_producer_lifecycle.rs"]
 mod producer_lifecycle;
+#[path = "sender_lifecycle.rs"]
+mod sender_lifecycle;
 #[path = "quorum_successor.rs"]
 mod successor;
+pub(super) fn run_sender_lifecycle(args: &[String]) -> Result<(), Error> {
+    sender_lifecycle::run(args)
+}
 pub(super) fn run_producer_lifecycle(args: &[String]) -> Result<(), Error> {
     producer_lifecycle::run(args)
 }

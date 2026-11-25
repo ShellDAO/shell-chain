@@ -276,7 +276,7 @@ missing or malformed references, chained references inside certificates,
 noncanonical encodings, duplicate map fields, trailing bytes and unsupported
 values. It bounds encoded bytes, nesting, templates, individual certificates,
 pool counts, reference counts and expanded data before native publication.
-The existing 256 MiB payload/per-job/global checkpoint limits, two-job retention
+The existing 256 MiB payload/per-job/global checkpoint limits, two active jobs
 and separate 512 MiB cache remain unchanged. Older readers require a compatible
 build for the new encoding; they must not silently use native signature fallback.
 
@@ -291,3 +291,24 @@ successor reaches nonce 32; historical full replay must not change current data.
 The larger experiment's idle observation window is separate from protocol timing.
 Keep all data and receipts across pauses. Distinct-key/witness layouts, full load,
 other algorithms and public release/activation remain separate qualifications.
+
+
+## Completed sender intake slots
+
+At most two candidate bodies remain in the untrusted intake table. A new sender
+extension can retire the oldest completed sender intake only after its exact
+body and receipts remain in independently finalized Native history, its original
+Native certificate and signer evidence still verify, and its exact sender
+manifest has complete hash-checked available bytes. Failed, pending, explicitly
+rechecking, unfinalized or corrupt candidates never qualify. Quorum candidates
+use their separate role and certificate checks; one role cannot retire the other.
+
+Retirement removes only duplicate intake body/status rows and commits their
+replacement with the new body, waiting record and index in one batch. Native
+blocks, receipts, certificates, signer evidence, producer sources, checkpoints
+and proof payloads stay intact. Backend rejection leaves the original intake
+unchanged. A completed cache flag never authorizes the new block: its full AIR
+must still cross the opaque verifier boundary before atomic Native execution.
+
+See the [three-source sender lifecycle](automatic-canonical-proof-production.md#three-source-sender-regression)
+for a real Node and peer regression, including cold historical verification.

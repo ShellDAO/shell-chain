@@ -15,7 +15,7 @@ settlement carrier would change unrelated protocol behavior.
 Add a separately opted-in prover-role path at native canonical publication and
 startup. Persist bounded public inputs and checkpoint jobs in the native store,
 with an exclusive writer lock, atomic quota accounting and immutable logical source and
-certificate bytes. Limit retained jobs to two and checkpoint key/value bytes to
+certificate bytes. Limit active jobs to two and checkpoint key/value bytes to
 256 MiB globally; reserve 64 KiB for terminal status/error metadata. The raw
 availability cache keeps its existing separate 512 MiB bound. Refuse capacity
 rather than deleting old state. There is no failed-job retry loop within a worker
@@ -201,7 +201,7 @@ atomic storage batch. Original records, source descriptors and checkpoint keys
 remain in place. Their bytes remain charged to the same global 256 MiB quota,
 including the new index metadata; the 64 KiB terminal reserve is unchanged.
 Quorum error text is bounded to 512 characters (at most 2 KiB of UTF-8 or
-3 KiB of escaped JSON) so retained status updates fit that reserve. The sender producer retains its original two-job behavior.
+3 KiB of escaped JSON) so retained status updates fit that reserve.
 
 A job qualifies for index rotation only after its source still matches the
 independently retained finalized canonical block and original certificate, and
@@ -230,3 +230,95 @@ closed. Read-only history queries do not migrate or compact storage.
 
 The runnable three-source lifecycle and its explicit seeded-proof scope are
 specified in [the quorum proof guide](commit-quorum-proof.md#node-owned-successor-job-lifecycle).
+
+## Sender completed-job history
+
+The sender producer also keeps two active jobs and at most eight total source
+identities. On capture of a new supported canonical source, it can archive the
+oldest eligible completed sender job and insert the new source, queued record,
+index and byte counter in one atomic batch. Existing source, record and
+certificate keys stay in place and remain charged to the same 256 MiB budget.
+The terminal reserve and the separate availability cache limits do not change.
+
+Eligibility requires the original source to restore against its historical
+canonical body, parent and account/key witnesses, an independently retained
+finalized Native block, and the exact version-1 sender manifest with complete
+hash-checked `ready` or `verified` bytes. An incomplete, errored, unfinalized,
+corrupt or unavailable job never retires. These checks permit local index
+rotation only; receivers still verify the full proof and Native authorization.
+Capacity failure leaves the canonical Native publication committed.
+
+The sender history envelope uses version 3 and an explicit `sender` role. Its
+reader rejects the separate version-2 quorum envelope, and quorum readers reject
+sender history. Original vector indexes remain readable without rewriting them.
+Older sender workers reject the new local envelope; preserve the original
+database snapshot for downgrade. No proof format or network activation changes.
+
+Archived sender jobs remain available to source/status queries and immutable
+one-hop certificate reuse. Read-only queries never compact or migrate storage.
+The worker continues to schedule only active incomplete jobs, and a new session
+rechecks their retained certificates before producing missing work. Rotation
+does not evict failed jobs, proof bytes or donor dependencies, and does not
+promise unbounded production beyond the existing object and byte limits.
+
+
+## Three-source sender regression
+
+This source regression requires the locked Rust toolchain, the RocksDB build
+prerequisites (including Clang and CMake), and enough disk and memory for three
+full graphs. No network service, existing keystore, private key file or testnet
+funds are required. Preparation generates temporary signers in memory and saves
+only genuine signed public controls.
+
+Build the example from the matching unreleased source:
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_PROFILE_TEST_OPT_LEVEL=1 CARGO_PROFILE_TEST_DEBUG=0 \
+  CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true \
+  cargo build --locked --profile test -p shell-node --features rocksdb --example quorum-native
+
+sender_case=$(mktemp -d)
+target/debug/examples/quorum-native prepare "$sender_case/controls"
+target/debug/examples/quorum-native sender-history-init "$sender_case/controls" "$sender_case/runtime"
+target/debug/examples/quorum-native sender-history-step "$sender_case/controls" "$sender_case/runtime" 16
+target/debug/examples/quorum-native sender-history-snapshot "$sender_case/controls" "$sender_case/runtime"
+```
+
+Repeat `sender-history-step` and `sender-history-snapshot` with the same paths
+until both jobs report `complete`. Each process rechecks existing certificates,
+adds at most sixteen new mathematical components, and preserves all earlier
+sources/checkpoints and Native state. An incomplete job has no final manifest;
+partial checkpoints do not constitute a proof or Native authorization.
+
+Then publish the original third block over actual TCP/Noise and continue its
+newly captured job through the same bounded steps:
+
+```sh
+target/debug/examples/quorum-native sender-history-advance "$sender_case/controls" "$sender_case/runtime"
+target/debug/examples/quorum-native sender-history-step "$sender_case/controls" "$sender_case/runtime" 16
+target/debug/examples/quorum-native sender-history-snapshot "$sender_case/controls" "$sender_case/runtime"
+```
+
+Once all three jobs report `complete`, run these as separate processes:
+
+```sh
+target/debug/examples/quorum-native sender-history-peer "$sender_case/controls" "$sender_case/runtime"
+target/debug/examples/quorum-native sender-history-peer "$sender_case/controls" "$sender_case/runtime"
+```
+
+With an unused receiver directory, the first peer process starts from independent
+genesis and an empty cache, automatically imports and finalizes all three
+proof-backed blocks, and fully rechecks every historical graph after state 3.
+The second physically reopens that receiver and repeats full history verification.
+Both compare independent Native rows, receipts, balances, nonce, value and gas/fee
+accounting without historical writeback. `sender-history-peer` accepts an optional
+receiver-directory name to exercise a separate fresh receiver while preserving
+the producer and original receiver. It resumes an existing receiver; it never
+replaces its database.
+
+Every command exits nonzero on a failed assertion and preserves its prefix.
+After repairing a failure, resume the same step or peer command. Do not repeat
+`prepare` or `sender-history-init` on existing output, delete databases, seed a
+reported completion flag, or regenerate a completed graph. These commands cover
+this bounded local profile; other signer layouts, hosts, default build profiles,
+public release and network activation remain separate qualifications.

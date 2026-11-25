@@ -97,24 +97,37 @@ struct QuorumJobIndex {
     active: Vec<ShellHash>,
     completed: Vec<ShellHash>,
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SenderJobIndex {
+    version: u8,
+    role: String,
+    active: Vec<ShellHash>,
+    completed: Vec<ShellHash>,
+}
+#[derive(Clone, Copy)]
+enum ProductionRole {
+    Sender,
+    Quorum,
+}
 
 /// One shared writer lock and global quota for descriptors, records and certificates.
 pub(super) struct CanonicalProductionStore<S: KvStore> {
     store: Arc<S>,
     lock: Arc<parking_lot::Mutex<Option<u64>>>,
-    completed_history: bool,
+    role: ProductionRole,
 }
 impl<S: KvStore> CanonicalProductionStore<S> {
     pub(super) fn new(store: Arc<S>) -> Self {
         Self {
             store,
             lock: Arc::new(parking_lot::Mutex::new(None)),
-            completed_history: false,
+            role: ProductionRole::Sender,
         }
     }
     pub(super) fn new_quorum(store: Arc<S>) -> Self {
         Self {
-            completed_history: true,
+            role: ProductionRole::Quorum,
             ..Self::new(store)
         }
     }
@@ -126,14 +139,27 @@ impl<S: KvStore> CanonicalProductionStore<S> {
         if bytes.len() > 4096 {
             return Err(error("production job index byte limit"));
         }
-        let index = if self.completed_history
-            && bytes.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{')
-        {
-            let index: QuorumJobIndex = serde_json::from_slice(&bytes).map_err(error)?;
-            if index.version != 2 {
-                return Err(error("quorum job history version"));
+        let index = if bytes.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{') {
+            match self.role {
+                ProductionRole::Quorum => {
+                    let index: QuorumJobIndex = serde_json::from_slice(&bytes).map_err(error)?;
+                    if index.version != 2 {
+                        return Err(error("quorum job history version"));
+                    }
+                    index
+                }
+                ProductionRole::Sender => {
+                    let index: SenderJobIndex = serde_json::from_slice(&bytes).map_err(error)?;
+                    if index.version != 3 || index.role != "sender" {
+                        return Err(error("sender job history role/version"));
+                    }
+                    QuorumJobIndex {
+                        version: index.version,
+                        active: index.active,
+                        completed: index.completed,
+                    }
+                }
             }
-            index
         } else {
             QuorumJobIndex {
                 version: 1,
@@ -142,13 +168,8 @@ impl<S: KvStore> CanonicalProductionStore<S> {
             }
         };
         let ids: Vec<_> = index.completed.iter().chain(&index.active).collect();
-        let limit = if self.completed_history {
-            shell_storage::MAX_CANONICAL_PROOF_OBJECTS
-        } else {
-            MAX_JOBS
-        };
         if index.active.len() > MAX_JOBS
-            || ids.len() > limit
+            || ids.len() > shell_storage::MAX_CANONICAL_PROOF_OBJECTS
             || ids.iter().copied().collect::<HashSet<_>>().len() != ids.len()
         {
             return Err(error("canonical production job index corrupt"));
@@ -364,13 +385,7 @@ impl<S: KvStore> CanonicalProductionStore<S> {
         }
         Ok(bytes)
     }
-    fn insert(&self, source: &CanonicalProductionSource) -> Result<(), StorageError> {
-        self.insert_source(
-            source.block().hash(),
-            source.block().number(),
-            source.identity(),
-        )
-    }
+    #[cfg(test)]
     pub(super) fn insert_source(
         &self,
         hash: ShellHash,
@@ -408,31 +423,29 @@ impl<S: KvStore> CanonicalProductionStore<S> {
         {
             return Err(error("orphaned canonical production source/index retained"));
         }
-        let limit = if self.completed_history {
-            shell_storage::MAX_CANONICAL_PROOF_OBJECTS
-        } else {
-            MAX_JOBS
-        };
-        if self.completed_history && ids.len() + completed.len() >= limit {
+        if ids.len() + completed.len() >= shell_storage::MAX_CANONICAL_PROOF_OBJECTS {
             return Err(error("canonical production retained history limit reached"));
         }
         if let Some(old) = retire {
-            if !self.completed_history || ids.len() != MAX_JOBS || !ids.contains(&old) {
-                return Err(error("quorum completed job retirement role/index mismatch"));
+            if ids.len() != MAX_JOBS || !ids.contains(&old) {
+                return Err(error("completed production job retirement index mismatch"));
             }
             let status = self
                 .status(old)?
-                .ok_or_else(|| error("completed quorum job absent"))?;
+                .ok_or_else(|| error("completed production job absent"))?;
+            let version = match self.role {
+                ProductionRole::Sender => 1,
+                ProductionRole::Quorum => 2,
+            };
             if status.state != CanonicalProductionState::Complete
                 || status.error.is_some()
                 || status.components == 0
                 || status.checkpoint_bytes == 0
-                || status
-                    .manifest
-                    .as_ref()
-                    .is_none_or(|m| m.version != 2 || m.block_hash != old || m.validate().is_err())
+                || status.manifest.as_ref().is_none_or(|m| {
+                    m.version != version || m.block_hash != old || m.validate().is_err()
+                })
             {
-                return Err(error("quorum job is not complete and available"));
+                return Err(error("production job is not complete and available"));
             }
             self.source(&status)?;
             ids.retain(|id| *id != old);
@@ -459,11 +472,19 @@ impl<S: KvStore> CanonicalProductionStore<S> {
         let encoded = if completed.is_empty() {
             encode(&ids)?
         } else {
-            encode(&QuorumJobIndex {
-                version: 2,
-                active: ids,
-                completed,
-            })?
+            match self.role {
+                ProductionRole::Quorum => encode(&QuorumJobIndex {
+                    version: 2,
+                    active: ids,
+                    completed,
+                })?,
+                ProductionRole::Sender => encode(&SenderJobIndex {
+                    version: 3,
+                    role: "sender".into(),
+                    active: ids,
+                    completed,
+                })?,
+            }
         };
         self.write_locked(
             vec![
@@ -481,7 +502,7 @@ impl<S: KvStore> CanonicalProductionStore<S> {
             lock: self.lock.clone(),
             block: hash,
             prefix: certificate_prefix(hash),
-            completed_history: self.completed_history,
+            role: self.role,
         }
     }
 }
@@ -491,7 +512,7 @@ pub(super) struct ProductionJob<S: KvStore> {
     lock: Arc<parking_lot::Mutex<Option<u64>>>,
     block: ShellHash,
     prefix: Vec<u8>,
-    completed_history: bool,
+    role: ProductionRole,
 }
 impl<S: KvStore> ProductionJob<S> {
     fn component_name(k: &[u8]) -> Result<&str, StorageError> {
@@ -626,7 +647,7 @@ impl<S: KvStore> ProductionJob<S> {
         let owner = CanonicalProductionStore {
             store: self.store.clone(),
             lock: self.lock.clone(),
-            completed_history: self.completed_history,
+            role: self.role,
         };
         let ids = owner.all_ids()?;
         if reference.bytes > MAX_BYTES as usize
@@ -670,7 +691,7 @@ impl<S: KvStore> ProductionJob<S> {
         let owner = CanonicalProductionStore {
             store: self.store.clone(),
             lock: self.lock.clone(),
-            completed_history: self.completed_history,
+            role: self.role,
         };
         for block in owner.all_ids()? {
             let job = owner.job(block);
@@ -800,7 +821,7 @@ impl<S: KvStore> KvStore for ProductionJob<S> {
         CanonicalProductionStore {
             store: self.store.clone(),
             lock: self.lock.clone(),
-            completed_history: self.completed_history,
+            role: self.role,
         }
         .write_locked(changes.into_iter().collect(), &mut guard, DATA_CEILING)
     }
@@ -833,13 +854,99 @@ impl<S: KvStore + 'static> Node<S> {
                 .map_err(|e| e.to_string())?
                 .ok_or("canonical production tip absent")?;
             let source = CanonicalProductionSource::capture(&self.chain_store, tip, block.hash())?;
+            let retire = if self
+                .canonical_production
+                .ids()
+                .map_err(|e| e.to_string())?
+                .len()
+                >= MAX_JOBS
+            {
+                self.completed_sender_job_slot()?
+            } else {
+                None
+            };
             self.canonical_production
-                .insert(&source)
+                .insert_source_retiring(
+                    source.block().hash(),
+                    source.block().number(),
+                    source.identity(),
+                    retire,
+                )
                 .map_err(|e| e.to_string())
         })();
         if let Err(error) = captured {
             warn!(block=%block.hash(),%error,"canonical sender proof capture unavailable; native block remains committed");
         }
+    }
+    fn completed_sender_job_slot(&self) -> Result<Option<ShellHash>, String> {
+        let finalized = self
+            .chain_store
+            .get_finalized_number()
+            .map_err(|e| e.to_string())?;
+        let available = self
+            .canonical_proof_uploads
+            .available_manifests()
+            .map_err(|e| e.to_string())?;
+        let mut eligible = Vec::new();
+        for id in self.canonical_production.ids().map_err(|e| e.to_string())? {
+            let status = self
+                .canonical_production
+                .status(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("indexed sender status absent")?;
+            if status.state != CanonicalProductionState::Complete
+                || status.error.is_some()
+                || status.components == 0
+                || status.checkpoint_bytes == 0
+                || finalized.is_none_or(|n| n < status.block_number)
+            {
+                continue;
+            }
+            let source = self.restore_canonical_job(&status)?;
+            if self
+                .chain_store
+                .get_block_by_hash(&id)
+                .map_err(|e| e.to_string())?
+                .as_ref()
+                != Some(source.block())
+            {
+                return Err("completed sender canonical body changed".into());
+            }
+            let manifest = status
+                .manifest
+                .as_ref()
+                .ok_or("completed sender manifest absent")?;
+            if manifest.version != 1 {
+                return Err("completed sender manifest role mismatch".into());
+            }
+            if !available.contains(manifest) {
+                continue;
+            }
+            let upload = self
+                .canonical_proof_uploads
+                .status(&manifest.id())
+                .map_err(|e| e.to_string())?;
+            if upload.manifest != *manifest {
+                return Err("completed sender availability source changed".into());
+            }
+            if !matches!(
+                upload.state,
+                shell_storage::CanonicalProofUploadState::Ready
+                    | shell_storage::CanonicalProofUploadState::Verified
+            ) {
+                continue;
+            }
+            // Availability and finality permit local index rotation only. The
+            // receiver still verifies the full proof before authorizing execution.
+            self.canonical_proof_uploads
+                .payload(&manifest.id())
+                .map_err(|e| e.to_string())?;
+            eligible.push((status.block_number, id));
+        }
+        Ok(eligible
+            .into_iter()
+            .min_by_key(|(number, _)| *number)
+            .map(|(_, hash)| hash))
     }
     fn restore_canonical_job(
         &self,
@@ -924,7 +1031,11 @@ impl<S: KvStore + 'static> Node<S> {
                 .map_err(|e| e.to_string())?;
             let mut kv = self.canonical_production.job(status.block_hash);
             let mut donors = Vec::new();
-            for hash in self.canonical_production.ids().map_err(|e| e.to_string())? {
+            for hash in self
+                .canonical_production
+                .all_ids()
+                .map_err(|e| e.to_string())?
+            {
                 if hash == status.block_hash {
                     continue;
                 }
@@ -1220,6 +1331,411 @@ fn cancellation_budget_exhausted(budget: Option<NonZeroUsize>, used: usize) -> b
 mod tests {
     use super::*;
     use shell_storage::MemoryDb;
+    #[test]
+    fn completed_sender_jobs_retain_sources_and_certificates_through_typed_history() {
+        let db = Arc::new(MemoryDb::new());
+        let (node, _) = crate::NodeBuilder::new(NodeConfig::dev(Address::ZERO), db.clone())
+            .build()
+            .unwrap();
+        let owner = &node.canonical_production;
+        let first = ShellHash::from([0x91; 32]);
+        let second = ShellHash::from([0x92; 32]);
+        let third = ShellHash::from([0x93; 32]);
+        // Index/quota codec values only; these are not AIR or Native authorization.
+        for (number, hash) in [first, second].into_iter().enumerate() {
+            owner
+                .insert_source(hash, number as u64 + 1, b"retained source")
+                .unwrap();
+            owner
+                .job(hash)
+                .put(b"production/component/key", b"certificate")
+                .unwrap();
+            let mut status = owner.status(hash).unwrap().unwrap();
+            status.state = CanonicalProductionState::Complete;
+            status.components = 1;
+            status.checkpoint_bytes = 1;
+            status.manifest = Some(CanonicalProofManifest {
+                version: 1,
+                chain_id: 1337,
+                genesis_hash: ShellHash::from([9; 32]),
+                block_hash: hash,
+                total_bytes: 1,
+                payload_hash: blake3_hash(b"x"),
+            });
+            owner.save(&status).unwrap();
+        }
+        let retained: Vec<_> = db
+            .scan_all()
+            .unwrap()
+            .into_iter()
+            .filter(|(k, _)| k != &key(b"jobs") && k != &key(b"bytes"))
+            .collect();
+        owner
+            .insert_source_retiring(third, 3, b"new source", Some(first))
+            .unwrap();
+        assert_eq!(owner.ids().unwrap(), vec![second, third]);
+        assert_eq!(owner.all_ids().unwrap(), vec![first, second, third]);
+        let index: serde_json::Value =
+            serde_json::from_slice(&db.get(&key(b"jobs")).unwrap().unwrap()).unwrap();
+        assert_eq!(index["version"], 3);
+        assert_eq!(index["role"], "sender");
+        assert_eq!(
+            owner
+                .source(&owner.status(first).unwrap().unwrap())
+                .unwrap(),
+            b"retained source"
+        );
+        for (k, value) in retained {
+            assert_eq!(db.get(&k).unwrap(), Some(value));
+        }
+        let before = db.scan_all().unwrap();
+        assert_eq!(
+            owner
+                .job(first)
+                .get(b"production/component/key")
+                .unwrap()
+                .unwrap(),
+            b"certificate"
+        );
+        assert!(CanonicalProductionStore::new_quorum(db.clone())
+            .all_ids()
+            .is_err());
+        assert_eq!(db.scan_all().unwrap(), before);
+        owner
+            .job(third)
+            .put(b"production/component/key", b"certificate")
+            .unwrap();
+        let reopened = CanonicalProductionStore::new(db.clone());
+        let before = db.scan_all().unwrap();
+        for hash in [first, second, third] {
+            assert_eq!(
+                reopened.job(hash).get(b"production/component/key").unwrap(),
+                Some(b"certificate".to_vec())
+            );
+        }
+        assert_eq!(db.scan_all().unwrap(), before);
+    }
+    fn sender_history_fixture<S: KvStore + 'static>(db: Arc<S>) -> (Node<S>, Vec<Block>) {
+        use shell_core::{Account, BlockHeader, SignedTransaction, Transaction};
+        use shell_crypto::{DilithiumSigner, Signer};
+        let signer = DilithiumSigner::generate();
+        let authority = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let mut node = super::super::tests::setup_node_with_store(authority, db);
+        node.config.enable_stark_aggregation = false;
+        node.chain_store
+            .put_pubkey(&authority, signer.public_key())
+            .unwrap();
+        let root = {
+            let mut world = node.world_state.write();
+            world
+                .set_account(
+                    &authority,
+                    &Account::new_user_account(
+                        blake3_hash(signer.public_key()),
+                        U256::from(1_000_000_000u64),
+                    ),
+                )
+                .unwrap();
+            world.state_root().unwrap()
+        };
+        let genesis = Block {
+            header: BlockHeader {
+                state_root: root,
+                proposer: authority,
+                gas_limit: 30_000_000,
+                base_fee_per_gas: 1,
+                timestamp: 1_700_000_000,
+                ..Default::default()
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        let cfg = serde_json::from_value(serde_json::json!({
+            "chain_id":1337,"genesis_hash":genesis.hash(),"fee_accounting_activation_height":1,
+            "native_address_context_height":1,"block_commitment_height":1
+        }))
+        .unwrap();
+        node.chain_store
+            .commit_genesis_block(&genesis, &cfg)
+            .unwrap();
+        let mut blocks = vec![];
+        for nonce in 0..3 {
+            let tx = Transaction {
+                chain_id: 1337,
+                nonce,
+                to: Some(Address::from([0x74; 32])),
+                value: U256::from(100u64),
+                data: Default::default(),
+                gas_limit: 21_000,
+                max_fee_per_gas: 1,
+                max_priority_fee_per_gas: 0,
+                access_list: None,
+                tx_type: 0,
+                max_fee_per_blob_gas: None,
+                blob_versioned_hashes: None,
+            };
+            let sig = signer
+                .sign(tx.signing_hash(signer.sig_type().as_u8()).as_bytes())
+                .unwrap();
+            node.handle_incoming_tx(SignedTransaction::new(authority, tx, sig), &MultiVerifier)
+                .unwrap();
+            let block = node.produce_block(&signer, 1).unwrap();
+            let cert = Node::<S>::encode_commit_certificate(&HashMap::from([(
+                authority,
+                signer.sign(block.hash().as_bytes()).unwrap(),
+            )]))
+            .unwrap();
+            assert!(node.fast_finalize_with_certificate(block.number(), block.hash(), &cert));
+            if nonce < 2 {
+                let source = CanonicalProductionSource::capture(
+                    &node.chain_store,
+                    block.hash(),
+                    block.hash(),
+                )
+                .unwrap();
+                node.canonical_production
+                    .insert_source(block.hash(), block.number(), source.identity())
+                    .unwrap();
+                let mut status = node
+                    .canonical_production
+                    .status(block.hash())
+                    .unwrap()
+                    .unwrap();
+                status.state = CanonicalProductionState::Complete;
+                status.components = 1;
+                status.checkpoint_bytes = 1;
+                // Availability markers exercise local lifecycle eligibility only.
+                // Genuine full AIR and peer acceptance run through the example.
+                let manifest = CanonicalProofManifest {
+                    version: 1,
+                    chain_id: 1337,
+                    genesis_hash: genesis.hash(),
+                    block_hash: block.hash(),
+                    total_bytes: 1,
+                    payload_hash: blake3_hash(b"x"),
+                };
+                let upload = node
+                    .canonical_proof_uploads
+                    .begin(manifest.clone())
+                    .unwrap();
+                node.canonical_proof_uploads
+                    .append(&upload.proof_id, 0, b"x")
+                    .unwrap();
+                status.manifest = Some(manifest);
+                node.canonical_production.save(&status).unwrap();
+            }
+            blocks.push(block);
+        }
+        node.config.canonical_proof_production = true;
+        node.config.node_role = crate::NodeRole::Prover;
+        (node, blocks)
+    }
+    #[test]
+    fn completed_sender_capture_retires_oldest_with_native_state_unchanged() {
+        let db = Arc::new(MemoryDb::new());
+        let (node, blocks) = sender_history_fixture(db.clone());
+        // Deliberately reverse active order: age, not index position, selects retirement.
+        {
+            let owner = &node.canonical_production;
+            let mut guard = owner.lock.lock();
+            owner
+                .write_locked(
+                    vec![(
+                        key(b"jobs"),
+                        encode(&vec![blocks[1].hash(), blocks[0].hash()]).unwrap(),
+                    )],
+                    &mut guard,
+                    DATA_CEILING,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            node.completed_sender_job_slot().unwrap(),
+            Some(blocks[0].hash())
+        );
+        let before: Vec<_> = db
+            .scan_all()
+            .unwrap()
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with(PREFIX))
+            .collect();
+        node.capture_canonical_production(&blocks[2]);
+        assert_eq!(
+            node.canonical_production.ids().unwrap(),
+            vec![blocks[1].hash(), blocks[2].hash()]
+        );
+        assert_eq!(
+            node.canonical_production.all_ids().unwrap(),
+            blocks.iter().map(Block::hash).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            db.scan_all()
+                .unwrap()
+                .into_iter()
+                .filter(|(k, _)| !k.starts_with(PREFIX))
+                .collect::<Vec<_>>(),
+            before
+        );
+        let before = db.scan_all().unwrap();
+        for block in &blocks {
+            assert!(node
+                .canonical_production_status(block.hash())
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(db.scan_all().unwrap(), before);
+    }
+    #[test]
+    fn completed_sender_capture_requires_finality_availability_and_valid_source() {
+        for corruption in 0..8 {
+            let db = Arc::new(MemoryDb::new());
+            let (mut node, blocks) = sender_history_fixture(db.clone());
+            let owner = &node.canonical_production;
+            for block in &blocks[..2] {
+                let mut s = owner.status(block.hash()).unwrap().unwrap();
+                match corruption {
+                    1 => s.state = CanonicalProductionState::Paused,
+                    2 => s.error = Some("unfinished".into()),
+                    3 => s.source_hash = ShellHash::ZERO,
+                    4 => s.manifest.as_mut().unwrap().version = 2,
+                    5 => s.manifest.as_mut().unwrap().chain_id += 1,
+                    6 => {
+                        s.manifest.as_mut().unwrap().payload_hash = blake3_hash(b"unavailable");
+                    }
+                    _ => (),
+                }
+                owner.save(&s).unwrap();
+            }
+            if corruption == 0 {
+                node.chain_store.set_finalized_number(0).unwrap();
+            } else if corruption == 7 {
+                for (k, v) in db
+                    .scan_prefix(shell_storage::CANONICAL_PROOF_CACHE_PREFIX)
+                    .unwrap()
+                {
+                    if k.starts_with(
+                        &[shell_storage::CANONICAL_PROOF_CACHE_PREFIX, b"data/"].concat(),
+                    ) && v == b"x"
+                    {
+                        db.put(&k, b"y").unwrap();
+                    }
+                }
+            }
+            let before = db.scan_all().unwrap();
+            node.capture_canonical_production(&blocks[2]);
+            assert!(owner.status(blocks[2].hash()).unwrap().is_none());
+            assert_eq!(db.scan_all().unwrap(), before);
+            node.config.canonical_proof_production = false;
+            node.capture_canonical_production(&blocks[2]);
+            assert_eq!(db.scan_all().unwrap(), before);
+        }
+    }
+    #[test]
+    fn completed_sender_capture_rolls_back_the_entire_local_batch() {
+        let db = Arc::new(super::super::tests::FailingBatchDb::new());
+        let (node, blocks) = sender_history_fixture(db.clone());
+        let before = db.scan_all().unwrap();
+        db.fail_next_batch();
+        node.capture_canonical_production(&blocks[2]);
+        assert_eq!(db.scan_all().unwrap(), before);
+        node.capture_canonical_production(&blocks[2]);
+        assert_eq!(node.canonical_production.all_ids().unwrap().len(), 3);
+    }
+    #[test]
+    fn sender_history_rejects_wrong_role_version_duplicate_and_oversize_indices_read_only() {
+        let db = Arc::new(MemoryDb::new());
+        let owner = CanonicalProductionStore::new(db.clone());
+        let a = ShellHash::from([1; 32]);
+        let b = ShellHash::from([2; 32]);
+        let index = encode(&vec![a, b]).unwrap();
+        db.put(&key(b"jobs"), &index).unwrap();
+        let before = db.scan_all().unwrap();
+        assert_eq!(owner.all_ids().unwrap(), vec![a, b]);
+        assert_eq!(db.scan_all().unwrap(), before);
+        for bad in [
+            serde_json::json!({"version":2,"active":[b],"completed":[a]}),
+            serde_json::json!({"version":3,"role":"quorum","active":[b],"completed":[a]}),
+            serde_json::json!({"version":2,"role":"sender","active":[b],"completed":[a]}),
+            serde_json::json!({"version":3,"role":"sender","active":[a],"completed":[a]}),
+            serde_json::json!({"version":3,"role":"sender","active":[b],"completed":[a],"unknown":true}),
+            serde_json::json!({"version":3,"role":"sender","active":[a,b,a],"completed":[]}),
+        ] {
+            db.put(&key(b"jobs"), &encode(&bad).unwrap()).unwrap();
+            let before = db.scan_all().unwrap();
+            assert!(owner.all_ids().is_err());
+            assert_eq!(db.scan_all().unwrap(), before);
+        }
+    }
+    #[test]
+    fn sender_history_counts_archived_data_and_refuses_a_ninth_source_atomically() {
+        let db = Arc::new(MemoryDb::new());
+        let owner = CanonicalProductionStore::new(db.clone());
+        for i in 1..=shell_storage::MAX_CANONICAL_PROOF_OBJECTS {
+            let hash = ShellHash::from([i as u8; 32]);
+            let ids = owner.ids().unwrap();
+            owner
+                .insert_source_retiring(
+                    hash,
+                    i as u64,
+                    &[i as u8],
+                    (ids.len() == MAX_JOBS).then(|| ids[0]),
+                )
+                .unwrap();
+            owner
+                .job(hash)
+                .put(b"production/component/shared", b"retained")
+                .unwrap();
+            let mut s = owner.status(hash).unwrap().unwrap();
+            s.state = CanonicalProductionState::Complete;
+            s.components = 1;
+            s.checkpoint_bytes = 8;
+            s.manifest = Some(CanonicalProofManifest {
+                version: 1,
+                chain_id: 1337,
+                genesis_hash: ShellHash::from([9; 32]),
+                block_hash: hash,
+                total_bytes: 1,
+                payload_hash: blake3_hash(b"x"),
+            });
+            owner.save(&s).unwrap();
+        }
+        assert_eq!(owner.ids().unwrap().len(), MAX_JOBS);
+        assert_eq!(
+            owner.all_ids().unwrap().len(),
+            shell_storage::MAX_CANONICAL_PROOF_OBJECTS
+        );
+        let before = db.scan_all().unwrap();
+        let actual: u64 = before
+            .iter()
+            .filter(|(k, _)| k != &key(b"bytes"))
+            .map(|(k, v)| (k.len() + v.len()) as u64)
+            .sum();
+        assert_eq!(
+            u64::from_be_bytes(db.get(&key(b"bytes")).unwrap().unwrap().try_into().unwrap()),
+            actual
+        );
+        assert!(owner
+            .insert_source_retiring(
+                ShellHash::from([10; 32]),
+                9,
+                b"ninth",
+                Some(owner.ids().unwrap()[0])
+            )
+            .is_err());
+        assert_eq!(db.scan_all().unwrap(), before);
+        let reopened = CanonicalProductionStore::new(db.clone());
+        for id in reopened.all_ids().unwrap() {
+            assert_eq!(
+                reopened
+                    .job(id)
+                    .get(b"production/component/shared")
+                    .unwrap(),
+                Some(b"retained".to_vec())
+            );
+        }
+        assert_eq!(db.scan_all().unwrap(), before);
+    }
     #[test]
     fn legacy_compaction_preserves_original_bytes_references_and_native_state() {
         let db = Arc::new(MemoryDb::new());
