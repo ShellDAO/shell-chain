@@ -1039,6 +1039,94 @@ fn recovery_native_digest<S: KvStore + 'static>(n: &Node<S>) -> Result<ShellHash
     Ok(blake3_hash(&serde_json::to_vec(&rows)?))
 }
 
+pub(super) fn run_producer_snapshot(
+    controls: &Path,
+    path: &Path,
+    proof_file: &Path,
+) -> Result<(), Error> {
+    let c: Control = read(&controls.join("control.cbor"))?;
+    ensure(
+        c.blocks.len() == 1 && c.certificates.len() == 1,
+        "snapshot requires one-block controls",
+    )?;
+    ensure(
+        path.join("CURRENT").is_file(),
+        "existing owner database required",
+    )?;
+    let fingerprint = |rows: &Rows| -> Result<ShellHash, Error> {
+        let entries: Vec<_> = rows
+            .iter()
+            .map(|(key, value)| (key, blake3_hash(value)))
+            .collect();
+        Ok(blake3_hash(&serde_json::to_vec(&entries)?))
+    };
+    let stores = RocksDbStore::open_all(path, None)?;
+    let store = Arc::new(stores.state);
+    let before = fingerprint(&store.scan_all()?)?;
+    let n = node_on_store(store, &c, false)?;
+    let reference = node(&controls.join("control-db"), &c, false)?;
+    let native = recovery_native_digest(&n)?;
+    ensure(
+        n.chain_store.get_head_hash()? == Some(c.blocks[0].hash())
+            && n.chain_store.get_finalized_number()? == Some(1)
+            && native == recovery_native_digest(&reference)?,
+        "snapshot differs from independent Native1",
+    )?;
+    ensure(
+        n.commit_quorum_source(1, c.blocks[0].hash(), &c.certificates[0])?
+            == read::<CommitQuorumSource>(&controls.join("source.cbor"))?,
+        "snapshot source differs from original controls",
+    )?;
+    let prefix = [
+        b"local/quorum-production/v1/certificates/".as_slice(),
+        c.blocks[0].hash().as_bytes(),
+        b"/production/",
+    ]
+    .concat();
+    let source = n
+        .store
+        .get(&[prefix.as_slice(), b"source"].concat())?
+        .ok_or("owned source absent")?;
+    let components = n
+        .store
+        .scan_prefix(&[prefix.as_slice(), b"component/"].concat())?;
+    let bytes = components
+        .iter()
+        .try_fold(source.len(), |sum, (_, value)| sum.checked_add(value.len()))
+        .ok_or("checkpoint bytes overflow")?;
+    ensure(
+        !components.is_empty()
+            && bytes <= shell_stark_prover::production_store::MAX_CHECKPOINT_BYTES,
+        "snapshot checkpoint count or quota invalid",
+    )?;
+    let payload = frame(proof_file)?;
+    let m = manifest(&c, &payload);
+    let cache = shell_storage::CanonicalProofUploadStore::new(n.store.clone());
+    ensure(
+        cache.status(&m.id())?.state == CanonicalProofUploadState::Ready
+            && cache.payload(&m.id())? == payload,
+        "snapshot availability differs from original produced payload",
+    )?;
+    drop(payload);
+    balances(&n, &c, 1)?;
+    let status = n
+        .quorum_production_status(c.blocks[0].hash())?
+        .ok_or("owner status absent")?;
+    ensure(
+        fingerprint(&n.store.scan_all()?)? == before,
+        "offline snapshot changed logical rows",
+    )?;
+    println!(
+        "{}",
+        json!({"quorumProducerSnapshot":true,"head":1,"finalized":1,
+        "nativeDigest":native,"ownedSourceHash":blake3_hash(&source),"componentRowsDigest":fingerprint(&components)?,
+        "componentCount":components.len(),"checkpointBytes":bytes,"payloadHash":m.payload_hash,
+        "payloadBytes":m.total_bytes,"proofCacheReady":true,"status":status,
+        "independentNative1RowsEqual":true,"logicalRowsUnchanged":true,"newProofMath":0})
+    );
+    Ok(())
+}
+
 fn recovery_genesis_balances<S: KvStore + 'static>(n: &Node<S>, c: &Control) -> Result<(), Error> {
     let state = n.world_state.read();
     let sender = state

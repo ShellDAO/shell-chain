@@ -1438,3 +1438,40 @@ are checked as verifier preflight refusals. The receiver remains at tip one;
 later-tip replay for this role layout, other signer layouts and host/resource
 profiles require their own results. These commands do not activate a network or
 guarantee that every mixed graph fits the existing resource bounds.
+### Abrupt loss during complete-job revalidation
+
+After the preceding one-block production flow completes, stop the provider
+before running this POSIX Python 3.11-or-newer regression. It locks the input databases
+while copying them to a new directory, then operates only on those copies:
+
+```sh
+python3 tools/check-quorum-producer-crash.py \
+  target/debug/examples/quorum-native \
+  reverse-controls reverse-provider-db reverse-receiver.proof.cbor \
+  reverse-crash-case \
+  --marker 'Reverified commit-signer-1-layer-5-chain-1'
+```
+
+Choose a marker present in the successful production log for your generated
+keys. The example selects a completed SLH component in the ML-DSA-primary
+profile; a zero-length WOTS chain can be absent for other inputs.
+The script kills only its own verifier child after observing that exact line.
+It requires a non-complete persisted job after interruption, identical source,
+component bytes, logical checkpoint charge, original payload and independent
+Native state. It then resumes the same owner through `producer-auto`, requires
+zero new proving and a real automatic TCP/Noise peer at Native/finality 1, and
+runs the receiver's full cold historical verification again.
+
+The `producer-snapshot <controls> <existing-owner-db> <complete-proof.cbor>`
+entry performs the offline comparisons without running a worker. Its Ready
+payload check measures availability; full proof authorization is established
+by the producer revalidation and receiving node. Snapshot reads must preserve
+all logical database rows.
+
+Success prints `quorumProducerCrashRecovery: true` and exits zero. Failure exits
+nonzero and leaves `result.json`, command logs and all copied databases in the
+new directory. A missing marker, timeout, unexpected exit, new proving or
+changed state fails the check. No input database, proof, key or dependency is
+deleted. This exercises process loss after a completed component revalidation,
+not interruption at an exact STARK instruction, initial checkpoint creation,
+machine power loss or every signer/host profile.
