@@ -1,7 +1,7 @@
 //! Consecutive full-quorum admissions with bounded local intake metadata.
 use super::*;
 
-fn controls(path: &Path) -> Result<Control, Error> {
+pub(super) fn controls(path: &Path) -> Result<Control, Error> {
     let c: Control = read(&path.join("control.cbor"))?;
     ensure(
         c.blocks.len() == 3
@@ -68,7 +68,7 @@ pub(super) fn capture(
     Ok(())
 }
 
-fn expected(
+pub(super) fn expected(
     receiver: &Live,
     provider: &Live,
     c: &Control,
@@ -96,7 +96,7 @@ fn expected(
     )
 }
 
-async fn wait_head(live: &Live, c: &Control, number: usize) -> Result<(), Error> {
+pub(super) async fn wait_head(live: &Live, c: &Control, number: usize) -> Result<(), Error> {
     tokio::time::timeout(Duration::from_secs(240), async {
         loop {
             ensure(!live.task.is_finished(), "successor receiver exited")?;

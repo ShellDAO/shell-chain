@@ -1268,12 +1268,12 @@ impl<S: KvStore + 'static> Node<S> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use shell_crypto::{MlDsaSigner, Signer};
     use shell_storage::MemoryDb;
 
-    fn completed_quorum_fixture<S: KvStore + 'static>(
+    pub(in crate::node) fn completed_quorum_fixture<S: KvStore + 'static>(
         db: Arc<S>,
         finalize: bool,
     ) -> (Node<S>, Vec<Block>, Vec<Vec<u8>>) {

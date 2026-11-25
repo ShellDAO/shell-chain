@@ -26,6 +26,10 @@ const QUORUM: &[u8] = b"local/quorum-production/v1/";
 fn error(e: impl std::fmt::Display) -> StorageError {
     StorageError::State(e.to_string())
 }
+fn terminal_error(message: &str) -> String {
+    // At most2KiB UTF-8 or3KiB escaped JSON per status, even for control bytes.
+    message.chars().take(512).collect()
+}
 /// Only owner-local keys can cross this adapter; Native and sender keys cannot.
 pub(super) struct QuorumNamespace<S: KvStore> {
     store: Arc<S>,
@@ -204,6 +208,74 @@ impl<S: KvStore + 'static> Node<S> {
         }
         Ok(expected)
     }
+    fn completed_quorum_job_slot(&self) -> Result<Option<ShellHash>, String> {
+        let mut eligible = Vec::new();
+        let available = self
+            .canonical_proof_uploads
+            .available_manifests()
+            .map_err(|e| e.to_string())?;
+        for id in self.quorum_production.ids().map_err(|e| e.to_string())? {
+            let status = self
+                .quorum_production
+                .status(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("indexed quorum status absent")?;
+            if status.state != State::Complete
+                || status.error.is_some()
+                || status.components == 0
+                || status.checkpoint_bytes == 0
+            {
+                continue;
+            }
+            self.restore_quorum_source(&status)?;
+            let manifest = status
+                .manifest
+                .as_ref()
+                .ok_or("completed quorum manifest absent")?;
+            if !available.contains(manifest) {
+                continue;
+            }
+            let upload = self
+                .canonical_proof_uploads
+                .status(&manifest.id())
+                .map_err(|e| e.to_string())?;
+            if upload.manifest != *manifest {
+                return Err("completed quorum availability source changed".into());
+            }
+            if !matches!(
+                upload.state,
+                shell_storage::CanonicalProofUploadState::Ready
+                    | shell_storage::CanonicalProofUploadState::Verified
+            ) {
+                continue;
+            }
+            // Hash-checked immutable bytes must still be available. This moves
+            // local index membership only; it grants no proof or Native authority.
+            self.canonical_proof_uploads
+                .payload(&manifest.id())
+                .map_err(|e| e.to_string())?;
+            eligible.push((status.block_number, id));
+        }
+        Ok(eligible
+            .into_iter()
+            .min_by_key(|(number, _)| *number)
+            .map(|(_, hash)| hash))
+    }
+    fn insert_quorum_source(
+        &self,
+        source: &Source,
+        retire: Option<ShellHash>,
+    ) -> Result<(), String> {
+        let bytes = bounded_json(source, 1024 * 1024).map_err(|e| e.to_string())?;
+        self.quorum_production
+            .insert_source_retiring(
+                source.source.context.block_hash,
+                source.source.context.block_number,
+                &bytes,
+                retire,
+            )
+            .map_err(|e| e.to_string())
+    }
     /// Recover only a separate complete source-bound job while this node is offline.
     /// Every checkpoint is reverified before any owned descriptor/component is written.
     pub fn recover_quorum_production_job<D: KvStore>(
@@ -230,10 +302,24 @@ impl<S: KvStore + 'static> Node<S> {
                 Ok(())
             })
             .map_err(|e| e.to_string())?;
-        let identity = bounded_json(&source, 1024 * 1024).map_err(|e| e.to_string())?;
-        self.quorum_production
-            .insert_source(block, source.source.context.block_number, &identity)
-            .map_err(|e| e.to_string())?;
+        let existing = self
+            .quorum_production
+            .status(block)
+            .map_err(|e| e.to_string())?
+            .is_some();
+        let retire = if !existing
+            && self
+                .quorum_production
+                .ids()
+                .map_err(|e| e.to_string())?
+                .len()
+                >= 2
+        {
+            self.completed_quorum_job_slot()?
+        } else {
+            None
+        };
+        self.insert_quorum_source(&source, retire)?;
         self.quorum_production
             .job(block)
             .write_batch(rows)
@@ -263,8 +349,11 @@ impl<S: KvStore + 'static> Node<S> {
         self.quorum_production.status(block).map_err(|e|e.to_string())?.map(|s|{self.restore_quorum_source(&s)?;Ok(serde_json::json!({"status":s,"artifactVersion":2,"nativeExecutionVerified":false}))}).transpose()
     }
     fn capture_next_quorum_job(&self) -> Result<(), String> {
-        let ids = self.quorum_production.ids().map_err(|e| e.to_string())?;
-        if ids.len() >= 2 {
+        let ids = self
+            .quorum_production
+            .all_ids()
+            .map_err(|e| e.to_string())?;
+        if ids.len() >= shell_storage::MAX_CANONICAL_PROOF_OBJECTS {
             return Ok(());
         }
         let cfg = self
@@ -297,16 +386,28 @@ impl<S: KvStore + 'static> Node<S> {
         {
             return Ok(());
         }
+        let full = self
+            .quorum_production
+            .ids()
+            .map_err(|e| e.to_string())?
+            .len()
+            >= 2;
+        let retire = if full {
+            self.completed_quorum_job_slot()?
+        } else {
+            None
+        };
+        if full && retire.is_none() {
+            // Existing queued/paused jobs must be allowed to finish first.
+            return Ok(());
+        }
         let hash = self
             .chain_store
             .get_block_hash_by_number(next)
             .map_err(|e| e.to_string())?
             .ok_or("finalized quorum header missing")?;
         let source = self.capture_quorum_source(hash)?;
-        let bytes = bounded_json(&source, 1024 * 1024).map_err(|e| e.to_string())?;
-        self.quorum_production
-            .insert_source(hash, next, &bytes)
-            .map_err(|e| e.to_string())
+        self.insert_quorum_source(&source, retire)
     }
     fn produce_quorum_job(
         &self,
@@ -409,7 +510,7 @@ impl<S: KvStore + 'static> Node<S> {
                 if status.state != State::Paused {
                     status.state = State::Failed;
                 }
-                status.error = Some(e.chars().take(2048).collect());
+                status.error = Some(terminal_error(&e));
             }
         }
         if let Err(e) = self.quorum_production.save(&status) {
@@ -430,7 +531,7 @@ impl<S: KvStore + 'static> Node<S> {
         }
         self.capture_next_quorum_job().map_err(NodeError::Startup)?;
         // Cold startup always rechecks complete checkpoints; persisted state is not authority.
-        for id in self.quorum_production.ids()? {
+        for id in self.quorum_production.all_ids()? {
             if let Some(mut s) = self.quorum_production.status(id)? {
                 s.state = State::Queued;
                 s.error = None;
@@ -454,7 +555,7 @@ impl<S: KvStore + 'static> Node<S> {
                         .canonical_proof_component_budget
                         .map(|n| n.get().saturating_sub(used));
                     if remaining != Some(0) {
-                        let next = node.quorum_production.ids().and_then(|ids| {
+                        let next = node.quorum_production.all_ids().and_then(|ids| {
                             for id in ids {
                                 if !attempted.contains(&id) {
                                     if let Some(s) = node.quorum_production.status(id)? {
@@ -520,6 +621,284 @@ mod tests {
     use super::super::canonical_production::CanonicalProductionStore;
     use super::*;
     use shell_storage::MemoryDb;
+    fn complete_marker<S: KvStore>(
+        owner: &CanonicalProductionStore<QuorumNamespace<S>>,
+        hash: ShellHash,
+    ) {
+        let mut status = owner.status(hash).unwrap().unwrap();
+        // Store lifecycle metadata only; not mathematical or Native authorization.
+        status.state = State::Complete;
+        status.components = 1;
+        status.checkpoint_bytes = 1;
+        status.manifest = Some(shell_storage::CanonicalProofManifest {
+            version: 2,
+            chain_id: 1337,
+            genesis_hash: ShellHash::from([9; 32]),
+            block_hash: hash,
+            total_bytes: 1,
+            payload_hash: shell_primitives::blake3_hash(b"x"),
+        });
+        owner.save(&status).unwrap();
+    }
+    fn completed_owner<S: KvStore>(
+        raw: Arc<S>,
+    ) -> (CanonicalProductionStore<QuorumNamespace<S>>, [ShellHash; 3]) {
+        raw.put(b"HEAD", b"Native anchor").unwrap();
+        let owner = CanonicalProductionStore::new_quorum(Arc::new(QuorumNamespace::new(raw)));
+        let blocks = [
+            ShellHash::from([1; 32]),
+            ShellHash::from([2; 32]),
+            ShellHash::from([3; 32]),
+        ];
+        for (i, hash) in blocks[..2].iter().enumerate() {
+            owner
+                .insert_source(*hash, (i + 1) as u64, &[i as u8])
+                .unwrap();
+            owner
+                .job(*hash)
+                .put(b"production/source", &[i as u8])
+                .unwrap();
+            owner
+                .job(*hash)
+                .put(b"production/component/shared-matrix", b"metadata fixture")
+                .unwrap();
+            complete_marker(&owner, *hash);
+        }
+        (owner, blocks)
+    }
+    #[test]
+    fn completed_quorum_jobs_admit_a_third_source_without_losing_history() {
+        let raw = Arc::new(MemoryDb::new());
+        let (owner, blocks) = completed_owner(raw.clone());
+        let before = raw.scan_all().unwrap();
+        owner
+            .insert_source_retiring(blocks[2], 3, b"third source", Some(blocks[0]))
+            .unwrap();
+        assert_eq!(owner.ids().unwrap(), vec![blocks[1], blocks[2]]);
+        assert_eq!(owner.all_ids().unwrap(), blocks);
+        for (key, value) in before {
+            if key != [QUORUM, b"jobs"].concat() && key != [QUORUM, b"bytes"].concat() {
+                assert_eq!(raw.get(&key).unwrap(), Some(value));
+            }
+        }
+        assert_eq!(
+            owner.status(blocks[0]).unwrap().unwrap().state,
+            State::Complete
+        );
+        let reopened = CanonicalProductionStore::new_quorum(Arc::new(QuorumNamespace::new(raw)));
+        assert_eq!(reopened.all_ids().unwrap(), blocks);
+        for hash in &blocks[..2] {
+            assert_eq!(
+                reopened
+                    .job(*hash)
+                    .get(b"production/component/shared-matrix")
+                    .unwrap(),
+                Some(b"metadata fixture".to_vec())
+            );
+        }
+        assert!(reopened
+            .job(blocks[2])
+            .put(b"production/component/shared-matrix", b"metadata fixture")
+            .is_ok());
+    }
+    #[test]
+    fn completed_quorum_jobs_reject_unfinished_corrupt_and_wrong_role_retirements() {
+        for state in [State::Queued, State::Proving, State::Paused, State::Failed] {
+            let raw = Arc::new(MemoryDb::new());
+            let (owner, blocks) = completed_owner(raw.clone());
+            let mut status = owner.status(blocks[0]).unwrap().unwrap();
+            status.state = state;
+            owner.save(&status).unwrap();
+            let before = raw.scan_all().unwrap();
+            assert!(owner
+                .insert_source_retiring(blocks[2], 3, b"new", Some(blocks[0]))
+                .is_err());
+            assert_eq!(raw.scan_all().unwrap(), before);
+        }
+        for corruption in 0..3 {
+            let raw = Arc::new(MemoryDb::new());
+            let (owner, blocks) = completed_owner(raw.clone());
+            let mut status = owner.status(blocks[0]).unwrap().unwrap();
+            match corruption {
+                0 => status.manifest.as_mut().unwrap().version = 1,
+                1 => status.source_hash = ShellHash::ZERO,
+                _ => status.error = Some("unrepaired".into()),
+            };
+            owner.save(&status).unwrap();
+            let before = raw.scan_all().unwrap();
+            assert!(owner
+                .insert_source_retiring(blocks[2], 3, b"new", Some(blocks[0]))
+                .is_err());
+            assert_eq!(raw.scan_all().unwrap(), before);
+        }
+        let raw = Arc::new(MemoryDb::new());
+        let sender = CanonicalProductionStore::new(raw.clone());
+        let hashes = [
+            ShellHash::from([1; 32]),
+            ShellHash::from([2; 32]),
+            ShellHash::from([3; 32]),
+        ];
+        for (i, hash) in hashes[..2].iter().enumerate() {
+            sender.insert_source(*hash, i as u64, b"sender").unwrap();
+        }
+        let before = raw.scan_all().unwrap();
+        assert!(sender.insert_source(hashes[2], 3, b"sender").is_err());
+        assert!(sender
+            .insert_source_retiring(hashes[2], 3, b"sender", Some(hashes[0]))
+            .is_err());
+        assert_eq!(raw.scan_all().unwrap(), before);
+    }
+    #[test]
+    fn completed_quorum_jobs_history_is_bounded_and_duplicate_membership_fails_closed() {
+        let raw = Arc::new(MemoryDb::new());
+        let (owner, _) = completed_owner(raw.clone());
+        for i in 3..=shell_storage::MAX_CANONICAL_PROOF_OBJECTS {
+            let hash = ShellHash::from([i as u8; 32]);
+            let old = owner.ids().unwrap()[0];
+            owner
+                .insert_source_retiring(hash, i as u64, &[i as u8], Some(old))
+                .unwrap();
+            complete_marker(&owner, hash);
+        }
+        assert_eq!(
+            owner.all_ids().unwrap().len(),
+            shell_storage::MAX_CANONICAL_PROOF_OBJECTS
+        );
+        assert_eq!(owner.ids().unwrap().len(), 2);
+        let before = raw.scan_all().unwrap();
+        assert!(owner
+            .insert_source_retiring(
+                ShellHash::from([9; 32]),
+                9,
+                b"over bound",
+                Some(owner.ids().unwrap()[0])
+            )
+            .is_err());
+        assert_eq!(raw.scan_all().unwrap(), before);
+        let index_key = [QUORUM, b"jobs"].concat();
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&raw.get(&index_key).unwrap().unwrap()).unwrap();
+        index["active"][0] = index["completed"][0].clone();
+        raw.put(&index_key, &serde_json::to_vec(&index).unwrap())
+            .unwrap();
+        let before = raw.scan_all().unwrap();
+        assert!(owner.all_ids().is_err());
+        assert!(owner
+            .insert_source(ShellHash::from([10; 32]), 10, b"bad index")
+            .is_err());
+        assert_eq!(raw.scan_all().unwrap(), before);
+    }
+    #[test]
+    fn completed_quorum_jobs_roll_back_history_source_and_counter_on_batch_error() {
+        let raw = Arc::new(super::super::tests::FailingBatchDb::new());
+        let (owner, blocks) = completed_owner(raw.clone());
+        let before = raw.scan_all().unwrap();
+        raw.fail_next_batch();
+        assert!(owner
+            .insert_source_retiring(blocks[2], 3, b"new", Some(blocks[0]))
+            .is_err());
+        assert_eq!(raw.scan_all().unwrap(), before);
+        owner
+            .insert_source_retiring(blocks[2], 3, b"new", Some(blocks[0]))
+            .unwrap();
+        assert_eq!(owner.all_ids().unwrap(), blocks);
+        assert_eq!(
+            owner
+                .job(blocks[1])
+                .get(b"production/component/shared-matrix")
+                .unwrap(),
+            Some(b"metadata fixture".to_vec())
+        );
+    }
+    #[test]
+    fn completed_quorum_jobs_require_real_native_source_and_ready_immutable_availability() {
+        for corruption in 0..4 {
+            let raw = Arc::new(MemoryDb::new());
+            let (mut node, blocks, _) =
+                super::super::canonical_admission::tests::completed_quorum_fixture(
+                    raw.clone(),
+                    true,
+                );
+            for block in &blocks[..2] {
+                let source = node.capture_quorum_source(block.hash()).unwrap();
+                let bytes = bounded_json(&source, 1024 * 1024).unwrap();
+                node.quorum_production
+                    .insert_source(block.hash(), block.number(), &bytes)
+                    .unwrap();
+                let mut status = node
+                    .quorum_production
+                    .status(block.hash())
+                    .unwrap()
+                    .unwrap();
+                status.state = State::Complete;
+                status.components = 1;
+                status.checkpoint_bytes = 1;
+                status.manifest = node
+                    .canonical_proof_uploads
+                    .available_manifests()
+                    .unwrap()
+                    .into_iter()
+                    .find(|m| m.block_hash == block.hash());
+                node.quorum_production.save(&status).unwrap();
+            }
+            assert_eq!(
+                node.completed_quorum_job_slot().unwrap(),
+                Some(blocks[0].hash())
+            );
+            if corruption == 0 {
+                node.chain_store.set_finalized_number(0).unwrap();
+            } else if corruption == 1 {
+                let mut s = node
+                    .quorum_production
+                    .status(blocks[0].hash())
+                    .unwrap()
+                    .unwrap();
+                s.manifest.as_mut().unwrap().chain_id += 1;
+                node.quorum_production.save(&s).unwrap();
+            } else if corruption == 2 {
+                let key = raw
+                    .scan_prefix(shell_storage::CANONICAL_PROOF_CACHE_PREFIX)
+                    .unwrap()
+                    .into_iter()
+                    .find(|(k, v)| {
+                        k.starts_with(
+                            &[shell_storage::CANONICAL_PROOF_CACHE_PREFIX, b"data/"].concat(),
+                        ) && v == b"x"
+                    })
+                    .unwrap()
+                    .0;
+                raw.put(&key, b"y").unwrap();
+            } else {
+                node.config.canonical_quorum_production = false;
+                let before = raw.scan_all().unwrap();
+                assert!(Arc::new(node).start_quorum_production().unwrap().is_none());
+                assert_eq!(raw.scan_all().unwrap(), before);
+                continue;
+            }
+            let before = raw.scan_all().unwrap();
+            assert!(node.completed_quorum_job_slot().is_err());
+            assert_eq!(raw.scan_all().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn completed_quorum_jobs_terminal_errors_fit_the_existing_metadata_reserve() {
+        let raw = Arc::new(MemoryDb::new());
+        let (owner, blocks) = completed_owner(raw);
+        for text in ["\0".repeat(4096), "😀".repeat(4096), "é".repeat(4096)] {
+            let message = terminal_error(&text);
+            assert!(message.len() <= 2048);
+            assert!(serde_json::to_vec(&message).unwrap().len() <= 3074);
+            let mut status = owner.status(blocks[0]).unwrap().unwrap();
+            status.error = Some(message);
+            status.state = State::Failed;
+            status.block_number = u64::MAX;
+            status.newly_proved = usize::MAX;
+            status.reused = usize::MAX;
+            let record_bytes = serde_json::to_vec(&status).unwrap().len() + 128;
+            assert!(record_bytes * shell_storage::MAX_CANONICAL_PROOF_OBJECTS < 64 * 1024);
+        }
+    }
     #[test]
     fn quorum_owner_isolates_roles_and_rejects_mixed_native_batch() {
         let raw = Arc::new(MemoryDb::new());

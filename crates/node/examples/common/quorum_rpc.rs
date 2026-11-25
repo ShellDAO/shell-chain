@@ -12,8 +12,13 @@ use shell_storage::{
 use std::{net::SocketAddr, time::Duration};
 #[path = "quorum_fault.rs"]
 mod batch_fault;
+#[path = "quorum_producer_lifecycle.rs"]
+mod producer_lifecycle;
 #[path = "quorum_successor.rs"]
 mod successor;
+pub(super) fn run_producer_lifecycle(args: &[String]) -> Result<(), Error> {
+    producer_lifecycle::run(args)
+}
 
 pub(super) fn run_successor(args: &[String]) -> Result<(), Error> {
     if args[0] == "successor-source" {

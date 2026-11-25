@@ -1014,9 +1014,10 @@ impl<S: KvStore + 'static> Node<S> {
 
         let canonical_proof_uploads =
             Arc::new(shell_storage::CanonicalProofUploadStore::new(store.clone()));
-        let quorum_production = Arc::new(canonical_production::CanonicalProductionStore::new(
-            Arc::new(quorum_production::QuorumNamespace::new(store.clone())),
-        ));
+        let quorum_production =
+            Arc::new(canonical_production::CanonicalProductionStore::new_quorum(
+                Arc::new(quorum_production::QuorumNamespace::new(store.clone())),
+            ));
         let canonical_production = Arc::new(canonical_production::CanonicalProductionStore::new(
             store.clone(),
         ));

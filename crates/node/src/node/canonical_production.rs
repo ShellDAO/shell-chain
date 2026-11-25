@@ -90,29 +90,77 @@ pub struct CanonicalProductionStatus {
     pub manifest: Option<CanonicalProofManifest>,
     pub error: Option<String>,
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuorumJobIndex {
+    version: u8,
+    active: Vec<ShellHash>,
+    completed: Vec<ShellHash>,
+}
+
 /// One shared writer lock and global quota for descriptors, records and certificates.
 pub(super) struct CanonicalProductionStore<S: KvStore> {
     store: Arc<S>,
     lock: Arc<parking_lot::Mutex<Option<u64>>>,
+    completed_history: bool,
 }
 impl<S: KvStore> CanonicalProductionStore<S> {
     pub(super) fn new(store: Arc<S>) -> Self {
         Self {
             store,
             lock: Arc::new(parking_lot::Mutex::new(None)),
+            completed_history: false,
         }
     }
-    pub(super) fn ids(&self) -> Result<Vec<ShellHash>, StorageError> {
-        let ids: Vec<ShellHash> = self
+    pub(super) fn new_quorum(store: Arc<S>) -> Self {
+        Self {
+            completed_history: true,
+            ..Self::new(store)
+        }
+    }
+    fn job_index(&self) -> Result<QuorumJobIndex, StorageError> {
+        let bytes = self
             .store
             .get(&key(b"jobs"))?
-            .map(|b| serde_json::from_slice(&b).map_err(error))
-            .transpose()?
-            .unwrap_or_default();
-        if ids.len() > MAX_JOBS || ids.iter().collect::<HashSet<_>>().len() != ids.len() {
+            .unwrap_or_else(|| b"[]".to_vec());
+        if bytes.len() > 4096 {
+            return Err(error("production job index byte limit"));
+        }
+        let index = if self.completed_history
+            && bytes.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{')
+        {
+            let index: QuorumJobIndex = serde_json::from_slice(&bytes).map_err(error)?;
+            if index.version != 2 {
+                return Err(error("quorum job history version"));
+            }
+            index
+        } else {
+            QuorumJobIndex {
+                version: 1,
+                active: serde_json::from_slice(&bytes).map_err(error)?,
+                completed: vec![],
+            }
+        };
+        let ids: Vec<_> = index.completed.iter().chain(&index.active).collect();
+        let limit = if self.completed_history {
+            shell_storage::MAX_CANONICAL_PROOF_OBJECTS
+        } else {
+            MAX_JOBS
+        };
+        if index.active.len() > MAX_JOBS
+            || ids.len() > limit
+            || ids.iter().copied().collect::<HashSet<_>>().len() != ids.len()
+        {
             return Err(error("canonical production job index corrupt"));
         }
-        Ok(ids)
+        Ok(index)
+    }
+    pub(super) fn all_ids(&self) -> Result<Vec<ShellHash>, StorageError> {
+        let index = self.job_index()?;
+        Ok(index.completed.into_iter().chain(index.active).collect())
+    }
+    pub(super) fn ids(&self) -> Result<Vec<ShellHash>, StorageError> {
+        Ok(self.job_index()?.active)
     }
     fn checked_total(&self, observed: &mut Option<u64>) -> Result<u64, StorageError> {
         let old = self
@@ -329,21 +377,67 @@ impl<S: KvStore> CanonicalProductionStore<S> {
         number: u64,
         identity: &[u8],
     ) -> Result<(), StorageError> {
+        self.insert_source_retiring(hash, number, identity, None)
+    }
+    pub(super) fn insert_source_retiring(
+        &self,
+        hash: ShellHash,
+        number: u64,
+        identity: &[u8],
+        retire: Option<ShellHash>,
+    ) -> Result<(), StorageError> {
         if identity.len() > 4 * 1024 * 1024 {
             return Err(error("production source size limit"));
         }
         let mut guard = self.lock.lock();
+        let index = self.job_index()?;
         if let Some(status) = self.status(hash)? {
+            if !index.active.contains(&hash) && !index.completed.contains(&hash) {
+                return Err(error("orphaned canonical production status retained"));
+            }
             if status.block_number != number || self.source(&status)? != identity {
                 return Err(error("immutable production source conflict"));
             }
             return Ok(());
         }
-        let mut ids = self.ids()?;
-        if ids.contains(&hash) || self.store.get(&source_key(hash))?.is_some() {
+        let mut ids = index.active;
+        let mut completed = index.completed;
+        if ids.contains(&hash)
+            || completed.contains(&hash)
+            || self.store.get(&source_key(hash))?.is_some()
+        {
             return Err(error("orphaned canonical production source/index retained"));
         }
-        if ids.len() >= MAX_JOBS {
+        let limit = if self.completed_history {
+            shell_storage::MAX_CANONICAL_PROOF_OBJECTS
+        } else {
+            MAX_JOBS
+        };
+        if self.completed_history && ids.len() + completed.len() >= limit {
+            return Err(error("canonical production retained history limit reached"));
+        }
+        if let Some(old) = retire {
+            if !self.completed_history || ids.len() != MAX_JOBS || !ids.contains(&old) {
+                return Err(error("quorum completed job retirement role/index mismatch"));
+            }
+            let status = self
+                .status(old)?
+                .ok_or_else(|| error("completed quorum job absent"))?;
+            if status.state != CanonicalProductionState::Complete
+                || status.error.is_some()
+                || status.components == 0
+                || status.checkpoint_bytes == 0
+                || status
+                    .manifest
+                    .as_ref()
+                    .is_none_or(|m| m.version != 2 || m.block_hash != old || m.validate().is_err())
+            {
+                return Err(error("quorum job is not complete and available"));
+            }
+            self.source(&status)?;
+            ids.retain(|id| *id != old);
+            completed.push(old);
+        } else if ids.len() >= MAX_JOBS {
             return Err(error("canonical production retained job limit reached"));
         }
         let status = CanonicalProductionStatus {
@@ -360,9 +454,20 @@ impl<S: KvStore> CanonicalProductionStore<S> {
             error: None,
         };
         ids.push(hash);
+        // One index value prevents readers from observing mixed active/history sets.
+        // Original source, record and checkpoint keys are never moved or deleted.
+        let encoded = if completed.is_empty() {
+            encode(&ids)?
+        } else {
+            encode(&QuorumJobIndex {
+                version: 2,
+                active: ids,
+                completed,
+            })?
+        };
         self.write_locked(
             vec![
-                (key(b"jobs"), encode(&ids)?),
+                (key(b"jobs"), encoded),
                 (record_key(hash), encode(&status)?),
                 (source_key(hash), identity.to_vec()),
             ],
@@ -376,6 +481,7 @@ impl<S: KvStore> CanonicalProductionStore<S> {
             lock: self.lock.clone(),
             block: hash,
             prefix: certificate_prefix(hash),
+            completed_history: self.completed_history,
         }
     }
 }
@@ -385,6 +491,7 @@ pub(super) struct ProductionJob<S: KvStore> {
     lock: Arc<parking_lot::Mutex<Option<u64>>>,
     block: ShellHash,
     prefix: Vec<u8>,
+    completed_history: bool,
 }
 impl<S: KvStore> ProductionJob<S> {
     fn component_name(k: &[u8]) -> Result<&str, StorageError> {
@@ -519,8 +626,9 @@ impl<S: KvStore> ProductionJob<S> {
         let owner = CanonicalProductionStore {
             store: self.store.clone(),
             lock: self.lock.clone(),
+            completed_history: self.completed_history,
         };
-        let ids = owner.ids()?;
+        let ids = owner.all_ids()?;
         if reference.bytes > MAX_BYTES as usize
             || !ids.contains(&self.block)
             || !ids.contains(&reference.block)
@@ -562,8 +670,9 @@ impl<S: KvStore> ProductionJob<S> {
         let owner = CanonicalProductionStore {
             store: self.store.clone(),
             lock: self.lock.clone(),
+            completed_history: self.completed_history,
         };
-        for block in owner.ids()? {
+        for block in owner.all_ids()? {
             let job = owner.job(block);
             let mut candidates = Vec::new();
             if block != self.block {
@@ -691,6 +800,7 @@ impl<S: KvStore> KvStore for ProductionJob<S> {
         CanonicalProductionStore {
             store: self.store.clone(),
             lock: self.lock.clone(),
+            completed_history: self.completed_history,
         }
         .write_locked(changes.into_iter().collect(), &mut guard, DATA_CEILING)
     }
@@ -1449,6 +1559,39 @@ mod tests {
             .put(b"x", b"y")
             .is_err());
         assert_eq!(db.get(b"HEAD").unwrap(), Some(b"native anchor".to_vec()));
+    }
+    #[test]
+    fn completed_quorum_jobs_simulated_quota_refuses_atomic_index_replacement() {
+        let db = Arc::new(MemoryDb::new());
+        let owner = CanonicalProductionStore::new_quorum(db.clone());
+        let a = ShellHash::from([1; 32]);
+        let b = ShellHash::from([2; 32]);
+        let c = ShellHash::from([3; 32]);
+        for (i, id) in [a, b].into_iter().enumerate() {
+            owner.insert_source(id, i as u64, b"source").unwrap();
+            let mut s = owner.status(id).unwrap().unwrap();
+            s.state = CanonicalProductionState::Complete;
+            s.components = 1;
+            s.checkpoint_bytes = 1;
+            s.manifest = Some(CanonicalProofManifest {
+                version: 2,
+                chain_id: 1337,
+                genesis_hash: ShellHash::from([9; 32]),
+                block_hash: id,
+                total_bytes: 1,
+                payload_hash: blake3_hash(b"x"),
+            });
+            owner.save(&s).unwrap();
+        }
+        // Counter-boundary simulation, not a physical256MiB stress qualification.
+        *owner.lock.lock() = Some(MAX_BYTES - 1);
+        db.put(&key(b"bytes"), &(MAX_BYTES - 1).to_be_bytes())
+            .unwrap();
+        let before = db.scan_all().unwrap();
+        assert!(owner
+            .insert_source_retiring(c, 3, b"new source", Some(a))
+            .is_err());
+        assert_eq!(db.scan_all().unwrap(), before);
     }
     #[test]
     fn simulated_global_quota_refuses_whole_batch_without_changing_native_data() {

@@ -190,3 +190,43 @@ and exact tuple matching, with no Native signature fallback for changed inputs.
 Parent registry provenance, validator selection and consensus authorization stay
 trusted Native context rather than newly proved selector or quorum AIR. Other
 combinations, defaults, quotas, activation and release status remain separate.
+
+
+## Quorum completed-job history
+
+The separate quorum producer retains at most two active jobs. When another
+finalized canonical source is available, it can move the oldest eligible
+completed quorum job into a bounded history and insert the new source in one
+atomic storage batch. Original records, source descriptors and checkpoint keys
+remain in place. Their bytes remain charged to the same global 256 MiB quota,
+including the new index metadata; the 64 KiB terminal reserve is unchanged.
+Quorum error text is bounded to 512 characters (at most 2 KiB of UTF-8 or
+3 KiB of escaped JSON) so retained status updates fit that reserve. The sender producer retains its original two-job behavior.
+
+A job qualifies for index rotation only after its source still matches the
+independently retained finalized canonical block and original certificate, and
+its exact manifest has complete hash-checked `ready` or `verified` bytes in the
+availability cache. Queued, proving, paused, failed, corrupt and unavailable
+jobs do not qualify. Status alone cannot establish these facts. No Native state,
+proof payload, original source or checkpoint is deleted or granted authority.
+
+The version-2 quorum index stores active and completed membership in one value,
+so readers cannot observe mixed generations of two indexes. Legacy vector
+indexes remain readable without a read-time rewrite. Sender readers do not
+accept the quorum history envelope. Older quorum workers reject the new local
+index format; retain the original database and complete checkpoints and use a
+compatible reader for recovery. This changes no chain data or proof format.
+
+At most eight total quorum source identities are retained, using the existing
+availability-object bound. The cache's eight-object and 512 MiB reservation
+limits and the producer's global checkpoint budget remain independent
+backpressure. A ninth identity or an over-budget atomic insertion is refused;
+no eviction or unbounded-chain guarantee follows from index rotation. One CPU
+worker still performs production. Cold startup requeues every active and
+historical job and fully verifies its original mathematical checkpoints before
+publishing bytes. Checkpoint references can resolve an immutable one-hop donor
+in either part of the index; missing, changed, cyclic and unindexed donors fail
+closed. Read-only history queries do not migrate or compact storage.
+
+The runnable three-source lifecycle and its explicit seeded-proof scope are
+specified in [the quorum proof guide](commit-quorum-proof.md#node-owned-successor-job-lifecycle).

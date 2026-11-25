@@ -442,8 +442,9 @@ heights or penalty policy.
 The controller selects finalized canonical blocks in activation order, derives
 their original stored QCs and current trusted authority/key/weight context, and
 captures immutable source descriptors. It uses the existing bounded checkpoint
-owner in a disjoint quorum namespace: two retained jobs, a 256 MiB checkpoint
-quota, immutable component writes, compression and full verification on reuse.
+owner in a disjoint quorum namespace: two active jobs and bounded completed
+history (at most eight total source identities), a 256 MiB checkpoint quota,
+immutable component writes, compression and full verification on reuse.
 Native and sender keys cannot cross the namespace adapter. The controller
 checks cancellation at durable component boundaries and records actual progress
 even when a budget or readiness change pauses work. Completed jobs are queued
@@ -1272,9 +1273,84 @@ and separate-process cold rechecks of all three proofs increase their attempt
 counters without writing current Native rows, even for the retired target.
 
 This qualifies a bounded three-child static-context flow. The proof cache's
-512 MiB capacity and the producer's two retained jobs and 256 MiB checkpoint
+512 MiB/eight-object capacity and the producer's two active jobs, bounded completed history and 256 MiB checkpoint
 budget remain independent backpressure limits; no proof or job eviction is
 introduced here. An unbounded chain, fork or reorganization, dynamic authority
 or penalty provenance, sender/proposer AIR, node-owned successor production,
 public release and network activation remain separate work. The default-off
 option, activation boundaries and consensus rules are unchanged.
+
+
+### Node-owned successor job lifecycle
+
+This exercise uses three separate complete checkpoint jobs. Each must match its
+own retained signed block and authority context exactly. It verifies and
+publishes those existing graphs through the real Node worker; it does not claim
+new from-scratch proof generation in this lifecycle exercise. Use unused paths,
+the Rust/RocksDB prerequisites above and these self-contained controls:
+
+```sh
+CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -p shell-node --features rocksdb --example quorum-native || exit "$?"
+CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -p shell-stark-prover --example commit-quorum || exit "$?"
+target/debug/examples/quorum-native prepare-producer-successor producer-controls || exit "$?"
+target/debug/examples/quorum-native successor-source producer-controls producer-controls/provider-db producer-source2.cbor 2 || exit "$?"
+target/debug/examples/quorum-native successor-source producer-controls producer-controls/provider-db producer-source3.cbor 3 || exit "$?"
+target/debug/examples/commit-quorum prove producer-controls/source.cbor producer-job1 producer-proof1.cbor || exit "$?"
+target/debug/examples/commit-quorum prove producer-source2.cbor producer-job2 producer-proof2.cbor || exit "$?"
+target/debug/examples/commit-quorum prove producer-source3.cbor producer-job3 producer-proof3.cbor || exit "$?"
+target/debug/examples/quorum-native producer-successor-live producer-controls producer-job1 producer-job2 producer-job3 producer-lifecycle || exit "$?"
+target/debug/examples/quorum-native producer-successor-cold producer-controls producer-job1 producer-job2 producer-job3 producer-lifecycle || exit "$?"
+```
+
+Preparation creates temporary two-primary-ML-DSA authorities, three genuinely
+signed transfers and independent Native references before dropping private keys.
+Matching complete jobs can be reused instead of generating them again. Preserve
+all sources, checkpoints and proofs on failure. The lifecycle entry needs genuine
+two-authority controls and refuses an existing destination in its live form.
+
+Preparation retains a Native2 snapshot taken after actual execution and
+finalization, alongside the independently executed Native3 control store. The
+lifecycle creates fresh Native-only destinations from these matching snapshots;
+all original databases, local cache bytes and checkpoints remain in their source
+stores. It recovers the two complete jobs and lets the ordinary prover-role Node
+worker fully reverify and publish them. It then shuts down and advances the
+provider to the real third block through an actual TCP/Noise certified peer,
+preserving proposer selection, certificate-view and timeout checks. Raw block
+import does not substitute for that path. After shutdown it tests ordinary
+startup capture before proving is ready.
+Only this short probe uses the non-development, two-authority no-peer readiness
+condition: network classification is `Testnet`, with the same chain ID, genesis,
+consensus configuration, signed blocks and activation settings. This holds the
+CPU worker while the third actual source must become durably queued. No third
+checkpoint may be generated. The probe stops before recovering the third
+complete donor. Subsequent publication and peer execution use the local
+`Dev` profile and the normal readiness gate.
+
+The next Node process fully rechecks all three jobs, including the first job
+now in completed history, and publishes source-bound bytes without new proving.
+A fresh TCP/Noise peer with proof admission enabled must automatically discover,
+fetch and fully verify each child before Native execution and finality three.
+No receiver upload, fetch or explicit fresh authorization call supplies that
+path. The provider and receiver must match independently executed Native3 rows,
+receipts, balances, nonce, gas and fees. Original checkpoint rows and sender
+production state remain unchanged. Hot and separate-OS-process cold history
+rechecks increase all three verification counters without writing current
+Native state; the cold provider also fully rechecks the archived job again.
+
+Two active jobs plus bounded completed history do not increase the existing
+256 MiB checkpoint, 512 MiB cache or eight-object limits. Archive metadata and
+all original job bytes remain charged. Default-off production and admission,
+consensus, activation and proof formats are unchanged. This does not qualify
+unbounded production, changing committees or penalties, forks, new host/profile
+combinations, public release or network activation.
+
+
+If the live exercise stops after the provider reaches Native3 and before a
+receiver is created, preserve the directory and use `producer-successor-resume`
+with the same five path arguments. It resumes the third-source readiness probe
+and checkpoint recovery in that existing provider; it does not replay the
+successful Native2 setup or change signed controls. The probe waits for producer
+startup capture to finish because authenticated RPC can become reachable before
+job capture/requeue completes. A missing third status in that initial window
+is not a persistent failure. The resume form refuses a directory that already
+contains a receiver; use the cold form after a completed live exercise.
