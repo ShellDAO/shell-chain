@@ -595,12 +595,23 @@ fn certify_slh_history(controls: &Path, source: &Path, c: &Control) -> Result<()
                 .get(&c.authority.to_string())
                 .ok_or("SLH authority signature absent")?;
             ensure(
-                signatures.len() == 1
+                signatures.len() == 1 + usize::from(c.co_authority.is_some())
                     && signature.sig_type == shell_crypto::SignatureType::SphincsSha2256f
                     && MultiVerifier.verify(&c.authority_key, hash.as_bytes(), signature)?,
                 "retained SLH certificate signature failed",
             )?;
             certificate_checks += 1;
+            if let Some((address, key)) = &c.co_authority {
+                let co = signatures
+                    .get(&address.to_string())
+                    .ok_or("history co-signature absent")?;
+                ensure(
+                    co.sig_type == shell_crypto::SignatureType::MlDsa65
+                        && MultiVerifier.verify(key, hash.as_bytes(), co)?,
+                    "retained ML-DSA history signature failed",
+                )?;
+                certificate_checks += 1;
+            }
             let head = n
                 .chain_store
                 .get_head_block()?
@@ -618,12 +629,28 @@ fn certify_slh_history(controls: &Path, source: &Path, c: &Control) -> Result<()
                 "SLH history control is not canonical",
             )?;
             if number > 1 {
-                let mut damaged = signature.clone();
-                damaged.data[0] ^= 1;
-                let bad = Node::<RocksDbStore>::encode_commit_certificate(&HashMap::from([(
-                    c.authority,
-                    damaged,
-                )]))?;
+                let bad = if let Some((address, key)) = &c.co_authority {
+                    let mut damaged = signatures
+                        .get(&address.to_string())
+                        .ok_or("history co-signature absent")?
+                        .clone();
+                    damaged.data[0] ^= 1;
+                    ensure(
+                        !MultiVerifier.verify(key, hash.as_bytes(), &damaged)?,
+                        "damaged co-signature verified",
+                    )?;
+                    Node::<RocksDbStore>::encode_commit_certificate(&HashMap::from([
+                        (c.authority, signature.clone()),
+                        (*address, damaged),
+                    ]))?
+                } else {
+                    let mut damaged = signature.clone();
+                    damaged.data[0] ^= 1;
+                    Node::<RocksDbStore>::encode_commit_certificate(&HashMap::from([(
+                        c.authority,
+                        damaged,
+                    )]))?
+                };
                 let before = n.store.scan_all()?;
                 let before_finality = {
                     let f = n.finality.read();
@@ -699,13 +726,20 @@ async fn exercise_live(
     source: &Path,
     mode: &str,
 ) -> Result<(), Error> {
+    let mixed_history = mode == "mixed-live-history3";
     let slh = mode.starts_with("slh-");
-    let mode = mode.strip_prefix("slh-").unwrap_or(mode);
-    let c: Control = read(&controls.join(if slh && mode == "live-history3" {
-        "history-control.cbor"
+    let mode = if mixed_history {
+        "live-history3"
     } else {
-        "control.cbor"
-    }))?;
+        mode.strip_prefix("slh-").unwrap_or(mode)
+    };
+    let c: Control = read(
+        &controls.join(if (slh || mixed_history) && mode == "live-history3" {
+            "history-control.cbor"
+        } else {
+            "control.cbor"
+        }),
+    )?;
     if slh {
         let blocks = if mode == "live-history3" { 3 } else { 1 };
         ensure(
@@ -721,10 +755,10 @@ async fn exercise_live(
             "genuine two-authority controls required",
         )?;
     }
-    if slh && mode == "live-history3" {
+    if (slh || mixed_history) && mode == "live-history3" {
         certify_slh_history(controls, source, &c)?;
     }
-    let proved_signatures = if slh { 1_u64 } else { 2 };
+    let proved_signatures = 1_u64 + u64::from(c.co_authority.is_some());
     let tip_number = c.blocks.len() as u64;
     let tip = c.blocks.last().ok_or("control tip absent")?.hash();
     if slh && mode == "live-persistent-batch-cold" {
@@ -850,7 +884,7 @@ async fn exercise_live(
             expected_result(&receiver,&c,&checked)?;
             balances(&receiver.node,&c,tip_number as usize)?;
             ensure(canonical_rows(&receiver)?==snapshot&&canonical_rows(&provider)?==snapshot,"after3 historical writeback or independent Native row mismatch")?;
-            println!("{}",json!({"freshLiveFirstThenNativeFollow3":true,"fullSLH":slh,"currentHeight":tip_number,"finalized":receiver.node.chain_store.get_finalized_number()?,"firstBlockFullAIRSigners":proved_signatures,"firstBlockRootReceiptsChecked":true,"successorQuorumCryptoNative":true,"historyRowsUnchanged":true,"independentNativeRowsEqual":true,"verificationAttempts":checked.verification_attempts,"newSigningOrProving":false}));return Ok::<_,Error>(());
+            println!("{}",json!({"freshLiveFirstThenNativeFollow3":true,"fullSLH":slh||mixed_history,"mixedAuthority":mixed_history,"currentHeight":tip_number,"finalized":receiver.node.chain_store.get_finalized_number()?,"firstBlockFullAIRSigners":proved_signatures,"firstBlockRootReceiptsChecked":true,"successorQuorumCryptoNative":true,"historyRowsUnchanged":true,"independentNativeRowsEqual":true,"verificationAttempts":checked.verification_attempts,"newSigningOrProving":false}));return Ok::<_,Error>(());
         }
         if mode=="live-default" {
             tokio::time::timeout(Duration::from_secs(60),async{loop{if receiver.node.chain_store.get_head_block()?.ok_or("receiver head absent")?.number()==tip_number{return Ok::<_,Error>(());}tokio::time::sleep(Duration::from_millis(100)).await;}}).await??;

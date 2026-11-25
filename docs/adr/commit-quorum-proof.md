@@ -1140,3 +1140,66 @@ This measures one active verification claim on a healthy local backend, with
 one static SLH authority. It does not establish power-loss or torn-write
 durability, every process-loss boundary, mixed-authority histories, other host
 profiles, public-release acceptance or network activation.
+
+### Mixed-authority history after state changes
+
+`prepare-mixed-history` generates temporary SLH and ML-DSA-65 authorities with
+weights `[2, 1]`, plus a funded test sender. It produces three genuine blocks
+under that dual-authority configuration, selecting and configuring the assigned
+base proposer for each height before sealing. Each block's certificate includes
+both genuine authority signatures. The primary-only certificate at exactly two
+thirds and a damaged co-signature must refuse without native or finality writes.
+The preparation retains independent Native1 and Native3 store pairs and signs
+all successors before discarding the temporary private keys. The first-block
+source captured at states one and three must be identical without writeback.
+
+Use the same Rust toolchain and RocksDB prerequisites as the full-SLH example.
+The following commands assume the default target directory and unused output
+paths. The measured development profile keeps default assertions, overflow
+checks and allocator behavior:
+
+```sh
+CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 \
+  cargo build --locked -p shell-node --features rocksdb --example quorum-native
+target/debug/examples/quorum-native prepare-mixed-history mixed-history-controls || exit "$?"
+test ! -e mixed-history-producer-db || exit 1
+cp -R mixed-history-controls/control-db mixed-history-producer-db || exit "$?"
+test ! -e mixed-history-receiver || exit 1
+test ! -e mixed-history-receiver.proof.cbor || exit 1
+target/debug/examples/quorum-native producer-step mixed-history-controls mixed-history-producer-db mixed-history-receiver 2 || exit "$?"
+target/debug/examples/quorum-native producer-step mixed-history-controls mixed-history-producer-db mixed-history-receiver 2 || exit "$?"
+while test ! -e mixed-history-receiver.proof.cbor; do
+  target/debug/examples/quorum-native producer-step mixed-history-controls mixed-history-producer-db mixed-history-receiver 16 || exit "$?"
+done
+target/debug/examples/quorum-native producer-cold mixed-history-controls mixed-history-producer-db mixed-history-receiver mixed-history-receiver.proof.cbor || exit "$?"
+target/debug/examples/quorum-native mixed-live-history3 mixed-history-controls mixed-history-receiver.proof.cbor mixed-history-receiver mixed-history-controls/history-provider-db || exit "$?"
+target/debug/examples/quorum-native mixed-live-history3 mixed-history-controls mixed-history-receiver.proof.cbor mixed-history-receiver mixed-history-controls/history-provider-db || exit "$?"
+```
+
+Preparation alone does not establish complete AIR verification. The production
+loop must finish both full signature graphs within the unchanged 256 MiB bound,
+deliver the node-produced payload automatically over TCP/Noise, and atomically
+execute and finalize the first block on a fresh receiver. The cold production
+command must observe a new recheck cycle with no new proving. Keep every store
+and checkpoint if a command fails; stop at the first failure.
+
+`mixed-live-history3` certifies both retained signatures on all three headers,
+persists successor finality on the independent references, and rejects modified
+successor co-signatures without changing native state. With proof admission
+disabled for the ordinary signed successors, the receiver follows to height and
+finality three. Authenticated historical RPC then fully verifies both first-block
+AIR graphs again. Original roots and receipts, current balances, nonce, fees
+and canonical rows must match the independent Native3 reference and remain
+unchanged by the query. The second invocation starts another OS process and
+must increase the verification-attempt counter again.
+
+A local ARM64 run completed a new 750-component graph from an empty job. Its
+CBOR artifact occupied 258,197,382 bytes and its version-two payload occupied
+258,197,405 bytes, within the original cap. Automatic peer admission reached
+Native1; both subsequent state-three historical queries passed, with attempts
+two and three and no current-state writes. A separate cold production cycle
+reverified the retained graph without new proving. Only the first block has
+full commit-signature AIR; successors use ordinary genuine signatures and
+certificates. This covers one static `[2, 1]` local case. Dynamic historical
+committees or penalties, successor AIR, other host profiles, public release
+and network activation remain separate work.

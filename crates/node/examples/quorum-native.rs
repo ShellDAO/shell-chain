@@ -164,6 +164,7 @@ fn prepare(
     certified_spacing: bool,
     slh: bool,
     slh_history: bool,
+    mixed: bool,
 ) -> Result<(), Error> {
     std::fs::create_dir(root)?;
     let authority: Box<dyn Signer> = if slh {
@@ -171,9 +172,15 @@ fn prepare(
     } else {
         Box::new(MlDsaSigner::generate())
     };
+    let co = mixed.then(MlDsaSigner::generate);
     let sender = DilithiumSigner::generate();
     let mut c = Control {
-        co_authority: None,
+        co_authority: co.as_ref().map(|signer| {
+            (
+                Address::from_public_key(signer.public_key(), signer.sig_type().as_u8()),
+                signer.public_key().to_vec(),
+            )
+        }),
         authority: Address::from_public_key(authority.public_key(), authority.sig_type().as_u8()),
         authority_key: authority.public_key().to_vec(),
         sender: Address::from_public_key(sender.public_key(), sender.sig_type().as_u8()),
@@ -242,15 +249,34 @@ fn prepare(
                 shell_consensus::VIEW_CHANGE_TIMEOUT_MS,
             ));
         }
-        let block = provider.produce_block(authority.as_ref(), 1)?;
+        let proposer: &dyn Signer = if provider
+            .consensus
+            .read()
+            .is_proposer(nonce + 1, &c.authority)
+        {
+            authority.as_ref()
+        } else {
+            co.as_ref().ok_or("expected proposer key absent")?
+        };
+        provider.config.proposer_address = Some(Address::from_public_key(
+            proposer.public_key(),
+            proposer.sig_type().as_u8(),
+        ));
+        let block = provider.produce_block(proposer, 1)?;
         ensure(
             block.transactions.len() == 1 && block.header.gas_used == 21_000,
             "Native transfer not executed",
         )?;
-        let cert = Node::<RocksDbStore>::encode_commit_certificate(&HashMap::from([(
-            c.authority,
-            authority.sign(block.hash().as_bytes())?,
-        )]))?;
+        let mut votes = HashMap::from([(c.authority, authority.sign(block.hash().as_bytes())?)]);
+        if let Some(co) = &co {
+            let address = c
+                .co_authority
+                .as_ref()
+                .ok_or("coauthority context absent")?
+                .0;
+            votes.insert(address, co.sign(block.hash().as_bytes())?);
+        }
+        let cert = Node::<RocksDbStore>::encode_commit_certificate(&votes)?;
         write(&root.join(format!("block-{}.cbor", nonce + 1)), &block)?;
         write(&root.join(format!("certificate-{}.cbor", nonce + 1)), &cert)?;
         follower.import_block(block.clone(), &MultiVerifier)?;
@@ -269,6 +295,42 @@ fn prepare(
                 && Some(receipts) == follower.chain_store.get_receipts(&block.hash())?,
             "Native receipt/import mismatch",
         )?;
+        if let Some((address, _)) = &c.co_authority {
+            let only = Node::<RocksDbStore>::encode_commit_certificate(&HashMap::from([(
+                c.authority,
+                votes[&c.authority].clone(),
+            )]))?;
+            let mut damaged = votes[address].clone();
+            damaged.data[0] ^= 1;
+            let bad = Node::<RocksDbStore>::encode_commit_certificate(&HashMap::from([
+                (c.authority, votes[&c.authority].clone()),
+                (*address, damaged),
+            ]))?;
+            for n in [&provider, &follower] {
+                let before = n.store.scan_all()?;
+                let finality = {
+                    let f = n.finality.read();
+                    (f.last_finalized_number(), *f.last_finalized_hash())
+                };
+                for rejected in [&only, &bad] {
+                    ensure(
+                        !n.fast_finalize_with_certificate(nonce + 1, block.hash(), rejected)
+                            && n.store.scan_all()? == before
+                            && {
+                                let f = n.finality.read();
+                                (f.last_finalized_number(), *f.last_finalized_hash())
+                            } == finality,
+                        "mixed quorum refusal changed Native rows/finality",
+                    )?;
+                }
+                if nonce > 0 {
+                    ensure(
+                        n.fast_finalize_with_certificate(nonce + 1, block.hash(), &cert),
+                        "mixed successor finality failed",
+                    )?;
+                }
+            }
+        }
         if nonce == 0 && slh {
             ensure(
                 provider.fast_finalize_with_certificate(1, block.hash(), &cert)
@@ -328,12 +390,15 @@ fn prepare(
     let before = provider.store.scan_all()?;
     let source = provider.commit_quorum_source(1, c.blocks[0].hash(), &c.certificates[0])?;
     ensure(
-        source.signatures[0].signature.sig_type
-            == if slh {
-                shell_crypto::SignatureType::SphincsSha2256f
-            } else {
-                shell_crypto::SignatureType::MlDsa65
-            },
+        source.signatures.len() == 1 + usize::from(mixed)
+            && source.signatures.iter().any(|signer| {
+                signer.signature.sig_type
+                    == if slh {
+                        shell_crypto::SignatureType::SphincsSha2256f
+                    } else {
+                        shell_crypto::SignatureType::MlDsa65
+                    }
+            }),
         "control QC profile missing",
     )?;
     if slh_history {
@@ -355,11 +420,18 @@ fn prepare(
     )?;
     balances(&provider, &c, 3)?;
     balances(&follower, &c, 3)?;
+    if mixed {
+        ensure(
+            provider.store.scan_all()? == follower.store.scan_all()?,
+            "independent mixed Native3 rows differ",
+        )?;
+    }
+    drop(co);
     drop(sender);
     drop(authority);
     println!(
         "{}",
-        serde_json::json!({"prepared":true,"genuineNativeTransfers":3,"independentRocksDBControls":if slh_history {4}else{2},"primaryQuorumSignature":!slh,"fullSLHHistoryControls":slh_history,"firstBlockSourceUnchangedAtHeight3":slh_history,"finalized":1,"temporaryKeysDroppedAfterAllControls":true,"privateKeysPersisted":false,"newCohort":true})
+        serde_json::json!({"prepared":true,"genuineNativeTransfers":3,"independentRocksDBControls":if slh_history {4}else{2},"primaryQuorumSignature":!slh,"fullSLHHistoryControls":slh_history,"firstBlockSourceUnchangedAtHeight3":slh_history,"mixedAuthority":mixed,"head":provider.chain_store.get_head_block()?.ok_or("prepared head absent")?.number(),"finalized":provider.chain_store.get_finalized_number()?,"temporaryKeysDroppedAfterAllControls":true,"privateKeysPersisted":false,"newCohort":true})
     );
     Ok(())
 }
@@ -998,7 +1070,7 @@ fn prepare_mixed(root: &Path) -> Result<(), Error> {
     std::fs::create_dir(root)?;
     // Produce a fresh, genuinely signed SLH block before adding the coauthority.
     // Keep its original controls; no private key or completed graph is copied.
-    prepare(&root.join("single-slh"), false, true, false)?;
+    prepare(&root.join("single-slh"), false, true, false, false)?;
     let mut c: Control = read(&root.join("single-slh/control.cbor"))?;
     let co = MlDsaSigner::generate();
     let address = Address::from_public_key(co.public_key(), co.sig_type().as_u8());
@@ -1582,7 +1654,7 @@ fn main() -> Result<(), Error> {
         Some("producer-step") if args.len()==5 => quorum_rpc::run_producer_step(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3]),args[4].parse()?),
         Some("producer-seed") if args.len()==4 => quorum_rpc::seed_producer(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3])),
         Some("producer-live"|"producer-cold"|"producer-corrupt"|"producer-disabled"|"producer-manifest"|"producer-auto"|"producer-auto-wait"|"producer-auto-resume"|"producer-auto-partial"|"producer-auto-worker"|"producer-auto-recover"|"producer-auto-batch-fault"|"producer-auto-batch-recover"|"producer-intact-rejection") if args.len()==5 => quorum_rpc::run_producer(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3]),Path::new(&args[4]),&args[0]),
-        Some("live-pause"|"live-import"|"live-cold"|"live-default"|"live-history3"|"live-invalid-recheck"|"slh-live-pause"|"slh-live-import"|"slh-live-cold"|"slh-live-default"|"slh-live-history3"|"slh-live-invalid-recheck"|"slh-live-batch-fault"|"slh-live-batch-recover"|"slh-live-persistent-batch-fault"|"slh-live-persistent-batch-cold"|"slh-live-crash-worker"|"slh-live-crash-recover") if args.len()==5 => quorum_rpc::run_live(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3]),Path::new(&args[4]),&args[0]),
+        Some("live-pause"|"live-import"|"live-cold"|"live-default"|"live-history3"|"live-invalid-recheck"|"slh-live-pause"|"slh-live-import"|"slh-live-cold"|"slh-live-default"|"slh-live-history3"|"slh-live-invalid-recheck"|"slh-live-batch-fault"|"slh-live-batch-recover"|"slh-live-persistent-batch-fault"|"slh-live-persistent-batch-cold"|"slh-live-crash-worker"|"slh-live-crash-recover"|"mixed-live-history3") if args.len()==5 => quorum_rpc::run_live(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3]),Path::new(&args[4]),&args[0]),
         Some("follow-peer") if args.len()==4 => follow(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3])),
         Some("follow-verify") if args.len()==4 => follow_verify(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3])),
         Some("rpc-pause"|"rpc-verify"|"rpc-recheck") if args.len()==4 => quorum_rpc::run(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3]),&args[0]),
@@ -1591,9 +1663,10 @@ fn main() -> Result<(), Error> {
 
         Some("receive" | "receive-resume" | "receive-verify" | "receive-one" | "receive-one-verify") if args.len() == 4 => receive(Path::new(&args[1]), Path::new(&args[2]), Path::new(&args[3]), args[0] == "receive" || args[0] == "receive-one", args[0] == "receive-resume", if args[0].starts_with("receive-one") {1} else {3}),
         Some("accept-slh") if args.len()==4 => accept_slh(Path::new(&args[1]),Path::new(&args[2]),Path::new(&args[3])),
-        Some("prepare-slh") if args.len()==2 => prepare(Path::new(&args[1]),false,true,false),
-        Some("prepare-slh-history") if args.len()==2 => prepare(Path::new(&args[1]),false,true,true),
+        Some("prepare-slh") if args.len()==2 => prepare(Path::new(&args[1]),false,true,false,false),
+        Some("prepare-slh-history") if args.len()==2 => prepare(Path::new(&args[1]),false,true,true,false),
         Some("prepare-mixed") if args.len()==2 => prepare_mixed(Path::new(&args[1])),
+        Some("prepare-mixed-history") if args.len()==2 => prepare(Path::new(&args[1]),false,true,true,true),
         Some("inspect-slh") if args.len()==2 => {
             let root=Path::new(&args[1]);
             let c:Control=read(&root.join("control.cbor"))?;
@@ -1605,11 +1678,11 @@ fn main() -> Result<(), Error> {
             if path.exists() {ensure(read::<CommitQuorumSource>(&path)?==source,"retained SLH source differs")?;} else {write(&path,&source)?;}
             println!("{}",serde_json::json!({"originalSLHQuorumSourceCaptured":true,"signers":source.signatures.len(),"newAuthoritySigningOrProving":false}));Ok(())
         },
-        Some("prepare") if args.len() == 2 => prepare(Path::new(&args[1]),false,false,false),
-        Some("prepare-certified") if args.len() == 2 => prepare(Path::new(&args[1]),true,false,false),
+        Some("prepare") if args.len() == 2 => prepare(Path::new(&args[1]),false,false,false,false),
+        Some("prepare-certified") if args.len() == 2 => prepare(Path::new(&args[1]),true,false,false,false),
         Some("inspect-follow") if args.len() == 2 => inspect_follow(Path::new(&args[1])),
         Some("inspect") if args.len() == 2 => inspect(Path::new(&args[1])),
         Some("verify") if args.len() == 3 => verify(Path::new(&args[1]), Path::new(&args[2])),
-        _ => Err("usage: quorum-native slh-live-crash-worker|slh-live-crash-recover|slh-live-persistent-batch-fault|slh-live-persistent-batch-cold <retained-slh-controls> <complete-proof.cbor> <receiver-root> <existing-Native1-provider-db> | prepare-mixed <new-control-directory> | prepare-slh-history <new-control-directory> | slh-live-history3 <history-controls> <complete-first-proof.cbor> <existing-receiver-root> <existing-Native3-provider-db> | producer-step <slh-controls> <existing-Native1-provider-db> <new-receiver-root> <new-component-budget-1..16> | slh-live-pause|slh-live-import|slh-live-cold|slh-live-default|slh-live-invalid-recheck|slh-live-batch-fault|slh-live-batch-recover <original-slh-controls> <complete-proof.cbor> <receiver-root> <existing-Native-one-provider-db> | accept-slh <slh-controls> <complete-proof.cbor> <new-import-directory> | prepare-slh <new-control-directory> | inspect-slh <retained-slh-controls> | live-cold-intent-recheck <controls> <proof> <retained-rejected-root> <independent-first-block-db> | live-explicit-recheck <controls> <proof> <retained-rejected-receiver-root> <independent-first-block-db> | producer-seed <controls> <completed-job-root> <owned-provider-db> | producer-live|producer-cold|producer-corrupt|producer-disabled|producer-manifest|producer-auto|producer-auto-wait|producer-auto-resume|producer-auto-partial|producer-auto-worker|producer-auto-recover|producer-auto-batch-fault|producer-auto-batch-recover|producer-intact-rejection <controls> <owned-provider-db> <new-receiver-root> <full-proof.cbor> | live-pause|live-import|live-cold|live-history3|live-default|live-invalid-recheck <controls> <proof> <receiver-root> <owned-provider-db> | rpc-pause <controls> <proof> <existing-native-root> | rpc-verify <controls> <proof> <existing-native-root> | rpc-recheck <controls> <proof> <existing-native-root> | prepare-certified <new-timed-controls> | inspect-follow <two-signer-controls> | follow-peer <two-signer-controls> <full-proof.cbor> <existing-first-block-directory> | follow-verify <two-signer-controls> <full-proof.cbor> <existing-follow-directory> | co-sign-input <original-controls> <new-messages.json> | augment <original-controls> <sdk-signatures.json> <new-two-signer-controls> | receive-one <two-signer-controls> <full-proof.cbor> <new-import-directory> | receive-one-verify <two-signer-controls> <full-proof.cbor> <existing-import-directory> | prepare <new-control-directory> | inspect <control-directory> | verify <control-directory> <full-quorum-proof.cbor> | receive <original-controls> <full-proof.cbor> <new-import-directory> | receive-resume <original-controls> <full-proof.cbor> <original-genesis-import-directory> | receive-verify <original-controls> <full-proof.cbor> <existing-import-directory>".into()),
+        _ => Err("usage: quorum-native slh-live-crash-worker|slh-live-crash-recover|slh-live-persistent-batch-fault|slh-live-persistent-batch-cold <retained-slh-controls> <complete-proof.cbor> <receiver-root> <existing-Native1-provider-db> | prepare-mixed|prepare-mixed-history <new-control-directory> | prepare-slh-history <new-control-directory> | slh-live-history3|mixed-live-history3 <history-controls> <complete-first-proof.cbor> <existing-receiver-root> <existing-Native3-provider-db> | producer-step <slh-controls> <existing-Native1-provider-db> <new-receiver-root> <new-component-budget-1..16> | slh-live-pause|slh-live-import|slh-live-cold|slh-live-default|slh-live-invalid-recheck|slh-live-batch-fault|slh-live-batch-recover <original-slh-controls> <complete-proof.cbor> <receiver-root> <existing-Native-one-provider-db> | accept-slh <slh-controls> <complete-proof.cbor> <new-import-directory> | prepare-slh <new-control-directory> | inspect-slh <retained-slh-controls> | live-cold-intent-recheck <controls> <proof> <retained-rejected-root> <independent-first-block-db> | live-explicit-recheck <controls> <proof> <retained-rejected-receiver-root> <independent-first-block-db> | producer-seed <controls> <completed-job-root> <owned-provider-db> | producer-live|producer-cold|producer-corrupt|producer-disabled|producer-manifest|producer-auto|producer-auto-wait|producer-auto-resume|producer-auto-partial|producer-auto-worker|producer-auto-recover|producer-auto-batch-fault|producer-auto-batch-recover|producer-intact-rejection <controls> <owned-provider-db> <new-receiver-root> <full-proof.cbor> | live-pause|live-import|live-cold|live-history3|live-default|live-invalid-recheck <controls> <proof> <receiver-root> <owned-provider-db> | rpc-pause <controls> <proof> <existing-native-root> | rpc-verify <controls> <proof> <existing-native-root> | rpc-recheck <controls> <proof> <existing-native-root> | prepare-certified <new-timed-controls> | inspect-follow <two-signer-controls> | follow-peer <two-signer-controls> <full-proof.cbor> <existing-first-block-directory> | follow-verify <two-signer-controls> <full-proof.cbor> <existing-follow-directory> | co-sign-input <original-controls> <new-messages.json> | augment <original-controls> <sdk-signatures.json> <new-two-signer-controls> | receive-one <two-signer-controls> <full-proof.cbor> <new-import-directory> | receive-one-verify <two-signer-controls> <full-proof.cbor> <existing-import-directory> | prepare <new-control-directory> | inspect <control-directory> | verify <control-directory> <full-quorum-proof.cbor> | receive <original-controls> <full-proof.cbor> <new-import-directory> | receive-resume <original-controls> <full-proof.cbor> <original-genesis-import-directory> | receive-verify <original-controls> <full-proof.cbor> <existing-import-directory>".into()),
     }
 }
