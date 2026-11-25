@@ -1354,3 +1354,41 @@ startup capture to finish because authenticated RPC can become reachable before
 job capture/requeue completes. A missing third status in that initial window
 is not a persistent failure. The resume form refuses a directory that already
 contains a receiver; use the cold form after a completed live exercise.
+
+### Persistent refusal of the producer history index
+
+The same controls and three complete jobs can exercise a controlled database
+refusal before the third source is inserted. Use a new destination and the
+Rust/RocksDB build above; no new signature graph is required:
+
+```sh
+target/debug/examples/quorum-native producer-history-prepare producer-controls producer-job1 producer-job2 producer-job3 producer-index-recovery || exit "$?"
+target/debug/examples/quorum-native producer-history-fault producer-controls producer-job1 producer-job2 producer-job3 producer-index-recovery || exit "$?"
+target/debug/examples/quorum-native producer-history-fault-cold producer-controls producer-job1 producer-job2 producer-job3 producer-index-recovery || exit "$?"
+target/debug/examples/quorum-native producer-successor-resume producer-controls producer-job1 producer-job2 producer-job3 producer-index-recovery || exit "$?"
+target/debug/examples/quorum-native producer-successor-cold producer-controls producer-job1 producer-job2 producer-job3 producer-index-recovery || exit "$?"
+```
+
+Preparation fully rechecks and publishes the first two jobs on Native2, then
+follows the actual certified peer to Native3 with production disabled. It saves
+the logical baseline before the third owner source exists. Each fault command
+runs in a separate OS process. Its RocksDB adapter forwards ordinary operations
+and persistently returns `StorageError::Database` for the complete third-source,
+record, version-2 index and byte-counter batch before applying it. It checks
+that this exact batch is attempted once, every logical row remains equal to
+the baseline, and startup returns the backend error and releases RPC/backend
+resources. The command exits zero only when this expected refusal is observed;
+an unexpected error exits nonzero and preserves the directory.
+
+The baseline and numbered `producer-history-refusal-*.json` observations are
+kept without replacement. Preserve them on failure. This is a controlled
+adapter refusal over a real persistent store, not a disk-corruption, torn-write
+or power-loss simulation. RPC reachability alone does not establish completed
+producer startup.
+
+The resume command uses the normal backend on that same prefix. It must capture
+the third source, recover its complete checkpoints and continue through the
+three-job publication, automatic peer execution/finality and hot/cold historical
+checks above. It neither deletes old jobs nor changes consensus, activation,
+defaults or resource limits. These commands qualify the stated failure boundary;
+other storage faults and process-loss boundaries need separate results.

@@ -1,5 +1,7 @@
 //! Source-bound completed checkpoints through three real node-owned quorum jobs.
 use super::*;
+#[path = "quorum_producer_fault.rs"]
+mod owner_fault;
 
 fn certificate_rows(n: &Node<RocksDbStore>, hash: ShellHash) -> Result<Rows, Error> {
     Ok(n.store.scan_prefix(
@@ -98,7 +100,7 @@ fn completed(status: &Value) -> Result<CanonicalProofManifest, Error> {
         status["status"]["manifest"].clone(),
     )?)
 }
-async fn prepare_owned(
+async fn prepare_prefix(
     c: &Control,
     controls: &Path,
     donors: &[String],
@@ -168,6 +170,15 @@ async fn prepare_owned(
         "{}",
         json!({"providerAdvancedViaActualCertifiedPeer":true,"NativeHeadAndFinality":3,"selectorAndTimeoutUnchanged":true})
     );
+    Ok(())
+}
+async fn prepare_owned(
+    c: &Control,
+    controls: &Path,
+    donors: &[String],
+    root: &Path,
+) -> Result<(), Error> {
+    prepare_prefix(c, controls, donors, root).await?;
     queue_and_recover_third(c, Path::new(&donors[2]), root).await
 }
 async fn queue_and_recover_third(c: &Control, donor: &Path, root: &Path) -> Result<(), Error> {
@@ -267,6 +278,9 @@ async fn queue_and_recover_third(c: &Control, donor: &Path, root: &Path) -> Resu
     Ok(())
 }
 async fn exercise(args: &[String]) -> Result<(), Error> {
+    if args[0].starts_with("producer-history-") {
+        return owner_fault::exercise(args).await;
+    }
     let cold = args[0] == "producer-successor-cold";
     let resume = args[0] == "producer-successor-resume";
     let c = successor::controls(Path::new(&args[1]))?;
