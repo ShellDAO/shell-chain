@@ -2042,7 +2042,7 @@ mod tests {
             }
         }
 
-        fn fail_next_batch(&self) {
+        pub(super) fn fail_next_batch(&self) {
             self.fail_next_batch.store(true, Ordering::SeqCst);
         }
 

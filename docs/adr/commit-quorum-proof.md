@@ -380,7 +380,7 @@ upload or fetch remains supported. Quorum discovery requires its own option;
 sender permission never enables it.
 
 The existing admission queue and worker lifetime are reused: at most two
-retained candidates, a 2 MiB body, a 64 KiB QC and one active verification worker.
+retained candidates, a 2 MiB body, a 3,194,880-byte QC and one active verification worker. The QC bound covers the JSON byte-array encoding of up to sixteen supported signatures.
 The original body bytes and QC hash bind the record. A worker checks the
 complete signature/weight graph against independently selected parent, header,
 keys and current authority weights. Only the serialized canonical event loop
@@ -1209,11 +1209,12 @@ and network activation remain separate work.
 
 `prepare-successor` creates temporary primary ML-DSA-65 authority and sender
 keys, three genuinely signed transfers and two independently executed Native3
-stores. Temporary private keys are dropped after signing all three blocks. The retained
-ordinary certificates finalize both independent stores before the entry returns. `successor-source` captures the second
-block's independent authority context without writing Native rows. Retained
-compatible two-authority controls can also supply the same entries; their first
-proof must match their original first block exactly.
+stores. Temporary private keys are dropped after signing all three blocks. The
+retained ordinary certificates finalize both independent stores before the
+entry returns. `successor-source` captures block two or three's authority
+context and original persisted certificate without writing Native rows. Retained
+compatible two-authority controls can also supply the same entries; each proof
+must match its original block exactly.
 
 With the same Rust and RocksDB prerequisites, use unused paths and build both
 examples in the measured development profile:
@@ -1222,37 +1223,58 @@ examples in the measured development profile:
 CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -p shell-node --features rocksdb --example quorum-native || exit "$?"
 CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG=0 cargo build --locked -p shell-stark-prover --example commit-quorum || exit "$?"
 target/debug/examples/quorum-native prepare-successor successor-controls || exit "$?"
-target/debug/examples/quorum-native successor-source successor-controls successor-controls/provider-db successor-source2.cbor || exit "$?"
+target/debug/examples/quorum-native successor-source successor-controls successor-controls/provider-db successor-source2.cbor 2 || exit "$?"
+target/debug/examples/quorum-native successor-source successor-controls successor-controls/provider-db successor-source3.cbor 3 || exit "$?"
 target/debug/examples/commit-quorum prove successor-controls/source.cbor successor-job1 successor-proof1.cbor || exit "$?"
 target/debug/examples/commit-quorum prove successor-source2.cbor successor-job2 successor-proof2.cbor || exit "$?"
-target/debug/examples/quorum-native successor-live successor-controls successor-proof1.cbor successor-proof2.cbor successor-receiver successor-controls/provider-db || exit "$?"
-target/debug/examples/quorum-native successor-cold successor-controls successor-proof1.cbor successor-proof2.cbor successor-receiver successor-controls/provider-db || exit "$?"
+target/debug/examples/commit-quorum prove successor-source3.cbor successor-job3 successor-proof3.cbor || exit "$?"
+target/debug/examples/quorum-native successor-live successor-controls successor-proof1.cbor successor-proof2.cbor successor-proof3.cbor successor-receiver successor-controls/provider-db || exit "$?"
+target/debug/examples/quorum-native successor-cold successor-controls successor-proof1.cbor successor-proof2.cbor successor-proof3.cbor successor-receiver successor-controls/provider-db || exit "$?"
 ```
 
 Each proof job is separate and source-bound. Preserve its checkpoints on a
-failure; retry that same source and job rather than regenerating its keys or
-signed blocks. An already complete first-block proof can be reused unchanged.
-Only the second block needs a new graph in that case.
+failure; retry that same source and job rather than regenerating keys or signed
+blocks. Already complete matching proofs can be reused unchanged; only a new
+source needs a new graph. The source command defaults to block two when its
+last argument is omitted. The live and cold entries also retain their two-proof
+form by omitting the third proof. Use a provider with no cached third proof for
+that form: a matching third proof would correctly allow automatic admission.
 
-The live entry advertises the provider's first proof, starts a fresh TCP/Noise
-receiver with quorum admission enabled, and waits for atomic execution and
-finality one. It withholds the second proof until the second body and certificate
-are pending, and checks that no second-block receipts or Native state appear.
-Verifier preflight rejects wrong-block and damaged second-block proofs while the
-receiver remains at height one. After the provider
-publishes the genuine second proof, the receiver must automatically discover,
-fetch and fully verify it before executing and finalizing block two. No receiver
-upload, fetch or explicit verification command authorizes either fresh child.
+The live entry advertises the first proof and starts a fresh TCP/Noise receiver
+with quorum admission enabled throughout. Each later proof is withheld until
+its body and certificate are pending; no receipts or Native state for that
+child may appear yet. Verifier preflight rejects a previous block's proof and
+a damaged current proof. These are local verifier rejection checks, not wire
+tamper tests. After publication, automatic discovery, fetch and full verification
+must precede execution and finality for that child. No receiver upload, fetch
+or explicit verification command authorizes a fresh child.
 
-Both blocks' roots and receipts must match the independent provider, as must
-account balances, nonce and fees at its retained historical state two. The
-entry then explicitly reverifies each historical proof against current state
-two without writing it back. `successor-cold` reopens that receiver in a separate
-OS process and increases both verification-attempt counters again. A stored
-verified result never replaces these full checks.
+The local intake index still retains at most two records. When that bound is
+reached, inserting another quorum candidate can atomically replace only the
+oldest role-two `Complete` record with no outstanding recheck or error. The
+retired target must be finalized and canonical, have matching Native body,
+receipts and original certificate, and retain matching valid native signer
+evidence. Its manifest must belong to this chain and genesis. Corrupt metadata
+fails closed. Pending, failed, paused, unfinalized and sender-role records do
+not qualify. Retirement of duplicate local status/body/certificate rows and
+insertion of the next untrusted source share one storage batch, so a batch
+failure preserves the previous index and all its inputs.
 
-This is a bounded two-child static-context flow. The existing retained-candidate
-limit is unchanged, and the third block without a full quorum proof remains
-absent from the receiver within that two-candidate limit. It does not qualify an unbounded chain, fork or reorganization,
-dynamic authority or penalty provenance, sender/proposer AIR, node-owned
-successor proof production, public release or network activation.
+Native blocks, state, receipts, certificates, signer evidence, proof cache
+payloads and production jobs are retained. An old target's intake-status query
+can return null after retirement; that status is not authorization. Its proof
+remains available for full historical verification. At height three the entry
+compares Native rows with the independently executed provider, checks every
+proof payload and all original body/certificate/signer evidence, and confirms
+that only the first intake record has retired. Account balances, nonce, gas,
+fees, roots and receipts must agree with the independent state. Explicit hot
+and separate-process cold rechecks of all three proofs increase their attempt
+counters without writing current Native rows, even for the retired target.
+
+This qualifies a bounded three-child static-context flow. The proof cache's
+512 MiB capacity and the producer's two retained jobs and 256 MiB checkpoint
+budget remain independent backpressure limits; no proof or job eviction is
+introduced here. An unbounded chain, fork or reorganization, dynamic authority
+or penalty provenance, sender/proposer AIR, node-owned successor production,
+public release and network activation remain separate work. The default-off
+option, activation boundaries and consensus rules are unchanged.

@@ -21,6 +21,7 @@ pub(super) fn run_successor(args: &[String]) -> Result<(), Error> {
             Path::new(&args[1]),
             Path::new(&args[2]),
             Path::new(&args[3]),
+            args.get(4).map(|n| n.parse()).transpose()?.unwrap_or(2),
         )
     } else {
         successor::run(args)

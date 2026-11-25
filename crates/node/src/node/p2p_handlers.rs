@@ -615,7 +615,7 @@ impl<S: KvStore + 'static> Node<S> {
         serde_json::to_vec(&cert)
     }
 
-    fn decode_commit_certificate(
+    pub(super) fn decode_commit_certificate(
         cert: &[u8],
     ) -> Option<HashMap<Address, shell_crypto::PQSignature>> {
         if let Ok(raw) =

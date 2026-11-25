@@ -385,6 +385,118 @@ impl<S: KvStore + 'static> Node<S> {
         }
         Ok(bytes)
     }
+    fn prepare_quorum_admission_slot(
+        &self,
+        ids: &mut Vec<ShellHash>,
+        batch: &mut WriteBatch,
+    ) -> Result<(), String> {
+        if ids.len() < MAX_JOBS {
+            return Ok(());
+        }
+        let finalized = self
+            .chain_store
+            .get_finalized_number()
+            .map_err(|e| e.to_string())?
+            .unwrap_or(0);
+        let mut completed = Vec::new();
+        for &id in ids.iter() {
+            let r = self
+                .admission_record(id)?
+                .ok_or("indexed admission record absent")?;
+            if r.version != 2
+                || r.state != AdmissionState::Complete
+                || r.explicit_recheck.is_some()
+                || r.error.is_some()
+                || r.attempts == 0
+                || r.manifest.is_none()
+                || r.number > finalized
+                || self
+                    .chain_store
+                    .get_block_hash_by_number(r.number)
+                    .map_err(|e| e.to_string())?
+                    != Some(id)
+            {
+                continue;
+            }
+            let manifest = r
+                .manifest
+                .as_ref()
+                .ok_or("completed quorum manifest absent")?;
+            if manifest.chain_id != self.config.chain_id
+                || self
+                    .chain_store
+                    .get_block_hash_by_number(0)
+                    .map_err(|e| e.to_string())?
+                    != Some(manifest.genesis_hash)
+            {
+                return Err("completed quorum manifest network mismatch".into());
+            }
+            let body = self.admission_body(&r)?;
+            let certificate = self.admission_certificate(&r)?;
+            if self
+                .chain_store
+                .get_block_by_hash(&id)
+                .map_err(|e| e.to_string())?
+                .as_ref()
+                != Some(&body)
+                || self
+                    .chain_store
+                    .get_receipts(&id)
+                    .map_err(|e| e.to_string())?
+                    .is_none()
+                || self
+                    .chain_store
+                    .get_commit_certificate(&id)
+                    .map_err(|e| e.to_string())?
+                    .as_ref()
+                    != Some(&certificate)
+            {
+                return Err("completed quorum source differs from finalized Native data".into());
+            }
+            self.chain_store
+                .verify_block_body_commitment(&body)
+                .map_err(|e| e.to_string())?;
+            let signatures = Self::decode_commit_certificate(&certificate)
+                .ok_or("completed quorum certificate encoding invalid")?;
+            if signatures.is_empty()
+                || signatures.len() > shell_stark_prover::commit_quorum::MAX_COMMIT_PROOF_SIGNERS
+            {
+                return Err("completed quorum certificate signer limit".into());
+            }
+            let evidence = self
+                .chain_store
+                .get_block_signers(&id)
+                .map_err(|e| e.to_string())?;
+            for (address, signature) in signatures {
+                let signer = evidence
+                    .iter()
+                    .find(|e| e.address == address)
+                    .ok_or("completed quorum signer evidence absent")?;
+                if signer.signature != signature
+                    || shell_crypto::infer_signature_type_from_address(&signer.public_key, &address)
+                        != Some(signature.sig_type)
+                    || !MultiVerifier
+                        .verify(&signer.public_key, id.as_bytes(), &signature)
+                        .map_err(|e| e.to_string())?
+                {
+                    return Err("completed quorum signer evidence changed".into());
+                }
+            }
+            completed.push((r.number, id));
+        }
+        let (_, oldest) = completed
+            .into_iter()
+            .min_by_key(|(number, _)| *number)
+            .ok_or("live admission retained candidate limit")?;
+        // These are duplicate, untrusted intake rows. Native body/QC/receipts,
+        // signer evidence and all proof availability bytes remain untouched.
+        // The caller commits retirement with the new source and index atomically.
+        for part in [b"record/".as_slice(), b"body/", b"quorum/"] {
+            batch.delete(key(part, Some(oldest)));
+        }
+        ids.retain(|id| *id != oldest);
+        Ok(())
+    }
     pub(super) fn stage_live_quorum_candidate(
         &self,
         peer: &PeerId,
@@ -428,15 +540,15 @@ impl<S: KvStore + 'static> Node<S> {
             return Ok(true);
         }
         let mut ids = self.admission_ids()?;
-        if ids.len() >= MAX_JOBS
-            || ids.iter().any(|h| {
-                self.admission_record(*h).ok().flatten().is_some_and(|r| {
-                    !matches!(r.state, AdmissionState::Complete | AdmissionState::Failed)
-                })
+        if ids.iter().any(|h| {
+            self.admission_record(*h).ok().flatten().is_some_and(|r| {
+                !matches!(r.state, AdmissionState::Complete | AdmissionState::Failed)
             })
-        {
+        }) {
             return Err("live admission retained candidate limit".into());
         }
+        let mut batch = WriteBatch::new();
+        self.prepare_quorum_admission_slot(&mut ids, &mut batch)?;
         let body = shell_stark_prover::production_store::bounded_json(block, MAX_BODY)
             .map_err(|e| e.to_string())?;
         let record = AdmissionRecord {
@@ -455,7 +567,6 @@ impl<S: KvStore + 'static> Node<S> {
             error: None,
         };
         ids.push(record.block);
-        let mut batch = WriteBatch::new();
         batch.put(key(b"body/", Some(record.block)), body);
         batch.put(key(b"quorum/", Some(record.block)), cert.to_vec());
         batch.put(
@@ -1159,7 +1270,318 @@ impl<S: KvStore + 'static> Node<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shell_crypto::{MlDsaSigner, Signer};
     use shell_storage::MemoryDb;
+
+    fn completed_quorum_fixture<S: KvStore + 'static>(
+        db: Arc<S>,
+        finalize: bool,
+    ) -> (Node<S>, Vec<Block>, Vec<Vec<u8>>) {
+        let signer = MlDsaSigner::generate();
+        let authority = Address::from_public_key(signer.public_key(), signer.sig_type().as_u8());
+        let genesis = Block {
+            header: BlockHeader {
+                state_root: WorldState::new(db.clone()).state_root().unwrap(),
+                gas_limit: 30_000_000,
+                base_fee_per_gas: 7,
+                proposer: authority,
+                ..Default::default()
+            },
+            transactions: vec![],
+            system_transactions: vec![],
+            proposer_seal: None,
+        };
+        fn init<S: KvStore + 'static>(
+            db: Arc<S>,
+            authority: Address,
+            public_key: &[u8],
+            genesis: &Block,
+        ) -> Node<S> {
+            let chain = ChainStore::new(db.clone());
+            chain.put_pubkey(&authority, public_key).unwrap();
+            let config: shell_storage::ChainConfig = serde_json::from_value(serde_json::json!({
+                "chain_id":1337,"genesis_hash":genesis.hash(),"fee_accounting_activation_height":1,
+                "native_address_context_height":1,"block_commitment_height":1
+            }))
+            .unwrap();
+            chain.commit_genesis_block(genesis, &config).unwrap();
+            let mut node = super::super::tests::setup_node_with_store(authority, db);
+            node.config.enable_stark_aggregation = false;
+            node.config.canonical_quorum_admission = true;
+            node
+        }
+        let producer = init(
+            Arc::new(MemoryDb::new()),
+            authority,
+            signer.public_key(),
+            &genesis,
+        );
+        let node = init(db.clone(), authority, signer.public_key(), &genesis);
+        let mut blocks = vec![];
+        let mut certificates = vec![];
+        for number in 1..=3 {
+            let block = producer.produce_block(&signer, 0).unwrap();
+            let certificate = Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(
+                authority,
+                signer.sign(block.hash().as_bytes()).unwrap(),
+            )]))
+            .unwrap();
+            assert!(producer.fast_finalize_with_certificate(number, block.hash(), &certificate));
+            if number < 3 {
+                node.import_block(block.clone(), &MultiVerifier).unwrap();
+                if finalize {
+                    assert!(node.fast_finalize_with_certificate(
+                        number,
+                        block.hash(),
+                        &certificate
+                    ));
+                }
+                let manifest = CanonicalProofManifest {
+                    version: 2,
+                    chain_id: 1337,
+                    genesis_hash: genesis.hash(),
+                    block_hash: block.hash(),
+                    total_bytes: 1,
+                    payload_hash: shell_primitives::blake3_hash(b"x"),
+                };
+                // Completion markers isolate local-slot lifecycle rules. These bytes
+                // are not proof authorization; real full-QC imports run in the example.
+                let upload = node
+                    .canonical_proof_uploads
+                    .begin(manifest.clone())
+                    .unwrap();
+                node.canonical_proof_uploads
+                    .append(&upload.proof_id, 0, b"x")
+                    .unwrap();
+                let body = serde_json::to_vec(&block).unwrap();
+                let record = AdmissionRecord {
+                    version: 2,
+                    block: block.hash(),
+                    number,
+                    parent: block.header.parent_hash,
+                    source_hash: shell_primitives::blake3_hash(&body),
+                    peer: "provider".into(),
+                    state: AdmissionState::Complete,
+                    manifest: Some(manifest),
+                    quorum_certificate_hash: Some(shell_primitives::blake3_hash(&certificate)),
+                    attempts: 1,
+                    hash_retries: 0,
+                    explicit_recheck: None,
+                    error: None,
+                };
+                db.put(&key(b"body/", Some(block.hash())), &body).unwrap();
+                db.put(&key(b"quorum/", Some(block.hash())), &certificate)
+                    .unwrap();
+                node.save_admission(&record).unwrap();
+            }
+            blocks.push(block);
+            certificates.push(certificate);
+        }
+        db.put(
+            &key(b"jobs", None),
+            &serde_json::to_vec(&vec![blocks[0].hash(), blocks[1].hash()]).unwrap(),
+        )
+        .unwrap();
+        (node, blocks, certificates)
+    }
+
+    #[test]
+    fn completed_quorum_slots_roll_forward_without_erasing_native_or_proof_bytes() {
+        let db = Arc::new(MemoryDb::new());
+        let (node, blocks, certificates) = completed_quorum_fixture(db.clone(), true);
+        let preserved: Vec<_> = db
+            .scan_all()
+            .unwrap()
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with(PREFIX))
+            .collect();
+        assert!(node
+            .stage_live_quorum_candidate(
+                &PeerId("provider".into()),
+                &blocks[2],
+                Some(&certificates[2])
+            )
+            .unwrap());
+        assert_eq!(
+            node.admission_ids().unwrap(),
+            vec![blocks[1].hash(), blocks[2].hash()]
+        );
+        for part in [b"record/".as_slice(), b"body/", b"quorum/"] {
+            assert!(db
+                .get(&key(part, Some(blocks[0].hash())))
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(
+            db.scan_all()
+                .unwrap()
+                .into_iter()
+                .filter(|(k, _)| !k.starts_with(PREFIX))
+                .collect::<Vec<_>>(),
+            preserved
+        );
+        assert_eq!(
+            node.chain_store.get_head_hash().unwrap(),
+            Some(blocks[1].hash())
+        );
+        assert_eq!(node.chain_store.get_finalized_number().unwrap(), Some(2));
+    }
+
+    #[test]
+    fn completed_quorum_slots_preserve_failed_unconsumed_and_sender_records() {
+        for state in [
+            AdmissionState::Failed,
+            AdmissionState::Paused,
+            AdmissionState::Waiting,
+            AdmissionState::Pulling,
+            AdmissionState::Verifying,
+        ] {
+            let db = Arc::new(MemoryDb::new());
+            let (node, blocks, certificates) = completed_quorum_fixture(db.clone(), true);
+            for block in &blocks[..2] {
+                let mut r = node.admission_record(block.hash()).unwrap().unwrap();
+                r.state = state.clone();
+                node.save_admission(&r).unwrap();
+            }
+            let before = db.scan_all().unwrap();
+            assert!(node
+                .stage_live_quorum_candidate(
+                    &PeerId("provider".into()),
+                    &blocks[2],
+                    Some(&certificates[2])
+                )
+                .is_err());
+            assert_eq!(db.scan_all().unwrap(), before);
+        }
+        for intent in [true, false] {
+            let db = Arc::new(MemoryDb::new());
+            let (node, blocks, certificates) = completed_quorum_fixture(db.clone(), true);
+            for block in &blocks[..2] {
+                let mut r = node.admission_record(block.hash()).unwrap().unwrap();
+                if intent {
+                    r.explicit_recheck = Some(r.manifest.as_ref().unwrap().id());
+                } else {
+                    r.version = 1;
+                    r.quorum_certificate_hash = None;
+                    r.manifest.as_mut().unwrap().version = 1;
+                }
+                node.save_admission(&r).unwrap();
+            }
+            let before = db.scan_all().unwrap();
+            assert!(node
+                .stage_live_quorum_candidate(
+                    &PeerId("provider".into()),
+                    &blocks[2],
+                    Some(&certificates[2])
+                )
+                .is_err());
+            assert_eq!(db.scan_all().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn completed_quorum_slots_require_finality_and_respect_disabled_mode() {
+        let db = Arc::new(MemoryDb::new());
+        let (mut node, blocks, certificates) = completed_quorum_fixture(db.clone(), false);
+        let before = db.scan_all().unwrap();
+        assert!(node
+            .stage_live_quorum_candidate(
+                &PeerId("provider".into()),
+                &blocks[2],
+                Some(&certificates[2])
+            )
+            .is_err());
+        assert_eq!(db.scan_all().unwrap(), before);
+        node.config.canonical_quorum_admission = false;
+        assert!(!node
+            .stage_live_quorum_candidate(
+                &PeerId("provider".into()),
+                &blocks[2],
+                Some(&certificates[2])
+            )
+            .unwrap());
+        assert_eq!(db.scan_all().unwrap(), before);
+    }
+
+    #[test]
+    fn completed_quorum_slots_fail_closed_on_changed_source_or_signer_evidence() {
+        for tamper in 0..4 {
+            let db = Arc::new(MemoryDb::new());
+            let (node, blocks, certificates) = completed_quorum_fixture(db.clone(), true);
+            let id = blocks[0].hash();
+            let mut r = node.admission_record(id).unwrap().unwrap();
+            if tamper >= 2 {
+                let manifest = r.manifest.as_mut().unwrap();
+                if tamper == 2 {
+                    manifest.chain_id += 1;
+                } else {
+                    manifest.genesis_hash = ShellHash::ZERO;
+                }
+                node.save_admission(&r).unwrap();
+            } else if tamper == 1 {
+                let mut signers = node.chain_store.get_block_signers(&id).unwrap();
+                signers[0].signature.data[0] ^= 1;
+                let cert = Node::<MemoryDb>::encode_commit_certificate(&HashMap::from([(
+                    signers[0].address,
+                    signers[0].signature.clone(),
+                )]))
+                .unwrap();
+                node.chain_store
+                    .set_commit_certificate_with_signers(&id, &cert, &signers)
+                    .unwrap();
+                db.put(&key(b"quorum/", Some(id)), &cert).unwrap();
+                r.quorum_certificate_hash = Some(shell_primitives::blake3_hash(&cert));
+                node.save_admission(&r).unwrap();
+            } else {
+                let mut body = db.get(&key(b"body/", Some(id))).unwrap().unwrap();
+                body[0] ^= 1;
+                db.put(&key(b"body/", Some(id)), &body).unwrap();
+            }
+            let before = db.scan_all().unwrap();
+            assert!(node
+                .stage_live_quorum_candidate(
+                    &PeerId("provider".into()),
+                    &blocks[2],
+                    Some(&certificates[2])
+                )
+                .is_err());
+            assert_eq!(db.scan_all().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn completed_quorum_slots_retire_oldest_and_roll_back_the_entire_local_batch() {
+        let db = Arc::new(super::super::tests::FailingBatchDb::new());
+        let (node, blocks, certificates) = completed_quorum_fixture(db.clone(), true);
+        db.put(
+            &key(b"jobs", None),
+            &serde_json::to_vec(&vec![blocks[1].hash(), blocks[0].hash()]).unwrap(),
+        )
+        .unwrap();
+        let before = db.scan_all().unwrap();
+        db.fail_next_batch();
+        assert!(node
+            .stage_live_quorum_candidate(
+                &PeerId("provider".into()),
+                &blocks[2],
+                Some(&certificates[2])
+            )
+            .unwrap_err()
+            .contains("injected batch failure"));
+        assert_eq!(db.scan_all().unwrap(), before);
+        assert!(node
+            .stage_live_quorum_candidate(
+                &PeerId("provider".into()),
+                &blocks[2],
+                Some(&certificates[2])
+            )
+            .unwrap());
+        assert_eq!(
+            node.admission_ids().unwrap(),
+            vec![blocks[1].hash(), blocks[2].hash()]
+        );
+        assert!(node.admission_record(blocks[0].hash()).unwrap().is_none());
+    }
     #[test]
     fn retained_quorum_certificate_supports_slh_and_refuses_oversize_or_changed_bytes() {
         let db = Arc::new(MemoryDb::new());
