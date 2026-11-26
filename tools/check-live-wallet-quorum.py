@@ -45,7 +45,8 @@ def port():
 
 
 @contextlib.contextmanager
-def history_copy(binary, source, destination):
+def history_copy(binary, source, destination, store_name="receiver"):
+    require(store_name in ["receiver", "native"], "supported closed source store required")
     require(source.is_dir() and not source.is_symlink(), "closed source case required")
     source = source.resolve(strict=True)
     destination = destination.absolute()
@@ -54,7 +55,7 @@ def history_copy(binary, source, destination):
             "history copy must be outside the source case")
     require(not any(p.is_symlink() for p in source.rglob("*")), "source contains symbolic links")
     with contextlib.ExitStack() as locks:
-        require((source / "receiver" / "db" / "LOCK").is_file(), "closed receiver database required")
+        require((source / store_name / "db" / "LOCK").is_file(), "closed source database required")
         for path in [source / "run.lock", *[source / name / "db" / "LOCK"
                                            for name in ["provider", "native", "receiver"]
                                            if (source / name).exists()]]:
@@ -70,11 +71,12 @@ def history_copy(binary, source, destination):
             destination.mkdir(mode=0o700)
             for name in ["validator.json", "recipient.json", "password", "genesis.json"]:
                 shutil.copy2(source / name, destination / name)
-            shutil.copytree(source / "receiver", destination / "receiver")
-            report.update(commands=[], historySourceSHA256=source_hash)
+            shutil.copytree(source / store_name, destination / "receiver")
+            report.update(commands=[], historySourceSHA256=source_hash, copyStore=store_name)
             (destination / "result.json").write_text(json.dumps(report, indent=2) + "\n")
         require(not any(p.is_symlink() for p in destination.rglob("*")), "history copy contains symbolic links")
-        require(json.loads((destination / "result.json").read_text()).get("historySourceSHA256") == source_hash,
+        saved = json.loads((destination / "result.json").read_text())
+        require(saved.get("historySourceSHA256") == source_hash and saved.get("copyStore", "receiver") == store_name,
                 "history destination belongs to another source; retain it for inspection")
         try:
             yield destination

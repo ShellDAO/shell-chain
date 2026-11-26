@@ -1795,3 +1795,39 @@ repeat the same command to resume; an unexpected result retains its exact
 first error for inspection. Success prints `liveWalletInnerTamperRejected: true`.
 This checks the stated mutation and local source profile; other proof parts,
 signer combinations and original public releases require separate evidence.
+
+### Unverified Ready bytes through automatic peer admission
+
+After the complete wallet and inner-tamper workflows, keep both cases offline:
+
+```sh
+python3 tools/check-live-wallet-peer-refusal.py \
+  target/release/shell-node live-slh-signature-case \
+  live-slh-tamper-case live-slh-peer-refusal-case
+```
+
+This optional regression uses the same Python environment and matching binary.
+It copies the wallet case's independent default-off Native peer, which has the
+authentic block but no proof upload, as a new provider. The existing rehashed
+nonce-mutant artifact is uploaded to `Ready` without local verification. Ready
+availability and chunk serving do not authorize execution. A fresh recipient
+enables sender/proposer proof admission, discovers that provider automatically,
+and pulls the actual artifact over TCP/Noise; no manual recipient upload or
+proof-fetch RPC supplies its bytes.
+
+The supported SLH sender/proposer extension must remain at genesis when its
+inner verification fails: no receipt, balance, nonce, head or finality change.
+The saved candidate identifies the actual provider and manifest, and its full
+intake must be rejected. A separate default-off recipient independently imports
+and finalizes the authentic block through Native verification, matching the
+original receipts and fee rewards. Disabled, unsupported or non-extension
+traffic keeps the existing Native policy; legitimate independent Native
+verification is not proof-based authorization.
+
+The failed recipient is reopened separately to check durable failure and
+unchanged genesis state. That is a persistence check, not another cryptographic
+reverification attempt. The source cases and provider Native state stay
+unchanged, no proof is regenerated, and limits and activation are preserved.
+Success prints `liveWalletPeerRefusalComplete: true`. Retain the new directory
+and use the same command to resume; the result covers this exact source and
+mutation, not every malicious-peer or public-network combination.
