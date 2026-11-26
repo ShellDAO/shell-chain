@@ -1596,3 +1596,67 @@ changed state fails the check. No input database, proof, key or dependency is
 deleted. This exercises process loss after a completed component revalidation,
 not interruption at an exact STARK instruction, initial checkpoint creation,
 machine power loss or every signer/host profile.
+
+### Wallet submission through a running validator
+
+The preceding controls sign their blocks before starting the proof provider.
+To exercise live transaction admission and block production, use the matching
+experimental source and its CLI instead. This follows the public
+[quickstart](https://shell.org/en/docs/quickstart) wallet commands and the
+[operator guide](https://shell.org/en/docs/testnet-operator#node-roles)
+`validator-prover` role:
+
+```sh
+cargo build --locked --release -p shell-cli --bin shell-node --features libp2p
+python3 tools/check-live-wallet-quorum.py target/release/shell-node live-wallet-case
+```
+
+This Unix Python 3.11-or-newer check creates disposable ML-DSA validator and
+recipient keystores, a password file and a funded Dev1337 genesis with the
+operator guide's explicit `authority_pubkeys` mapping. It retains
+those files. The validator is also the sender, matching the quickstart; its
+balance must account for the gas fee returning through the real system reward.
+The check submits one SHELL through `tx send`, waits for the live proposal and
+stored quorum certificate, and compares transfer and gas-reward receipts,
+balances and nonces. Malformed input and a stale signed nonce must refuse
+without changing that state.
+
+The explicit experimental profile uses WPoA, persistent RocksDB, native address
+context, fee accounting and block commitments from block one, and full-QC
+production. Metrics use an ephemeral loopback port for each process. These extend the quickstart's PoA, memory-backed example; they do
+not change a deployed network or qualify a published binary. RPC and P2P listen
+only on loopback. Empty-block production keeps its normal idle-skipping setting,
+and settlement aggregation remains disabled.
+
+The initial validator process pauses after two genuine proof components and
+stops before another process opens its database. Subsequent prover-role
+processes continue only missing components, at most sixteen per process.
+For a bounded initial run and later continuation:
+
+```sh
+python3 tools/check-live-wallet-quorum.py --stop-after-partial \
+  target/release/shell-node live-wallet-partial
+python3 tools/check-live-wallet-quorum.py --resume \
+  target/release/shell-node live-wallet-partial
+```
+
+A complete run also starts an independent default-off Native follower and a
+fresh proof-backed receiver from the same genesis. Both must actually follow
+the provider over TCP/Noise and match its finalized block, roots, receipts and
+account state. The receiver must record complete proof admission and pass hot
+and separate-process cold full verification without changing its Native state.
+Historical verification is asynchronous: the check saves the initial RPC
+response, polls to a verified terminal result and requires one new verification
+attempt for each explicit recheck.
+This single-block check does not establish replay after a later state change;
+the multi-block history checks above cover their separately recorded layouts.
+
+Success exits zero and prints `liveWalletQuorumComplete: true`. A partial run
+prints `liveWalletPartial: true` and establishes only its two components.
+Failures exit nonzero and retain `result.json`, exact CLI arguments, process
+exits, command logs and all databases. Keep the same case and binary for resume;
+inspect an interrupted submission before retrying it. The check neither seeds
+completed proof jobs nor directly writes blocks, certificates or registry rows;
+the configured authority key enters through normal CLI genesis startup.
+Full proving can take hours and requires enough memory and disk for the
+existing proof bounds.
