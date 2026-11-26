@@ -150,7 +150,9 @@ pub fn decrypt_any(
 ) -> Result<Box<dyn Signer>, KeystoreError> {
     match encrypted.key_type.as_str() {
         "dilithium3" | "" => Ok(Box::new(decrypt(encrypted, password)?)),
-        "sphincs-sha2-256f" => Ok(Box::new(decrypt_sphincs(encrypted, password)?)),
+        "sphincs-sha2-256f" | "slh-dsa-sha2-256f" => {
+            Ok(Box::new(decrypt_sphincs(encrypted, password)?))
+        }
         "mldsa65" => Ok(Box::new(decrypt_mldsa(encrypted, password)?)),
         other => Err(KeystoreError::InvalidKey(format!(
             "unsupported key_type: {other}"
@@ -170,7 +172,7 @@ pub fn migrate_keystore(
 ) -> Result<EncryptedKey, KeystoreError> {
     if !matches!(
         encrypted.key_type.as_str(),
-        "dilithium3" | "" | "mldsa65" | "sphincs-sha2-256f"
+        "dilithium3" | "" | "mldsa65" | "sphincs-sha2-256f" | "slh-dsa-sha2-256f"
     ) {
         return Err(KeystoreError::InvalidKey(format!(
             "unsupported key_type: {}",
@@ -184,7 +186,7 @@ pub fn migrate_keystore(
             &migration_signer(&secret_key, &public_key, MlDsaSigner::from_bytes)?,
             password,
         ),
-        "sphincs-sha2-256f" => encrypt_sphincs(
+        "sphincs-sha2-256f" | "slh-dsa-sha2-256f" => encrypt_sphincs(
             &migration_signer(&secret_key, &public_key, SphincsSigner::from_bytes)?,
             password,
         ),
@@ -384,14 +386,17 @@ pub fn encrypt_sphincs(
 
 /// Decrypt an encrypted key with a password, returning a SphincsSigner.
 ///
-/// The stored `key_type` must be `"sphincs-sha2-256f"`.
+/// Accepts `"sphincs-sha2-256f"` and its `"slh-dsa-sha2-256f"` alias.
 pub fn decrypt_sphincs(
     encrypted: &EncryptedKey,
     password: &[u8],
 ) -> Result<SphincsSigner, KeystoreError> {
-    if encrypted.key_type != "sphincs-sha2-256f" {
+    if !matches!(
+        encrypted.key_type.as_str(),
+        "sphincs-sha2-256f" | "slh-dsa-sha2-256f"
+    ) {
         return Err(KeystoreError::InvalidKey(format!(
-            "expected key_type sphincs-sha2-256f, got {}",
+            "expected key_type sphincs-sha2-256f or slh-dsa-sha2-256f, got {}",
             encrypted.key_type
         )));
     }
@@ -534,7 +539,14 @@ mod tests {
 
         let migrated = migrate_keystore(&legacy, &password).unwrap();
         assert_eq!(migrated.ciphertext.len(), (secret_key.len() + 16) * 2);
-        assert_eq!(migrated.key_type, key_type);
+        assert_eq!(
+            migrated.key_type,
+            if key_type == "slh-dsa-sha2-256f" {
+                "sphincs-sha2-256f"
+            } else {
+                key_type
+            }
+        );
         assert_eq!(migrated.public_key, legacy.public_key);
         assert_eq!(
             migrated.address,
@@ -970,6 +982,85 @@ mod tests {
         let verifier = shell_crypto::SphincsVerifier;
         use shell_crypto::Verifier;
         assert!(verifier.verify(recovered.public_key(), msg, &sig).unwrap());
+    }
+
+    #[test]
+    fn slhdsa_alias_preserves_identity_and_migration() {
+        let signer = SphincsSigner::generate();
+        let password = b"SLH alias test password";
+        let encrypted = encrypt_sphincs(&signer, password).unwrap();
+        assert_eq!(encrypted.key_type, "sphincs-sha2-256f");
+        for tag in ["sphincs-sha2-256f", "slh-dsa-sha2-256f"] {
+            let mut input = encrypted.clone();
+            input.key_type = tag.into();
+            let before = serde_json::to_vec(&input).unwrap();
+            let recovered = decrypt_any(&input, password).unwrap();
+            assert_eq!(recovered.public_key(), signer.public_key());
+            assert_eq!(recovered.sig_type(), signer.sig_type());
+            assert_eq!(
+                decrypt_sphincs(&input, password)
+                    .unwrap()
+                    .secret_key_bytes(),
+                signer.secret_key_bytes()
+            );
+            let message = b"same SLH keystore identity";
+            let signature = recovered.sign(message).unwrap();
+            assert!(shell_crypto::verify_signature(
+                signer.sig_type(),
+                signer.public_key(),
+                message,
+                &signature.data
+            )
+            .unwrap());
+            assert!(!shell_crypto::verify_signature(
+                signer.sig_type(),
+                signer.public_key(),
+                b"changed",
+                &signature.data
+            )
+            .unwrap());
+            let migrated = migrate_keystore(&input, password).unwrap();
+            assert_eq!(migrated.key_type, "sphincs-sha2-256f");
+            assert_eq!(migrated.public_key, input.public_key);
+            assert_eq!(migrated.address, input.address);
+            assert_eq!(
+                decrypt_sphincs(&migrated, password)
+                    .unwrap()
+                    .secret_key_bytes(),
+                signer.secret_key_bytes()
+            );
+            assert_eq!(serde_json::to_vec(&input).unwrap(), before);
+        }
+        assert_legacy_migration(&signer, signer.secret_key_bytes(), "slh-dsa-sha2-256f");
+    }
+
+    #[test]
+    fn slhdsa_alias_rejects_tampered_keys_and_other_algorithms() {
+        let signer = SphincsSigner::generate();
+        let password = b"SLH tamper test password";
+        let mut input = encrypt_sphincs(&signer, password).unwrap();
+        input.key_type = "slh-dsa-sha2-256f".into();
+        assert!(decrypt_any(&input, b"wrong").is_err());
+        assert!(migrate_keystore(&input, b"wrong").is_err());
+        for field in ["ciphertext", "nonce", "public_key", "key_type"] {
+            let mut bad = input.clone();
+            let value = match field {
+                "ciphertext" => &mut bad.ciphertext,
+                "nonce" => &mut bad.cipher_params.nonce,
+                "public_key" => &mut bad.public_key,
+                _ => &mut bad.key_type,
+            };
+            let first = if value.starts_with('0') { "1" } else { "0" };
+            value.replace_range(..1, first);
+            assert!(decrypt_any(&bad, password).is_err(), "{field}");
+            assert!(migrate_keystore(&bad, password).is_err(), "{field}");
+        }
+        for tag in ["dilithium3", "mldsa65", "slh-dsa-shake-256f", "hd-seed"] {
+            let mut bad = input.clone();
+            bad.key_type = tag.into();
+            assert!(decrypt_any(&bad, password).is_err(), "{tag}");
+            assert!(migrate_keystore(&bad, password).is_err(), "{tag}");
+        }
     }
 
     #[test]

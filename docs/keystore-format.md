@@ -70,7 +70,7 @@ and the TypeScript SDK (`shell-sdk`).
 |-------|------|-------------|
 | `version` | `u32` | Always `1`. Future breaking changes increment this. |
 | `address` | `string` | Canonical `0x` + 64 lowercase hex address derived from the public key (see §7). |
-| `key_type` | `string` | Algorithm identifier: `"dilithium3"` or `"mldsa65"` (see §4). |
+| `key_type` | `string` | Algorithm identifier (see §4), including both accepted SLH spellings. |
 | `kdf` | `string` | Always `"argon2id"`. |
 | `kdf_params.m_cost` | `u32` | Argon2id memory cost in KiB (CLI default: `65536` = 64 MiB). |
 | `kdf_params.t_cost` | `u32` | Argon2id time cost / iterations (CLI default: `3`). |
@@ -87,6 +87,7 @@ and the TypeScript SDK (`shell-sdk`).
 |-----------|-----------|--------------------------------------|
 | `dilithium3` | 4000 B | 4016 B (8032 hex chars) |
 | `mldsa65` | 4032 B | 4048 B (8096 hex chars) |
+| SLH-DSA-SHA2-256f (both tags) | 128 B | 144 B (288 hex chars) |
 
 ---
 
@@ -97,8 +98,16 @@ and the TypeScript SDK (`shell-sdk`).
 | `mldsa65` | ML-DSA-65 (FIPS 204) | 1952 B | 4032 B | **Primary** (`--algorithm mldsa65`) |
 | `dilithium3` | Dilithium3 (NIST Round 3 reference) | 1952 B | 4000 B | Legacy-compatible active path; use with `--algorithm dilithium3` |
 
-Both algorithms use the same keystore format. The `key_type` field tells the runtime which
-decryption path to use.
+| `sphincs-sha2-256f` | SLH-DSA-SHA2-256f (FIPS 205) | 64 B | 128 B | Current writer output; `--algorithm slhdsa` |
+| `slh-dsa-sha2-256f` | Same SLH-DSA algorithm | 64 B | 128 B | Accepted read alias for the preceding row |
+
+All algorithms use the same keystore format. The `key_type` field selects the
+signer. The two SLH spellings refer to the same key encoding, address domain and
+signature type; changing between them does not rotate an account. Generation
+and migration continue to write `sphincs-sha2-256f` for existing-reader compatibility.
+Older binaries may accept only this writer spelling; the read alias requires a
+binary containing the compatibility update. Decryption and migration reject SLH
+public-key metadata that differs from the public key in the encrypted private key.
 
 ---
 
@@ -168,6 +177,7 @@ The `algo_id` used in the address derivation scheme:
 |------------|-----------|
 | `dilithium3` | `0` |
 | `mldsa65` | `1` |
+| `sphincs-sha2-256f` or `slh-dsa-sha2-256f` | `2` |
 
 Shell Chain addresses are encoded as `0x` + 64 lowercase hex everywhere user-facing:
 CLI, explorer, RPC, genesis, SDK APIs, and the keystore `address` field. Legacy
@@ -280,7 +290,8 @@ shell-node --password-file /run/secrets/pw key migrate \
 
 Migration accepts both current secret-key-only payloads and legacy payloads whose
 appended public key exactly matches the `public_key` field. It retains the declared
-signature algorithm and the original private and public keys, derives the canonical
+signature algorithm and the original private and public keys (both SLH input tags
+are written as `sphincs-sha2-256f`), derives the canonical
 address, and encrypts with the same password using a fresh salt and nonce. It does
 not convert keys between signature algorithms or generate a replacement account.
 The output must be a new file; the input is preserved.
@@ -300,3 +311,22 @@ signer keystores and are not accepted by this command.
 - `crates/keystore/src/types.rs` — Rust type definitions
 - `crates/keystore/src/crypto.rs` — encrypt/decrypt implementation
 - `shell-sdk/src/keystore.ts` — TypeScript SDK implementation
+
+## SLH keystore compatibility check
+
+With Python 3.11+ on Unix and a matching `shell-node` built with RocksDB and
+libp2p, run from the repository root:
+
+```bash
+cargo test -p shell-keystore slhdsa_alias
+cargo test -p shell-cli --test slh_keystore
+cargo build -p shell-cli --release --features libp2p
+python3 tools/check-slh-keystore.py target/release/shell-node /tmp/shell-slh-keystore-case
+```
+
+The case directory must be new. The script creates temporary accounts and private
+Dev funds, then checks alias inspection, migration, a real SLH wallet transfer and
+validator signature, nonce/malformed/tampered input rejection, independent Native
+peer import and cold restart. It reconciles balances, nonces, fee rewards and
+receipts, retains its keys/data/command logs, and exits nonzero on failure. It does
+not generate a new QC proof graph or qualify a public release/network activation.

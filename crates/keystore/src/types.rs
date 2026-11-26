@@ -70,7 +70,8 @@ pub struct EncryptedKey {
     pub version: u32,
     /// Shell-chain address derived from the public key (`0x` + 64 lowercase hex).
     pub address: String,
-    /// PQ algorithm type ("dilithium3" or "sphincs-sha2-256f").
+    /// PQ algorithm type: "dilithium3", "mldsa65", or "sphincs-sha2-256f".
+    /// SLH keys also accept the "slh-dsa-sha2-256f" alias when read.
     #[serde(default = "default_key_type")]
     pub key_type: String,
     /// KDF algorithm identifier.

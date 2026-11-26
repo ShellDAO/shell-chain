@@ -150,7 +150,7 @@ fn signature_type_from_key_type(
     match key_type {
         "dilithium3" | "" => Ok(SignatureType::Dilithium3),
         "mldsa65" => Ok(SignatureType::MlDsa65),
-        "sphincs-sha2-256f" => Ok(SignatureType::SphincsSha2256f),
+        "sphincs-sha2-256f" | "slh-dsa-sha2-256f" => Ok(SignatureType::SphincsSha2256f),
         other => Err(format!("unsupported keystore algorithm: {other}").into()),
     }
 }

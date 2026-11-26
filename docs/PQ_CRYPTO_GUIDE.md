@@ -365,7 +365,7 @@ Shell-chain supports **SLH-DSA-SHA2-256f**, the FIPS 205 successor to the SPHINC
 | Speed | Fast | Slower |
 | Conservative | Moderate | Very conservative |
 
-SLH-DSA keystores use `"key_type": "sphincs-sha2-256f"` for wire compatibility and are managed with the same CLI tools.
+SLH-DSA keystore generation and migration write `"key_type": "sphincs-sha2-256f"` for existing-reader compatibility. Readers also accept `"slh-dsa-sha2-256f"` as an alias for the same 64-byte public key, 128-byte private key and address domain. Older binaries require the writer spelling until upgraded. Both tags use the same CLI inspection, migration, wallet and validator paths; see the [keystore format](keystore-format.md#4-supported-algorithms).
 
 The `MultiVerifier` automatically detects the algorithm from the signature's embedded type tag, enabling mixed validator sets where some validators use Dilithium3 and others use SLH-DSA.
 

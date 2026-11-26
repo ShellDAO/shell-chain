@@ -49,12 +49,18 @@ impl SphincsSigner {
                 got: public_key.len(),
             }
         })?;
-        slh_dsa_sha2_256f::PrivateKey::try_from_bytes(secret_key).map_err(|_| {
-            CryptoError::InvalidSecretKeyLength {
-                expected: slh_dsa_sha2_256f::SK_LEN,
-                got: secret_key.len(),
-            }
-        })?;
+        let private_key =
+            slh_dsa_sha2_256f::PrivateKey::try_from_bytes(secret_key).map_err(|_| {
+                CryptoError::InvalidSecretKeyLength {
+                    expected: slh_dsa_sha2_256f::SK_LEN,
+                    got: secret_key.len(),
+                }
+            })?;
+        if private_key.get_public_key().into_bytes() != *public_key {
+            return Err(CryptoError::InvalidInput(
+                "SLH public key does not match secret key".into(),
+            ));
+        }
         Ok(Self {
             secret_key_bytes: zeroize::Zeroizing::new(secret_key.to_vec()),
             public_key_bytes: public_key.to_vec(),
@@ -161,6 +167,17 @@ impl Verifier for SphincsVerifier {
 mod tests {
     use super::*;
     use crate::{DilithiumSigner, DilithiumVerifier};
+
+    #[test]
+    fn imported_key_rejects_public_key_substitution() {
+        let signer = SphincsSigner::generate();
+        let mut public_key = signer.public_key().to_vec();
+        public_key[0] ^= 1;
+        assert!(matches!(
+            SphincsSigner::from_bytes(&public_key, signer.secret_key_bytes()),
+            Err(CryptoError::InvalidInput(message)) if message.contains("does not match")
+        ));
+    }
 
     #[test]
     fn generate_and_sign_verify() {
