@@ -1,5 +1,7 @@
 //! Source-bound completed checkpoints through three real node-owned quorum jobs.
 use super::*;
+#[path = "quorum_fresh.rs"]
+mod fresh;
 #[path = "quorum_producer_fault.rs"]
 mod owner_fault;
 
@@ -278,24 +280,36 @@ async fn queue_and_recover_third(c: &Control, donor: &Path, root: &Path) -> Resu
     Ok(())
 }
 async fn exercise(args: &[String]) -> Result<(), Error> {
+    let from_empty = args[0].starts_with("producer-fresh-");
+    if from_empty
+        && !matches!(
+            args[0].as_str(),
+            "producer-fresh-peer" | "producer-fresh-cold"
+        )
+    {
+        return fresh::exercise(args).await;
+    }
     if args[0].starts_with("producer-history-") {
         return owner_fault::exercise(args).await;
     }
-    let cold = args[0] == "producer-successor-cold";
+    let cold = matches!(
+        args[0].as_str(),
+        "producer-successor-cold" | "producer-fresh-cold"
+    );
     let resume = args[0] == "producer-successor-resume";
     let c = successor::controls(Path::new(&args[1]))?;
     ensure(
         c.co_authority.is_some(),
         "producer lifecycle requires genuine two-authority controls",
     )?;
-    let root = Path::new(&args[5]);
+    let root = Path::new(&args[if from_empty { 2 } else { 5 }]);
     ensure(
-        root.exists() == (cold || resume),
+        root.exists() == (cold || resume || from_empty),
         "producer lifecycle destination ownership mismatch",
     )?;
     if resume {
         queue_and_recover_third(&c, Path::new(&args[4]), root).await?;
-    } else if !cold {
+    } else if !cold && !from_empty {
         prepare_owned(&c, Path::new(&args[1]), &args[2..5], root).await?;
     }
     let path = root.join("provider-db");
@@ -312,7 +326,7 @@ async fn exercise(args: &[String]) -> Result<(), Error> {
         let mut manifests = Vec::new();
         let mut production = Vec::new();
         for block in &c.blocks {
-            let status = wait_production(&provider,block.hash(),cold).await?;
+            let status = wait_production(&provider,block.hash(),cold || from_empty).await?;
             manifests.push(completed(&status)?);
             production.push(status);
         }
@@ -322,7 +336,8 @@ async fn exercise(args: &[String]) -> Result<(), Error> {
         for (index, block) in c.blocks.iter().enumerate() {
             ensure(certificate_rows(&provider.node,block.hash())? == original[index], "cold/active producer rewrote original checkpoints")?;
         }
-        let receiver = Live::start_mode(&root.join("receiver-db"),&c,vec![provider.dial()],true,!cold).await?;
+        let receiver_exists = root.join("receiver-db/CURRENT").is_file();
+        let receiver = Live::start_mode(&root.join("receiver-db"),&c,vec![provider.dial()],true,!(cold||from_empty&&receiver_exists)).await?;
         let result = async {
             successor::wait_head(&receiver,&c,3).await?;
             ensure(recovery_native_digest(&receiver.node)? == native, "fresh peer Native3 differs from independent provider")?;
@@ -331,7 +346,7 @@ async fn exercise(args: &[String]) -> Result<(), Error> {
             let mut attempts=Vec::new();
             for (index, manifest) in manifests.iter().enumerate() {
                 let old=receiver.status(manifest.id()).await?;
-                ensure(old.verification_attempts == if cold {2}else{1}, "unexpected history authorization attempts before explicit full check")?;
+                ensure(if from_empty {old.verification_attempts>=1}else{old.verification_attempts == if cold {2}else{1}}, "unexpected history authorization attempts before explicit full check")?;
                 let checked=receiver.verify(manifest.id()).await?;
                 successor::expected(&receiver,&provider,&c,index,&checked,c.blocks[2].hash())?;
                 ensure(checked.verification_attempts == old.verification_attempts+1, "historical proof did not run a new full check")?;
@@ -339,7 +354,7 @@ async fn exercise(args: &[String]) -> Result<(), Error> {
                 attempts.push(checked.verification_attempts);
             }
             ensure(canonical_rows(&receiver)? == before && recovery_native_digest(&receiver.node)? == native && receiver.node.chain_store.get_finalized_number()? == Some(3), "full historical recheck changed current Native3")?;
-            println!("{}",json!({"nodeOwnedQuorumJobs":3,"activeJobs":2,"completedHistoryJobs":1,"production":production,"newProofMath":0,"automaticThirdCaptureProbeThisProcess":!cold,"actualTCPNoise":true,"freshPeerImportThisProcess":!cold,"receiverManualUploadOrFetch":false,"NativeHeadAndFinality":3,"independentNative3RowsEqual":true,"originalCheckpointRowsPreserved":true,"historyVerificationAttempts":attempts,"historicalNativeRowsUnchanged":true,"coldProcess":cold,"senderOwnerUntouched":provider.node.store.scan_prefix(b"local/canonical-production/v1/")?.is_empty()}));
+            println!("{}",json!({"nodeOwnedQuorumJobs":3,"activeJobs":2,"completedHistoryJobs":1,"productionEntry":args[0],"production":production,"newProofMath":0,"automaticThirdCaptureProbeThisProcess":!cold&&!from_empty,"actualTCPNoise":true,"freshPeerImportThisProcess":!cold&&!receiver_exists,"receiverManualUploadOrFetch":false,"NativeHeadAndFinality":3,"independentNative3RowsEqual":true,"originalCheckpointRowsPreserved":true,"historyVerificationAttempts":attempts,"historicalNativeRowsUnchanged":true,"coldProcess":cold,"senderOwnerUntouched":provider.node.store.scan_prefix(b"local/canonical-production/v1/")?.is_empty()}));
             Ok::<_, Error>(())
         }.await;
         receiver.stop().await?;

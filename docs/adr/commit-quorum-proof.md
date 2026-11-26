@@ -1355,6 +1355,62 @@ job capture/requeue completes. A missing third status in that initial window
 is not a persistent failure. The resume form refuses a directory that already
 contains a receiver; use the cold form after a completed live exercise.
 
+### Fresh Node-owned three-source generation
+
+The seeded lifecycle above does not establish initial source capture or fresh
+generation. This separate exercise starts with empty production and proof-cache
+namespaces. It needs Python 3.11 or later on POSIX, the Rust/RocksDB prerequisites
+above, and the matching unreleased source:
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_PROFILE_TEST_OPT_LEVEL=1 CARGO_PROFILE_TEST_DEBUG=0 \
+  CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true \
+  cargo build --locked --profile test -p shell-node --features rocksdb --example quorum-native
+python3 tools/check-fresh-quorum-production.py target/debug/examples/quorum-native fresh-quorum-case
+```
+
+Use a new case directory. Preparation generates temporary signers in memory,
+saves three genuine signed blocks and certificates, and independently executes
+the Native controls before dropping private keys. No existing keystore, testnet
+funds, complete donor job or proof artifact is an input. The initial provider is
+a fresh Native-only snapshot at height 2. An actual Node session first checks
+that default-off production leaves sources, checkpoints and cache empty.
+
+Opt-in Node sessions then capture the original finalized sources and produce
+their full graphs with at most sixteen newly proved components per process.
+Cold sessions reverify existing checkpoints before continuing; equivalent
+certificates created within this same new owner may be reused after verification.
+No external completed job or reported completion flag is imported. Read-only
+snapshots and every production step check preserved Native and earlier
+source/checkpoint bytes. After the first two jobs complete, an actual certified
+TCP/Noise peer advances the provider to height 3. Normal Node startup captures
+the third source and rotates the eligible completed-job index within the same
+active, total, byte and cache bounds.
+
+The tool then uses ordinary automatic full-QC peer admission to reach Native
+execution and finality 3 from fresh genesis, followed by hot and separate-process
+cold historical verification after state 3. The provider, receiver and independent
+Native reference must agree on rows, receipts, balances, nonce, value, gas and
+fees. Historical checks must not write current Native state, and all completed
+checkpoints and payloads must remain unchanged.
+
+The underlying entries are `producer-fresh-init`, `producer-fresh-step` (with a
+budget from 1 through 16), `producer-fresh-snapshot`, `producer-fresh-advance`,
+`producer-fresh-peer` and `producer-fresh-cold`; each takes the retained controls
+and runtime directory. Failed assertions exit nonzero with command arguments,
+PIDs, exit codes and logs in the case directory. Inspect the first failure,
+repair its cause and continue that same case:
+
+```sh
+python3 tools/check-fresh-quorum-production.py --resume \
+  target/debug/examples/quorum-native fresh-quorum-case
+```
+
+Do not recreate signed controls, delete databases or regenerate a completed
+graph. This bounded static two-ML-DSA weight-[2,1] exercise does not qualify
+changing committees or penalties, forks, physical quota saturation, all host or
+build profiles, public releases or network activation.
+
 ### Persistent refusal of the producer history index
 
 The same controls and three complete jobs can exercise a controlled database
