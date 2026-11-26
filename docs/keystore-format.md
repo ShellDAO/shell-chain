@@ -97,7 +97,6 @@ and the TypeScript SDK (`shell-sdk`).
 |------------|----------|------------|------------|-------|
 | `mldsa65` | ML-DSA-65 (FIPS 204) | 1952 B | 4032 B | **Primary** (`--algorithm mldsa65`) |
 | `dilithium3` | Dilithium3 (NIST Round 3 reference) | 1952 B | 4000 B | Legacy-compatible active path; use with `--algorithm dilithium3` |
-
 | `sphincs-sha2-256f` | SLH-DSA-SHA2-256f (FIPS 205) | 64 B | 128 B | Current writer output; `--algorithm slhdsa` |
 | `slh-dsa-sha2-256f` | Same SLH-DSA algorithm | 64 B | 128 B | Accepted read alias for the preceding row |
 
