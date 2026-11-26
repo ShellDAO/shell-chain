@@ -1411,6 +1411,31 @@ graph. This bounded static two-ML-DSA weight-[2,1] exercise does not qualify
 changing committees or penalties, forks, physical quota saturation, all host or
 build profiles, public releases or network activation.
 
+To exercise abrupt loss during initial generation, use a different new case:
+
+```sh
+python3 tools/check-fresh-quorum-production.py --interrupt-production \
+  target/debug/examples/quorum-native interrupted-quorum-case
+```
+
+This form first persists two genuine components with a budget of two. A second
+owned child revalidates both, then the tool sends `SIGKILL` only to that child
+at the exact `Proving commit-signer-0-signature` log line. The line precedes
+the new component's proving call and checkpoint write; observing it does not
+identify a particular CPU instruction inside the prover. A separate offline
+process must observe the durable `proving` claim with unchanged original source
+and component rows, checkpoint counts and bytes, Native state and empty payload
+cache. Mutable production metadata can change.
+
+The same case then resumes through normal bounded Node sessions and completes
+all three sources, automatic peer admission and hot/cold history checks above.
+It uses new disposable controls and never changes a completed job into an
+incomplete job. After a later failure, use `--resume` with that retained case;
+the successful interruption is recorded and is not repeated. An incomplete
+interruption receipt instead exits nonzero for inspection. This is a process
+loss at a component dispatch boundary, not a torn-write, power-loss or
+all-host guarantee.
+
 ### Persistent refusal of the producer history index
 
 The same controls and three complete jobs can exercise a controlled database
