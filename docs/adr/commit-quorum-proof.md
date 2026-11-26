@@ -1660,3 +1660,29 @@ completed proof jobs nor directly writes blocks, certificates or registry rows;
 the configured authority key enters through normal CLI genesis startup.
 Full proving can take hours and requires enough memory and disk for the
 existing proof bounds.
+
+
+For the supported SLH-DSA-SHA2-256f signing identity, select the authority and
+wallet sender scheme explicitly:
+
+```sh
+python3 tools/check-live-wallet-quorum.py --validator-algorithm slhdsa \
+  target/release/shell-node live-slh-wallet-case
+python3 tools/check-live-wallet-quorum.py --resume \
+  target/release/shell-node live-slh-wallet-case
+```
+
+This check defaults to its existing ML-DSA case; the recipient remains ML-DSA
+for either authority scheme. The selected scheme is saved before key generation
+and cannot change on resume. Older cases without that field retain their
+original ML-DSA interpretation. The SLH case uses the CLI's existing
+`key generate --algorithm slhdsa` entry and the operator guide's genesis key
+mapping. It creates a distinct signing identity and preserves governance
+fallback policy.
+
+The full-QC artifact proves the actual SLH commit signature. Wallet and proposer
+seal signatures also pass ordinary Native validation; their separate sender or
+proposer AIR production profiles require their own results. Keep the new case
+through bounded proving sessions and resume it without repeating completed
+components. The same receipt, fee reward, independent peer, default-off and
+asynchronous hot/cold history checks apply.

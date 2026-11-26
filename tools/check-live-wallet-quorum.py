@@ -44,10 +44,17 @@ def port():
 
 
 class Case:
-    def __init__(self, binary, root, resume):
+    def __init__(self, binary, root, resume, algorithm=None):
         self.binary, self.root = binary, root
         self.path = root / "result.json"
         self.report = json.loads(self.path.read_text()) if resume else {"complete": False, "commands": []}
+        stored_algorithm = self.report.get("validatorAlgorithm", "mldsa65")
+        require(stored_algorithm in ["mldsa65", "slhdsa"], "unsupported saved validator algorithm")
+        require(not resume or algorithm in [None, stored_algorithm],
+                "cannot change validator algorithm when resuming a retained case")
+        self.algorithm = stored_algorithm if resume else (algorithm or "mldsa65")
+        if not resume:
+            self.report["validatorAlgorithm"] = self.algorithm
         actual = digest(binary)
         require(self.report.get("binarySHA256", actual) == actual,
                 "binary changed; inspect the retained prefix before selecting recovery")
@@ -164,7 +171,8 @@ class Case:
             stream.write(secrets.token_urlsafe(32) + "\n")
         for name in ["validator", "recipient"]:
             self.run(name + "-generate", ["--password-file", "password", "key", "generate",
-                     "--algorithm", "mldsa65", "--output", name + ".json"])
+                     "--algorithm", self.algorithm if name == "validator" else "mldsa65",
+                     "--output", name + ".json"])
             text = self.run(name + "-inspect", ["key", "inspect", name + ".json"])
             address = re.search(r"Address:\s+(0x[0-9a-f]{64})", text)
             require(address, "key inspect did not return a full-width address")
@@ -184,6 +192,19 @@ class Case:
                      "--chain-id", "1337", "--network", "dev"])
         self.report["initialized"] = True
         self.save()
+
+    def check_scheme(self):
+        kind, key_bytes, signature_bytes = {
+            "mldsa65": ("MlDsa65", 1952, 3309),
+            "slhdsa": ("SphincsSha2256f", 64, 49856),
+        }[self.algorithm]
+        key = json.loads((self.root / "validator.json").read_text())
+        certificate = self.report["liveCertificate"]["certificate"]
+        signature = certificate.get(self.report["validator"])
+        require(len(bytes.fromhex(key["public_key"].removeprefix("0x"))) == key_bytes
+                and len(certificate) == 1 and signature and signature["sig_type"] == kind
+                and isinstance(signature["data"], list) and len(signature["data"]) == signature_bytes,
+                "actual authority key and QC signature do not match the selected scheme")
 
     def snapshot(self, endpoint):
         block = self.rpc(endpoint, "eth_getBlockByNumber", ["0x1", True])
@@ -368,6 +389,8 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("root", type=Path)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--validator-algorithm", choices=["mldsa65", "slhdsa"],
+                        help="Authority and wallet sender scheme; new cases default to mldsa65, resume keeps the saved scheme")
     parser.add_argument("--stop-after-partial", action="store_true", help="Retain the first two genuine components for later resume")
     args = parser.parse_args()
     binary, root = args.binary.resolve(strict=True), args.root.absolute()
@@ -378,11 +401,12 @@ def main():
     require(not any(p.is_symlink() for p in root.rglob("*")), "case contains symbolic links")
     with (root / "run.lock").open("a+b") as lock:
         fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        case = Case(binary, root, args.resume)
+        case = Case(binary, root, args.resume, args.validator_algorithm)
         try:
             if not case.report["complete"]:
                 case.initialize()
                 case.propose()
+                case.check_scheme()
                 if args.stop_after_partial:
                     print(json.dumps({"liveWalletPartial": True, "block": case.report["blockHash"], "components": 2}))
                     return
@@ -390,6 +414,7 @@ def main():
                 case.peer()
                 case.report["complete"] = True
                 case.save()
+            case.check_scheme()
             print(json.dumps({"liveWalletQuorumComplete": True, "block": case.report["blockHash"],
                               "components": case.report["production"]["components"],
                               "proofId": case.report["proofId"]}))
