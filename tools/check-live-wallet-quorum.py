@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise wallet -> live validator -> durable full-QC proof -> independent peers.
+"""Exercise wallet -> live validator -> durable signature proof -> independent peers.
 
 Requires Python 3.11+ on Unix and a matching shell-node built with rocksdb/libp2p.
 Creates disposable Dev accounts and retains all keys, chain data and checkpoints.
@@ -44,7 +44,7 @@ def port():
 
 
 class Case:
-    def __init__(self, binary, root, resume, algorithm=None):
+    def __init__(self, binary, root, resume, algorithm=None, proof_kind=None):
         self.binary, self.root = binary, root
         self.path = root / "result.json"
         self.report = json.loads(self.path.read_text()) if resume else {"complete": False, "commands": []}
@@ -55,6 +55,13 @@ class Case:
         self.algorithm = stored_algorithm if resume else (algorithm or "mldsa65")
         if not resume:
             self.report["validatorAlgorithm"] = self.algorithm
+        stored_kind = self.report.get("proofKind", "quorum")
+        require(stored_kind in ["quorum", "sender-proposer"], "unsupported saved proof kind")
+        require(not resume or proof_kind in [None, stored_kind],
+                "cannot change proof kind when resuming a retained case")
+        self.proof_kind = stored_kind if resume else (proof_kind or "quorum")
+        if not resume:
+            self.report["proofKind"] = self.proof_kind
         actual = digest(binary)
         require(self.report.get("binarySHA256", actual) == actual,
                 "binary changed; inspect the retained prefix before selecting recovery")
@@ -110,9 +117,12 @@ class Case:
         if role == "validator-prover":
             args += ["--keystore", "validator.json", "--password-file", "password"]
         if production:
-            args += ["--canonical-quorum-production", "--canonical-proof-component-budget", str(budget)]
+            flag = ("--canonical-quorum-production" if self.proof_kind == "quorum"
+                    else "--canonical-proof-production=true")
+            args += [flag, "--canonical-proof-component-budget", str(budget)]
         if admission:
-            args += ["--canonical-quorum-admission"]
+            args += ["--canonical-quorum-admission" if self.proof_kind == "quorum"
+                     else "--canonical-proof-admission=true"]
         if bootnode:
             args += ["--bootnode", bootnode]
         child, log, row = self.command(name + "-" + role, args)
@@ -236,14 +246,31 @@ class Case:
                 and receipts[1]["gasUsed"] == "0x0", "effective fee/reward reconciliation failed")
 
     def production(self, endpoint):
-        value = self.rpc(endpoint, "admin_quorumProofProduction", [self.report["blockHash"]])
+        method = ("admin_quorumProofProduction" if self.proof_kind == "quorum"
+                  else "admin_canonicalProofProduction")
+        value = self.rpc(endpoint, method, [self.report["blockHash"]])
         if value:
+            if self.proof_kind == "sender-proposer":
+                require(value["nativeExecutionVerified"] is False,
+                        "production status must not be Native authorization")
+                self.report["senderSourceObservation"] = value
+                self.save()
             status = value["status"]
             require(status["state"] != "failed" and (not status.get("error") or status["state"] == "paused"),
-                    "quorum production failed: " + json.dumps(value))
+                    "signature production failed: " + json.dumps(value))
             require(status["blockNumber"] == 1 and status["blockHash"] == self.report["blockHash"],
                     "production source identity mismatch")
             return status
+        if self.proof_kind == "sender-proposer":
+            for row in reversed(self.report["commands"]):
+                if row["label"].startswith("provider-"):
+                    failed = [line for line in (self.root / row["log"]).read_text().splitlines()
+                              if "canonical sender proof capture unavailable" in line]
+                    if failed:
+                        self.report["senderCaptureFirstFailure"] = {"log": row["log"], "line": failed[-1]}
+                        self.save()
+                        raise RuntimeError("sender source capture refused; inspect retained first failure")
+                    break
         return None
 
     def propose(self):
@@ -292,19 +319,21 @@ class Case:
             with self.node("provider", production=True) as (endpoint, child):
                 def settled():
                     status = self.production(endpoint)
-                    return status if (status and status["state"] in ["paused", "complete"]
-                                      and status["components"] > old["components"]) else None
+                    return status if (status and (status["state"] == "complete" or
+                                      (status["state"] == "paused" and status["components"] > old["components"]))) else None
                 status = self.wait(settled, child)
-                require(status["components"] > old["components"] and status["newlyProved"] <= 16,
+                require((status["components"] > old["components"] or status["state"] == "complete")
+                        and status["newlyProved"] <= 16,
                         "missing component progress or per-process budget exceeded")
                 require(status["sourceHash"] == old["sourceHash"], "immutable source changed on restart")
                 self.report["production"] = status
                 require(self.snapshot(endpoint) == self.report["liveState"], "proof generation changed Native state")
                 if status["state"] == "complete":
                     manifest = status["manifest"]
-                    require(manifest and manifest["version"] == 2 and manifest["chainId"] == 1337
+                    version = 2 if self.proof_kind == "quorum" else 1
+                    require(manifest and manifest["version"] == version and manifest["chainId"] == 1337
                             and manifest["genesisHash"] == self.report["genesisHash"]
-                            and manifest["blockHash"] == self.report["blockHash"], "full-QC manifest binding mismatch")
+                            and manifest["blockHash"] == self.report["blockHash"], "signature manifest binding mismatch")
                     upload = self.rpc(endpoint, "admin_beginCanonicalProof", [manifest])
                     self.report["proofId"] = upload["proofId"]
                     self.report["proved"] = True
@@ -331,7 +360,29 @@ class Case:
                 label + " full verification attempt count mismatch")
         self.report[label + "Verification"] = status
         self.save()
+        self.check_history_result(status)
         return status
+
+    def check_history_result(self, status):
+        result = status["result"]
+        native = self.report["liveState"]
+        if self.proof_kind == "quorum":
+            require(result["proved_commit_signatures"] == 1, "actual QC signature AIR result absent")
+            execution = result["execution"]
+            require(execution["proved_sender_signatures"] == 0, "unexpected QC artifact signature scope")
+        else:
+            execution = result
+            require(execution["proved_sender_signatures"] == 1
+                    and execution["proved_proposer_signature"] is True,
+                    "actual full sender/proposer AIR result absent")
+        receipts = execution["receipts"]
+        require(execution["block"] == self.report["blockHash"]
+                and execution["parent"] == native["block"]["parentHash"]
+                and execution["state_root"] == native["block"]["stateRoot"]
+                and [x["tx_hash"] for x in receipts] == [x["transactionHash"] for x in native["receipts"]]
+                and all(x["status"] == 1 for x in receipts)
+                and [x["gas_used"] for x in receipts] == [int(x["gasUsed"], 16) for x in native["receipts"]],
+                "historical AIR execution differs from independent Native receipts")
 
     def peer(self):
         if self.report.get("coldVerification"):
@@ -391,6 +442,8 @@ def main():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--validator-algorithm", choices=["mldsa65", "slhdsa"],
                         help="Authority and wallet sender scheme; new cases default to mldsa65, resume keeps the saved scheme")
+    parser.add_argument("--proof-kind", choices=["quorum", "sender-proposer"],
+                        help="Signature proof role; new cases default to quorum, resume keeps the saved role")
     parser.add_argument("--stop-after-partial", action="store_true", help="Retain the first two genuine components for later resume")
     args = parser.parse_args()
     binary, root = args.binary.resolve(strict=True), args.root.absolute()
@@ -401,7 +454,7 @@ def main():
     require(not any(p.is_symlink() for p in root.rglob("*")), "case contains symbolic links")
     with (root / "run.lock").open("a+b") as lock:
         fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        case = Case(binary, root, args.resume, args.validator_algorithm)
+        case = Case(binary, root, args.resume, args.validator_algorithm, args.proof_kind)
         try:
             if not case.report["complete"]:
                 case.initialize()
@@ -415,7 +468,9 @@ def main():
                 case.report["complete"] = True
                 case.save()
             case.check_scheme()
-            print(json.dumps({"liveWalletQuorumComplete": True, "block": case.report["blockHash"],
+            completed = ("liveWalletQuorumComplete" if case.proof_kind == "quorum"
+                         else "liveWalletSenderProposerComplete")
+            print(json.dumps({completed: True, "block": case.report["blockHash"],
                               "components": case.report["production"]["components"],
                               "proofId": case.report["proofId"]}))
         except BaseException as error:

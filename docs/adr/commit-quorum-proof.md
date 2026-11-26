@@ -1686,3 +1686,41 @@ proposer AIR production profiles require their own results. Keep the new case
 through bounded proving sessions and resume it without repeating completed
 components. The same receipt, fee reward, independent peer, default-off and
 asynchronous hot/cold history checks apply.
+
+### Live sender and proposer signature proof role
+
+The same source workflow can select the existing automatic sender/proposer
+producer and admission paths. It uses a separate case and worker from quorum
+production:
+
+```sh
+python3 tools/check-live-wallet-quorum.py --validator-algorithm slhdsa \
+  --proof-kind sender-proposer --stop-after-partial \
+  target/release/shell-node live-slh-signature-case
+python3 tools/check-live-wallet-quorum.py --resume \
+  target/release/shell-node live-slh-signature-case
+```
+
+This optional source workflow selects `--canonical-proof-production=true` and
+`admin_canonicalProofProduction`; its independent receiver selects
+`--canonical-proof-admission=true`. Keep the explicit genesis authority key and
+private activation profile used by the wallet check above. The eligible case
+contains one ordinary SLH wallet transaction, its block gas reward, and a
+registered SLH proposer seal. The producer freezes the actual committed source
+and persists bounded missing components across normal CLI restarts.
+
+The selected proof role is saved with the case and cannot change on resume.
+New cases default to `quorum`; older cases without a role field preserve that
+interpretation. Scheme selection and the recipient remain as described above.
+The initial partial run has no complete manifest. Continue the same directory
+to the full artifact, automatic independent peer admission, and asynchronous
+hot/cold verification. Each terminal historical result must report
+`proved_sender_signatures: 1` and `proved_proposer_signature: true`, with the same
+block, parent, state root, transaction receipts and gas as the independent
+Native result. Current balances, nonces and finality must remain unchanged by
+historical verification and rejected inputs.
+
+Success prints `liveWalletSenderProposerComplete: true`. The quorum selection
+retains its separate commit-signature proof and output. Defaults, proof limits,
+governance policy and network activation remain as configured; each source
+profile and public released artifact requires its own complete acceptance.
