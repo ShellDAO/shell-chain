@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import signal
 import socket
 import subprocess
@@ -41,6 +42,43 @@ def port():
     with socket.socket() as stream:
         stream.bind(("127.0.0.1", 0))
         return stream.getsockname()[1]
+
+
+@contextlib.contextmanager
+def history_copy(binary, source, destination):
+    require(source.is_dir() and not source.is_symlink(), "closed source case required")
+    source = source.resolve(strict=True)
+    destination = destination.absolute()
+    require(destination.resolve() == destination and not destination.is_symlink() and source not in destination.parents
+            and destination not in source.parents and source != destination,
+            "history copy must be outside the source case")
+    require(not any(p.is_symlink() for p in source.rglob("*")), "source contains symbolic links")
+    with contextlib.ExitStack() as locks:
+        for path in [source / "run.lock", *[source / name / "db" / "LOCK"
+                                           for name in ["provider", "native", "receiver"]]]:
+            stream = locks.enter_context(path.open("r+b"))
+            fcntl.lockf(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        report = json.loads((source / "result.json").read_text())
+        source_hash = digest(source / "result.json")
+        require(report["complete"] and report.get("proved") and report.get("coldVerification")
+                and report["coldVerification"]["state"] == "verified", "complete cold-verified source required")
+        require(report["binarySHA256"] == digest(binary), "source binary mismatch")
+        before = {str(p.relative_to(source)): digest(p) for p in source.rglob("*") if p.is_file()}
+        if not destination.exists():
+            destination.mkdir(mode=0o700)
+            for name in ["validator.json", "recipient.json", "password", "genesis.json"]:
+                shutil.copy2(source / name, destination / name)
+            shutil.copytree(source / "receiver", destination / "receiver")
+            report.update(commands=[], historySourceSHA256=source_hash)
+            (destination / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+        require(not any(p.is_symlink() for p in destination.rglob("*")), "history copy contains symbolic links")
+        require(json.loads((destination / "result.json").read_text()).get("historySourceSHA256") == source_hash,
+                "history destination belongs to another source; retain it for inspection")
+        try:
+            yield destination
+        finally:
+            after = {str(p.relative_to(source)): digest(p) for p in source.rglob("*") if p.is_file()}
+            require(after == before, "original source changed during copied history check")
 
 
 class Case:
@@ -216,9 +254,9 @@ class Case:
                 and isinstance(signature["data"], list) and len(signature["data"]) == signature_bytes,
                 "actual authority key and QC signature do not match the selected scheme")
 
-    def snapshot(self, endpoint):
-        block = self.rpc(endpoint, "eth_getBlockByNumber", ["0x1", True])
-        return {"block": block, "receipts": self.rpc(endpoint, "eth_getBlockReceipts", ["0x1"]),
+    def snapshot(self, endpoint, number="0x1"):
+        block = self.rpc(endpoint, "eth_getBlockByNumber", [number, True])
+        return {"block": block, "receipts": self.rpc(endpoint, "eth_getBlockReceipts", [number]),
                 "balances": [self.rpc(endpoint, "eth_getBalance", [self.report[n], "latest"])
                              for n in ["validator", "recipient"]],
                 "nonces": [self.rpc(endpoint, "eth_getTransactionCount", [self.report[n], "latest"])
@@ -363,7 +401,7 @@ class Case:
         self.check_history_result(status)
         return status
 
-    def check_history_result(self, status):
+    def check_history_result(self, status, expected_tip=None):
         result = status["result"]
         native = self.report["liveState"]
         if self.proof_kind == "quorum":
@@ -383,6 +421,8 @@ class Case:
                 and all(x["status"] == 1 for x in receipts)
                 and [x["gas_used"] for x in receipts] == [int(x["gasUsed"], 16) for x in native["receipts"]],
                 "historical AIR execution differs from independent Native receipts")
+        require(expected_tip is None or execution["tip"] == expected_tip,
+                "historical result current canonical anchor mismatch")
 
     def peer(self):
         if self.report.get("coldVerification"):
@@ -434,6 +474,75 @@ class Case:
             self.report["coldVerification"] = cold
             self.save()
 
+    def history_after_advance(self):
+        require(self.report.get("historySourceSHA256"), "a separate history copy is required")
+        if self.report.get("advancedHistoryComplete"):
+            for label in ["advancedHotVerification", "advancedColdVerification"]:
+                self.check_history_result(self.report[label], self.report["advancedState"]["block"]["hash"])
+            return
+        with self.node("receiver", role="validator-prover") as (endpoint, child):
+            if not self.report.get("advancedTransaction"):
+                require(not self.report.get("advanceSubmitted"),
+                        "advance submission interrupted; inspect its retained log before recovery")
+                require(self.snapshot(endpoint) == self.report["liveState"], "copy differs from original Native state")
+                self.report["advanceSubmitted"] = True
+                self.save()
+                text = self.run("wallet-advance", ["tx", "send", "--to", self.report["recipient"],
+                                "--value", str(VALUE), "--keystore", "validator.json", "--password-file", "password",
+                                "--rpc-url", endpoint])
+                hashes = re.findall(r"^0x[0-9a-f]{64}$", text, flags=re.MULTILINE)
+                require(len(hashes) == 1, "advance wallet did not return one transaction hash")
+                self.report["advancedTransaction"] = hashes[0]
+                self.save()
+            receipt = self.wait(lambda: self.rpc(endpoint, "eth_getTransactionReceipt",
+                                                [self.report["advancedTransaction"]]), child, timeout=120)
+            require(receipt["blockNumber"] == "0x2" and receipt["status"] == "0x1",
+                    "actual second Native block transaction required")
+            self.wait(lambda: self.rpc(endpoint, "eth_getBlockByNumber", ["finalized", False])["hash"]
+                      == receipt["blockHash"], child, timeout=120)
+            current = self.snapshot(endpoint, "0x2")
+            old = self.snapshot(endpoint)
+            require(old["block"] == self.report["liveState"]["block"]
+                    and old["receipts"] == self.report["liveState"]["receipts"], "original canonical history changed")
+            require(current["head"] == "0x2" and current["finalized"] == receipt["blockHash"]
+                    and current["block"]["hash"] == receipt["blockHash"]
+                    and current["block"]["parentHash"] == self.report["blockHash"]
+                    and current["block"]["stateRoot"] != old["block"]["stateRoot"]
+                    and [int(x, 16) for x in current["balances"]] == [INITIAL - 2 * VALUE, 2 * VALUE]
+                    and current["nonces"] == ["0x2", "0x0"], "current Native state did not really advance")
+            receipts = current["receipts"]
+            require(len(receipts) == 2 and all(x["status"] == "0x1" for x in receipts)
+                    and receipts[0]["transactionHash"] == self.report["advancedTransaction"],
+                    "second-block receipts mismatch")
+            fee = int(receipts[0]["gasUsed"], 16) * int(receipts[0]["effectiveGasPrice"], 16)
+            reward = next(t for t in current["block"]["transactions"] if t.get("rewardKind") == "blockGasReward")
+            require(fee > 0 and int(reward["value"], 16) == fee and reward["to"] == self.report["validator"]
+                    and receipts[1]["transactionHash"] == reward["hash"] and receipts[1]["gasUsed"] == "0x0",
+                    "second-block fee/reward mismatch")
+            require(self.report.get("advancedState", current) == current, "advanced Native state changed on resume")
+            self.report["advancedState"] = current
+            self.save()
+            for method in ["admin_canonicalProofProduction", "admin_quorumProofProduction"]:
+                require(self.rpc(endpoint, method, [receipt["blockHash"]]) is None,
+                        "default-off advance unexpectedly generated a proof")
+            self.report["unknownProofRejection"] = self.rpc(endpoint, "admin_verifyCanonicalProof",
+                                                          ["0x" + "00" * 32, True], reject=True)
+            self.run("wallet-advanced-stale-nonce", ["tx", "send", "--to", self.report["recipient"],
+                     "--value", str(VALUE), "--keystore", "validator.json", "--password-file", "password",
+                     "--rpc-url", endpoint, "--nonce", "1", "--gas-limit", "21000"], expected=1)
+            require(self.snapshot(endpoint, "0x2") == current, "rejected input changed advanced Native state")
+            if not self.report.get("advancedHotVerification"):
+                self.verify_history(endpoint, child, "advancedHot")
+            self.check_history_result(self.report["advancedHotVerification"], current["block"]["hash"])
+            require(self.snapshot(endpoint, "0x2") == current, "hot history overwrote advanced Native state")
+        with self.node("receiver") as (endpoint, child):
+            require(self.snapshot(endpoint, "0x2") == self.report["advancedState"], "advanced state lost on restart")
+            self.verify_history(endpoint, child, "advancedCold")
+            self.check_history_result(self.report["advancedColdVerification"], self.report["advancedState"]["block"]["hash"])
+            require(self.snapshot(endpoint, "0x2") == self.report["advancedState"], "cold history overwrote advanced Native state")
+        self.report["advancedHistoryComplete"] = True
+        self.save()
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -445,8 +554,28 @@ def main():
     parser.add_argument("--proof-kind", choices=["quorum", "sender-proposer"],
                         help="Signature proof role; new cases default to quorum, resume keeps the saved role")
     parser.add_argument("--stop-after-partial", action="store_true", help="Retain the first two genuine components for later resume")
+    parser.add_argument("--history-after-advance", type=Path, metavar="COPY_ROOT",
+                        help="With --resume, clone a closed complete case and verify old proof after a real later transaction")
     args = parser.parse_args()
     binary, root = args.binary.resolve(strict=True), args.root.absolute()
+    if args.history_after_advance:
+        require(args.resume and not args.stop_after_partial, "history advance requires a complete --resume source")
+        require(args.validator_algorithm is None and args.proof_kind is None,
+                "history copies retain the source scheme and proof kind")
+        with history_copy(binary, root, args.history_after_advance) as target:
+            with (target / "run.lock").open("a+b") as lock:
+                fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                case = Case(binary, target, True, args.validator_algorithm, args.proof_kind)
+                try:
+                    case.check_scheme()
+                    case.history_after_advance()
+                    print(json.dumps({"liveWalletAdvancedHistoryComplete": True, "block": case.report["blockHash"],
+                                      "currentBlock": case.report["advancedState"]["block"]["hash"]}))
+                except BaseException as error:
+                    case.report["error"] = str(error)
+                    case.save()
+                    raise
+        return
     require(binary.is_file(), "matching shell-node binary required")
     require(not root.is_symlink() and root.exists() == args.resume, "new directory required, or use --resume")
     if not args.resume:

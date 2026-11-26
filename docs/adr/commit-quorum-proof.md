@@ -1724,3 +1724,38 @@ Success prints `liveWalletSenderProposerComplete: true`. The quorum selection
 retains its separate commit-signature proof and output. Defaults, proof limits,
 governance policy and network activation remain as configured; each source
 profile and public released artifact requires its own complete acceptance.
+
+### Historical proof after a real later wallet transaction
+
+Keep the completed case and its nodes offline. The same helper can copy its
+closed receiver and disposable wallet controls into a separate directory, send
+another real transaction, and verify the original proof against its retained
+historical state:
+
+```sh
+python3 tools/check-live-wallet-quorum.py --resume \
+  --history-after-advance live-slh-history-case \
+  target/release/shell-node live-slh-signature-case
+```
+
+Run this after the complete sender/proposer workflow above. The source directory
+stays unchanged; the tool locks its databases during the check and refuses a
+running source, changed binary, unsafe destination, or destination belonging to
+another source. Scheme and proof role come from the original case. The copy
+keeps all keys, chain data, proof intake and command receipts; use the same
+command to resume its recorded progress. An interrupted submission without a
+recorded transaction hash requires inspecting the retained command log before
+recovery, so it cannot silently submit a second transaction.
+
+The second wallet transfer must finalize block 2 with balances of 998 and 2
+SHELL and nonces 2 and 0. Proof production stays off. Both the hot query and a
+separate-process cold query force asynchronous verification of the original
+block 1 artifact and compare its sender/proposer proof result, state root and
+receipts with the original Native result. The result's `tip` identifies the
+current canonical view anchor at block 2; its `block` identifies historical
+block 1. The later block, receipts, balances,
+nonces and finality must remain unchanged, including after stale-nonce and
+unknown-proof refusals. Success prints `liveWalletAdvancedHistoryComplete: true`.
+This check reuses the complete artifact and matching binary; it does not prove
+the second block or establish public network activation or all resource and
+failure combinations.
