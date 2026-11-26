@@ -54,8 +54,10 @@ def history_copy(binary, source, destination):
             "history copy must be outside the source case")
     require(not any(p.is_symlink() for p in source.rglob("*")), "source contains symbolic links")
     with contextlib.ExitStack() as locks:
+        require((source / "receiver" / "db" / "LOCK").is_file(), "closed receiver database required")
         for path in [source / "run.lock", *[source / name / "db" / "LOCK"
-                                           for name in ["provider", "native", "receiver"]]]:
+                                           for name in ["provider", "native", "receiver"]
+                                           if (source / name).exists()]]:
             stream = locks.enter_context(path.open("r+b"))
             fcntl.lockf(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
         report = json.loads((source / "result.json").read_text())

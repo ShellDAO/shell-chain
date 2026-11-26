@@ -1759,3 +1759,39 @@ unknown-proof refusals. Success prints `liveWalletAdvancedHistoryComplete: true`
 This check reuses the complete artifact and matching binary; it does not prove
 the second block or establish public network activation or all resource and
 failure combinations.
+
+### Rehashed inner proof tampering at the newer Native state
+
+After the advanced-history check, the following optional regression copies its
+closed receiver into another directory and reuses the actual complete artifact.
+Its additional Python dependencies are `blake3==1.0.8` and `cbor2==6.3.0`:
+
+```sh
+python3 -m venv proof-check-env
+. proof-check-env/bin/activate
+python3 -m pip install blake3==1.0.8 cbor2==6.3.0
+python3 tools/check-live-wallet-tamper.py \
+  target/release/shell-node live-slh-history-case live-slh-tamper-case
+```
+
+The tested source profile is the compact frame 11/12 SLH sender/proposer
+artifact. Both original CBOR roundtrips and certificate hashes must match before
+mutation. The tool changes one bit in a BLAKE3 compression certificate's inner
+Winterfell proof nonce, preserves framing and byte count, and recomputes both
+the certificate hash and complete artifact manifest hash. It uploads the new
+artifact through the real chunk RPCs and requires an asynchronous inner
+`BLAKE3 compression verification` refusal, including after a separate-process
+cold restart. Transport hash or payload decoding errors do not satisfy this
+check. It does not generate another proof or change any quota or activation.
+The nonce mutation exercises query-seed proof-of-work verification; changing
+arithmetic witnesses or other proof fields requires its own evidence. Chunk
+requests are paced below the default RPC rate limit. A completed download
+prefix and the server's persisted upload offset are reused on resume.
+
+The current block 2 accounts, receipts, head and finality, and the authentic
+original proof intake/result must remain unchanged. The source case stays
+offline and locked during copying and verification. Keep the new directory and
+repeat the same command to resume; an unexpected result retains its exact
+first error for inspection. Success prints `liveWalletInnerTamperRejected: true`.
+This checks the stated mutation and local source profile; other proof parts,
+signer combinations and original public releases require separate evidence.
