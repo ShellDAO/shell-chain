@@ -46,7 +46,7 @@ def port():
 
 @contextlib.contextmanager
 def history_copy(binary, source, destination, store_name="receiver"):
-    require(store_name in ["receiver", "native"], "supported closed source store required")
+    require(store_name in ["receiver", "native", "fresh"], "supported closed source store required")
     require(source.is_dir() and not source.is_symlink(), "closed source case required")
     source = source.resolve(strict=True)
     destination = destination.absolute()
@@ -57,7 +57,7 @@ def history_copy(binary, source, destination, store_name="receiver"):
     with contextlib.ExitStack() as locks:
         require((source / store_name / "db" / "LOCK").is_file(), "closed source database required")
         for path in [source / "run.lock", *[source / name / "db" / "LOCK"
-                                           for name in ["provider", "native", "receiver"]
+                                           for name in ["provider", "native", "receiver", "fresh", "control"]
                                            if (source / name).exists()]]:
             stream = locks.enter_context(path.open("r+b"))
             fcntl.lockf(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)

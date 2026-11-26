@@ -1831,3 +1831,32 @@ unchanged, no proof is regenerated, and limits and activation are preserved.
 Success prints `liveWalletPeerRefusalComplete: true`. Retain the new directory
 and use the same command to resume; the result covers this exact source and
 mutation, not every malicious-peer or public-network combination.
+
+### Recovering the failed recipient from a correct source
+
+Keep the completed refusal case offline. The same entry can copy its failed
+recipient and connect it to a separate copy of the original authentic provider:
+
+```sh
+python3 tools/check-live-wallet-peer-refusal.py \
+  target/release/shell-node live-slh-signature-case \
+  live-slh-tamper-case live-slh-peer-refusal-case \
+  --recover-root live-slh-peer-recovery-case
+```
+
+The copy must first retain the rejected artifact, failed candidate, funded
+genesis accounts and absent wallet receipt. Proof admission remains enabled.
+The correct peer advertises a different manifest for the same independently
+bound block and genesis. The existing second allowed manifest attempt must
+automatically fetch and fully verify the authentic artifact, execute the wallet
+transaction, and import/finalize block 1 with the original receipts, balances,
+nonces and fee reward. The rejected artifact and old failed transfer remain
+unchanged; no database reset or Native-only workaround provides recovery.
+
+A separate cold reopen must retain the complete candidate, verified good
+artifact, rejected bad artifact and correct Native state. Same-manifest repeats
+remain ignored, and the existing two-attempt bound is preserved. The new copy
+and honest-provider data remain available for the same command to resume.
+Success prints `liveWalletPeerRecoveryComplete: true`. This recovers the stated
+candidate from one bad source; other retry, disconnect, fork and exhausted-bound
+combinations need their own evidence.

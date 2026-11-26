@@ -135,14 +135,119 @@ def exercise(case, manifest, payload):
     case.save()
 
 
+def recover(case, provider_case):
+    require(case.report.get("peerRefusalComplete") and case.report.get("copyStore") == "fresh",
+            "retained failed peer copy required")
+    if case.report.get("peerRecoveryComplete"):
+        return
+    good_manifest = provider_case.report["production"]["manifest"]
+    good_id = provider_case.report["proofId"]
+    require(good_manifest["blockHash"] == case.report["blockHash"]
+            and good_manifest != case.report["badManifest"] and good_id != case.report["badProofId"]
+            and provider_case.report["liveState"] == case.report["liveState"], "correct-source identity mismatch")
+    case.report["goodManifest"] = good_manifest
+    case.report["goodProofId"] = good_id
+    if not case.report.get("recoveryBefore"):
+        with case.node("receiver", admission=True) as (endpoint, child):
+            baseline = unchanged_genesis(case, endpoint)
+            failed = case.rpc(endpoint, "admin_canonicalProofAdmission", [case.report["blockHash"]])
+            rejected = check_failure(case, endpoint, failed)
+            case.report["recoveryGoodProofAbsent"] = case.rpc(endpoint, "admin_canonicalProofStatus", [good_id], reject=True)
+            case.report["recoveryBefore"] = {"genesis": baseline, "admission": failed, "badIntake": rejected,
+                "badFetch": case.rpc(endpoint, "admin_canonicalProofFetchStatus", [case.report["badProofId"]])}
+            case.save()
+    with provider_case.node("receiver") as (provider, source):
+        require(provider_case.snapshot(provider) == case.report["liveState"], "honest provider Native state mismatch")
+        offered = provider_case.rpc(provider, "admin_canonicalProofStatus", [good_id])
+        require(offered["state"] == "verified" and offered["manifest"] == good_manifest,
+                "authentic provider artifact unavailable")
+        provider_case.check_history_result(offered)
+
+        def listening():
+            info = provider_case.rpc(provider, "admin_nodeInfo")
+            return info if info["id"] and info["listenAddr"] else None
+
+        info = provider_case.wait(listening, source)
+        require(info["id"] != case.report["providerNodeInfo"]["id"], "independent correct peer required")
+        address = info["listenAddr"]
+        if "/p2p/" not in address:
+            address += "/p2p/" + info["id"]
+        case.report["recoveryProviderInfo"] = info
+        case.save()
+        with case.node("receiver", admission=True, bootnode=address) as (endpoint, child):
+            def completed():
+                admission = case.rpc(endpoint, "admin_canonicalProofAdmission", [case.report["blockHash"]])
+                return admission if admission and admission["status"]["state"] == "complete" else None
+
+            admission = case.wait(completed, child, timeout=1800)
+            record = admission["status"]
+            require(admission["nativeCanonical"] is True and admission["statusIsAuthorization"] is False
+                    and record["attempts"] == 2 and record["manifest"] == good_manifest
+                    and record["peer"] == info["id"] and record["error"] is None
+                    and record["sourceHash"] == case.report["recoveryBefore"]["admission"]["status"]["sourceHash"],
+                    "correct second-manifest source binding mismatch")
+            case.wait(lambda: case.rpc(endpoint, "eth_getBlockByNumber", ["finalized", False])["hash"]
+                      == case.report["blockHash"], child)
+            actual = case.snapshot(endpoint)
+            case.check_state(actual)
+            require(actual == case.report["liveState"], "recovered Native receipts/accounts differ from independent original")
+            verified = case.rpc(endpoint, "admin_canonicalProofStatus", [good_id])
+            require(verified["state"] == "verified" and verified["result"]
+                    and verified["verificationAttempts"] == 1, "authentic peer payload not freshly verified")
+            case.check_history_result(verified)
+            old = case.rpc(endpoint, "admin_canonicalProofStatus", [case.report["badProofId"]])
+            require(old == case.report["recoveryBefore"]["badIntake"], "recovery changed the rejected original proof")
+            require(case.rpc(endpoint, "admin_canonicalProofFetchStatus", [case.report["badProofId"]])
+                    == case.report["recoveryBefore"]["badFetch"], "recovery changed the old failed peer transfer")
+            case.report.update(recoveredAdmission=admission, recoveredNative=actual, recoveredVerified=verified,
+                               preservedBadIntake=old,
+                               recoveryFetch=case.rpc(endpoint, "admin_canonicalProofFetchStatus", [good_id]))
+            case.save()
+        require(provider_case.snapshot(provider) == case.report["liveState"], "honest provider state changed")
+        require(provider_case.rpc(provider, "admin_canonicalProofStatus", [good_id]) == offered,
+                "recovery changed authentic provider proof metadata")
+    with case.node("receiver", admission=True) as (endpoint, child):
+        require(case.snapshot(endpoint) == case.report["recoveredNative"], "recovered Native state lost on cold restart")
+        admission = case.rpc(endpoint, "admin_canonicalProofAdmission", [case.report["blockHash"]])
+        require(admission == case.report["recoveredAdmission"], "cold recovered candidate changed")
+        require(case.rpc(endpoint, "admin_canonicalProofStatus", [good_id]) == case.report["recoveredVerified"]
+                and case.rpc(endpoint, "admin_canonicalProofStatus", [case.report["badProofId"]])
+                == case.report["preservedBadIntake"], "cold recovery changed good/bad proof states")
+        case.report["coldRecoveredAdmission"] = admission
+        case.save()
+    case.report["peerRecoveryComplete"] = True
+    case.save()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("source", type=Path)
     parser.add_argument("tamper_source", type=Path)
     parser.add_argument("root", type=Path)
+    parser.add_argument("--recover-root", type=Path, metavar="COPY_ROOT",
+                        help="Copy the completed failed recipient and reconnect it to the original authentic provider")
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
+    if args.recover_root:
+        with wallet.history_copy(binary, args.root.absolute(), args.recover_root, store_name="fresh") as target:
+            with wallet.history_copy(binary, args.source.absolute(), target / "honest-provider") as honest:
+                with (target / "run.lock").open("a+b") as lock, (honest / "run.lock").open("a+b") as source_lock:
+                    fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.lockf(source_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    case = wallet.Case(binary, target, True)
+                    provider_case = wallet.Case(binary, honest, True)
+                    try:
+                        case.check_scheme()
+                        provider_case.check_scheme()
+                        recover(case, provider_case)
+                        print(json.dumps({"liveWalletPeerRecoveryComplete": True, "block": case.report["blockHash"],
+                                          "attempts": case.report["recoveredAdmission"]["status"]["attempts"]}))
+                    except BaseException as error:
+                        case.report["error"] = str(error)
+                        case.save()
+                        raise
+        return
     tamper = json.loads((args.tamper_source / "result.json").read_text())
     require(tamper.get("tamperComplete") and tamper["binarySHA256"] == wallet.digest(binary), "complete matching tamper source required")
     payload = (args.tamper_source / "tampered-payload.bin").read_bytes()
