@@ -1436,6 +1436,46 @@ interruption receipt instead exits nonzero for inspection. This is a process
 loss at a component dispatch boundary, not a torn-write, power-loss or
 all-host guarantee.
 
+### Live source capture from genesis
+
+The same portable entry can start the producer at the funded genesis, with
+empty source, checkpoint and proof-cache namespaces, using a separate new case:
+
+```sh
+python3 tools/check-fresh-quorum-production.py --live-genesis \
+  target/debug/examples/quorum-native live-genesis-quorum-case
+```
+
+Use the matching example build above. This option and `--interrupt-production`
+are separate scenarios. Preparation creates new temporary genuine signed
+controls once. The reference has independently executed their three blocks;
+the producer receives their bodies and certificates through an actual TCP/Noise
+peer while its Node worker is already running from genesis. Native rows are
+not copied into the producer. An independent default-off genesis follower
+first receives all three blocks and must retain empty production and cache
+namespaces, with Native state equal to the reference.
+
+The opt-in producer uses a budget of two new components in its first process.
+At Native finality 3, the first source must have a genuine partial checkpoint,
+the second must be queued, and the third must remain absent while both active
+slots are unfinished. Continued worker polling must preserve this deferral and
+must not publish a partial proof. Subsequent bounded sessions resume the same
+checkpoints; the Node captures the third source after a completed job becomes
+eligible for history. No caller inserts a source, marks a job complete or
+raises the active, total, byte or cache bounds.
+
+The process then completes all three full graphs, a new automatic proof-backed
+receiver through Native execution and finality 3, and hot and separate-process
+cold history against the independent Native rows, receipts, accounts and fees.
+The underlying additional entries are `producer-fresh-genesis-init` and
+`producer-fresh-follow`, each taking the retained controls and runtime
+directory. After a failure, retain the case and inspect the exact command log;
+`--resume` keeps its original scenario and never repeats preparation or a
+completed follow step. A partial failed initialization requires inspection.
+This is live certified-peer catch-up in the stated local static profile, not
+live validator transaction forging, changing committees, all-host coverage,
+public release or network activation.
+
 ### Persistent refusal of the producer history index
 
 The same controls and three complete jobs can exercise a controlled database

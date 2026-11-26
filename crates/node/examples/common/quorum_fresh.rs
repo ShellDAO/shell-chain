@@ -39,21 +39,33 @@ fn manifest(v: &Value) -> Result<CanonicalProofManifest, Error> {
     ensure(m.version == 2, "full quorum manifest required")?;
     Ok(m)
 }
-async fn init(c: &Control, controls: &Path, root: &Path) -> Result<(), Error> {
+async fn init(c: &Control, controls: &Path, root: &Path, genesis: bool) -> Result<(), Error> {
     std::fs::create_dir(root)?;
-    copy_native_snapshot(
-        &controls.join("prefix2-db"),
-        &root.join("provider-db"),
-        c,
-        2,
-    )?;
+    if !genesis {
+        copy_native_snapshot(
+            &controls.join("prefix2-db"),
+            &root.join("provider-db"),
+            c,
+            2,
+        )?;
+    }
     copy_native_snapshot(
         &controls.join("control-db"),
         &root.join("reference-db"),
         c,
         3,
     )?;
-    let n = node(&root.join("provider-db"), c, false)?;
+    let n = node(&root.join("provider-db"), c, genesis)?;
+    let height = if genesis { 0 } else { 2 };
+    ensure(
+        n.chain_store
+            .get_head_block()?
+            .ok_or("head absent")?
+            .number()
+            == height
+            && n.chain_store.get_finalized_number()?.unwrap_or(0) == height,
+        "initial Native height mismatch",
+    )?;
     ensure(
         n.store.scan_prefix(OWNER)?.is_empty()
             && n.store
@@ -75,10 +87,130 @@ async fn init(c: &Control, controls: &Path, root: &Path) -> Result<(), Error> {
                 && recovery_native_digest(&off.node)? == native,
             "default-off Node captured/proved or changed Native",
         )?;
-        println!("{}",json!({"freshQuorumInitialized":true,"NativeHeadAndFinality":2,"defaultOffObserved":true,"initialComponents":0,"initialSources":0,"proofCacheEmpty":true,"seededJobs":0,"privateKeysPersisted":false}));
+        println!("{}",json!({"freshQuorumInitialized":true,"NativeHeadAndFinality":height,"defaultOffObserved":true,"initialComponents":0,"initialSources":0,"proofCacheEmpty":true,"seededJobs":0,"privateKeysPersisted":false}));
         Ok::<_, Error>(())
     }.await;
     off.stop().await?;
+    result
+}
+async fn follow(c: &Control, root: &Path) -> Result<(), Error> {
+    let reference = Live::start(&root.join("reference-db"), c, vec![]).await?;
+    let result = async {
+        let off_path = root.join("default-off-db");
+        let off = Live::start_mode(
+            &off_path,
+            c,
+            vec![reference.dial()],
+            false,
+            !off_path.join("CURRENT").is_file(),
+        )
+        .await?;
+        let result = async {
+            successor::wait_head(&off, c, 3).await?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            ensure(
+                off.node.store.scan_prefix(OWNER)?.is_empty()
+                    && off
+                        .node
+                        .store
+                        .scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?
+                        .is_empty()
+                    && off
+                        .node
+                        .store
+                        .scan_prefix(b"local/canonical-production/v1/")?
+                        .is_empty()
+                    && recovery_native_digest(&off.node)?
+                        == recovery_native_digest(&reference.node)?,
+                "default-off live arrival generated proofs or mismatched Native3",
+            )?;
+            Ok::<_, Error>(())
+        }
+        .await;
+        off.stop().await?;
+        result?;
+        let mut n = node(&root.join("provider-db"), c, false)?;
+        let starting = n
+            .chain_store
+            .get_head_block()?
+            .ok_or("head absent")?
+            .number();
+        ensure(
+            starting <= 3 && n.chain_store.get_block_hash_by_number(0)? == Some(c.genesis.hash()),
+            "matching genesis provider required",
+        )?;
+        let old = immutable(&n)?;
+        n.config.canonical_proof_component_budget = std::num::NonZeroUsize::new(2);
+        let live = Live::start_on_node(n, c, vec![reference.dial()], false, true).await?;
+        let result = async {
+            successor::wait_head(&live, c, 3).await?;
+            let observed = tokio::time::timeout(Duration::from_secs(10800), async {
+                loop {
+                    ensure(!live.task.is_finished(), "live genesis producer stopped")?;
+                    let values = statuses(&live.node, c, 3)?;
+                    ensure(
+                        values.iter().all(|v| v["status"]["state"] != "failed"),
+                        "live genesis source generation failed",
+                    )?;
+                    if values[0]["status"]["state"] == "paused"
+                        && values[0]["status"]["components"].as_u64().unwrap_or(0) >= 2
+                        && values[1]["status"]["state"] == "queued"
+                    {
+                        return Ok::<_, Error>(values);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await??;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            ensure(
+                observed == statuses(&live.node, c, 3)?
+                    && observed[2].is_null()
+                    && observed[1]["status"]["components"] == 0
+                    && observed[0]["status"]["newlyProved"].as_u64().unwrap_or(0) <= 2,
+                "third source was not stably deferred behind two unfinished jobs",
+            )?;
+            let index: Value = serde_json::from_slice(
+                &live
+                    .node
+                    .store
+                    .get(&[OWNER, b"jobs"].concat())?
+                    .ok_or("owner index absent")?,
+            )?;
+            let expected = serde_json::to_value(vec![c.blocks[0].hash(), c.blocks[1].hash()])?;
+            ensure(
+                index == expected
+                    || (index["version"] == 2
+                        && index["active"] == expected
+                        && index["completed"] == json!([])),
+                "deferred live source index mismatch",
+            )?;
+            preserve(&old, &live.node)?;
+            ensure(
+                live.node
+                    .store
+                    .scan_prefix(CANONICAL_PROOF_CACHE_PREFIX)?
+                    .is_empty()
+                    && recovery_native_digest(&live.node)?
+                        == recovery_native_digest(&reference.node)?,
+                "deferred production changed Native3 or published an incomplete proof",
+            )?;
+            println!(
+                "{}",
+                json!({"liveGenesisSourceCapture":true,"startingNativeHead":starting,
+                "NativeHeadAndFinality":3,"actualTCPNoise":true,"defaultOffLiveArrivalEmpty":true,
+                "production":observed,"index":index,"thirdSourceDeferred":true,
+                "Native3RowsEqual":true,"originalSourceComponentRowsPreserved":true,
+                "newlyProvedThisProcess":observed[0]["status"]["newlyProved"],"seededJobs":0})
+            );
+            Ok::<_, Error>(())
+        }
+        .await;
+        live.stop().await?;
+        result
+    }
+    .await;
+    reference.stop().await?;
     result
 }
 async fn step(c: &Control, root: &Path, budget: usize) -> Result<(), Error> {
@@ -215,7 +347,9 @@ pub(super) async fn exercise(args: &[String]) -> Result<(), Error> {
     )?;
     let root = Path::new(&args[2]);
     match args[0].as_str() {
-        "producer-fresh-init" => init(&c, controls, root).await,
+        "producer-fresh-init" => init(&c, controls, root, false).await,
+        "producer-fresh-genesis-init" => init(&c, controls, root, true).await,
+        "producer-fresh-follow" => follow(&c, root).await,
         "producer-fresh-step" => step(&c, root, args[3].parse()?).await,
         "producer-fresh-advance" => advance(&c, root).await,
         "producer-fresh-snapshot" => snapshot(&c, root),

@@ -59,7 +59,9 @@ def main():
     parser.add_argument("root", type=Path)
     parser.add_argument("--resume", action="store_true", help="Continue the retained case without recreating controls or graphs")
     parser.add_argument("--interrupt-production", action="store_true", help="Interrupt one owned child before its first missing signature checkpoint, then recover")
+    parser.add_argument("--live-genesis", action="store_true", help="Capture sources while a genesis producer follows a certified peer, including full-slot deferral and backfill")
     args = parser.parse_args()
+    require(not (args.live_genesis and args.interrupt_production), "select one independent production scenario")
     binary = args.binary.resolve(strict=True)
     root = args.root.absolute()
     require(binary.is_file(), "built quorum-native binary required")
@@ -69,15 +71,19 @@ def main():
     require(not any(p.is_symlink() for p in root.rglob("*")), "case contains a symbolic link")
     with (root / "run.lock").open("a+b") as lock:
         fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        exercise(binary, root, args.resume, args.interrupt_production)
+        exercise(binary, root, args.resume, args.interrupt_production, args.live_genesis)
 
 
-def exercise(binary, root, resume, interrupt=False):
+def exercise(binary, root, resume, interrupt=False, live_genesis=False):
     result_path = root / "result.json"
     report = json.loads(result_path.read_text()) if resume else {"complete": False, "commands": [], "steps": 0}
     require(not (interrupt and resume and not report.get("interruptProduction")),
             "cannot add an interruption to an existing ordinary case")
+    require(not (live_genesis and resume and not report.get("liveGenesis")),
+            "cannot add live genesis to an existing case")
     report["interruptProduction"] = report.get("interruptProduction", interrupt)
+    report["liveGenesis"] = report.get("liveGenesis", live_genesis)
+    require(not (report["interruptProduction"] and report["liveGenesis"]), "independent production scenarios required")
     with binary.open("rb") as stream:
         binary_hash = hashlib.file_digest(stream, "sha256").hexdigest()
     if report.get("binarySHA256") not in [None, binary_hash]:
@@ -91,6 +97,7 @@ def exercise(binary, root, resume, interrupt=False):
         print(json.dumps({"freshNodeQuorumProductionComplete": True, "sources": 3, "seededJobs": 0,
                           "steps": report["steps"], "NativeHeadAndFinality": 3,
                           "productionInterruptionVerified": report.get("productionCrash", {}).get("verified", False),
+                          "liveGenesisCaptureVerified": report.get("liveFollow", {}).get("liveGenesisSourceCapture", False),
                           "historyVerificationAttempts": [report[k]["historyVerificationAttempts"] for k in ["peer", "cold"]]}))
 
     def save():
@@ -197,12 +204,25 @@ def exercise(binary, root, resume, interrupt=False):
                     and prepared["privateKeysPersisted"] is False, "genuine two-authority controls required")
         require((controls / "control.cbor").is_file(), "partial control preparation retained; inspect before resuming")
         if not runtime.exists():
-            initial = run("init", ["producer-fresh-init", controls, runtime], "freshQuorumInitialized")
+            entry = "producer-fresh-genesis-init" if report["liveGenesis"] else "producer-fresh-init"
+            initial = run("init", [entry, controls, runtime], "freshQuorumInitialized")
             require(initial["initialComponents"] == initial["initialSources"] == initial["seededJobs"] == 0
-                    and initial["defaultOffObserved"] and initial["proofCacheEmpty"], "initial owner was not empty/default-off")
+                    and initial["defaultOffObserved"] and initial["proofCacheEmpty"]
+                    and initial["NativeHeadAndFinality"] == (0 if report["liveGenesis"] else 2),
+                    "initial owner was not empty/default-off at the expected Native height")
             report["initial"] = initial
             save()
         require(report.get("initial"), "missing successful empty-owner initialization receipt; retain prefix")
+        if report["liveGenesis"] and "liveFollow" not in report:
+            followed = run("live-follow", ["producer-fresh-follow", controls, runtime], "liveGenesisSourceCapture")
+            require(followed["actualTCPNoise"] and followed["defaultOffLiveArrivalEmpty"]
+                    and followed["NativeHeadAndFinality"] == 3 and followed["thirdSourceDeferred"]
+                    and followed["Native3RowsEqual"] and followed["originalSourceComponentRowsPreserved"]
+                    and followed["seededJobs"] == 0 and 0 < followed["newlyProvedThisProcess"] <= 2,
+                    "live genesis capture or full-slot deferral failed")
+            report["steps"] += 1
+            report["liveFollow"] = followed
+            save()
         value = prove(crash(snapshot("before-continuation")))
         if value["head"] == 2:
             run("advance", ["producer-fresh-advance", controls, runtime], "freshQuorumAdvanced")
