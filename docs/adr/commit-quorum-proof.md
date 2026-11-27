@@ -1899,3 +1899,51 @@ the helper refuses to send another signal. The observed boundary is a durable
 claim/dispatch, which may include payload loading, rather than an exact inner
 verification instruction. Power loss, torn writes, other hosts/backends and
 public network activation require separate evidence.
+
+
+### Live mixed SLH/ML-DSA wallet quorum source
+
+The wallet helper also accepts an opt-in static two-authority case. It creates
+independent SLH-DSA-SHA2-256f and ML-DSA-65 keystores, configures genesis weights
+`[2,1]`, and funds the sender and co-authority with test balances. The strict
+weighted quorum is 3, so both genuine identities must participate. Existing
+single-authority commands keep their saved scheme and behavior.
+
+```sh
+python3 tools/check-live-wallet-quorum.py \
+  target/release/shell-node live-mixed-wallet-case \
+  --mixed-weighted --stop-after-partial
+```
+
+The SLH proposer first rejects a transaction signed with its key for the other
+funded registered account, without changing genesis state. Its valid wallet
+transfer produces a provisional block and receipt while the ML-DSA authority
+is offline; repeated finality observations must remain at genesis. Provisional
+Native execution is expected here and is distinct from finality. Starting the
+ML-DSA authority with its own keystore must yield a certificate containing both
+valid signer identities and their actual keys. Both nodes must agree on block 1,
+wallet receipts, sender/recipient balances and nonces, and the exact gas reward;
+the co-authority balance stays unchanged.
+
+The source-only quorum-production option captures this actual live certificate
+and its execution context, then pauses after two new components. A separate cold
+provider process must retain the Native result, mixed signer keys/certificate,
+immutable source hash and exact partial checkpoint without new proving.
+`liveWalletPartial: true` establishes this bounded source stage only. It does
+not establish a complete mixed STARK artifact, proof-based peer admission or
+public release availability. Keep the directory and keys.
+
+To continue that distinct source without recreating its controls or components:
+
+```sh
+python3 tools/check-live-wallet-quorum.py \
+  target/release/shell-node live-mixed-wallet-case --resume
+```
+
+The full continuation still requires actual AIR verification of both commit
+signatures, independent fresh Native and proof-admitted peers, and hot/cold
+historical execution checks. Until those pass, leave that acceptance open.
+Later-block mixed history needs another live quorum and is not provided by the
+single-authority `--history-after-advance` mode. This local `[2,1]` experiment
+does not establish dynamic committees, every signer order, all weight sets,
+power-loss behavior or public network activation.

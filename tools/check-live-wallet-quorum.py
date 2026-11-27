@@ -57,7 +57,7 @@ def history_copy(binary, source, destination, store_name="receiver"):
     with contextlib.ExitStack() as locks:
         require((source / store_name / "db" / "LOCK").is_file(), "closed source database required")
         for path in [source / "run.lock", *[source / name / "db" / "LOCK"
-                                           for name in ["provider", "native", "receiver", "fresh", "control"]
+                                           for name in ["provider", "native", "receiver", "fresh", "control", "cosigner"]
                                            if (source / name).exists()]]:
             stream = locks.enter_context(path.open("r+b"))
             fcntl.lockf(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -147,7 +147,7 @@ class Case:
 
     @contextlib.contextmanager
     def node(self, name, role="prover", production=False, admission=False, bootnode=None, budget=16,
-             expected_exit_codes=(0,)):
+             expected_exit_codes=(0,), keystore="validator.json"):
         rpc_port, p2p_port = port(), port()
         while p2p_port == rpc_port:
             p2p_port = port()
@@ -158,7 +158,7 @@ class Case:
                 "--rpc-addr", f"127.0.0.1:{rpc_port}", "--rpc-api", "eth,net,web3,shell,admin",
                 "--p2p", "--p2p-addr", f"127.0.0.1:{p2p_port}"]
         if role == "validator-prover":
-            args += ["--keystore", "validator.json", "--password-file", "password"]
+            args += ["--keystore", keystore, "--password-file", "password"]
         if production:
             flag = ("--canonical-quorum-production" if self.proof_kind == "quorum"
                     else "--canonical-proof-production=true")
@@ -222,7 +222,8 @@ class Case:
         password = os.open(self.root / "password", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(password, "w") as stream:
             stream.write(secrets.token_urlsafe(32) + "\n")
-        for name in ["validator", "recipient"]:
+        names = ["validator", "recipient"] + (["cosigner"] if self.report.get("mixedWeighted") else [])
+        for name in names:
             self.run(name + "-generate", ["--password-file", "password", "key", "generate",
                      "--algorithm", self.algorithm if name == "validator" else "mldsa65",
                      "--output", name + ".json"])
@@ -230,7 +231,7 @@ class Case:
             address = re.search(r"Address:\s+(0x[0-9a-f]{64})", text)
             require(address, "key inspect did not return a full-width address")
             self.report[name] = address.group(1)
-        require(self.report["validator"] != self.report["recipient"], "distinct recipient required")
+        require(len({self.report[name] for name in names}) == len(names), "distinct generated identities required")
         genesis = {"chain_id": 1337, "chain_name": "shell-local", "network_type": "Dev",
                    "timestamp": int(time.time()), "gas_limit": 30_000_000, "extra_data": "shell-genesis",
                    "consensus": {"engine": "wpoa", "authorities": [self.report["validator"]],
@@ -239,8 +240,15 @@ class Case:
                    "alloc": {self.report["validator"]: {"balance": hex(INITIAL)}}, "boot_nodes": [],
                    "block_commitment_height": 1, "native_address_context_height": 1,
                    "fee_accounting_activation_height": 1}
+        if self.report.get("mixedWeighted"):
+            require(self.algorithm == "slhdsa" and self.proof_kind == "quorum", "mixed SLH/MLDSA quorum mode required")
+            genesis["consensus"]["authorities"].append(self.report["cosigner"])
+            genesis["consensus"]["authority_pubkeys"].append(
+                "0x" + json.loads((self.root / "cosigner.json").read_text())["public_key"].removeprefix("0x"))
+            genesis["consensus"]["weights"] = [2, 1]
+            genesis["alloc"][self.report["cosigner"]] = {"balance": hex(INITIAL)}
         (self.root / "genesis.json").write_text(json.dumps(genesis, indent=2) + "\n")
-        for name in ["provider", "native", "receiver"]:
+        for name in ["provider", "native", "receiver"] + (["cosigner"] if self.report.get("mixedWeighted") else []):
             self.run(name + "-init", ["--datadir", name, "init", "--genesis", "genesis.json",
                      "--chain-id", "1337", "--network", "dev"])
         self.report["initialized"] = True
@@ -255,9 +263,23 @@ class Case:
         certificate = self.report["liveCertificate"]["certificate"]
         signature = certificate.get(self.report["validator"])
         require(len(bytes.fromhex(key["public_key"].removeprefix("0x"))) == key_bytes
-                and len(certificate) == 1 and signature and signature["sig_type"] == kind
+                and len(certificate) == (2 if self.report.get("mixedWeighted") else 1)
+                and signature and signature["sig_type"] == kind
                 and isinstance(signature["data"], list) and len(signature["data"]) == signature_bytes,
                 "actual authority key and QC signature do not match the selected scheme")
+        if self.report.get("mixedWeighted"):
+            other = json.loads((self.root / "cosigner.json").read_text())
+            signature = certificate.get(self.report["cosigner"])
+            require(len(bytes.fromhex(other["public_key"].removeprefix("0x"))) == 1952
+                    and signature and signature["sig_type"] == "MlDsa65" and len(signature["data"]) == 3309,
+                    "genuine mixed co-authority signature absent")
+            signers = {x["address"]: x for x in self.report["liveSigners"]["signers"]}
+            for name in ["validator", "cosigner"]:
+                address = self.report[name]
+                expected = json.loads((self.root / (name + ".json")).read_text())["public_key"]
+                require(signers[address]["signatureValid"] is True
+                        and signers[address]["pqPubkey"].removeprefix("0x") == expected.removeprefix("0x"),
+                        "mixed signer RPC identity/key mismatch")
 
     def snapshot(self, endpoint, number="0x1"):
         block = self.rpc(endpoint, "eth_getBlockByNumber", [number, True])
@@ -320,9 +342,23 @@ class Case:
         if self.report.get("proposed"):
             return
         require(not self.report.get("transaction"), "wallet already submitted; inspect its retained receipt before resuming")
-        with self.node("provider", role="validator-prover", production=True, budget=2) as (endpoint, child):
+        with contextlib.ExitStack() as peers, self.node(
+                "provider", role="validator-prover", production=True, budget=2) as (endpoint, child):
             require(self.rpc(endpoint, "eth_blockNumber") == "0x0", "live validator must start at genesis")
             self.report["genesisHash"] = self.rpc(endpoint, "eth_getBlockByNumber", ["0x0", False])["hash"]
+            if self.report.get("mixedWeighted"):
+                before = self.snapshot(endpoint, "0x0")
+                co_before = [self.rpc(endpoint, method, [self.report["cosigner"], "latest"])
+                             for method in ["eth_getBalance", "eth_getTransactionCount"]]
+                self.report["wrongSenderRefusal"] = self.run("wallet-wrong-sender", ["tx", "send",
+                    "--from", self.report["cosigner"], "--to", self.report["recipient"], "--value", str(VALUE),
+                    "--keystore", "validator.json", "--password-file", "password", "--rpc-url", endpoint,
+                    "--nonce", "0", "--gas-limit", "21000"], expected=1)
+                require("pubkey" in self.report["wrongSenderRefusal"].lower()
+                        and self.snapshot(endpoint, "0x0") == before
+                        and co_before == [self.rpc(endpoint, method, [self.report["cosigner"], "latest"])
+                                          for method in ["eth_getBalance", "eth_getTransactionCount"]],
+                        "wrong registered sender was not refused unchanged")
             text = self.run("wallet-send", ["tx", "send", "--to", self.report["recipient"], "--value", str(VALUE),
                             "--keystore", "validator.json", "--password-file", "password", "--rpc-url", endpoint])
             hashes = re.findall(r"^0x[0-9a-f]{64}$", text, flags=re.MULTILINE)
@@ -332,12 +368,35 @@ class Case:
             receipt = self.wait(lambda: self.rpc(endpoint, "eth_getTransactionReceipt", hashes), child, timeout=120)
             self.report["blockHash"] = receipt["blockHash"]
             self.save()
+            if self.report.get("mixedWeighted"):
+                observations = []
+                for _ in range(3):
+                    info = self.rpc(endpoint, "shell_getFinalityInfo")
+                    require(int(info["lastFinalizedBlock"], 16) == 0, "weight2 alone finalized a total3 committee")
+                    observations.append(info)
+                    time.sleep(1)
+                self.report["insufficientWeightFinality"] = observations
+                info = self.wait(lambda: self.rpc(endpoint, "admin_nodeInfo"), child)
+                address = info["listenAddr"]
+                require(address and info["id"], "mixed proposer listening address absent")
+                if "/p2p/" not in address:
+                    address += "/p2p/" + info["id"]
+                co_endpoint, co_child = peers.enter_context(self.node(
+                    "cosigner", role="validator-prover", bootnode=address, keystore="cosigner.json"))
             self.wait(lambda: self.rpc(endpoint, "eth_getBlockByNumber", ["finalized", False])["hash"]
                       == self.report["blockHash"], child, timeout=120)
             actual = self.snapshot(endpoint)
             self.report["liveState"] = actual
             self.report["liveCertificate"] = self.rpc(endpoint, "shell_finalityProof", [self.report["blockHash"]])
             self.report["liveSigners"] = self.rpc(endpoint, "shell_getBlockSigners", ["0x1"])
+            if self.report.get("mixedWeighted"):
+                self.wait(lambda: self.rpc(co_endpoint, "eth_getBlockByNumber", ["finalized", False])["hash"]
+                          == self.report["blockHash"], co_child, timeout=120)
+                require(self.snapshot(co_endpoint) == actual, "mixed co-authority Native result mismatch")
+                self.report["cosignerNative"] = self.snapshot(co_endpoint)
+                self.report["cosignerBalance"] = self.rpc(co_endpoint, "eth_getBalance", [self.report["cosigner"], "latest"])
+                require(int(self.report["cosignerBalance"], 16) == INITIAL, "mixed co-authority account changed")
+                self.check_scheme()
             self.save()
             self.check_state(actual)
             require(self.report["liveCertificate"].get("certificate"), "live QC was not persisted")
@@ -354,6 +413,29 @@ class Case:
                     and status["manifest"] is None, "initial bounded proof prefix mismatch")
             self.report["partialProduction"] = status
             self.report["proposed"] = True
+            self.save()
+
+    def cold_mixed_source(self):
+        if not self.report.get("mixedWeighted") or (self.report.get("coldMixedSource")
+                                                    and self.report.get("coldMixedCosignerNonce") == "0x0"):
+            return
+        with self.node("provider") as (endpoint, child):
+            require(self.snapshot(endpoint) == self.report["liveState"], "mixed Native state lost on cold restart")
+            require(self.rpc(endpoint, "shell_finalityProof", [self.report["blockHash"]])
+                    == self.report["liveCertificate"], "mixed certificate changed on cold restart")
+            require(self.rpc(endpoint, "shell_getBlockSigners", ["0x1"]) == self.report["liveSigners"],
+                    "mixed signer keys lost on cold restart")
+            status = self.production(endpoint)
+            before = self.report["partialProduction"]
+            require(status and all(status[k] == before[k] for k in
+                    ["sourceHash", "components", "checkpointBytes", "manifest", "state"]),
+                    "mixed source/checkpoint changed without production")
+            require(self.rpc(endpoint, "eth_getBalance", [self.report["cosigner"], "latest"])
+                    == self.report["cosignerBalance"], "mixed co-authority account changed on cold restart")
+            nonce = self.rpc(endpoint, "eth_getTransactionCount", [self.report["cosigner"], "latest"])
+            require(nonce == "0x0", "mixed co-authority nonce changed without its own transaction")
+            self.report["coldMixedCosignerNonce"] = nonce
+            self.report["coldMixedSource"] = status
             self.save()
 
     def prove(self):
@@ -410,7 +492,8 @@ class Case:
         result = status["result"]
         native = self.report["liveState"]
         if self.proof_kind == "quorum":
-            require(result["proved_commit_signatures"] == 1, "actual QC signature AIR result absent")
+            require(result["proved_commit_signatures"] == (2 if self.report.get("mixedWeighted") else 1),
+                    "actual QC signature AIR result absent")
             execution = result["execution"]
             require(execution["proved_sender_signatures"] == 0, "unexpected QC artifact signature scope")
         else:
@@ -559,12 +642,19 @@ def main():
     parser.add_argument("--proof-kind", choices=["quorum", "sender-proposer"],
                         help="Signature proof role; new cases default to quorum, resume keeps the saved role")
     parser.add_argument("--stop-after-partial", action="store_true", help="Retain the first two genuine components for later resume")
+    parser.add_argument("--mixed-weighted", action="store_true",
+                        help="New SLH/MLDSA quorum case with weights2/1; both actual authorities must finalize")
     parser.add_argument("--history-after-advance", type=Path, metavar="COPY_ROOT",
                         help="With --resume, clone a closed complete case and verify old proof after a real later transaction")
     args = parser.parse_args()
+    require(not args.mixed_weighted or (args.validator_algorithm in [None, "slhdsa"]
+            and args.proof_kind in [None, "quorum"] and not args.history_after_advance),
+            "mixed weighted mode requires SLH authority/quorum and no history-advance copy")
     binary, root = args.binary.resolve(strict=True), args.root.absolute()
     if args.history_after_advance:
         require(args.resume and not args.stop_after_partial, "history advance requires a complete --resume source")
+        require(not json.loads((root / "result.json").read_text()).get("mixedWeighted"),
+                "mixed-authority later-block history needs its own live quorum; retain this source")
         require(args.validator_algorithm is None and args.proof_kind is None,
                 "history copies retain the source scheme and proof kind")
         with history_copy(binary, root, args.history_after_advance) as target:
@@ -590,10 +680,17 @@ def main():
         fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         case = Case(binary, root, args.resume, args.validator_algorithm, args.proof_kind)
         try:
+            require(not args.mixed_weighted or not args.resume or case.report.get("mixedWeighted"),
+                    "cannot add mixed authorities to an existing case")
+            if args.mixed_weighted and not args.resume:
+                case.algorithm = "slhdsa"
+                case.report.update(mixedWeighted=True, validatorAlgorithm="slhdsa")
+                case.save()
             if not case.report["complete"]:
                 case.initialize()
                 case.propose()
                 case.check_scheme()
+                case.cold_mixed_source()
                 if args.stop_after_partial:
                     print(json.dumps({"liveWalletPartial": True, "block": case.report["blockHash"], "components": 2}))
                     return
