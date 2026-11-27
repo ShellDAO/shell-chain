@@ -1943,7 +1943,40 @@ python3 tools/check-live-wallet-quorum.py \
 The full continuation still requires actual AIR verification of both commit
 signatures, independent fresh Native and proof-admitted peers, and hot/cold
 historical execution checks. Until those pass, leave that acceptance open.
-Later-block mixed history needs another live quorum and is not provided by the
-single-authority `--history-after-advance` mode. This local `[2,1]` experiment
-does not establish dynamic committees, every signer order, all weight sets,
-power-loss behavior or public network activation.
+This local `[2,1]` experiment does not establish dynamic committees, every
+signer order, all weight sets, power-loss behavior or public network activation.
+
+### Mixed history after a later Native transaction
+
+Keep the complete mixed wallet case closed, then use the same history entry:
+
+```sh
+python3 tools/check-live-wallet-quorum.py \
+  target/release/shell-node live-mixed-wallet-case --resume \
+  --history-after-advance live-mixed-history-case
+```
+
+The source must have completed full proof admission and cold verification.
+The copy retains the receiver, independently finalized co-authority database,
+original encrypted co-authority key, and generated account controls. Both
+source databases must be closed and unlocked; original source files stay
+unchanged. The saved mixed committee is inherited without a new mode flag.
+
+Two actual authority processes finalize a new signed wallet transfer at block 2
+using Native verification, with new proof production disabled. They must agree
+on the new block, mixed certificate, receipts, account balances and nonces.
+The effective fee belongs to the actual block proposer: when the co-authority
+proposes, the sender pays that fee and the co-authority receives it. Signing
+consensus votes does not consume the co-authority's account nonce.
+
+The existing block-1 artifact is then fully reverified with the current chain at
+block 2. Its two QC AIR signatures, old block/root and receipts must match the
+original execution; the result's current-tip anchor must identify block 2.
+Unknown-proof and stale-nonce requests must be rejected without state changes.
+Hot and separate-process cold rechecks must preserve the complete current
+Native state, including the co-authority's fee balance and nonce. Every recheck
+increments the actual verification counter; cached status is not authorization.
+No new proof graph is generated. This checks historical verification of block 1;
+proof-backed admission of block 2 and other committee/weight histories require
+separate acceptance. Retain the copy and resume the identical command after an
+interruption. Success prints `liveWalletAdvancedHistoryComplete: true`.

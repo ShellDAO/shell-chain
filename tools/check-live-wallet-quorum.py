@@ -66,18 +66,26 @@ def history_copy(binary, source, destination, store_name="receiver"):
         require(report["complete"] and report.get("proved") and report.get("coldVerification")
                 and report["coldVerification"]["state"] == "verified", "complete cold-verified source required")
         require(report["binarySHA256"] == digest(binary), "source binary mismatch")
+        mixed = report.get("mixedWeighted", False)
+        if mixed:
+            require((source / "cosigner.json").is_file() and (source / "cosigner" / "db" / "LOCK").is_file(),
+                    "closed mixed co-authority controls and database required")
         before = {str(p.relative_to(source)): digest(p) for p in source.rglob("*") if p.is_file()}
         if not destination.exists():
             destination.mkdir(mode=0o700)
-            for name in ["validator.json", "recipient.json", "password", "genesis.json"]:
+            for name in ["validator.json", "recipient.json", "password", "genesis.json"] + (["cosigner.json"] if mixed else []):
                 shutil.copy2(source / name, destination / name)
             shutil.copytree(source / store_name, destination / "receiver")
+            if mixed:
+                shutil.copytree(source / "cosigner", destination / "cosigner")
             report.update(commands=[], historySourceSHA256=source_hash, copyStore=store_name)
             (destination / "result.json").write_text(json.dumps(report, indent=2) + "\n")
         require(not any(p.is_symlink() for p in destination.rglob("*")), "history copy contains symbolic links")
         saved = json.loads((destination / "result.json").read_text())
         require(saved.get("historySourceSHA256") == source_hash and saved.get("copyStore", "receiver") == store_name,
                 "history destination belongs to another source; retain it for inspection")
+        require(not mixed or ((destination / "cosigner.json").is_file()
+                and (destination / "cosigner" / "db" / "LOCK").is_file()), "mixed history copy lost co-authority controls")
         try:
             yield destination
         finally:
@@ -254,13 +262,13 @@ class Case:
         self.report["initialized"] = True
         self.save()
 
-    def check_scheme(self):
+    def check_scheme(self, certificate=None, signers=None):
         kind, key_bytes, signature_bytes = {
             "mldsa65": ("MlDsa65", 1952, 3309),
             "slhdsa": ("SphincsSha2256f", 64, 49856),
         }[self.algorithm]
         key = json.loads((self.root / "validator.json").read_text())
-        certificate = self.report["liveCertificate"]["certificate"]
+        certificate = self.report["liveCertificate"]["certificate"] if certificate is None else certificate["certificate"]
         signature = certificate.get(self.report["validator"])
         require(len(bytes.fromhex(key["public_key"].removeprefix("0x"))) == key_bytes
                 and len(certificate) == (2 if self.report.get("mixedWeighted") else 1)
@@ -273,7 +281,8 @@ class Case:
             require(len(bytes.fromhex(other["public_key"].removeprefix("0x"))) == 1952
                     and signature and signature["sig_type"] == "MlDsa65" and len(signature["data"]) == 3309,
                     "genuine mixed co-authority signature absent")
-            signers = {x["address"]: x for x in self.report["liveSigners"]["signers"]}
+            signers = self.report["liveSigners"] if signers is None else signers
+            signers = {x["address"]: x for x in signers["signers"]}
             for name in ["validator", "cosigner"]:
                 address = self.report[name]
                 expected = json.loads((self.root / (name + ".json")).read_text())["public_key"]
@@ -568,11 +577,32 @@ class Case:
             for label in ["advancedHotVerification", "advancedColdVerification"]:
                 self.check_history_result(self.report[label], self.report["advancedState"]["block"]["hash"])
             return
-        with self.node("receiver", role="validator-prover") as (endpoint, child):
+        mixed = self.report.get("mixedWeighted", False)
+
+        def co_account(endpoint):
+            return ([self.rpc(endpoint, method, [self.report["cosigner"], "latest"])
+                     for method in ["eth_getBalance", "eth_getTransactionCount"]] if mixed else None)
+
+        with contextlib.ExitStack() as peers, self.node("receiver", role="validator-prover") as (endpoint, child):
+            if mixed:
+                def listening():
+                    info = self.rpc(endpoint, "admin_nodeInfo")
+                    return info if info["id"] and info["listenAddr"] else None
+
+                info = self.wait(listening, child)
+                address = info["listenAddr"]
+                if "/p2p/" not in address:
+                    address += "/p2p/" + info["id"]
+                co_endpoint, co_child = peers.enter_context(self.node(
+                    "cosigner", role="validator-prover", bootnode=address, keystore="cosigner.json"))
             if not self.report.get("advancedTransaction"):
                 require(not self.report.get("advanceSubmitted"),
                         "advance submission interrupted; inspect its retained log before recovery")
                 require(self.snapshot(endpoint) == self.report["liveState"], "copy differs from original Native state")
+                if mixed:
+                    require(self.snapshot(co_endpoint) == self.report["liveState"]
+                            and co_account(endpoint) == co_account(co_endpoint) == [self.report["cosignerBalance"], "0x0"],
+                            "copied co-authority differs from original finalized Native1")
                 self.report["advanceSubmitted"] = True
                 self.save()
                 text = self.run("wallet-advance", ["tx", "send", "--to", self.report["recipient"],
@@ -596,38 +626,70 @@ class Case:
                     and current["block"]["hash"] == receipt["blockHash"]
                     and current["block"]["parentHash"] == self.report["blockHash"]
                     and current["block"]["stateRoot"] != old["block"]["stateRoot"]
-                    and [int(x, 16) for x in current["balances"]] == [INITIAL - 2 * VALUE, 2 * VALUE]
                     and current["nonces"] == ["0x2", "0x0"], "current Native state did not really advance")
             receipts = current["receipts"]
             require(len(receipts) == 2 and all(x["status"] == "0x1" for x in receipts)
-                    and receipts[0]["transactionHash"] == self.report["advancedTransaction"],
+                    and receipts[0]["transactionHash"] == self.report["advancedTransaction"]
+                    and receipts[0]["from"] == self.report["validator"]
+                    and receipts[0]["to"] == self.report["recipient"],
                     "second-block receipts mismatch")
             fee = int(receipts[0]["gasUsed"], 16) * int(receipts[0]["effectiveGasPrice"], 16)
             reward = next(t for t in current["block"]["transactions"] if t.get("rewardKind") == "blockGasReward")
-            require(fee > 0 and int(reward["value"], 16) == fee and reward["to"] == self.report["validator"]
+            proposer = current["block"]["miner"]
+            authorities = [self.report["validator"]] + ([self.report["cosigner"]] if mixed else [])
+            require(fee > 0 and int(reward["value"], 16) == fee and reward["to"] == proposer and proposer in authorities
                     and receipts[1]["transactionHash"] == reward["hash"] and receipts[1]["gasUsed"] == "0x0",
                     "second-block fee/reward mismatch")
+            sender_balance = INITIAL - 2 * VALUE - fee + (fee if proposer == self.report["validator"] else 0)
+            require([int(x, 16) for x in current["balances"]] == [sender_balance, 2 * VALUE],
+                    "advanced sender value/fee balance mismatch")
+            if mixed:
+                expected_co = [hex(int(self.report["cosignerBalance"], 16)
+                                   + (fee if proposer == self.report["cosigner"] else 0)), "0x0"]
+                require(co_account(endpoint) == expected_co, "advanced co-authority fee/nonce mismatch")
+                self.wait(lambda: self.rpc(co_endpoint, "eth_getBlockByNumber", ["finalized", False])["hash"]
+                          == receipt["blockHash"], co_child, timeout=120)
+                require(self.snapshot(co_endpoint, "0x2") == current and co_account(co_endpoint) == expected_co,
+                        "independent co-authority Native2 result mismatch")
+                certificate = self.rpc(endpoint, "shell_finalityProof", [receipt["blockHash"]])
+                signers = self.rpc(endpoint, "shell_getBlockSigners", ["0x2"])
+                require(certificate["blockHash"] == receipt["blockHash"]
+                        and self.rpc(co_endpoint, "shell_finalityProof", [receipt["blockHash"]]) == certificate,
+                        "advanced mixed certificate is not shared by both nodes")
+                self.check_scheme(certificate, signers)
+                self.report.update(advancedCosignerState=expected_co, advancedCertificate=certificate,
+                                   advancedSigners=signers)
             require(self.report.get("advancedState", current) == current, "advanced Native state changed on resume")
             self.report["advancedState"] = current
             self.save()
             for method in ["admin_canonicalProofProduction", "admin_quorumProofProduction"]:
                 require(self.rpc(endpoint, method, [receipt["blockHash"]]) is None,
                         "default-off advance unexpectedly generated a proof")
+                require(not mixed or self.rpc(co_endpoint, method, [receipt["blockHash"]]) is None,
+                        "co-authority advance unexpectedly generated a proof")
             self.report["unknownProofRejection"] = self.rpc(endpoint, "admin_verifyCanonicalProof",
                                                           ["0x" + "00" * 32, True], reject=True)
             self.run("wallet-advanced-stale-nonce", ["tx", "send", "--to", self.report["recipient"],
                      "--value", str(VALUE), "--keystore", "validator.json", "--password-file", "password",
                      "--rpc-url", endpoint, "--nonce", "1", "--gas-limit", "21000"], expected=1)
-            require(self.snapshot(endpoint, "0x2") == current, "rejected input changed advanced Native state")
+            require(self.snapshot(endpoint, "0x2") == current
+                    and (not mixed or co_account(endpoint) == self.report["advancedCosignerState"]),
+                    "rejected input changed advanced Native state")
             if not self.report.get("advancedHotVerification"):
                 self.verify_history(endpoint, child, "advancedHot")
             self.check_history_result(self.report["advancedHotVerification"], current["block"]["hash"])
-            require(self.snapshot(endpoint, "0x2") == current, "hot history overwrote advanced Native state")
+            require(self.snapshot(endpoint, "0x2") == current
+                    and (not mixed or co_account(endpoint) == self.report["advancedCosignerState"]),
+                    "hot history overwrote advanced Native state")
         with self.node("receiver") as (endpoint, child):
-            require(self.snapshot(endpoint, "0x2") == self.report["advancedState"], "advanced state lost on restart")
+            require(self.snapshot(endpoint, "0x2") == self.report["advancedState"]
+                    and (not mixed or co_account(endpoint) == self.report["advancedCosignerState"]),
+                    "advanced state lost on restart")
             self.verify_history(endpoint, child, "advancedCold")
             self.check_history_result(self.report["advancedColdVerification"], self.report["advancedState"]["block"]["hash"])
-            require(self.snapshot(endpoint, "0x2") == self.report["advancedState"], "cold history overwrote advanced Native state")
+            require(self.snapshot(endpoint, "0x2") == self.report["advancedState"]
+                    and (not mixed or co_account(endpoint) == self.report["advancedCosignerState"]),
+                    "cold history overwrote advanced Native state")
         self.report["advancedHistoryComplete"] = True
         self.save()
 
@@ -653,8 +715,6 @@ def main():
     binary, root = args.binary.resolve(strict=True), args.root.absolute()
     if args.history_after_advance:
         require(args.resume and not args.stop_after_partial, "history advance requires a complete --resume source")
-        require(not json.loads((root / "result.json").read_text()).get("mixedWeighted"),
-                "mixed-authority later-block history needs its own live quorum; retain this source")
         require(args.validator_algorithm is None and args.proof_kind is None,
                 "history copies retain the source scheme and proof kind")
         with history_copy(binary, root, args.history_after_advance) as target:
