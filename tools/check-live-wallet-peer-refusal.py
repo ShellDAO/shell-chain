@@ -10,8 +10,10 @@ all inputs and state; resume using the same command without regenerating proofs.
 import argparse
 import fcntl
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
+import signal
 import time
 
 import blake3
@@ -135,10 +137,142 @@ def exercise(case, manifest, payload):
     case.save()
 
 
-def recover(case, provider_case):
+def closed_store(case):
+    """Read closed RocksDB column families without starting Node or writing keys."""
+    from rocksdict import AccessType, Options, Rdict
+
+    path = case.root / "receiver" / "db"
+    files = lambda: {str(p.relative_to(path)): wallet.digest(p) for p in path.rglob("*") if p.is_file()}
+    before = files()
+    native = hashlib.sha256()
+    count = 0
+    with (path / "LOCK").open("r+b") as lock:
+        fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        db = Rdict(str(path), options=Options(raw_mode=True), access_type=AccessType.read_only())
+        try:
+            families = sorted(Rdict.list_cf(str(path), Options(raw_mode=True)))
+            require(families == ["chain", "default", "index", "receipts", "state", "witness"],
+                    "unexpected RocksDB column families")
+            for name in families:
+                cf = db.get_column_family(name)
+                try:
+                    for key, value in cf.items():
+                        if not key.startswith(b"local/"):
+                            for part in [name.encode(), key, value]:
+                                native.update(len(part).to_bytes(8, "big"))
+                                native.update(part)
+                            count += 1
+                finally:
+                    cf.close()
+            state = db.get_column_family("state")
+            try:
+                block = bytes.fromhex(case.report["blockHash"][2:])
+                admission_prefix = b"local/canonical-admission/v1/"
+                body = state[admission_prefix + b"body/" + block]
+                record = json.loads(state[admission_prefix + b"record/" + block])
+                require("0x" + blake3.blake3(body).hexdigest() == record["sourceHash"],
+                        "closed candidate body/source mismatch")
+                proofs = {}
+                for label in ["bad", "good"]:
+                    proof_id = case.report.get(label + "ProofId")
+                    if not proof_id:
+                        continue
+                    raw_id = bytes.fromhex(proof_id[2:])
+                    prefix = b"local/canonical-proof-upload/v1/"
+                    raw = state.get(prefix + b"object/" + raw_id)
+                    if raw is None:
+                        continue
+                    status = json.loads(raw)
+                    generation = status.get("generation", 0)
+                    chunk_prefix = (prefix + b"generation-data/" + raw_id + generation.to_bytes(8, "big")
+                                    if generation else prefix + b"data/" + raw_id)
+                    payload, size, chunks = blake3.blake3(), 0, []
+                    for index in range(status["nextChunk"]):
+                        chunk = state[chunk_prefix + index.to_bytes(4, "big")]
+                        payload.update(chunk)
+                        size += len(chunk)
+                        chunks.append(hashlib.sha256(chunk).hexdigest())
+                    require(size == status["receivedBytes"] == status["manifest"]["totalBytes"]
+                            and "0x" + payload.hexdigest() == status["manifest"]["payloadHash"],
+                            "closed proof chunks/manifest mismatch")
+                    fetch = state.get(prefix + b"fetch/" + raw_id)
+                    proofs[label] = {"status": status, "chunkSHA256": chunks,
+                                     "fetch": json.loads(fetch) if fetch else None}
+                result = {"nativeSHA256": native.hexdigest(), "nativeRows": count,
+                          "head": "0x" + state[b"HEAD"].hex(), "admission": record,
+                          "bodySHA256": hashlib.sha256(body).hexdigest(), "proofs": proofs}
+            finally:
+                state.close()
+        finally:
+            db.close()
+    after = files()
+    # RocksDict may add its own format sidecar on the first foreign-store read.
+    require(all(after.get(k) == v for k, v in before.items())
+            and set(after) - set(before) <= {"rocksdict-config.json"}, "read-only inspection changed database files")
+    result["readerSidecarCreated"] = "rocksdict-config.json" in set(after) - set(before)
+    result["databaseFilesUnchanged"] = True
+    return result
+
+
+def interrupt_recovery(case, address):
+    if not case.report.get("processLoss"):
+        require(not case.report.get("processLossAttempted"), "previous crash boundary inconclusive; do not repeat the signal")
+        case.report["processLossAttempted"] = True
+        case.save()
+        with case.node("receiver", admission=True, bootnode=address,
+                       expected_exit_codes=(0, -signal.SIGKILL)) as (endpoint, child):
+            deadline = time.monotonic() + 1800
+            while True:
+                require(child.poll() is None, "recipient exited before the crash boundary")
+                admission = case.rpc(endpoint, "admin_canonicalProofAdmission", [case.report["blockHash"]])
+                record = admission["status"] if admission else {}
+                require(record.get("state") != "complete"
+                        and not (record.get("state") == "failed" and record["attempts"] == 2),
+                        "crash boundary missed; retain this prefix")
+                if record.get("state") == "verifying":
+                    status = case.rpc(endpoint, "admin_canonicalProofStatus", [case.report["goodProofId"]])
+                    if status["state"] == "verifying":
+                        require(admission["nativeCanonical"] is False and admission["statusIsAuthorization"] is False
+                                and record["attempts"] == 2 and record["manifest"] == case.report["goodManifest"]
+                                and record["peer"] == case.report["recoveryProviderInfo"]["id"]
+                                and status["verificationAttempts"] == 1 and status["result"] is None
+                                and status["manifest"] == case.report["goodManifest"]
+                                and status["receivedBytes"] == case.report["goodManifest"]["totalBytes"],
+                                "unexpected interrupted verification claim")
+                        native = unchanged_genesis(case, endpoint)
+                        case.report["processLoss"] = {"pid": child.pid, "signal": int(signal.SIGKILL),
+                            "observedAt": time.time(), "admission": admission, "intake": status, "native": native}
+                        case.save()
+                        require(child.poll() is None, "recipient exited before its owned signal")
+                        child.send_signal(signal.SIGKILL)
+                        require(child.wait(timeout=120) == -signal.SIGKILL, "own recipient did not exit from SIGKILL")
+                        break
+                require(time.monotonic() < deadline, "verification claim timed out; do not repeat the crash attempt")
+                time.sleep(0.05)
+    loss = case.report["processLoss"]
+    require(any(row.get("pid") == loss["pid"] and row.get("exitCode") == -signal.SIGKILL
+                for row in case.report["commands"]), "own signal lacks a completed command receipt")
+    if not case.report.get("interruptedStore"):
+        closed = closed_store(case)
+        baseline = case.report["closedBaseline"]
+        require(closed["nativeSHA256"] == baseline["nativeSHA256"] and closed["head"] == case.report["genesisHash"]
+                and closed["admission"] == loss["admission"]["status"]
+                and closed["bodySHA256"] == baseline["bodySHA256"]
+                and closed["proofs"]["good"]["status"] == loss["intake"]
+                and closed["proofs"]["bad"] == baseline["proofs"]["bad"],
+                "durable interrupted claim/chunks or Native0 mismatch")
+        case.report["interruptedStore"] = closed
+        case.save()
+
+
+def recover(case, provider_case, crash_after_claim=False):
     require(case.report.get("peerRefusalComplete") and case.report.get("copyStore") == "fresh",
             "retained failed peer copy required")
+    require(crash_after_claim or not case.report.get("processLossAttempted"),
+            "resume this interrupted case with --crash-after-claim")
     if case.report.get("peerRecoveryComplete"):
+        require(not crash_after_claim or case.report.get("crashRecoveryComplete"),
+                "completed happy recovery cannot establish process loss")
         return
     good_manifest = provider_case.report["production"]["manifest"]
     good_id = provider_case.report["proofId"]
@@ -147,6 +281,9 @@ def recover(case, provider_case):
             and provider_case.report["liveState"] == case.report["liveState"], "correct-source identity mismatch")
     case.report["goodManifest"] = good_manifest
     case.report["goodProofId"] = good_id
+    if crash_after_claim and not case.report.get("closedBaseline"):
+        case.report["closedBaseline"] = closed_store(case)
+        case.save()
     if not case.report.get("recoveryBefore"):
         with case.node("receiver", admission=True) as (endpoint, child):
             baseline = unchanged_genesis(case, endpoint)
@@ -174,6 +311,8 @@ def recover(case, provider_case):
             address += "/p2p/" + info["id"]
         case.report["recoveryProviderInfo"] = info
         case.save()
+        if crash_after_claim:
+            interrupt_recovery(case, address)
         with case.node("receiver", admission=True, bootnode=address) as (endpoint, child):
             def completed():
                 admission = case.rpc(endpoint, "admin_canonicalProofAdmission", [case.report["blockHash"]])
@@ -193,7 +332,8 @@ def recover(case, provider_case):
             require(actual == case.report["liveState"], "recovered Native receipts/accounts differ from independent original")
             verified = case.rpc(endpoint, "admin_canonicalProofStatus", [good_id])
             require(verified["state"] == "verified" and verified["result"]
-                    and verified["verificationAttempts"] == 1, "authentic peer payload not freshly verified")
+                    and verified["verificationAttempts"] == (2 if crash_after_claim else 1),
+                    "authentic peer payload not freshly verified")
             case.check_history_result(verified)
             old = case.rpc(endpoint, "admin_canonicalProofStatus", [case.report["badProofId"]])
             require(old == case.report["recoveryBefore"]["badIntake"], "recovery changed the rejected original proof")
@@ -215,6 +355,17 @@ def recover(case, provider_case):
                 == case.report["preservedBadIntake"], "cold recovery changed good/bad proof states")
         case.report["coldRecoveredAdmission"] = admission
         case.save()
+    if crash_after_claim:
+        closed = closed_store(case)
+        interrupted = case.report["interruptedStore"]
+        require(closed["head"] == case.report["blockHash"]
+                and closed["admission"] == case.report["recoveredAdmission"]["status"]
+                and closed["bodySHA256"] == interrupted["bodySHA256"]
+                and closed["proofs"]["good"]["chunkSHA256"] == interrupted["proofs"]["good"]["chunkSHA256"]
+                and closed["proofs"]["good"]["status"] == case.report["recoveredVerified"]
+                and closed["proofs"]["bad"] == interrupted["proofs"]["bad"], "closed recovered store mismatch")
+        case.report["recoveredStore"] = closed
+        case.report["crashRecoveryComplete"] = True
     case.report["peerRecoveryComplete"] = True
     case.save()
 
@@ -227,7 +378,11 @@ def main():
     parser.add_argument("root", type=Path)
     parser.add_argument("--recover-root", type=Path, metavar="COPY_ROOT",
                         help="Copy the completed failed recipient and reconnect it to the original authentic provider")
+    parser.add_argument("--crash-after-claim", action="store_true",
+                        help="With --recover-root and rocksdict 0.3.29, kill the owned recipient once at Verifying1")
     args = parser.parse_args()
+    if args.crash_after_claim and not args.recover_root:
+        parser.error("--crash-after-claim requires --recover-root")
     binary = args.binary.resolve(strict=True)
     if args.recover_root:
         with wallet.history_copy(binary, args.root.absolute(), args.recover_root, store_name="fresh") as target:
@@ -240,7 +395,7 @@ def main():
                     try:
                         case.check_scheme()
                         provider_case.check_scheme()
-                        recover(case, provider_case)
+                        recover(case, provider_case, args.crash_after_claim)
                         print(json.dumps({"liveWalletPeerRecoveryComplete": True, "block": case.report["blockHash"],
                                           "attempts": case.report["recoveredAdmission"]["status"]["attempts"]}))
                     except BaseException as error:

@@ -146,7 +146,8 @@ class Case:
         return (self.root / row["log"]).read_text()
 
     @contextlib.contextmanager
-    def node(self, name, role="prover", production=False, admission=False, bootnode=None, budget=16):
+    def node(self, name, role="prover", production=False, admission=False, bootnode=None, budget=16,
+             expected_exit_codes=(0,)):
         rpc_port, p2p_port = port(), port()
         while p2p_port == rpc_port:
             p2p_port = port()
@@ -182,7 +183,7 @@ class Case:
                     child.kill()
                     child.wait()
             self.finish(child, log, row)
-            require(child.returncode == 0, name + " did not stop cleanly; retain this prefix")
+            require(child.returncode in expected_exit_codes, name + " unexpected exit; retain this prefix")
 
     def rpc(self, endpoint, method, params=None, reject=False):
         data = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}

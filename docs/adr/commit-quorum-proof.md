@@ -1860,3 +1860,42 @@ and honest-provider data remain available for the same command to resume.
 Success prints `liveWalletPeerRecoveryComplete: true`. This recovers the stated
 candidate from one bad source; other retry, disconnect, fork and exhausted-bound
 combinations need their own evidence.
+
+
+### Process loss during correct-source recovery
+
+Use a new recovery directory to interrupt the correct artifact's first durable
+verification claim. This optional POSIX check additionally requires
+`rocksdict==0.3.29` in the Python environment; the ordinary recovery command does
+not import it.
+
+```sh
+python3 tools/check-live-wallet-peer-refusal.py \
+  target/release/shell-node live-slh-signature-case \
+  live-slh-tamper-case live-slh-peer-refusal-case \
+  --recover-root live-slh-peer-crash-case --crash-after-claim
+```
+
+The helper sends SIGKILL once to its own newly spawned recipient after observing
+the second candidate manifest, complete good chunks, `Verifying` attempt 1 with
+no result, and unchanged funded genesis with no wallet receipt. It independently
+opens the closed RocksDB column families read-only before any node restart:
+all non-local rows must match the original genesis, the durable claim and source
+body must match the observations, both artifacts' chunk digests must match their
+manifests, and the old rejected upload and failed transfer must stay unchanged.
+RocksDict may create its format sidecar on its first read of a foreign store;
+existing database files and keys must remain unchanged.
+
+Reopening the same prefix must perform fresh full verification attempt 2 before
+importing/finalizing block 1 with the original wallet receipts, accounts and fee
+reward. A separate cold restart and closed-store check retain that state, all
+good chunks and the old bad artifact. No proof is regenerated or database reset.
+The report records `crashRecoveryComplete: true` only after these checks pass.
+A previously completed happy recovery cannot substitute for this new case.
+
+Keep the directory and resume the identical command after an interruption.
+An unconfirmed or missed termination boundary is retained as inconclusive;
+the helper refuses to send another signal. The observed boundary is a durable
+claim/dispatch, which may include payload loading, rather than an exact inner
+verification instruction. Power loss, torn writes, other hosts/backends and
+public network activation require separate evidence.
