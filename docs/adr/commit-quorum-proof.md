@@ -1980,3 +1980,34 @@ No new proof graph is generated. This checks historical verification of block 1;
 proof-backed admission of block 2 and other committee/weight histories require
 separate acceptance. Retain the copy and resume the identical command after an
 interruption. Success prints `liveWalletAdvancedHistoryComplete: true`.
+
+### Mixed co-authority inner proof refusal at block 2
+
+After completing mixed history, close its processes and use the same tamper
+entry and Python dependencies described above:
+
+```sh
+python3 tools/check-live-wallet-tamper.py \
+  target/release/shell-node live-mixed-history-case live-mixed-tamper-case
+```
+
+This profile requires the genuine version-2 quorum artifact with one SLH and
+one ML-DSA-65 commit signature. The tool roundtrips its canonical CBOR and binds
+the ML-DSA public key and original block-1 signature to the retained
+co-authority. It changes one bit in that signature decoder's inner Winterfell
+proof nonce, preserves every other field and the artifact's byte count, and
+recomputes the payload hash. The quorum format has no compact certificate pool
+to rehash. Both good and bad artifacts must fit the original 256 MiB object and
+512 MiB cache bounds.
+
+The bad artifact must pass chunk intake and reach actual hot and
+separate-process cold verification, each refusing with
+`signature encoding: decoder verification: QuerySeedProofOfWorkVerificationFailed`.
+The authentic verified artifact and complete current Native2 state, including
+the co-authority's fee balance and nonce, must stay unchanged. Source controls,
+keys, proof graph, activation and limits are reused. Retain the output directory
+and resume the same command after interruption; success prints
+`liveWalletInnerTamperRejected: true`. This covers the stated decoder nonce
+mutation in this local mixed profile; automatic malicious-peer admission,
+other proof fields, resource profiles and public releases require separate
+acceptance.

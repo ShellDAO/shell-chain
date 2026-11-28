@@ -28,7 +28,37 @@ def payload_hash(data):
     return "0x" + blake3.blake3(data).hexdigest()
 
 
-def mutate(payload):
+def mutate(payload, co_entry=None):
+    quorum_prefix = b"\0commit-quorum/cbor/v2/"
+    if payload.startswith(quorum_prefix):
+        require(co_entry is not None, "actual mixed co-authority binding required")
+        encoded = payload[len(quorum_prefix):]
+        frame = cbor2.loads(encoded)
+        require(cbor2.dumps(frame) == encoded and frame["version"] == 2
+                and len(frame["signatures"]) == len(frame["slh_signatures"]) == 1,
+                "canonical mixed two-signature quorum frame required")
+        lattice = frame["signatures"][0]
+        require(lattice["version"] == 1
+                and lattice["equation"]["key"]["public_key"] == co_entry["publicKey"]
+                and lattice["equation"]["signature"]["signature"] == co_entry["signature"],
+                "actual ML-DSA co-authority key/signature mismatch")
+        decoder = lattice["equation"]["signature"]
+        raw = decoder["proof_bytes"]
+        require(isinstance(raw, list) and 8 < len(raw) <= 1_048_576
+                and all(isinstance(v, int) and 0 <= v <= 255 for v in raw), "bounded decoder proof required")
+        before = raw[-1]
+        raw[-1] ^= 1
+        changed = quorum_prefix + cbor2.dumps(frame)
+        after = raw[-1]
+        raw[-1] = before
+        require(cbor2.dumps(frame) == encoded, "mutation changed another quorum field")
+        require(len(changed) == len(payload) and changed != payload, "quorum mutation changed geometry")
+        return changed, {"path": ["signatures", 0, "equation", "signature", "proof_bytes"],
+                         "coAuthority": co_entry["address"], "innerProofBytes": len(raw),
+                         "changedOffset": len(raw) - 1, "beforeByte": before, "afterByte": after,
+                         "mutation": "one bit in Winterfell serialized trailing u64 decoder proof nonce",
+                         "expectedVerifierError": "signature encoding: decoder verification: QuerySeedProofOfWorkVerificationFailed",
+                         "frame": quorum_prefix.decode("ascii")}
     marker = b"\0canonical-proof/cbor/"
     require(payload.startswith(marker), "compact canonical artifact required")
     end = payload.find(b"/", len(marker)) + 1
@@ -83,18 +113,29 @@ def check_rejected(case, endpoint, child, label):
             "verification must claim the actual persisted complete payload")
     require(status["state"] == "rejected" and status["result"] is None
             and status["verificationAttempts"] == before["verificationAttempts"] + 1
-            and "BLAKE3 compression verification:" in (status.get("error") or ""),
-            "expected inner BLAKE3 STARK verification refusal; inspect the retained first result")
+            and case.report["mutation"].get("expectedVerifierError", "BLAKE3 compression verification:")
+            in (status.get("error") or ""),
+            "expected inner STARK verification refusal; inspect the retained first result")
+
+
+def unchanged_current(case, endpoint):
+    require(case.snapshot(endpoint, "0x2") == case.report["advancedState"], "inner proof changed current Native state")
+    if case.report.get("mixedWeighted"):
+        account = [case.rpc(endpoint, method, [case.report["cosigner"], "latest"])
+                   for method in ["eth_getBalance", "eth_getTransactionCount"]]
+        require(account == case.report["advancedCosignerState"], "inner proof changed co-authority fee/nonce")
 
 
 def exercise(case):
     require(case.report.get("advancedHistoryComplete"), "real advanced-history source required")
-    require(case.proof_kind == "sender-proposer", "sender/proposer source artifact required")
+    require(case.proof_kind == "sender-proposer"
+            or (case.proof_kind == "quorum" and case.report.get("mixedWeighted")),
+            "sender/proposer or actual mixed-quorum source artifact required")
     if case.report.get("tamperComplete"):
         return
     with case.node("receiver") as (endpoint, child):
         golden = case.report["advancedState"]
-        require(case.snapshot(endpoint, "0x2") == golden, "copy differs from actual advanced Native state")
+        unchanged_current(case, endpoint)
         original = case.rpc(endpoint, "admin_canonicalProofStatus", [case.report["proofId"]])
         require(original["state"] == "verified" and original["result"], "authentic full proof required")
         case.check_history_result(original, golden["block"]["hash"])
@@ -118,7 +159,14 @@ def exercise(case):
                 "authentic retained payload mismatch")
         mutated_file = case.root / "tampered-payload.bin"
         if not mutated_file.exists():
-            changed, observation = mutate(payload)
+            co_entry = None
+            if case.proof_kind == "quorum":
+                key = json.loads((case.root / "cosigner.json").read_text())["public_key"]
+                signature = case.report["liveCertificate"]["certificate"][case.report["cosigner"]]
+                require(signature["sig_type"] == "MlDsa65", "actual ML-DSA co-authority signature required")
+                co_entry = {"address": case.report["cosigner"],
+                            "publicKey": list(bytes.fromhex(key.removeprefix("0x"))), "signature": signature["data"]}
+            changed, observation = mutate(payload, co_entry)
             mutated_file.write_bytes(changed)
             case.report["mutation"] = observation
             case.save()
@@ -126,6 +174,8 @@ def exercise(case):
         altered = dict(manifest, payloadHash=payload_hash(changed))
         require(len(changed) == manifest["totalBytes"] and altered["payloadHash"] != manifest["payloadHash"],
                 "mutated artifact hash/geometry mismatch")
+        require(len(changed) <= 256 * 1024 * 1024 and 2 * len(changed) <= 512 * 1024 * 1024,
+                "good and bad artifacts exceed the original object/cache bounds")
         case.report["tamperedManifest"] = altered
         status = case.rpc(endpoint, "admin_beginCanonicalProof", [altered])
         case.report["tamperedProofId"] = status["proofId"]
@@ -139,12 +189,12 @@ def exercise(case):
         require(status["receivedBytes"] == len(changed), "incomplete mutated payload")
         if not case.report.get("hotTamperRejection"):
             check_rejected(case, endpoint, child, "hotTamper")
-        require(case.snapshot(endpoint, "0x2") == golden, "rejected inner proof changed current Native state")
+        unchanged_current(case, endpoint)
         require(case.rpc(endpoint, "admin_canonicalProofStatus", [case.report["proofId"]]) == original,
                 "mutated artifact changed authentic original intake/result")
     with case.node("receiver") as (endpoint, child):
         check_rejected(case, endpoint, child, "coldTamper")
-        require(case.snapshot(endpoint, "0x2") == case.report["advancedState"], "cold rejection changed current Native state")
+        unchanged_current(case, endpoint)
         require(case.rpc(endpoint, "admin_canonicalProofStatus", [case.report["proofId"]]) == case.report["originalIntake"],
                 "cold mutated artifact changed authentic intake/result")
     case.report["tamperComplete"] = True
